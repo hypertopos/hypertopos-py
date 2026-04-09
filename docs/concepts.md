@@ -58,10 +58,6 @@ where μ = E[s] is the population mean, σ = max(std(s), ε) the clamped standar
 - **Cross-sphere comparison** *(planned)* — dimensionless scalar metrics from independently calibrated coordinate spaces enable comparison across separate data systems
 - **What-if analysis** *(planned)* — hypothetical edge changes produce a modified coordinate vector showing the geometric effect
 
-### Intellectual Property
-
-**Patent Pending.** The method for constructing population-relative geometric coordinate systems from typed entity relationships is the subject of a U.S. provisional patent application (USPTO, 2026). This covers the core mechanism: shape vector derivation from typed edge counts and property indicators, statistical normalization into a population-calibrated coordinate space, and geometric operations over the resulting space. As of March 2026, no prior patent or published scientific work describing this specific construction has been identified. All rights reserved.
-
 ## Three Scales
 
 ![Three Scales](images/three-scales.svg)
@@ -100,6 +96,32 @@ The important nuance is:
 - the polygon is the linked structure of points inside that population
 - the edges connect those points to other lines
 
+### Anchor and event lines
+
+Every line has a `line_role` — either **anchor** or **event**. The distinction reflects the nature of the entities it holds.
+
+| | Anchor line | Event line |
+|---|-------------|------------|
+| **What it holds** | Stable entities (customers, accounts, products, districts) | Discrete occurrences (transactions, orders, log entries) |
+| **Cardinality** | Typically thousands–millions of unique entities | Often orders of magnitude larger — one row per event |
+| **Identity** | Each point has a persistent identity across time | Each point is a single, immutable occurrence |
+| **Full-text search** | Enabled by default (`fts: true`) | Disabled by default — event volume makes FTS impractical |
+| **Role in patterns** | Subject of anchor patterns — geometry built from relationships and properties of the entity itself | Subject of event patterns — geometry built from which anchor entities participated and continuous event dimensions (e.g. amount, duration) |
+
+The same distinction carries into patterns: `pattern_type` is `"anchor"` or `"event"`.
+
+**Anchor patterns** describe the geometric shape of a stable entity. Their dimensions come from:
+- **relations** — edges to other anchor lines (e.g. account → district)
+- **derived dimensions** — aggregates computed from linked event patterns (e.g. transaction count, burst frequency)
+- **precomputed dimensions** — columns already present on the entity (e.g. balance volatility)
+- **tracked properties** — categorical columns carried through for cohort analysis
+
+**Event patterns** describe the geometric shape of a single occurrence. Their dimensions come from:
+- **relations** — edges pointing back to anchor lines (e.g. transaction → account, transaction → operation)
+- **event dimensions** — continuous numeric columns on the event itself (e.g. amount, balance)
+
+In a typical sphere, event lines feed into anchor patterns via `derived_dimensions` — the builder aggregates event-level data per anchor entity to produce behavioral features. This is how "1M transactions" becomes "4,500 account behavioral profiles."
+
 ## Geometry Vocabulary
 
 | Term | Definition |
@@ -136,26 +158,26 @@ For the full YAML syntax, field tables, and examples, see [configuration.md](con
 
 Navigation is stateful. Each step depends on the current position.
 
-| Primitive | Purpose | Category |
-|-----------|---------|----------|
-| `π1` walk_line | Move along a line | Position |
-| `π2` jump_polygon | Jump through polygon to another line | Position |
-| `π3` dive_solid | Dive into temporal history | Depth |
-| `π4` emerge | Return to higher level | Depth |
-| `π5` attract_anomaly | Find most anomalous polygons | Attract |
-| `π6` attract_boundary | Find boundary-near entities | Attract |
-| `π7` attract_hub | Find most connected entities | Attract |
-| `π8` attract_cluster | Discover geometric archetypes | Attract |
-| `π9` attract_drift | Find highest temporal drift | Temporal |
-| `π10` attract_trajectory | Find similar temporal trajectories | Temporal |
-| `π11` attract_population_compare | Compare geometry across time windows | Temporal |
-| `π12` attract_regime_change | Detect geometry regime shifts | Temporal |
+| Primitive | Purpose | Category | Requires |
+|-----------|---------|----------|----------|
+| `π1` walk_line | Move along a line | Position | Point on a line |
+| `π2` jump_polygon | Jump through polygon to another line | Position | Polygon with alive edge to target line |
+| `π3` dive_solid | Dive into temporal history | Depth | entity key + pattern (any position) |
+| `π4` emerge | Return to higher level | Depth | Polygon or Solid position |
+| `π5` attract_anomaly | Find most anomalous polygons | Attract | pattern only (population scan) |
+| `π6` attract_boundary | Find boundary-near entities | Attract | pattern + alias (population scan) |
+| `π7` attract_hub | Find most connected entities | Attract | pattern only (population scan) |
+| `π8` attract_cluster | Discover geometric archetypes | Attract | pattern only (population scan) |
+| `π9` attract_drift | Find highest temporal drift | Temporal | pattern + temporal data |
+| `π10` attract_trajectory | Find similar temporal trajectories | Temporal | pattern + reference entity |
+| `π11` attract_population_compare | Compare geometry across time windows | Temporal | pattern + two time windows |
+| `π12` attract_regime_change | Detect geometry regime shifts | Temporal | pattern + temporal data |
 
 The primitives are intentionally small. They work best as building blocks:
 
-- walk and jump move the current position
-- dive and emerge change the level of detail
-- attract_* primitives search for things worth looking at
+- walk and jump move the current position — they require an active point or polygon
+- dive and emerge change the level of detail — dive enters a solid, emerge returns to point
+- attract_* primitives scan the population — they need only a pattern, not a specific position
 - compare and regime primitives summarize what changed across time or groups
 
 This keeps the agent interaction model readable. Instead of one giant search API, GDS gives a small set of moves that can be chained together.
@@ -197,3 +219,7 @@ This is not a full API reference or storage specification. For those, see:
 - [api-reference.md](api-reference.md) -- full Python API and primitive signatures
 - [data-format.md](data-format.md) -- Arrow IPC format, directory structure, and schemas
 - [configuration.md](configuration.md) -- YAML builder syntax and field tables
+
+## Intellectual Property
+
+**Patent Pending.** The method for constructing population-relative geometric coordinate systems from typed entity relationships is the subject of a U.S. provisional patent application (USPTO, 2026). This covers the core mechanism: shape vector derivation from typed edge counts and property indicators, statistical normalization into a population-calibrated coordinate space, and geometric operations over the resulting space. As of March 2026, no prior patent or published scientific work describing this specific construction has been identified. All rights reserved.

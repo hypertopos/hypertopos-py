@@ -175,9 +175,6 @@ graph LR
     MCP --> Agent["AI Agent"]
     CT["CalibrationTracker\nonline drift\nWelford stats"] -.-> E
     M["Manifest\nMVCC version pin"] -.-> ST
-    style PS fill:#fda
-    style CT fill:#adf
-    style M fill:#dfa
 ```
 
 ## MVCC Model

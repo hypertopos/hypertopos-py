@@ -6,24 +6,7 @@
 
 ## Directory Layout
 
-```mermaid
-mindmap
-  root((Sphere))
-    _gds_meta/
-      sphere.json — config & stats
-      geometry_stats/ — precomputed summaries
-      trajectory/ — ANN index
-      temporal_centroids/ — centroid cache
-    points/
-      line_id/v=n/ — entity data per line
-      Lance with BTREE + FTS indices
-    geometry/
-      pattern_id/v=n/ — delta vectors & edges
-      Lance with IVF-PQ ANN index for similarity
-    temporal/
-      pattern_id/ — deformation history
-      shape snapshots over time
-```
+![Directory Layout](images/directory-layout.svg)
 
 Each sphere is a self-contained directory:
 

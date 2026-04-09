@@ -25,6 +25,14 @@ pip install hypertopos
 
 ![hypertopos overview](docs/images/hypertopos-overview.svg)
 
+## Under the Hood
+
+At its core, the system builds a population-calibrated coordinate space from typed relationships and entity properties — and enables agents to navigate it.
+
+Each entity occupies a position derived from statistical normalization (μ and σ per dimension), producing a shared coordinate system in ℝ^D.
+
+Navigation primitives turn this space into a stateful, step-by-step workspace, where clustering, anomaly detection, drift tracking, and temporal analysis are performed as geometric operations — without model training or learned embeddings.
+
 ## What Makes It Different
 
 - **Geometry, not queries** — entities live in a population-calibrated coordinate space (μ, σ, θ). Position tells you what's typical. Distance reveals what's unusual, what's similar, and where clusters form.
@@ -49,6 +57,21 @@ pip install hypertopos
 | **Explains why** | Witness sets, dimension ranking | Centrality scores | Nearest neighbors | Anomaly scores |
 
 hypertopos is not a graph database, a vector store, or an ML framework. It is a **geometric coordinate system** built from relational structure — designed for AI agents to navigate, not for humans to query.
+
+## Why This Matters
+
+Most systems either:
+
+- operate on raw relationships (queries, traversals), or
+- rely on trained models (embeddings, ML pipelines)
+
+This approach provides a third option:
+
+- a persistent, interpretable coordinate system
+- consistent across time
+- usable for multiple analytical tasks without retraining
+
+This enables simpler, more transparent analysis of complex relational systems.
 
 ## Documentation
 

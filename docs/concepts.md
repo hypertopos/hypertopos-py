@@ -220,6 +220,16 @@ This is not a full API reference or storage specification. For those, see:
 - [data-format.md](data-format.md) -- Arrow IPC format, directory structure, and schemas
 - [configuration.md](configuration.md) -- YAML builder syntax and field tables
 
-## Intellectual Property
+## Patent Pending
 
-**Patent Pending.** The method for constructing population-relative geometric coordinate systems from typed entity relationships is the subject of a U.S. provisional patent application (USPTO, 2026). This covers the core mechanism: shape vector derivation from typed edge counts and property indicators, statistical normalization into a population-calibrated coordinate space, and geometric operations over the resulting space. As of March 2026, no prior patent or published scientific work describing this specific construction has been identified. All rights reserved.
+This work explores a different way of thinking about data.
+
+Instead of querying entities or training models, it constructs a shared geometric space where every entity occupies a position defined relative to the population it belongs to. Entities are mapped to coordinates derived from their relational structure, enabling direct geometric interpretation of similarity, deviation, and change over time.
+
+From this perspective, anomaly is distance. Similarity is proximity. Change is trajectory.
+
+The system derives these positions directly from observable relational patterns and maintains them as a persistent, population-calibrated coordinate system — enabling analysis, comparison, and navigation without retraining or opaque embeddings.
+
+This approach opens the door to treating complex data systems as navigable spaces rather than queryable records.
+
+Based on a U.S. provisional patent application (2026, USPTO). The scope of protection will be defined by the claims of the subsequent non-provisional application.

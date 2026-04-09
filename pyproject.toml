@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hypertopos"
+version = "0.1.0"
+description = "Navigate your data like space."
+requires-python = ">=3.12"
+license = {text = "BSL-1.1"}
+dependencies = [
+    "pyarrow>=14.0",
+    "numpy>=1.26",
+    "pylance>=0.20",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+]
+mcp = [
+    "mcp[cli]>=1.20",
+    "tzdata>=2024.1",
+]
+datafusion = [
+    "datafusion>=40.0",
+]
+
+[project.scripts]
+hypertopos = "hypertopos.cli.main:main"
+
+[[project.authors]]
+name = "Karol Kędzia"
+
+[project.urls]
+Homepage = "https://github.com/hypertopos/hypertopos-py"
+Documentation = "https://github.com/hypertopos/hypertopos-py/tree/main/docs"
+Repository = "https://github.com/hypertopos/hypertopos-py"
+Issues = "https://github.com/hypertopos/hypertopos-py/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["hypertopos"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"

@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 380" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0a0e27"/>
+      <stop offset="100%" stop-color="#1a1a3e"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="760" height="380" fill="url(#bg)" rx="12"/>
+
+  <!-- ===== Scale 1: Sphere ===== -->
+  <g transform="translate(35, 22)">
+    <rect x="0" y="0" width="690" height="72" rx="10" fill="#0f2040" stroke="#3b82f6" stroke-width="1.5"/>
+
+    <text x="20" y="26" fill="#60a5fa" font-size="18" font-weight="700">Scale 1</text>
+    <text x="120" y="26" fill="#93c5fd" font-size="12">Sphere — population-level view of the whole domain</text>
+
+    <rect x="20" y="38" width="120" height="24" rx="5" fill="#1a2744" stroke="#3b82f6" stroke-width="0.8"/>
+    <text x="80" y="54" fill="#ccd6f6" font-size="9" text-anchor="middle">sphere_overview</text>
+
+    <rect x="150" y="38" width="95" height="24" rx="5" fill="#1a2744" stroke="#3b82f6" stroke-width="0.8"/>
+    <text x="197" y="54" fill="#ccd6f6" font-size="9" text-anchor="middle">check_alerts</text>
+
+    <rect x="255" y="38" width="80" height="24" rx="5" fill="#1a2744" stroke="#3b82f6" stroke-width="0.8"/>
+    <text x="295" y="54" fill="#ccd6f6" font-size="9" text-anchor="middle">aggregate</text>
+  </g>
+
+  <!-- Arrow 1→2 -->
+  <g>
+    <line x1="380" y1="98" x2="380" y2="125" stroke="#f59e0b" stroke-width="2"/>
+    <polygon points="375,125 380,134 385,125" fill="#f59e0b"/>
+    <text x="400" y="120" fill="#fbbf24" font-size="10" font-weight="600">drill down</text>
+  </g>
+
+  <!-- ===== Scale 2: Population ===== -->
+  <g transform="translate(35, 138)">
+    <rect x="0" y="0" width="690" height="82" rx="10" fill="#1a1500" stroke="#f59e0b" stroke-width="1.5"/>
+
+    <text x="20" y="26" fill="#fbbf24" font-size="18" font-weight="700">Scale 2</text>
+    <text x="125" y="26" fill="#fcd34d" font-size="12">Population — clustering, comparison, drift, hubs, boundaries</text>
+
+    <rect x="20" y="40" width="68" height="24" rx="5" fill="#2a1f00" stroke="#f59e0b" stroke-width="0.8"/>
+    <text x="54" y="56" fill="#fcd34d" font-size="9" text-anchor="middle">π5 anomaly</text>
+
+    <rect x="96" y="40" width="72" height="24" rx="5" fill="#2a1f00" stroke="#f59e0b" stroke-width="0.8"/>
+    <text x="132" y="56" fill="#fcd34d" font-size="9" text-anchor="middle">π6 boundary</text>
+
+    <rect x="176" y="40" width="52" height="24" rx="5" fill="#2a1f00" stroke="#f59e0b" stroke-width="0.8"/>
+    <text x="202" y="56" fill="#fcd34d" font-size="9" text-anchor="middle">π7 hub</text>
+
+    <rect x="236" y="40" width="62" height="24" rx="5" fill="#2a1f00" stroke="#f59e0b" stroke-width="0.8"/>
+    <text x="267" y="56" fill="#fcd34d" font-size="9" text-anchor="middle">π8 cluster</text>
+
+    <rect x="306" y="40" width="55" height="24" rx="5" fill="#2a1f00" stroke="#f59e0b" stroke-width="0.8"/>
+    <text x="333" y="56" fill="#fcd34d" font-size="9" text-anchor="middle">π9 drift</text>
+
+    <rect x="369" y="40" width="76" height="24" rx="5" fill="#2a1f00" stroke="#f59e0b" stroke-width="0.8"/>
+    <text x="407" y="56" fill="#fcd34d" font-size="9" text-anchor="middle">π10 trajectory</text>
+
+    <rect x="453" y="40" width="78" height="24" rx="5" fill="#2a1f00" stroke="#f59e0b" stroke-width="0.8"/>
+    <text x="492" y="56" fill="#fcd34d" font-size="9" text-anchor="middle">π11 compare</text>
+
+    <rect x="539" y="40" width="70" height="24" rx="5" fill="#2a1f00" stroke="#f59e0b" stroke-width="0.8"/>
+    <text x="574" y="56" fill="#fcd34d" font-size="9" text-anchor="middle">π12 regime</text>
+  </g>
+
+  <!-- Arrow 2→3 -->
+  <g>
+    <line x1="380" y1="224" x2="380" y2="251" stroke="#2ed573" stroke-width="2"/>
+    <polygon points="375,251 380,260 385,251" fill="#2ed573"/>
+    <text x="400" y="246" fill="#2ed573" font-size="10" font-weight="600">inspect</text>
+  </g>
+
+  <!-- ===== Scale 3: Entity ===== -->
+  <g transform="translate(35, 264)">
+    <rect x="0" y="0" width="690" height="82" rx="10" fill="#001a0a" stroke="#2ed573" stroke-width="1.5"/>
+
+    <text x="20" y="26" fill="#2ed573" font-size="18" font-weight="700">Scale 3</text>
+    <text x="120" y="26" fill="#6ee7b7" font-size="12">Entity — one point, one polygon, one solid, full inspection</text>
+
+    <rect x="20" y="40" width="55" height="24" rx="5" fill="#002a12" stroke="#2ed573" stroke-width="0.8"/>
+    <text x="47" y="56" fill="#6ee7b7" font-size="9" text-anchor="middle">π1 walk</text>
+
+    <rect x="83" y="40" width="58" height="24" rx="5" fill="#002a12" stroke="#2ed573" stroke-width="0.8"/>
+    <text x="112" y="56" fill="#6ee7b7" font-size="9" text-anchor="middle">π2 jump</text>
+
+    <rect x="149" y="40" width="55" height="24" rx="5" fill="#002a12" stroke="#2ed573" stroke-width="0.8"/>
+    <text x="176" y="56" fill="#6ee7b7" font-size="9" text-anchor="middle">π3 dive</text>
+
+    <rect x="212" y="40" width="70" height="24" rx="5" fill="#002a12" stroke="#2ed573" stroke-width="0.8"/>
+    <text x="247" y="56" fill="#6ee7b7" font-size="9" text-anchor="middle">π4 emerge</text>
+
+    <rect x="300" y="40" width="130" height="24" rx="5" fill="#002a12" stroke="#2ed573" stroke-width="0.8"/>
+    <text x="365" y="56" fill="#6ee7b7" font-size="9" text-anchor="middle">explain · investigate</text>
+  </g>
+</svg>

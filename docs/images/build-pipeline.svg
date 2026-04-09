@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 160" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0a0e27"/>
+      <stop offset="100%" stop-color="#1a1a3e"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="760" height="160" fill="url(#bg)" rx="12"/>
+
+  <!-- Title -->
+  <text x="380" y="24" fill="#ccd6f6" font-size="12" font-weight="600" text-anchor="middle" letter-spacing="2">BUILD PIPELINE</text>
+
+  <!-- All boxes on one row, y=45 -->
+
+  <!-- sphere.yaml -->
+  <g transform="translate(15, 45)">
+    <rect x="0" y="0" width="85" height="55" rx="8" fill="#2a1040" stroke="#c084fc" stroke-width="1.5"/>
+    <text x="42" y="22" fill="#c084fc" font-size="11" font-weight="700" text-anchor="middle">sphere</text>
+    <text x="42" y="38" fill="#c084fc" font-size="11" font-weight="700" text-anchor="middle">.yaml</text>
+  </g>
+
+  <!-- Arrow -->
+  <line x1="108" y1="72" x2="130" y2="72" stroke="#8892b0" stroke-width="2"/>
+  <polygon points="130,67 140,72 130,77" fill="#8892b0"/>
+
+  <!-- Sources -->
+  <g transform="translate(148, 45)">
+    <rect x="0" y="0" width="90" height="55" rx="8" fill="#1a1a3e" stroke="#8892b0" stroke-width="1.5"/>
+    <text x="45" y="22" fill="#ccd6f6" font-size="12" font-weight="700" text-anchor="middle">Sources</text>
+    <text x="45" y="40" fill="#8892b0" font-size="8" text-anchor="middle">CSV · Parquet · Py</text>
+  </g>
+
+  <!-- Arrow -->
+  <line x1="246" y1="72" x2="268" y2="72" stroke="#8892b0" stroke-width="2"/>
+  <polygon points="268,67 278,72 268,77" fill="#8892b0"/>
+
+  <!-- Lines -->
+  <g transform="translate(286, 45)">
+    <rect x="0" y="0" width="80" height="55" rx="8" fill="#0f2040" stroke="#22d3ee" stroke-width="1.5"/>
+    <text x="40" y="22" fill="#22d3ee" font-size="12" font-weight="700" text-anchor="middle">Lines</text>
+    <text x="40" y="40" fill="#67e8f9" font-size="8" text-anchor="middle">entity tables</text>
+  </g>
+
+  <!-- Arrow -->
+  <line x1="374" y1="72" x2="396" y2="72" stroke="#8892b0" stroke-width="2"/>
+  <polygon points="396,67 406,72 396,77" fill="#8892b0"/>
+
+  <!-- Patterns -->
+  <g transform="translate(414, 45)">
+    <rect x="0" y="0" width="90" height="55" rx="8" fill="#0f2040" stroke="#3b82f6" stroke-width="1.5"/>
+    <text x="45" y="22" fill="#60a5fa" font-size="12" font-weight="700" text-anchor="middle">Patterns</text>
+    <text x="45" y="38" fill="#93c5fd" font-size="8" text-anchor="middle">relations + dims</text>
+    <text x="45" y="48" fill="#4a6fa5" font-size="7" text-anchor="middle">μ, σ, θ</text>
+  </g>
+
+  <!-- Arrow -->
+  <line x1="512" y1="72" x2="534" y2="72" stroke="#60a5fa" stroke-width="2"/>
+  <polygon points="534,67 544,72 534,77" fill="#60a5fa"/>
+
+  <!-- Aliases -->
+  <g transform="translate(552, 45)">
+    <rect x="0" y="0" width="75" height="55" rx="8" fill="#1a1000" stroke="#fbbf24" stroke-width="1.5"/>
+    <text x="37" y="22" fill="#fbbf24" font-size="12" font-weight="700" text-anchor="middle">Aliases</text>
+    <text x="37" y="40" fill="#fcd34d" font-size="8" text-anchor="middle">cutting planes</text>
+  </g>
+
+  <!-- Arrow -->
+  <line x1="635" y1="72" x2="657" y2="72" stroke="#60a5fa" stroke-width="2"/>
+  <polygon points="657,67 667,72 657,77" fill="#60a5fa"/>
+
+  <!-- Output Sphere -->
+  <g transform="translate(675, 38)">
+    <rect x="0" y="0" width="70" height="68" rx="10" fill="#0f2040" stroke="#60a5fa" stroke-width="2"/>
+    <text x="35" y="20" fill="#60a5fa" font-size="11" font-weight="700" text-anchor="middle">Sphere</text>
+    <text x="35" y="34" fill="#ccd6f6" font-size="7" text-anchor="middle">sphere.json</text>
+    <text x="35" y="46" fill="#8892b0" font-size="7" text-anchor="middle">points/</text>
+    <text x="35" y="56" fill="#8892b0" font-size="7" text-anchor="middle">geometry/</text>
+  </g>
+
+  <!-- Subtitle -->
+  <text x="380" y="130" fill="#4a6fa5" font-size="9" text-anchor="middle">sphere.yaml → Sources → Lines → Patterns → Aliases → navigable sphere on disk</text>
+</svg>

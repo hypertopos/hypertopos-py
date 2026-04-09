@@ -1,0 +1,172 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 520" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0a0e27"/>
+      <stop offset="100%" stop-color="#1a1a3e"/>
+    </linearGradient>
+    <radialGradient id="sphereGrad" cx="40%" cy="35%" r="65%" fx="35%" fy="30%">
+      <stop offset="0%" stop-color="#2a4a7f" stop-opacity="0.9"/>
+      <stop offset="50%" stop-color="#1a3460" stop-opacity="0.85"/>
+      <stop offset="100%" stop-color="#0a1530" stop-opacity="0.95"/>
+    </radialGradient>
+    <radialGradient id="sphereHighlight" cx="30%" cy="25%" r="40%">
+      <stop offset="0%" stop-color="#4a8fff" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#4a8fff" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="sphereShadow">
+      <feDropShadow dx="4" dy="6" stdDeviation="8" flood-color="#000" flood-opacity="0.4"/>
+    </filter>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="960" height="520" fill="url(#bg)" rx="12"/>
+
+  <!-- === LEFT: Raw Data === -->
+  <g transform="translate(55, 105)">
+    <text x="65" y="0" fill="#ccd6f6" font-size="11" font-weight="600" letter-spacing="2" text-anchor="middle">RAW DATA</text>
+
+    <rect x="0" y="16" width="130" height="72" rx="6" fill="#1a1a3e" stroke="#2d3561" stroke-width="1"/>
+    <rect x="0" y="16" width="130" height="20" rx="6" fill="#2d3561"/>
+    <text x="65" y="30" fill="#ccd6f6" font-size="10" font-weight="600" text-anchor="middle">customers</text>
+    <text x="10" y="50" fill="#a8b2d1" font-size="9">id · name · segment</text>
+    <text x="10" y="63" fill="#a8b2d1" font-size="9">region · tier · ...</text>
+    <text x="10" y="78" fill="#8892b0" font-size="8">1,200 entities</text>
+
+    <rect x="0" y="100" width="130" height="72" rx="6" fill="#1a1a3e" stroke="#2d3561" stroke-width="1"/>
+    <rect x="0" y="100" width="130" height="20" rx="6" fill="#2d3561"/>
+    <text x="65" y="114" fill="#ccd6f6" font-size="10" font-weight="600" text-anchor="middle">transactions</text>
+    <text x="10" y="134" fill="#a8b2d1" font-size="9">from · to · amount</text>
+    <text x="10" y="147" fill="#a8b2d1" font-size="9">date · type · ...</text>
+    <text x="10" y="162" fill="#8892b0" font-size="8">85,000 events</text>
+
+    <rect x="0" y="184" width="130" height="72" rx="6" fill="#1a1a3e" stroke="#2d3561" stroke-width="1"/>
+    <rect x="0" y="184" width="130" height="20" rx="6" fill="#2d3561"/>
+    <text x="65" y="198" fill="#ccd6f6" font-size="10" font-weight="600" text-anchor="middle">products</text>
+    <text x="10" y="218" fill="#a8b2d1" font-size="9">id · category</text>
+    <text x="10" y="231" fill="#a8b2d1" font-size="9">supplier · ...</text>
+    <text x="10" y="246" fill="#8892b0" font-size="8">340 entities</text>
+  </g>
+
+  <!-- Arrow: Data → Sphere -->
+  <line x1="200" y1="260" x2="260" y2="260" stroke="#8892b0" stroke-width="2" stroke-dasharray="6,4"/>
+  <polygon points="260,255 275,260 260,265" fill="#8892b0"/>
+  <text x="237" y="248" fill="#ccd6f6" font-size="9" text-anchor="middle">build</text>
+
+  <!-- === CENTER: Geometric Space === -->
+  <g transform="translate(475, 260)">
+    <!-- 3D sphere: shadow + main body + highlight + rim -->
+    <ellipse cx="0" cy="0" rx="195" ry="185" fill="url(#sphereGrad)" filter="url(#sphereShadow)" stroke="#1a3a6a" stroke-width="1"/>
+    <ellipse cx="0" cy="0" rx="195" ry="185" fill="url(#sphereHighlight)"/>
+    <ellipse cx="0" cy="0" rx="195" ry="185" fill="none" stroke="#3b82f6" stroke-width="0.8" opacity="0.4"/>
+    <!-- Grid lines for depth -->
+    <ellipse cx="0" cy="0" rx="195" ry="50" fill="none" stroke="#1e3a5f" stroke-width="0.5" opacity="0.35"/>
+    <ellipse cx="0" cy="0" rx="130" ry="120" fill="none" stroke="#1e3a5f" stroke-width="0.5" opacity="0.25"/>
+    <line x1="0" y1="-185" x2="0" y2="185" stroke="#1e3a5f" stroke-width="0.5" opacity="0.2"/>
+    <line x1="-195" y1="0" x2="195" y2="0" stroke="#1e3a5f" stroke-width="0.5" opacity="0.2"/>
+
+    <!-- Population center μ -->
+    <circle cx="0" cy="0" r="6" fill="#ffd43b" filter="url(#glow)" opacity="0.9"/>
+    <text x="12" y="4" fill="#ffd43b" font-size="14" font-weight="700">μ</text>
+
+    <!-- Cluster A (blue) -->
+    <circle cx="-65" cy="-55" r="6" fill="#60a5fa" filter="url(#glow)" opacity="0.9"/>
+    <circle cx="-50" cy="-70" r="5" fill="#60a5fa" filter="url(#glow)" opacity="0.8"/>
+    <circle cx="-80" cy="-45" r="5" fill="#60a5fa" filter="url(#glow)" opacity="0.7"/>
+    <circle cx="-55" cy="-40" r="4" fill="#60a5fa" filter="url(#glow)" opacity="0.7"/>
+    <circle cx="-72" cy="-65" r="4" fill="#60a5fa" filter="url(#glow)" opacity="0.6"/>
+
+    <!-- Cluster B (green) -->
+    <circle cx="45" cy="15" r="6" fill="#2ed573" filter="url(#glow)" opacity="0.9"/>
+    <circle cx="60" cy="30" r="5" fill="#2ed573" filter="url(#glow)" opacity="0.8"/>
+    <circle cx="35" cy="35" r="5" fill="#2ed573" filter="url(#glow)" opacity="0.7"/>
+    <circle cx="55" cy="5" r="4" fill="#2ed573" filter="url(#glow)" opacity="0.7"/>
+    <circle cx="30" cy="10" r="4" fill="#2ed573" filter="url(#glow)" opacity="0.6"/>
+
+    <!-- Cluster C (purple) -->
+    <circle cx="-15" cy="70" r="5" fill="#a78bfa" filter="url(#glow)" opacity="0.8"/>
+    <circle cx="5" cy="80" r="5" fill="#a78bfa" filter="url(#glow)" opacity="0.7"/>
+    <circle cx="-30" cy="85" r="4" fill="#a78bfa" filter="url(#glow)" opacity="0.7"/>
+    <circle cx="15" cy="65" r="4" fill="#a78bfa" filter="url(#glow)" opacity="0.6"/>
+
+    <!-- Scattered neutral entities -->
+    <circle cx="-20" cy="-15" r="4" fill="#8892b0" filter="url(#glow)" opacity="0.5"/>
+    <circle cx="10" cy="-35" r="4" fill="#8892b0" filter="url(#glow)" opacity="0.5"/>
+    <circle cx="-40" cy="20" r="3" fill="#8892b0" filter="url(#glow)" opacity="0.4"/>
+
+    <!-- Outliers — far from center -->
+    <circle cx="-140" cy="-80" r="7" fill="#ff6b6b" filter="url(#glow)"/>
+    <circle cx="150" cy="95" r="7" fill="#ff6b6b" filter="url(#glow)"/>
+
+    <!-- Drift arrows -->
+    <line x1="-50" y1="-70" x2="-35" y2="-85" stroke="#fbbf24" stroke-width="1.5" opacity="0.7"/>
+    <polygon points="-37,-83 -32,-88 -33,-81" fill="#fbbf24" opacity="0.7"/>
+    <line x1="45" y1="15" x2="70" y2="40" stroke="#fbbf24" stroke-width="1.5" opacity="0.7"/>
+    <polygon points="68,36 75,42 65,42" fill="#fbbf24" opacity="0.7"/>
+    <text x="80" y="50" fill="#fbbf24" font-size="9" font-weight="600" opacity="0.8">drift</text>
+
+    <!-- Cutting plane (alias boundary) -->
+    <line x1="-100" y1="-130" x2="100" y2="130" stroke="#22d3ee" stroke-width="1" stroke-dasharray="6,4" opacity="0.5"/>
+    <text x="108" y="125" fill="#22d3ee" font-size="9" font-weight="600" opacity="0.7">boundary</text>
+
+    <!-- Delta vector to outlier -->
+    <line x1="0" y1="0" x2="-136" y2="-77" stroke="#ff6b6b" stroke-width="1.2" opacity="0.4" stroke-dasharray="4,3"/>
+    <text x="-80" y="-50" fill="#ff6b6b" font-size="10" font-weight="600" opacity="0.7">δ</text>
+
+    <!-- Sphere title -->
+    <text x="0" y="-200" fill="#ccd6f6" font-size="12" font-weight="600" text-anchor="middle" letter-spacing="2">GEOMETRIC DATA SPHERE</text>
+
+    <!-- Legend -->
+    <g transform="translate(-90, 210)">
+      <circle cx="0" cy="0" r="4" fill="#60a5fa"/>
+      <circle cx="50" cy="0" r="4" fill="#2ed573"/>
+      <circle cx="100" cy="0" r="4" fill="#a78bfa"/>
+      <text x="115" y="4" fill="#ccd6f6" font-size="9">clusters</text>
+      <circle cx="160" cy="0" r="4" fill="#ff6b6b"/>
+      <text x="170" y="4" fill="#ccd6f6" font-size="9">outliers</text>
+    </g>
+  </g>
+
+  <!-- Arrow: Sphere → Explore -->
+  <line x1="685" y1="260" x2="745" y2="260" stroke="#8892b0" stroke-width="2" stroke-dasharray="6,4"/>
+  <polygon points="745,255 760,260 745,265" fill="#8892b0"/>
+  <text x="722" y="248" fill="#ccd6f6" font-size="9" text-anchor="middle">navigate</text>
+
+  <!-- === RIGHT: What You Can Explore === -->
+  <g transform="translate(785, 90)">
+    <text x="75" y="0" fill="#ccd6f6" font-size="11" font-weight="600" letter-spacing="2" text-anchor="middle">EXPLORE</text>
+
+    <rect x="0" y="16" width="150" height="50" rx="8" fill="#1a1a3e" stroke="#3b82f6" stroke-width="1.5"/>
+    <text x="75" y="34" fill="#60a5fa" font-size="10" font-weight="700" text-anchor="middle">π1–π4  Move</text>
+    <text x="75" y="48" fill="#ccd6f6" font-size="9" text-anchor="middle">walk · jump · dive · emerge</text>
+    <text x="75" y="60" fill="#a8b2d1" font-size="8" text-anchor="middle">traverse entities and time</text>
+
+    <rect x="0" y="76" width="150" height="50" rx="8" fill="#1a1a3e" stroke="#f59e0b" stroke-width="1.5"/>
+    <text x="75" y="94" fill="#fbbf24" font-size="10" font-weight="700" text-anchor="middle">π5–π8  Attract</text>
+    <text x="75" y="108" fill="#ccd6f6" font-size="9" text-anchor="middle">outliers · boundaries · hubs</text>
+    <text x="75" y="120" fill="#a8b2d1" font-size="8" text-anchor="middle">find what stands out</text>
+
+    <rect x="0" y="136" width="150" height="50" rx="8" fill="#1a1a3e" stroke="#8b5cf6" stroke-width="1.5"/>
+    <text x="75" y="154" fill="#a78bfa" font-size="10" font-weight="700" text-anchor="middle">π9–π12  Time</text>
+    <text x="75" y="168" fill="#ccd6f6" font-size="9" text-anchor="middle">drift · trajectories · regimes</text>
+    <text x="75" y="180" fill="#a8b2d1" font-size="8" text-anchor="middle">track change over time</text>
+
+    <rect x="0" y="196" width="150" height="50" rx="8" fill="#1a1a3e" stroke="#22d3ee" stroke-width="1.5"/>
+    <text x="75" y="214" fill="#22d3ee" font-size="10" font-weight="700" text-anchor="middle">Analyze</text>
+    <text x="75" y="228" fill="#ccd6f6" font-size="9" text-anchor="middle">compare · cluster · explain</text>
+    <text x="75" y="240" fill="#a8b2d1" font-size="8" text-anchor="middle">understand the geometry</text>
+
+    <rect x="0" y="256" width="150" height="50" rx="8" fill="#1a1a3e" stroke="#f43f5e" stroke-width="1.5"/>
+    <text x="75" y="274" fill="#fb7185" font-size="10" font-weight="700" text-anchor="middle">Detect</text>
+    <text x="75" y="288" fill="#ccd6f6" font-size="9" text-anchor="middle">anomalies · contamination</text>
+    <text x="75" y="300" fill="#a8b2d1" font-size="8" text-anchor="middle">find what needs attention</text>
+
+    <rect x="0" y="316" width="150" height="50" rx="8" fill="#1a1a3e" stroke="#2ed573" stroke-width="1.5"/>
+    <text x="75" y="334" fill="#2ed573" font-size="10" font-weight="700" text-anchor="middle">Investigate</text>
+    <text x="75" y="348" fill="#ccd6f6" font-size="9" text-anchor="middle">witness sets · reputation</text>
+    <text x="75" y="360" fill="#a8b2d1" font-size="8" text-anchor="middle">understand why</text>
+  </g>
+</svg>

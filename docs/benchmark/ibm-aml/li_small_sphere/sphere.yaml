@@ -1,0 +1,202 @@
+version: "0.1.0"
+
+sphere_id: aml_li_small
+name: "AML LI-Small"
+description: "IBM AML LI-Small dataset. 7M transactions, 712K accounts. Multi-criteria anomaly detection for money laundering patterns."
+
+sources:
+  transactions:
+    script: prepare_transactions.py
+  accounts:
+    script: prepare_accounts.py
+  currencies:
+    script: prepare_currencies.py
+  payment_formats:
+    script: prepare_payment_formats.py
+
+lines:
+  transactions:
+    source: transactions
+    key: primary_key
+    role: event
+    description: "Financial transactions with sender/receiver accounts, amounts, currencies, and context features (z-scores, cross-currency flags)."
+  accounts:
+    source: accounts
+    key: primary_key
+    role: anchor
+    fts: true
+    description: "Bank accounts with entity type, community membership, and pre-computed ratio features (intermediary, fan asymmetry, structuring)."
+  currencies:
+    source: currencies
+    key: primary_key
+    role: anchor
+    fts: true
+    description: "Receiving currencies."
+  payment_formats:
+    source: payment_formats
+    key: primary_key
+    role: anchor
+    fts: true
+    description: "Payment format types."
+
+patterns:
+  tx_pattern:
+    type: event
+    entity_line: transactions
+    description: "Per-transaction anomaly detection. 4 relational dims (from/to account, currency, format) + 8 event dims (amounts, z-scores, cross-currency, timing)."
+    relations:
+      - line: accounts
+        direction: in
+        key_on_entity: from_account
+        required: true
+        display_name: sender
+      - line: accounts
+        direction: in
+        key_on_entity: to_account
+        required: false
+        display_name: receiver
+      - line: currencies
+        direction: in
+        key_on_entity: receiving_currency
+        required: false
+      - line: payment_formats
+        direction: in
+        key_on_entity: payment_format
+        required: false
+    event_dimensions:
+      - column: amount_received
+      - column: amount_paid
+      - column: amount_z_sender
+        display_name: sender_z_score
+      - column: delta_z_recv
+        display_name: receiver_z_score
+      - column: amount_z_pair
+        display_name: pair_z_score
+      - column: is_cross_currency
+      - column: is_new_counterparty
+      - column: time_interval_ratio
+    anomaly_percentile: 95
+    dimension_weights: kurtosis
+
+  account_pattern:
+    type: anchor
+    entity_line: accounts
+    description: "Account behavioral profile — 27 dims: 9 outgoing, 4 incoming, 2 burst, 4 graph, 5 precomputed ratios, 1 incoming currency, 2 inter-event-time."
+    derived_dimensions:
+      # Outgoing (9 dims)
+      - from_pattern: tx_pattern
+        features:
+          - tx_out_count: count
+          - n_out_targets: count_distinct:to_account
+          - n_dest_banks: count_distinct:to_bank
+          - n_currencies_out: count_distinct:receiving_currency
+          - n_payment_formats: count_distinct:payment_format
+          - amount_out_std: std:amount_received
+          - sum_out: sum:amount_received
+          - max_out: max:amount_received
+          - mean_out: avg:amount_received
+      # Incoming (4 dims) — uses to_account as FK
+      - from_pattern: transactions
+        anchor_fk: to_account
+        features:
+          - tx_in_count: count
+          - n_in_sources: count_distinct:from_account
+          - n_source_banks: count_distinct:from_bank
+          - sum_in: sum:amount_received
+      # Burst (2 dims)
+      - from_pattern: tx_pattern
+        features:
+          - burst_tx_out: "count:window=1d:agg=max"
+      - from_pattern: transactions
+        anchor_fk: to_account
+        features:
+          - burst_tx_in: "count:window=1d:agg=max"
+      # Incoming currency diversity (1 dim)
+      - from_pattern: transactions
+        anchor_fk: to_account
+        features:
+          - n_currencies_in: count_distinct:receiving_currency
+      # Inter-event-time (2 dims)
+      - from_pattern: tx_pattern
+        features:
+          - avg_gap_between_tx: iet_mean
+          - tx_regularity: iet_std
+    graph_features:
+      event_line: transactions
+      from_col: from_account
+      to_col: to_account
+      features: [in_degree, out_degree, reciprocity, counterpart_overlap]
+    precomputed_dimensions:
+      - column: intermediary_score
+        edge_max: 1
+      - column: fan_asymmetry
+        edge_max: 1
+      - column: amount_uniformity
+        edge_max: 1
+      - column: structuring_pct
+        edge_max: 1
+      - column: return_ratio
+        edge_max: 1
+      - column: incoming_concentration
+        edge_max: 1
+    relations: auto
+    anomaly_percentile: 95
+    use_mahalanobis: true
+    tracked_properties: [bank_id, entity_type]
+    group_by_property: entity_type
+
+composite_lines:
+  account_pairs:
+    event_line: transactions
+    key_cols: [from_account, to_account]
+    description: "Account-to-account relationship geometry. Transaction flow between sender-receiver pairs."
+    derived_dimensions:
+      - features:
+          - pair_tx_count: count
+          - pair_currency_diversity: count_distinct:receiving_currency
+          - pair_amount_std: std:amount_received
+          - pair_max_amount: max:amount_received
+          - pair_sum_amount: sum:amount_received
+          - pair_mean_amount: avg:amount_received
+    anomaly_percentile: 95
+
+chain_lines:
+  tx_chains:
+    event_line: transactions
+    from_col: from_account
+    to_col: to_account
+    description: "Transaction chains — multi-hop money flows extracted via seeded BFS with multi-criteria seed selection."
+    features:
+      - hop_count
+      - is_cyclic
+      - time_span_hours
+      - n_distinct_categories
+      - amount_decay
+      - amount_std
+      - amount_cv
+      - n_unique_keys
+      - total_amount
+    seed_percentile_fan_out: 95
+    seed_percentile_cross_bank: 90
+    seed_multi_currency: 2
+    seed_pass_through: true
+    time_window_hours: 168
+    max_hops: 15
+    min_hops: 2
+    max_chains: 300000
+    bidirectional: true
+    anomaly_percentile: 95
+
+temporal:
+  - pattern: account_pattern
+    event_line: transactions
+    timestamp_col: timestamp
+    window: 2d
+  - pattern: account_pairs_pattern
+    event_line: transactions
+    timestamp_col: timestamp
+    window: 2d
+  - pattern: tx_chains_pattern
+    event_line: transactions
+    timestamp_col: timestamp
+    window: 2d

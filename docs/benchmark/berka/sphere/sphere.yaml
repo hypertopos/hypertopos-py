@@ -1,0 +1,222 @@
+version: "0.1.0"
+
+sphere_id: berka_banking
+name: "Berka Banking"
+description: "Czech banking dataset (PKDD 1999). 4,500 accounts, 1M transactions, 682 loans. Behavioral anomaly detection on account activity patterns."
+
+sources:
+  accounts:
+    script: prepare_accounts.py
+  transactions:
+    script: prepare_transactions.py
+  orders:
+    script: prepare_orders.py
+  districts:
+    script: prepare_districts.py
+  tx_types:
+    script: prepare_tx_types.py
+  operations_src:
+    script: prepare_operations.py
+  cpty_banks_src:
+    script: prepare_cpty_banks.py
+  loan_accounts_src:
+    script: prepare_loan_accounts.py
+
+lines:
+  transactions:
+    source: transactions
+    key: primary_key
+    role: event
+    description: "Individual banking transactions (deposits, withdrawals, transfers). 1M+ records spanning 1993-1998."
+  accounts:
+    source: accounts
+    key: primary_key
+    role: anchor
+    fts: true
+    description: "Bank accounts enriched with owner demographics, loan status, card type, and standing orders."
+  districts:
+    source: districts
+    key: primary_key
+    role: anchor
+    fts: true
+    description: "Czech districts with region, population, and average salary."
+  tx_types:
+    source: tx_types
+    key: primary_key
+    role: anchor
+    fts: true
+    description: "Transaction types: PRIJEM (credit), VYDAJ (debit), VYBER (withdrawal)."
+  operations:
+    source: operations_src
+    key: primary_key
+    role: anchor
+    fts: true
+    description: "Transaction operation categories (VKLAD, PREVOD Z UCTU, VYBER, etc.)."
+  cpty_banks:
+    source: cpty_banks_src
+    key: primary_key
+    role: anchor
+    fts: true
+    description: "Counterparty bank codes for inter-bank transfers."
+  orders:
+    source: orders
+    key: primary_key
+    role: event
+    description: "Standing orders (recurring payments). 6,471 records."
+  accounts_stress:
+    source: accounts
+    key: primary_key
+    role: anchor
+    description: "Account stress view — separate entity line for isolated stress pattern (avoids inheriting behavioral/loan dims from shared accounts line)."
+  loan_accounts:
+    source: loan_accounts_src
+    key: primary_key
+    role: anchor
+    description: "Loan-bearing accounts only (682 entities). Isolated population for loan stress pattern — mu/sigma calibrated to loan-holders, not all 4,500 accounts."
+
+patterns:
+  tx_pattern:
+    type: event
+    entity_line: transactions
+    description: "Transaction geometry — structural shape of each banking transaction. Captures account, type, operation, counterparty bank as relational dims + amount/balance as continuous event dims."
+    relations:
+      - line: accounts
+        direction: in
+        key_on_entity: account_id
+        required: true
+      - line: tx_types
+        direction: in
+        key_on_entity: type
+        required: true
+      - line: operations
+        direction: in
+        key_on_entity: operation
+        required: false
+      - line: cpty_banks
+        direction: in
+        key_on_entity: bank
+        required: false
+    event_dimensions:
+      - column: amount
+      - column: balance
+    anomaly_percentile: 95
+    dimension_weights: kurtosis
+
+  account_behavior_pattern:
+    type: anchor
+    entity_line: accounts
+    description: "Account behavioral profile — transaction activity, diversity, and burst patterns. Orthogonal to stress/loan patterns for NB-Split-style composite scoring via Fisher's method."
+    derived_dimensions:
+      - from_pattern: tx_pattern
+        features:
+          - tx_count: count
+          - n_distinct_banks: count_distinct:bank
+          - n_categories: count_distinct:k_symbol
+          - n_operations: count_distinct:operation
+          - burst_daily: "count:window=1d:agg=max"
+          - burst_weekly: "count:window=7d:agg=max"
+          - burst_monthly: "count:window=30d:agg=max"
+      - from_pattern: orders
+        features:
+          - n_standing_orders_derived: count
+    relations: auto
+    anomaly_percentile: 95
+    dimension_weights: kurtosis
+    tracked_properties: [owner_gender, frequency]
+
+  account_stress_pattern:
+    type: anchor
+    entity_line: accounts_stress
+    description: "Financial stress signals with context — penalty interest, balance volatility, minimum balance, balance trend + frequency and district context for per-cohort calibration."
+    precomputed_dimensions:
+      - column: penalty_interest_count
+        display_name: "Penalty Interest Count"
+      - column: balance_volatility
+        display_name: "Balance Volatility (CV)"
+      - column: min_balance
+        display_name: "Minimum Balance"
+      - column: balance_trend
+        display_name: "Balance Trend"
+    derived_dimensions:
+      - from_pattern: tx_pattern
+        anchor_fk: account_id
+        features:
+          - amount_std: std:amount
+          - mean_balance: avg:balance
+    relations: []
+    anomaly_percentile: 90
+    group_by_property: frequency
+    dimension_weights: kurtosis
+    tracked_properties: [loan_status, has_loan]
+
+  loan_stress_pattern:
+    type: anchor
+    entity_line: loan_accounts
+    description: "Loan-only stress pattern — population restricted to 682 loan-bearing accounts. mu/sigma calibrated to loan-holders only, so bad loans must deviate from OTHER loan accounts. Adds balance_to_loan and income_coverage as geometry dims (meaningful only within loan population)."
+    precomputed_dimensions:
+      - column: penalty_interest_count
+        display_name: "Penalty Interest Count"
+      - column: balance_volatility
+        display_name: "Balance Volatility (CV)"
+      - column: min_balance
+        display_name: "Minimum Balance"
+      - column: balance_trend
+        display_name: "Balance Trend"
+      - column: balance_to_loan
+        display_name: "Balance-to-Loan Ratio"
+      - column: income_coverage
+        display_name: "Income Coverage Ratio"
+    derived_dimensions:
+      - from_pattern: tx_pattern
+        anchor_fk: account_id
+        features:
+          - amount_std: std:amount
+          - mean_balance: avg:balance
+    relations: []
+    anomaly_percentile: 90
+    group_by_property: frequency
+    dimension_weights: kurtosis
+    tracked_properties: [loan_status]
+
+aliases:
+  high_activity_accounts:
+    base_pattern: account_behavior_pattern
+    cutting_plane:
+      dimension: _d_tx_count
+      threshold: 1.5
+    description: "Accounts with tx_count > 1.5σ above mean — high-activity segment"
+  low_engagement_accounts:
+    base_pattern: account_behavior_pattern
+    cutting_plane:
+      dimension: _d_burst_monthly
+      threshold: -1.0
+    description: "Accounts with burst_monthly < -1σ — low engagement segment"
+
+composite_lines:
+  account_bank_pairs:
+    event_line: transactions
+    key_cols: [account_id, bank]
+    description: "Account-bank relationship geometry. Each pair represents an account's activity with a specific counterparty bank."
+    derived_dimensions:
+      - features:
+          - pair_tx_count: count
+          - pair_sum_amount: sum:amount
+          - pair_amount_std: std:amount
+          - pair_category_diversity: count_distinct:k_symbol
+    anomaly_percentile: 95
+
+temporal:
+  - pattern: account_behavior_pattern
+    event_line: transactions
+    timestamp_col: date
+    window: 90d
+  - pattern: account_stress_pattern
+    event_line: transactions
+    timestamp_col: date
+    anchor_fk: account_id
+    window: 90d
+  - pattern: loan_stress_pattern
+    event_line: transactions
+    timestamp_col: date
+    anchor_fk: account_id
+    window: 90d

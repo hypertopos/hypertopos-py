@@ -1,0 +1,159 @@
+version: "0.1.0"
+
+sphere_id: nyc_taxi_2019_jan
+name: "NYC Yellow Taxi — January 2019"
+description: "7M+ yellow taxi trips in NYC. Organic anomalies: ghost trips, price outliers, speed anomalies, tip fraud, zone dead spots."
+
+sources:
+  trips_src:
+    script: prepare_trips.py
+  zones_src:
+    path: data/zones.parquet
+  vendors_src:
+    path: data/vendors.parquet
+  rate_codes_src:
+    path: data/rate_codes.parquet
+  payment_types_src:
+    path: data/payment_types.parquet
+
+lines:
+  trips:
+    source: trips_src
+    key: primary_key
+    role: event
+    description: "Individual taxi trips with fare, distance, duration, tip, speed."
+  zones:
+    source: zones_src
+    key: primary_key
+    role: anchor
+    fts: true
+    description: "265 TLC taxi zones with borough and service zone."
+  vendors:
+    source: vendors_src
+    key: primary_key
+    role: anchor
+    fts: true
+    description: "Taxi technology vendors (Creative Mobile, VeriFone)."
+  rate_codes:
+    source: rate_codes_src
+    key: primary_key
+    role: anchor
+    fts: true
+    description: "Rate codes: Standard, JFK, Newark, Nassau, Negotiated, Group."
+  payment_types:
+    source: payment_types_src
+    key: primary_key
+    role: anchor
+    fts: true
+    description: "Payment types: Credit card, Cash, No charge, Dispute, Voided."
+  # NB-Split: isolated zone line for pickup behavior pattern
+  zones_pickup:
+    source: zones_src
+    key: primary_key
+    role: anchor
+    description: "Pickup zone behavior — isolated line for zone activity pattern."
+  # NB-Split: isolated zone line for dropoff behavior
+  zones_dropoff:
+    source: zones_src
+    key: primary_key
+    role: anchor
+    description: "Dropoff zone behavior — isolated line for destination pattern."
+
+patterns:
+  trip_pattern:
+    type: event
+    entity_line: trips
+    description: "Trip geometry — structural shape of each taxi trip. Pickup zone, dropoff zone, vendor, rate code, payment type as relational dims + fare, distance, duration, tip%, speed as continuous event dims."
+    relations:
+      - line: zones
+        direction: in
+        key_on_entity: pu_zone
+        required: true
+      - line: zones
+        direction: in
+        key_on_entity: do_zone
+        required: true
+      - line: vendors
+        direction: in
+        key_on_entity: vendor
+        required: true
+      - line: rate_codes
+        direction: in
+        key_on_entity: rate_code
+        required: true
+      - line: payment_types
+        direction: in
+        key_on_entity: pay_type
+        required: true
+    event_dimensions:
+      - column: fare_amount
+      - column: trip_distance
+      - column: trip_duration_min
+      - column: tip_pct
+      - column: speed_mph
+      - column: passenger_count
+    anomaly_percentile: 95
+    dimension_weights: kurtosis
+    timestamp_col: pickup_date
+
+  zone_activity_pattern:
+    type: anchor
+    entity_line: zones_pickup
+    description: "Pickup zone activity profile — trip volume, fare levels, vendor mix. Detects dead zones, surge zones, anomalous pickup patterns."
+    derived_dimensions:
+      - from_pattern: trip_pattern
+        anchor_fk: pu_zone
+        features:
+          - trip_count: count
+          - total_fare: sum:fare_amount
+          - avg_fare: avg:fare_amount
+          - fare_std: std:fare_amount
+          - max_fare: max:fare_amount
+          - avg_distance: avg:trip_distance
+          - avg_tip_pct: avg:tip_pct
+          - n_vendors: count_distinct:vendor
+    relations: []
+    anomaly_percentile: 95
+    dimension_weights: kurtosis
+    tracked_properties: [borough, service_zone]
+
+  zone_destination_pattern:
+    type: anchor
+    entity_line: zones_dropoff
+    description: "Dropoff zone destination profile — who gets dropped off where, at what cost. Detects unusual destination patterns."
+    derived_dimensions:
+      - from_pattern: trip_pattern
+        anchor_fk: do_zone
+        features:
+          - dropoff_count: count
+          - dropoff_total_fare: sum:fare_amount
+          - dropoff_avg_fare: avg:fare_amount
+          - dropoff_avg_distance: avg:trip_distance
+          - dropoff_avg_duration: avg:trip_duration_min
+          - dropoff_avg_tip: avg:tip_pct
+    relations: []
+    anomaly_percentile: 95
+    dimension_weights: kurtosis
+    tracked_properties: [borough, service_zone]
+
+  # vendor_pattern skipped — only 2 entities (insufficient for population statistics)
+
+aliases:
+  high_volume_zones:
+    base_pattern: zone_activity_pattern
+    cutting_plane:
+      dimension: _d_trip_count
+      threshold: 2.0
+    description: "Zones with trip_count > 2σ above mean — high-volume pickup zones (airports, Manhattan core)."
+
+temporal:
+  - pattern: zone_activity_pattern
+    event_line: trips
+    timestamp_col: pickup_date
+    anchor_fk: pu_zone
+    window: 7d
+  - pattern: zone_destination_pattern
+    event_line: trips
+    timestamp_col: pickup_date
+    anchor_fk: do_zone
+    window: 7d

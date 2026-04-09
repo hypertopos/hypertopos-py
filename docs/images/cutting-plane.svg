@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 140" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0a0e27"/>
+      <stop offset="100%" stop-color="#1a1a3e"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="400" height="140" fill="url(#bg)" rx="12"/>
+
+  <!-- Cutting plane line -->
+  <line x1="200" y1="15" x2="200" y2="110" stroke="#22d3ee" stroke-width="1.5" stroke-dasharray="5,3" opacity="0.7"/>
+
+  <!-- Left: excluded -->
+  <circle cx="60" cy="45" r="3.5" fill="#8892b0" opacity="0.35"/>
+  <circle cx="95" cy="60" r="3.5" fill="#8892b0" opacity="0.35"/>
+  <circle cx="75" cy="80" r="3.5" fill="#8892b0" opacity="0.35"/>
+  <circle cx="130" cy="50" r="3" fill="#8892b0" opacity="0.3"/>
+  <circle cx="45" cy="70" r="3" fill="#8892b0" opacity="0.3"/>
+  <circle cx="145" cy="85" r="3" fill="#8892b0" opacity="0.3"/>
+  <circle cx="110" cy="95" r="3" fill="#8892b0" opacity="0.25"/>
+  <circle cx="160" cy="65" r="3" fill="#8892b0" opacity="0.25"/>
+  <circle cx="170" cy="45" r="3" fill="#8892b0" opacity="0.3"/>
+  <circle cx="180" cy="75" r="3" fill="#8892b0" opacity="0.25"/>
+  <text x="110" y="118" fill="#5a6580" font-size="9" text-anchor="middle">w·δ &lt; b</text>
+
+  <!-- Right: alias population -->
+  <circle cx="230" cy="50" r="4" fill="#fbbf24" opacity="0.6"/>
+  <circle cx="260" cy="65" r="4" fill="#fbbf24" opacity="0.6"/>
+  <circle cx="245" cy="85" r="4" fill="#fbbf24" opacity="0.55"/>
+  <circle cx="290" cy="55" r="3.5" fill="#fbbf24" opacity="0.55"/>
+  <circle cx="280" cy="90" r="3.5" fill="#fbbf24" opacity="0.5"/>
+  <circle cx="220" cy="70" r="3.5" fill="#fbbf24" opacity="0.5"/>
+  <circle cx="310" cy="75" r="3" fill="#fbbf24" opacity="0.45"/>
+  <circle cx="340" cy="60" r="3" fill="#fbbf24" opacity="0.4"/>
+  <circle cx="325" cy="95" r="3" fill="#fbbf24" opacity="0.4"/>
+  <circle cx="235" cy="40" r="3" fill="#fbbf24" opacity="0.45"/>
+  <text x="285" y="118" fill="#fcd34d" font-size="9" font-weight="600" text-anchor="middle">w·δ ≥ b  (alias)</text>
+
+  <!-- Cutting plane label -->
+  <text x="200" y="132" fill="#22d3ee" font-size="8" text-anchor="middle" opacity="0.7">cutting plane</text>
+</svg>

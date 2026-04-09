@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Type checking
+.mypy_cache/
+
+# Linting
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+.cursor/
+*.iml
+
+# Claude Code
+.claude/
+.worktrees/
+.agents/
+
+# Generated test fixtures
+tests/fixtures/gds/
+
+# Built spheres (output of hypertopos build)
+**/sphere/gds_*/
+
+# Build CLI cache (source parquet + chain pickle)
+.cache/

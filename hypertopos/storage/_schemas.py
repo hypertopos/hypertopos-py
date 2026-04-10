@@ -40,3 +40,11 @@ GEOMETRY_REQUIRED_COLUMNS = {
 GEOMETRY_EVENT_SCHEMA = pa.schema([
     f for f in GEOMETRY_SCHEMA if f.name != "edges"
 ])
+
+EDGE_TABLE_SCHEMA = pa.schema([
+    pa.field("from_key",   pa.string()),
+    pa.field("to_key",     pa.string()),
+    pa.field("event_key",  pa.string()),
+    pa.field("timestamp",  pa.float64()),
+    pa.field("amount",     pa.float64()),
+])

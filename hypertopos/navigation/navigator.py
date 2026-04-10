@@ -657,7 +657,8 @@ class GDSNavigator:
                 resp = _json.loads(worker.stdout.readline())
                 if "error" not in resp:
                     total_found = resp["total_found"]
-                    sub_keys = resp["keys"][offset:]
+                    # Deduplicate keys (Lance may have duplicate rows)
+                    sub_keys = list(dict.fromkeys(resp["keys"][offset:]))
                     sub_norms = resp["delta_norms"][offset:]
                     if sub_keys:
                         # Skip edge columns — anomaly listing needs only
@@ -852,6 +853,15 @@ class GDSNavigator:
             results.sort(key=lambda p: key_order.get(p.primary_key, 999999))
         else:
             results.sort(key=lambda p: p.delta_norm, reverse=True)
+
+        # Deduplicate on primary_key — Lance may have duplicate rows from
+        # interrupted incremental_update. Keep highest delta_norm per key.
+        seen: dict[str, Polygon] = {}
+        for p in results:
+            if p.primary_key not in seen or p.delta_norm > seen[p.primary_key].delta_norm:
+                seen[p.primary_key] = p
+        results = sorted(seen.values(), key=lambda p: p.delta_norm, reverse=True)
+
         emerging = self._find_emerging(
             pattern_id, version, pattern, include_emerging, offset, top_n,
         )
@@ -2165,6 +2175,138 @@ class GDSNavigator:
             "edges_b": len(poly_b.alive_edges()),
         }
 
+    def _find_counterparties_via_edges(
+        self,
+        primary_key: str,
+        line_id: str,
+        pattern_id: str,
+        top_n: int = 20,
+    ) -> dict[str, Any]:
+        """Fast counterparty lookup via edge table BTREE indexes.
+
+        Returns same structure as find_counterparties but with ``amount_sum``
+        and ``amount_max`` per counterparty entry.  Anomaly enrichment uses
+        the resolved anchor pattern's geometry.
+        """
+        # Outgoing: from_key == primary_key → counterparties in to_key
+        fwd = self._storage.read_edges(pattern_id, from_keys=[primary_key])
+        # Incoming: to_key == primary_key → counterparties in from_key
+        rev = self._storage.read_edges(pattern_id, to_keys=[primary_key])
+
+        def _group(edges: pa.Table, group_col: str) -> list[dict[str, Any]]:
+            if edges.num_rows == 0:
+                return []
+            grouped = edges.group_by(group_col).aggregate([
+                ("event_key", "count"),
+                ("amount", "sum"),
+                ("amount", "max"),
+            ])
+            keys = grouped[group_col].to_pylist()
+            counts = grouped["event_key_count"].to_pylist()
+            sums = grouped["amount_sum"].to_pylist()
+            maxes = grouped["amount_max"].to_pylist()
+            pairs = sorted(
+                zip(keys, counts, sums, maxes, strict=False),
+                key=lambda x: x[1],
+                reverse=True,
+            )[:top_n]
+            return [
+                {
+                    "key": k,
+                    "tx_count": c,
+                    "amount_sum": round(float(s), 2),
+                    "amount_max": round(float(m), 2),
+                }
+                for k, c, s, m in pairs
+            ]
+
+        outgoing = _group(fwd, "to_key")
+        incoming = _group(rev, "from_key")
+
+        # Anomaly enrichment via anchor pattern geometry
+        scoring_pattern = (
+            self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
+        )
+        all_cp_keys = {e["key"] for e in outgoing} | {e["key"] for e in incoming}
+        geo_lookup: dict[str, dict[str, Any]] = {}
+        _enrichment_warning: str | None = None
+
+        if all_cp_keys:
+            try:
+                geo_version = self._resolve_version(scoring_pattern)
+
+                # Detect composite-key patterns by sampling one geometry PK
+                _composite_map: dict[str, str] = {}
+                _geo_sample = self._storage.read_geometry(
+                    scoring_pattern, geo_version,
+                    columns=["primary_key"], sample_size=1,
+                )
+                if _geo_sample.num_rows > 0:
+                    _sample_pk = str(_geo_sample["primary_key"][0].as_py())
+                    for sep in ("→", "|"):
+                        if sep in _sample_pk:
+                            for cpk in all_cp_keys:
+                                _composite_map[f"{primary_key}{sep}{cpk}"] = cpk
+                            break
+
+                # Read geometry — use point_keys for direct match, full scan for composite
+                if _composite_map:
+                    geo = self._storage.read_geometry(
+                        scoring_pattern, geo_version,
+                        columns=["primary_key", "is_anomaly", "delta_rank_pct"],
+                    )
+                else:
+                    geo = self._storage.read_geometry(
+                        scoring_pattern, geo_version,
+                        point_keys=list(all_cp_keys),
+                        columns=["primary_key", "is_anomaly", "delta_rank_pct"],
+                    )
+
+                for i in range(geo.num_rows):
+                    pk = geo["primary_key"][i].as_py()
+                    _data = {
+                        "is_anomaly": bool(geo["is_anomaly"][i].as_py()),
+                        "delta_rank_pct": round(
+                            float(geo["delta_rank_pct"][i].as_py()), 2,
+                        ),
+                    }
+                    if pk in all_cp_keys:
+                        geo_lookup[pk] = _data
+                    elif pk in _composite_map:
+                        geo_lookup[_composite_map[pk]] = _data
+
+                if all_cp_keys and not geo_lookup:
+                    _enrichment_warning = (
+                        f"Enrichment returned 0 matches for '{scoring_pattern}'. "
+                        f"Pattern may use composite keys that don't match "
+                        f"counterparty keys directly."
+                    )
+            except GDSNavigationError:
+                pass  # no geometry available — skip enrichment
+
+        for entry in (*outgoing, *incoming):
+            if entry["key"] in geo_lookup:
+                entry.update(geo_lookup[entry["key"]])
+
+        anomalous_out = sum(1 for e in outgoing if e.get("is_anomaly"))
+        anomalous_in = sum(1 for e in incoming if e.get("is_anomaly"))
+
+        result: dict[str, Any] = {
+            "primary_key": primary_key,
+            "line_id": line_id,
+            "outgoing": outgoing,
+            "incoming": incoming,
+            "summary": {
+                "total_outgoing": len(outgoing),
+                "total_incoming": len(incoming),
+                "anomalous_outgoing": anomalous_out,
+                "anomalous_incoming": anomalous_in,
+            },
+        }
+        if _enrichment_warning:
+            result["enrichment_warning"] = _enrichment_warning
+        return result
+
     def find_counterparties(
         self,
         primary_key: str,
@@ -2173,17 +2315,29 @@ class GDSNavigator:
         to_col: str,
         pattern_id: str | None = None,
         top_n: int = 20,
+        use_edge_table: bool = True,
     ) -> dict[str, Any]:
         """Find transaction counterparties of an entity with anomaly enrichment.
 
-        Scans the points table of *line_id* and groups outgoing (from_col == primary_key)
-        and incoming (to_col == primary_key) transactions by counterparty key.
+        When *pattern_id* is given and its edge table exists, uses BTREE-indexed
+        lookup for O(log n) performance and includes ``amount_sum``/``amount_max``
+        per counterparty.  Falls back to full points scan otherwise.
 
         If *pattern_id* is provided, each counterparty is enriched with ``is_anomaly``
         and ``delta_rank_pct`` from that pattern's geometry.
 
         Returns ``{primary_key, outgoing, incoming, summary}``.
         """
+        # Fast path: edge table BTREE lookup
+        if (
+            pattern_id
+            and use_edge_table
+            and self._storage.has_edge_table(pattern_id)
+        ):
+            return self._find_counterparties_via_edges(
+                primary_key, line_id, pattern_id, top_n,
+            )
+
         sphere = self._storage.read_sphere()
         if line_id not in sphere.lines:
             raise GDSNavigationError(
@@ -2305,6 +2459,711 @@ class GDSNavigator:
         if _enrichment_warning:
             result["enrichment_warning"] = _enrichment_warning
         return result
+
+    def entity_flow(
+        self,
+        primary_key: str,
+        pattern_id: str,
+        top_n: int = 20,
+    ) -> dict[str, Any]:
+        """Net flow analysis per counterparty via edge table.
+
+        Two edge lookups (outgoing + incoming), sum amounts, compute
+        per-counterparty net flow.
+
+        Returns ``{outgoing_total, incoming_total, net_flow, flow_direction,
+        counterparties: [{key, net_flow, direction}]}``.
+        """
+        if not self._storage.has_edge_table(pattern_id):
+            raise GDSNavigationError(
+                f"Pattern '{pattern_id}' has no edge table. "
+                "entity_flow requires an edge table."
+            )
+        fwd = self._storage.read_edges(pattern_id, from_keys=[primary_key])
+        rev = self._storage.read_edges(pattern_id, to_keys=[primary_key])
+
+        # Sum outgoing amounts per counterparty
+        out_by_cp: dict[str, float] = {}
+        if fwd.num_rows > 0:
+            grouped = fwd.group_by("to_key").aggregate([("amount", "sum")])
+            for k, s in zip(
+                grouped["to_key"].to_pylist(),
+                grouped["amount_sum"].to_pylist(),
+                strict=False,
+            ):
+                out_by_cp[k] = float(s)
+
+        # Sum incoming amounts per counterparty
+        in_by_cp: dict[str, float] = {}
+        if rev.num_rows > 0:
+            grouped = rev.group_by("from_key").aggregate([("amount", "sum")])
+            for k, s in zip(
+                grouped["from_key"].to_pylist(),
+                grouped["amount_sum"].to_pylist(),
+                strict=False,
+            ):
+                in_by_cp[k] = float(s)
+
+        outgoing_total = sum(out_by_cp.values())
+        incoming_total = sum(in_by_cp.values())
+        net_flow = outgoing_total - incoming_total
+
+        # Per-counterparty net flow
+        all_cps = set(out_by_cp) | set(in_by_cp)
+        cp_flows: list[dict[str, Any]] = []
+        for cp in all_cps:
+            cp_out = out_by_cp.get(cp, 0.0)
+            cp_in = in_by_cp.get(cp, 0.0)
+            cp_net = cp_out - cp_in
+            cp_flows.append({
+                "key": cp,
+                "net_flow": round(cp_net, 2),
+                "direction": "outgoing" if cp_net > 0 else "incoming" if cp_net < 0 else "balanced",
+            })
+        cp_flows.sort(key=lambda x: abs(x["net_flow"]), reverse=True)
+        cp_flows = cp_flows[:top_n]
+
+        return {
+            "primary_key": primary_key,
+            "pattern_id": pattern_id,
+            "outgoing_total": round(outgoing_total, 2),
+            "incoming_total": round(incoming_total, 2),
+            "net_flow": round(net_flow, 2),
+            "flow_direction": "outgoing" if net_flow > 0 else "incoming" if net_flow < 0 else "balanced",
+            "counterparties": cp_flows,
+        }
+
+    def contagion_score(
+        self,
+        primary_key: str,
+        pattern_id: str,
+    ) -> dict[str, Any]:
+        """Score how many of an entity's counterparties are anomalous.
+
+        Edge lookup for counterparties, batch geometry check on the anchor
+        pattern.  Score = anomalous_counterparties / total_counterparties.
+
+        Returns ``{score: 0.0-1.0, total_counterparties,
+        anomalous_counterparties, interpretation}``.
+        """
+        if not self._storage.has_edge_table(pattern_id):
+            raise GDSNavigationError(
+                f"Pattern '{pattern_id}' has no edge table. "
+                "contagion_score requires an edge table."
+            )
+        fwd = self._storage.read_edges(pattern_id, from_keys=[primary_key])
+        rev = self._storage.read_edges(pattern_id, to_keys=[primary_key])
+
+        cp_keys: set[str] = set()
+        if fwd.num_rows > 0:
+            cp_keys.update(fwd["to_key"].to_pylist())
+        if rev.num_rows > 0:
+            cp_keys.update(rev["from_key"].to_pylist())
+        cp_keys.discard(primary_key)
+
+        total = len(cp_keys)
+        if total == 0:
+            return {
+                "primary_key": primary_key,
+                "pattern_id": pattern_id,
+                "score": 0.0,
+                "total_counterparties": 0,
+                "anomalous_counterparties": 0,
+                "interpretation": "No counterparties found.",
+            }
+
+        scoring_pattern = (
+            self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
+        )
+        try:
+            batch = self.check_anomaly_batch(
+                scoring_pattern, list(cp_keys), max_keys=500,
+            )
+            anomalous = batch["anomalous_count"]
+        except GDSNavigationError:
+            anomalous = 0
+        score = round(anomalous / total, 4)
+
+        return {
+            "primary_key": primary_key,
+            "pattern_id": pattern_id,
+            "score": score,
+            "total_counterparties": total,
+            "anomalous_counterparties": anomalous,
+            "interpretation": (
+                f"{anomalous}/{total} counterparties are anomalous "
+                f"(contagion score {score:.2f})."
+            ),
+        }
+
+    def contagion_score_batch(
+        self,
+        primary_keys: list[str],
+        pattern_id: str,
+        max_keys: int = 200,
+    ) -> dict[str, Any]:
+        """Contagion score for multiple entities.
+
+        Returns per-entity scores plus a summary with mean/max.
+        """
+        keys = primary_keys[:max_keys]
+        results: list[dict[str, Any]] = []
+        for pk in keys:
+            results.append(self.contagion_score(pk, pattern_id))
+
+        scores = [r["score"] for r in results]
+        mean_score = round(sum(scores) / len(scores), 4) if scores else 0.0
+        max_score = max(scores) if scores else 0.0
+
+        return {
+            "pattern_id": pattern_id,
+            "total": len(results),
+            "results": results,
+            "summary": {
+                "mean_score": mean_score,
+                "max_score": max_score,
+                "high_contagion_count": sum(1 for s in scores if s >= 0.5),
+            },
+        }
+
+    def degree_velocity(
+        self,
+        primary_key: str,
+        pattern_id: str,
+        n_buckets: int = 4,
+    ) -> dict[str, Any]:
+        """Temporal connection velocity via edge table.
+
+        Buckets edges by timestamp, counts unique counterparties per bucket.
+        Velocity = degree in last bucket / degree in first bucket.
+
+        Returns ``{buckets: [{period, out_degree, in_degree}],
+        velocity_out, velocity_in, interpretation}``.
+        """
+        if not self._storage.has_edge_table(pattern_id):
+            raise GDSNavigationError(
+                f"Pattern '{pattern_id}' has no edge table. "
+                "degree_velocity requires an edge table."
+            )
+        fwd = self._storage.read_edges(pattern_id, from_keys=[primary_key])
+        rev = self._storage.read_edges(pattern_id, to_keys=[primary_key])
+
+        # Collect all timestamps
+        fwd_ts = fwd["timestamp"].to_pylist() if fwd.num_rows > 0 else []
+        rev_ts = rev["timestamp"].to_pylist() if rev.num_rows > 0 else []
+        fwd_to = fwd["to_key"].to_pylist() if fwd.num_rows > 0 else []
+        rev_from = rev["from_key"].to_pylist() if rev.num_rows > 0 else []
+
+        all_ts = fwd_ts + rev_ts
+        # Degenerate: no edges, all timestamps 0, or no temporal spread
+        if not all_ts or min(all_ts) == max(all_ts):
+            return {
+                "primary_key": primary_key,
+                "pattern_id": pattern_id,
+                "buckets": [],
+                "velocity_out": None,
+                "velocity_in": None,
+                "warning": "Insufficient temporal spread to compute velocity "
+                "(no edges, uniform timestamps, or all zeros).",
+            }
+
+        ts_min = min(all_ts)
+        ts_max = max(all_ts)
+        bucket_width = (ts_max - ts_min) / n_buckets
+
+        def _bucket_idx(ts: float) -> int:
+            idx = int((ts - ts_min) / bucket_width)
+            return min(idx, n_buckets - 1)
+
+        # Count unique counterparties per bucket
+        out_buckets: list[set[str]] = [set() for _ in range(n_buckets)]
+        for ts, to_k in zip(fwd_ts, fwd_to, strict=False):
+            out_buckets[_bucket_idx(ts)].add(to_k)
+
+        in_buckets: list[set[str]] = [set() for _ in range(n_buckets)]
+        for ts, from_k in zip(rev_ts, rev_from, strict=False):
+            in_buckets[_bucket_idx(ts)].add(from_k)
+
+        buckets = []
+        for i in range(n_buckets):
+            period_start = ts_min + i * bucket_width
+            period_end = period_start + bucket_width
+            buckets.append({
+                "period": f"{period_start:.0f}-{period_end:.0f}",
+                "out_degree": len(out_buckets[i]),
+                "in_degree": len(in_buckets[i]),
+            })
+
+        first_out = len(out_buckets[0]) or 1
+        last_out = len(out_buckets[-1])
+        first_in = len(in_buckets[0]) or 1
+        last_in = len(in_buckets[-1])
+        velocity_out = round(last_out / first_out, 4)
+        velocity_in = round(last_in / first_in, 4)
+
+        return {
+            "primary_key": primary_key,
+            "pattern_id": pattern_id,
+            "buckets": buckets,
+            "velocity_out": velocity_out,
+            "velocity_in": velocity_in,
+            "interpretation": (
+                f"Out-degree velocity {velocity_out:.2f} "
+                f"({'accelerating' if velocity_out > 1 else 'decelerating' if velocity_out < 1 else 'stable'}), "
+                f"in-degree velocity {velocity_in:.2f} "
+                f"({'accelerating' if velocity_in > 1 else 'decelerating' if velocity_in < 1 else 'stable'})."
+            ),
+        }
+
+    def investigation_coverage(
+        self,
+        primary_key: str,
+        pattern_id: str,
+        explored_keys: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """Agent guidance: how much of an entity's edge neighborhood has been explored.
+
+        Looks up all counterparties via edge table, splits into explored vs
+        unexplored based on *explored_keys*, and runs a batch anomaly check
+        on the unexplored set.
+
+        Returns ``{total_edges, explored, unexplored, unexplored_anomalous,
+        coverage_pct, summary}``.
+        """
+        if not self._storage.has_edge_table(pattern_id):
+            raise GDSNavigationError(
+                f"Pattern '{pattern_id}' has no edge table. "
+                "investigation_coverage requires an edge table."
+            )
+        if explored_keys is None:
+            explored_keys = set()
+
+        fwd = self._storage.read_edges(pattern_id, from_keys=[primary_key])
+        rev = self._storage.read_edges(pattern_id, to_keys=[primary_key])
+
+        all_cp: set[str] = set()
+        if fwd.num_rows > 0:
+            all_cp.update(fwd["to_key"].to_pylist())
+        if rev.num_rows > 0:
+            all_cp.update(rev["from_key"].to_pylist())
+        all_cp.discard(primary_key)
+
+        explored = all_cp & explored_keys
+        unexplored = all_cp - explored_keys
+        total = len(all_cp)
+        coverage_pct = round(len(explored) / total, 4) if total > 0 else None
+
+        # Batch anomaly check on unexplored counterparties
+        unexplored_anomalous: list[dict[str, Any]] = []
+        if unexplored:
+            scoring_pattern = (
+                self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
+            )
+            try:
+                batch = self.check_anomaly_batch(
+                    scoring_pattern, list(unexplored), max_keys=500,
+                )
+                unexplored_anomalous = [
+                    r for r in batch["results"] if r["is_anomaly"]
+                ]
+            except GDSNavigationError:
+                pass  # no geometry — skip enrichment
+
+        return {
+            "primary_key": primary_key,
+            "pattern_id": pattern_id,
+            "total_edges": total,
+            "explored": len(explored),
+            "unexplored": len(unexplored),
+            "unexplored_anomalous": unexplored_anomalous,
+            "coverage_pct": coverage_pct,
+            "summary": (
+                "No counterparties found."
+                if total == 0
+                else (
+                    f"{len(explored)}/{total} counterparties explored "
+                    f"({coverage_pct:.0%} coverage). "
+                    f"{len(unexplored_anomalous)} unexplored anomalous entities."
+                )
+            ),
+        }
+
+    def propagate_influence(
+        self,
+        seed_keys: list[str],
+        pattern_id: str,
+        max_depth: int = 3,
+        decay: float = 0.7,
+        min_threshold: float = 0.001,
+        max_affected: int = 10_000,
+    ) -> dict[str, Any]:
+        """BFS influence propagation from seed entities with geometric decay.
+
+        At each hop, influence_score = parent_score * decay * geometric_coherence.
+        Stops expanding when score falls below *min_threshold* or when
+        *max_affected* entities have been reached.
+
+        Returns ``{seeds, affected_entities, summary}``.
+        """
+        if not self._storage.has_edge_table(pattern_id):
+            raise GDSNavigationError(
+                f"Pattern '{pattern_id}' has no edge table. "
+                "propagate_influence requires an edge table."
+            )
+        scoring_pattern = (
+            self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
+        )
+        seed_set = set(seed_keys)
+
+        # Build weighted adjacency directly from edges (not _build_adjacency,
+        # which deduplicates to one edge per pair — influence needs tx_count).
+        # adj[key] = {neighbor: tx_count}
+        adj: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        expanded_keys: set[str] = set()
+
+        seen_edges: set[str] = set()  # event_key dedup across fwd/rev reads
+
+        def _expand_neighbors(keys: set[str]) -> None:
+            """Read edges for keys and aggregate tx_count per neighbor."""
+            key_list = list(keys)
+            fwd = self._storage.read_edges(pattern_id, from_keys=key_list)
+            rev = self._storage.read_edges(pattern_id, to_keys=key_list)
+            for tbl in (fwd, rev):
+                from_arr = tbl["from_key"].to_pylist()
+                to_arr = tbl["to_key"].to_pylist()
+                ek_arr = tbl["event_key"].to_pylist()
+                for f, t, ek in zip(from_arr, to_arr, ek_arr, strict=False):
+                    if f == t or ek in seen_edges:
+                        continue
+                    seen_edges.add(ek)
+                    adj[f][t] += 1
+                    adj[t][f] += 1
+
+        # BFS: frontier = [(key, score, depth)]
+        frontier: list[tuple[str, float, int]] = [(k, 1.0, 0) for k in seed_keys]
+        visited: dict[str, tuple[float, int, int]] = {}  # key → (score, depth, tx_count)
+
+        while frontier:
+            if len(visited) >= max_affected:
+                break
+            next_frontier: list[tuple[str, float, int]] = []
+            # Expand edges for new tips
+            tips = {k for k, _, _ in frontier} - expanded_keys
+            if tips:
+                _expand_neighbors(tips)
+                expanded_keys |= tips
+                # Prefetch deltas for scoring
+                neighbor_keys = set()
+                for tip in tips:
+                    neighbor_keys |= set(adj.get(tip, {}).keys())
+                self._prefetch_deltas(neighbor_keys | tips, scoring_pattern)
+
+            for key, score, depth in frontier:
+                if depth >= max_depth:
+                    continue
+                for neighbor, tx_count in adj.get(key, {}).items():
+                    if neighbor in seed_set:
+                        continue
+                    coherence = self._score_hop(key, neighbor, scoring_pattern, "geometric")
+                    # Clamp to prevent sign flips from negative cosine
+                    coherence = max(coherence, 0.01)
+                    # Weight by log(tx_count) — more transactions = stronger influence
+                    tx_weight = 1.0 + float(np.log1p(tx_count - 1)) if tx_count > 1 else 1.0
+                    new_score = score * decay * coherence * tx_weight
+                    if new_score < min_threshold:
+                        continue
+                    # Keep highest score if revisited
+                    if neighbor in visited and visited[neighbor][0] >= new_score:
+                        continue
+                    visited[neighbor] = (new_score, depth + 1, tx_count)
+                    next_frontier.append((neighbor, new_score, depth + 1))
+
+            frontier = next_frontier
+
+        # Anomaly enrichment
+        affected_keys = list(visited.keys())
+        anomaly_map: dict[str, bool] = {}
+        if affected_keys:
+            try:
+                batch = self.check_anomaly_batch(
+                    scoring_pattern, affected_keys, max_keys=500,
+                )
+                for r in batch["results"]:
+                    anomaly_map[r["primary_key"]] = r["is_anomaly"]
+            except GDSNavigationError:
+                pass
+
+        affected = sorted(
+            [
+                {
+                    "key": k,
+                    "depth": d,
+                    "influence_score": round(s, 4),
+                    "tx_count": tc,
+                    "is_anomaly": anomaly_map.get(k, False),
+                }
+                for k, (s, d, tc) in visited.items()
+            ],
+            key=lambda x: x["influence_score"],
+            reverse=True,
+        )
+
+        max_depth_reached = max((d for _, (_, d, _) in visited.items()), default=0)
+        anomalous_affected = sum(1 for a in affected if a["is_anomaly"])
+
+        return {
+            "seeds": seed_keys,
+            "pattern_id": pattern_id,
+            "affected_entities": affected,
+            "summary": {
+                "total_affected": len(affected),
+                "max_depth_reached": max_depth_reached,
+                "anomalous_affected": anomalous_affected,
+            },
+        }
+
+    def cluster_bridges(
+        self,
+        pattern_id: str,
+        n_clusters: int = 5,
+        top_n_bridges: int = 10,
+        sample_size: int | None = None,
+    ) -> dict[str, Any]:
+        """Find entities that bridge geometric clusters via edge table.
+
+        1. Run π8 clustering on the anchor pattern to get cluster membership.
+        2. Read full edge table to find cross-cluster edges.
+        3. Identify top bridge entities connecting different clusters.
+
+        Warning: reads the full edge table into memory. When *sample_size* is set,
+        only sampled entities appear in the cluster map — bridge counts will be
+        systematically underreported for non-sampled entities.
+
+        Returns ``{clusters, bridges, summary}``.
+        """
+        if not self._storage.has_edge_table(pattern_id):
+            raise GDSNavigationError(
+                f"Pattern '{pattern_id}' has no edge table. "
+                "cluster_bridges requires an edge table."
+            )
+        scoring_pattern = (
+            self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
+        )
+
+        # Step 1: cluster the anchor pattern — get full membership
+        clusters = self.π8_attract_cluster(
+            scoring_pattern, n_clusters=n_clusters,
+            top_n=None, sample_size=sample_size,
+        )
+
+        # Build entity → cluster_id map
+        entity_cluster: dict[str, int] = {}
+        for c in clusters:
+            cid = c["cluster_id"]
+            for key in c.get("member_keys", []):
+                entity_cluster[key] = cid
+
+        # Step 2: read edge table — vectorized with pandas for speed on millions of rows
+        import pandas as pd
+
+        edges = self._storage.read_edges(
+            pattern_id, columns=["from_key", "to_key"],
+        )
+        df = pd.DataFrame({
+            "f": edges["from_key"].to_pandas(),
+            "t": edges["to_key"].to_pandas(),
+        })
+        df = df[df["f"] != df["t"]]  # drop self-loops
+        df["c_f"] = df["f"].map(entity_cluster)
+        df["c_t"] = df["t"].map(entity_cluster)
+        cross = df.dropna(subset=["c_f", "c_t"])
+        cross = cross[cross["c_f"] != cross["c_t"]]
+
+        # Normalize cluster pairs (min, max) and count edges
+        cross["c_lo"] = cross[["c_f", "c_t"]].min(axis=1).astype(int)
+        cross["c_hi"] = cross[["c_f", "c_t"]].max(axis=1).astype(int)
+
+        bridge_edges: dict[tuple[int, int], int] = {}
+        if not cross.empty:
+            pair_counts = cross.groupby(["c_lo", "c_hi"]).size()
+            bridge_edges = {(int(a), int(b)): int(c) for (a, b), c in pair_counts.items()}
+
+        # Count bridge appearances per entity
+        bridge_entity_count: dict[str, int] = defaultdict(int)
+        if not cross.empty:
+            for col in ("f", "t"):
+                for entity, cnt in cross[col].value_counts().items():
+                    bridge_entity_count[entity] += int(cnt)
+
+        # Step 3: batch anomaly check on top bridge entities
+        top_bridge_entities = sorted(
+            bridge_entity_count.items(), key=lambda x: x[1], reverse=True,
+        )
+        bridge_keys = [k for k, _ in top_bridge_entities[:200]]
+        anomaly_map: dict[str, bool] = {}
+        if bridge_keys:
+            try:
+                batch = self.check_anomaly_batch(
+                    scoring_pattern, bridge_keys, max_keys=200,
+                )
+                for r in batch["results"]:
+                    anomaly_map[r["primary_key"]] = r["is_anomaly"]
+            except GDSNavigationError:
+                pass
+
+        # Format bridges
+        bridges_out = sorted(
+            [
+                {
+                    "cluster_a": a,
+                    "cluster_b": b,
+                    "edge_count": cnt,
+                    "bridge_entities": [
+                        {
+                            "key": k,
+                            "is_anomaly": anomaly_map.get(k, False),
+                        }
+                        for k, _ in sorted(
+                            [(e, c) for e, c in bridge_entity_count.items()
+                             if entity_cluster.get(e) in (a, b)],
+                            key=lambda x: x[1], reverse=True,
+                        )[:5]
+                    ],
+                }
+                for (a, b), cnt in bridge_edges.items()
+            ],
+            key=lambda x: x["edge_count"],
+            reverse=True,
+        )[:top_n_bridges]
+
+        # Format clusters
+        clusters_out = [
+            {
+                "cluster_id": c["cluster_id"],
+                "size": c["size"],
+                "anomaly_rate": c.get("anomaly_rate", 0.0),
+            }
+            for c in clusters
+        ]
+
+        total_bridge_entities = len(bridge_entity_count)
+        top_bridge = top_bridge_entities[0][0] if top_bridge_entities else None
+
+        return {
+            "pattern_id": pattern_id,
+            "clusters": clusters_out,
+            "bridges": bridges_out,
+            "summary": {
+                "total_clusters": len(clusters),
+                "total_bridge_edges": sum(bridge_edges.values()),
+                "total_bridge_entities": total_bridge_entities,
+                "top_bridge_entity": top_bridge,
+            },
+        }
+
+    def anomalous_edges(
+        self,
+        from_key: str,
+        to_key: str,
+        pattern_id: str,
+        top_n: int = 10,
+    ) -> dict[str, Any]:
+        """Find edges between two entities enriched with event-level geometry.
+
+        Unlike path/chain tools which resolve anchor pattern geometry, this reads
+        geometry from the EVENT pattern itself — ``event_key`` is the primary key
+        in event geometry.  Sorts by ``delta_norm`` descending.
+
+        Returns ``{from_key, to_key, edges, summary}``.
+        """
+        if not self._storage.has_edge_table(pattern_id):
+            raise GDSNavigationError(
+                f"Pattern '{pattern_id}' has no edge table. "
+                "anomalous_edges requires an edge table."
+            )
+        # A→B edges
+        fwd = self._storage.read_edges(pattern_id, from_keys=[from_key], to_keys=[to_key])
+        # B→A edges
+        rev = self._storage.read_edges(pattern_id, from_keys=[to_key], to_keys=[from_key])
+
+        # Concat edge data
+        all_edges: list[dict[str, Any]] = []
+        for tbl in (fwd, rev):
+            if tbl.num_rows == 0:
+                continue
+            from_arr = tbl["from_key"].to_pylist()
+            to_arr = tbl["to_key"].to_pylist()
+            ek_arr = tbl["event_key"].to_pylist()
+            ts_arr = tbl["timestamp"].to_pylist()
+            amt_arr = tbl["amount"].to_pylist()
+            for f, t, ek, ts, amt in zip(from_arr, to_arr, ek_arr, ts_arr, amt_arr, strict=False):
+                all_edges.append({
+                    "event_key": ek,
+                    "from_key": f,
+                    "to_key": t,
+                    "amount": round(float(amt), 2),
+                    "timestamp": float(ts),
+                })
+
+        if not all_edges:
+            return {
+                "from_key": from_key,
+                "to_key": to_key,
+                "pattern_id": pattern_id,
+                "edges": [],
+                "summary": {
+                    "total_edges": 0,
+                    "returned": 0,
+                    "anomalous": 0,
+                    "max_delta_norm": 0.0,
+                },
+            }
+
+        # Enrich with EVENT geometry (not anchor!)
+        event_keys = [e["event_key"] for e in all_edges]
+        try:
+            version = self._resolve_version(pattern_id)
+            geo = self._storage.read_geometry(
+                pattern_id, version,
+                point_keys=event_keys,
+                columns=["primary_key", "delta_norm", "is_anomaly", "delta_rank_pct"],
+            )
+            geo_map: dict[str, dict[str, Any]] = {}
+            for i in range(geo.num_rows):
+                pk = geo["primary_key"][i].as_py()
+                geo_map[pk] = {
+                    "delta_norm": round(float(geo["delta_norm"][i].as_py()), 4),
+                    "is_anomaly": bool(geo["is_anomaly"][i].as_py()),
+                    "delta_rank_pct": round(float(geo["delta_rank_pct"][i].as_py()), 2),
+                }
+        except GDSNavigationError:
+            geo_map = {}
+
+        for edge in all_edges:
+            geo_data = geo_map.get(edge["event_key"], {})
+            edge["delta_norm"] = geo_data.get("delta_norm", 0.0)
+            edge["is_anomaly"] = geo_data.get("is_anomaly", False)
+            edge["delta_rank_pct"] = geo_data.get("delta_rank_pct", 0.0)
+
+        # Sort by delta_norm desc, cap at top_n
+        all_edges.sort(key=lambda e: e["delta_norm"], reverse=True)
+        total = len(all_edges)
+        anomalous = sum(1 for e in all_edges if e["is_anomaly"])
+        max_dn = all_edges[0]["delta_norm"] if all_edges else 0.0
+        returned = all_edges[:top_n]
+
+        return {
+            "from_key": from_key,
+            "to_key": to_key,
+            "pattern_id": pattern_id,
+            "edges": returned,
+            "summary": {
+                "total_edges": total,
+                "returned": len(returned),
+                "anomalous": anomalous,
+                "max_delta_norm": round(max_dn, 4),
+            },
+        }
 
     def solid_forecast(
         self,
@@ -5498,6 +6357,454 @@ class GDSNavigator:
             },
         }
 
+    # ── Edge table: geometric path finding & lazy chains ──────
+
+    def _resolve_anchor_pattern_for_scoring(self, event_pattern_id: str) -> str | None:
+        """Find the anchor pattern that holds geometry for entities in this event pattern.
+
+        Edge table lives on event patterns (tx_pattern) but entities (accounts)
+        have their geometry in anchor patterns (account_pattern). Scoring needs
+        the anchor pattern's deltas, not the event pattern's.
+        """
+        if not hasattr(self, "_anchor_pattern_cache"):
+            self._anchor_pattern_cache: dict[str, str | None] = {}
+        if event_pattern_id in self._anchor_pattern_cache:
+            return self._anchor_pattern_cache[event_pattern_id]
+        sphere = self._storage.read_sphere()
+        event_pat = sphere.patterns.get(event_pattern_id)
+        if event_pat is None or event_pat.pattern_type != "event":
+            # Not an event pattern — use itself
+            self._anchor_pattern_cache[event_pattern_id] = event_pattern_id
+            return event_pattern_id
+        # Find anchor pattern whose entity_line matches from/to target line
+        edge_meta = getattr(event_pat, "edge_table", None)
+        # Look for an anchor pattern that covers the same entities
+        for pid, pat in sphere.patterns.items():
+            if pat.pattern_type == "anchor" and pid != event_pattern_id:
+                entity_line = pat.entity_line_id
+                # Check if any of the event pattern's relations point to this line
+                for rel in event_pat.relations:
+                    if rel.line_id == entity_line:
+                        self._anchor_pattern_cache[event_pattern_id] = pid
+                        return pid
+        self._anchor_pattern_cache[event_pattern_id] = None
+        return None
+
+    def _build_adjacency(
+        self,
+        pattern_id: str,
+        keys: set[str] | None = None,
+    ) -> dict[str, list[tuple[str, str, float, float]]]:
+        """Build adjacency dict from edge table via BTREE indexed lookups.
+
+        Only loads edges for requested keys (subgraph). Never loads full table.
+        Returns {key: [(neighbor, event_key, timestamp, amount), ...]}.
+        Deduplicated: only one entry per unique neighbor per key (keeps first/best).
+        Includes reverse edges for undirected traversal.
+        """
+        if not keys:
+            return defaultdict(list)
+        fwd = self._storage.read_edges(pattern_id, from_keys=list(keys))
+        rev = self._storage.read_edges(pattern_id, to_keys=list(keys))
+        # Collect all edges, then deduplicate per (key, neighbor)
+        raw: dict[str, dict[str, tuple[str, float, float]]] = defaultdict(dict)
+        for tbl in (fwd, rev):
+            from_arr = tbl["from_key"].to_pylist()
+            to_arr = tbl["to_key"].to_pylist()
+            ek_arr = tbl["event_key"].to_pylist()
+            ts_arr = tbl["timestamp"].to_pylist()
+            amt_arr = tbl["amount"].to_pylist()
+            for f, t, ek, ts, amt in zip(from_arr, to_arr, ek_arr, ts_arr, amt_arr):
+                if f == t:
+                    continue  # skip self-loops
+                # Forward: f → t
+                if t not in raw[f]:
+                    raw[f][t] = (ek, ts, amt)
+                # Reverse: t → f
+                if f not in raw[t]:
+                    raw[t][f] = (ek, ts, amt)
+        # Convert to adjacency list format
+        adj: dict[str, list[tuple[str, str, float, float]]] = defaultdict(list)
+        for key, neighbors in raw.items():
+            for nb, (ek, ts, amt) in neighbors.items():
+                adj[key].append((nb, ek, ts, amt))
+        return adj
+
+    def _get_cached_delta(
+        self,
+        primary_key: str,
+        pattern_id: str,
+    ) -> np.ndarray | None:
+        """Get delta vector for entity. Caches in _delta_cache."""
+        if not hasattr(self, "_delta_cache"):
+            self._delta_cache: dict[tuple[str, str], np.ndarray] = {}
+        cache_key = (primary_key, pattern_id)
+        if cache_key in self._delta_cache:
+            return self._delta_cache[cache_key]
+        version = self._resolve_version(pattern_id)
+        geo = self._storage.read_geometry(
+            pattern_id, version, primary_key=primary_key,
+            columns=["primary_key", "delta"],
+        )
+        if geo.num_rows == 0:
+            return None
+        delta = np.array(geo["delta"][0].as_py(), dtype=np.float32)
+        self._delta_cache[cache_key] = delta
+        return delta
+
+    def _prefetch_deltas(
+        self,
+        keys: set[str],
+        pattern_id: str,
+    ) -> None:
+        """Batch-prefetch delta vectors for a set of entities."""
+        if not hasattr(self, "_delta_cache"):
+            self._delta_cache = {}
+        missing = [k for k in keys if (k, pattern_id) not in self._delta_cache]
+        if not missing:
+            return
+        version = self._resolve_version(pattern_id)
+        geo = self._storage.read_geometry(
+            pattern_id, version,
+            point_keys=missing,
+            columns=["primary_key", "delta"],
+        )
+        for i in range(geo.num_rows):
+            pk = geo["primary_key"][i].as_py()
+            delta = geo["delta"][i].as_py()
+            if delta is not None:
+                self._delta_cache[(pk, pattern_id)] = np.array(delta, dtype=np.float32)
+
+    def _get_cached_theta(self, pattern_id: str) -> np.ndarray:
+        """Get theta vector for pattern, cached to avoid repeated read_sphere()."""
+        if not hasattr(self, "_theta_cache"):
+            self._theta_cache: dict[str, np.ndarray] = {}
+        if pattern_id not in self._theta_cache:
+            sphere = self._storage.read_sphere()
+            pat = sphere.patterns[pattern_id]
+            self._theta_cache[pattern_id] = np.array(pat.theta, dtype=np.float32)
+        return self._theta_cache[pattern_id]
+
+    def _score_hop(
+        self,
+        from_key: str,
+        to_key: str,
+        pattern_id: str,
+        scoring: str,
+        amount: float = 0.0,
+        max_amount: float = 1.0,
+    ) -> float:
+        """Score a single hop by the chosen strategy.
+
+        When *scoring* is ``"amount"``, the geometric score is modulated by
+        ``(1 + log1p(amount) / log1p(max_amount))``.
+        """
+        if scoring == "shortest":
+            return 1.0
+        delta_from = self._get_cached_delta(from_key, pattern_id)
+        delta_to = self._get_cached_delta(to_key, pattern_id)
+        if delta_from is None or delta_to is None:
+            return 0.0
+        if scoring == "anomaly":
+            return float(np.linalg.norm(delta_to))
+        # "geometric" base scoring
+        norm_f = float(np.linalg.norm(delta_from))
+        norm_t = float(np.linalg.norm(delta_to))
+        # 1. Delta direction alignment (cosine similarity)
+        denom = norm_f * norm_t + 1e-10
+        alignment = float(np.dot(delta_from, delta_to) / denom)
+        # 2. Witness overlap (shared anomalous dimensions)
+        theta = self._get_cached_theta(pattern_id)
+        witness_from = set(np.where(np.abs(delta_from) > theta)[0])
+        witness_to = set(np.where(np.abs(delta_to) > theta)[0])
+        if witness_from or witness_to:
+            overlap = len(witness_from & witness_to) / len(witness_from | witness_to)
+        else:
+            overlap = 0.0
+        # 3. Anomaly signal preservation
+        preservation = min(norm_t, norm_f) / (max(norm_t, norm_f) + 1e-10)
+        geo_score = 0.4 * alignment + 0.3 * overlap + 0.3 * preservation
+
+        if scoring == "amount":
+            # Modulate by transaction amount
+            log_max = float(np.log1p(max_amount)) if max_amount > 0 else 1.0
+            amount_factor = 1.0 + float(np.log1p(amount)) / (log_max + 1e-10)
+            return geo_score * amount_factor
+
+        return geo_score
+
+    def find_geometric_path(
+        self,
+        from_key: str,
+        to_key: str,
+        pattern_id: str,
+        max_depth: int = 5,
+        beam_width: int = 10,
+        scoring: str = "geometric",
+    ) -> dict[str, Any]:
+        """Find paths between two entities scored by geometric coherence.
+
+        Uses edge table for traversal, delta vectors for scoring.
+        Beam search: at each depth, keep top beam_width candidates.
+
+        Args:
+            from_key: Source entity primary key.
+            to_key: Target entity primary key.
+            pattern_id: Event pattern with edge table.
+            max_depth: Maximum hops to search.
+            beam_width: Candidates kept per depth level.
+            scoring: "geometric" | "anomaly" | "shortest" | "amount".
+
+        Returns dict with paths, each scored, plus summary.
+        """
+        if not self._storage.has_edge_table(pattern_id):
+            raise GDSNavigationError(
+                f"Pattern '{pattern_id}' has no edge table. "
+                "Rebuild sphere with edge table support."
+            )
+        # Resolve anchor pattern for geometry scoring (entities live in anchor,
+        # not event patterns — event pattern_id is only for edge table reads).
+        scoring_pattern = self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
+        # Iterative beam search with per-depth adjacency expansion
+        frontier: list[tuple[list[str], float]] = [([from_key], 0.0)]
+        arrived: list[tuple[list[str], float]] = []
+        adj: dict[str, list[tuple[str, str, float, float]]] = defaultdict(list)
+        expanded_keys: set[str] = set()
+        max_amt_seen = 1.0  # track max amount for "amount" scoring normalization
+
+        for _depth in range(max_depth):
+            # Expand adjacency only for frontier tips not yet expanded
+            tips = {path[-1] for path, _ in frontier} - expanded_keys
+            if tips:
+                new_adj = self._build_adjacency(pattern_id, tips)
+                for k, v in new_adj.items():
+                    adj[k].extend(v)
+                    if scoring == "amount":
+                        for _, _, _, amt in v:
+                            if amt > max_amt_seen:
+                                max_amt_seen = amt
+                expanded_keys |= tips
+                # Prefetch deltas for newly discovered neighbors
+                if scoring != "shortest":
+                    neighbor_keys = {nb for tip in tips for nb, *_ in adj.get(tip, [])}
+                    self._prefetch_deltas(neighbor_keys | tips, scoring_pattern)
+
+            candidates: list[tuple[list[str], float]] = []
+            for path, score in frontier:
+                last = path[-1]
+                for neighbor, _ek, _ts, _amt in adj.get(last, []):
+                    if neighbor in set(path):  # no cycles
+                        continue
+                    hop_score = self._score_hop(
+                        last, neighbor, scoring_pattern, scoring,
+                        amount=_amt, max_amount=max_amt_seen,
+                    )
+                    new_path = path + [neighbor]
+                    new_score = score + hop_score
+                    if neighbor == to_key:
+                        arrived.append((new_path, new_score))
+                    else:
+                        candidates.append((new_path, new_score))
+            if arrived:
+                break
+            # Beam: keep top beam_width
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            frontier = candidates[:beam_width]
+            if not frontier:
+                break
+
+        # Format results
+        paths = []
+        for path_keys, score in sorted(arrived, key=lambda x: x[1], reverse=True):
+            paths.append({
+                "keys": path_keys,
+                "hops": len(path_keys) - 1,
+                "geometric_score": round(score, 4),
+            })
+
+        return {
+            "from_key": from_key,
+            "to_key": to_key,
+            "pattern_id": pattern_id,
+            "scoring": scoring,
+            "paths": paths,
+            "summary": {
+                "paths_found": len(paths),
+                "best_score": round(paths[0]["geometric_score"], 4) if paths else 0.0,
+                "max_depth": max_depth,
+                "beam_width": beam_width,
+                "score_interpretation": (
+                    "geometric: 0=no coherence, 1=perfect alignment. "
+                    "Components: delta alignment (40%), witness overlap (30%), anomaly preservation (30%)"
+                    if scoring == "geometric"
+                    else "amount: geometric score modulated by log(amount). "
+                    "Higher = geometrically coherent path through high-value transactions"
+                    if scoring == "amount"
+                    else "anomaly: higher = more anomalous intermediaries"
+                    if scoring == "anomaly"
+                    else "shortest: all hops score 1.0"
+                ),
+            },
+        }
+
+    def discover_chains(
+        self,
+        primary_key: str,
+        pattern_id: str,
+        time_window_hours: int = 168,
+        max_hops: int = 10,
+        min_hops: int = 2,
+        max_chains: int = 100,
+        direction: str = "forward",
+    ) -> dict[str, Any]:
+        """Discover transaction chains from entity via temporal BFS on edge table.
+
+        Unlike find_chains_for_entity() which looks up pre-computed chains,
+        this performs runtime BFS — works without build-time chain extraction.
+
+        **Note:** total_amount is the sum of hop amounts, not a tracked money flow.
+        See "Chain Interpretation" in concepts.md for details.
+
+        Args:
+            primary_key: Starting entity.
+            pattern_id: Event pattern with edge table.
+            time_window_hours: Max gap between consecutive hops.
+            max_hops: Maximum chain length.
+            min_hops: Minimum chain length (filter shorter).
+            max_chains: Output cap.
+            direction: "forward" | "backward" | "both".
+
+        Returns dict with chains, each scored by geometric coherence.
+        """
+        if not self._storage.has_edge_table(pattern_id):
+            raise GDSNavigationError(
+                f"Pattern '{pattern_id}' has no edge table."
+            )
+        window_secs = time_window_hours * 3600.0
+
+        def _load_temporal_adj(keys: list[str]) -> tuple[dict, dict]:
+            """Load temporal adjacency for specific keys only (BTREE indexed)."""
+            fwd_edges = self._storage.read_edges(pattern_id, from_keys=keys)
+            bwd_edges = self._storage.read_edges(pattern_id, to_keys=keys)
+            fwd_adj: dict[str, list[tuple[str, float, float]]] = defaultdict(list)
+            bwd_adj: dict[str, list[tuple[str, float, float]]] = defaultdict(list)
+            for tbl, adj, f_col, t_col in [
+                (fwd_edges, fwd_adj, "from_key", "to_key"),
+                (bwd_edges, bwd_adj, "to_key", "from_key"),
+            ]:
+                f_arr = tbl[f_col].to_pylist()
+                t_arr = tbl[t_col].to_pylist()
+                ts_arr = tbl["timestamp"].to_pylist()
+                amt_arr = tbl["amount"].to_pylist()
+                for f, t, ts, amt in zip(f_arr, t_arr, ts_arr, amt_arr):
+                    if f == t:
+                        continue  # skip self-loops
+                    adj[f].append((t, ts, amt))
+            for k in fwd_adj:
+                fwd_adj[k].sort(key=lambda x: x[1])
+            for k in bwd_adj:
+                bwd_adj[k].sort(key=lambda x: x[1])
+            return fwd_adj, bwd_adj
+
+        fwd, bwd = _load_temporal_adj([primary_key])
+
+        _QUEUE_CAP = 500_000  # prevent unbounded memory on dense graphs
+
+        chains: list[dict[str, Any]] = []
+        chain_id_counter = 0
+
+        expanded_keys: set[str] = set()
+        seen_chains: set[tuple[str, ...]] = set()
+
+        def _bfs(is_forward: bool, start: str) -> None:
+            nonlocal chain_id_counter
+            adj = fwd if is_forward else bwd
+            # Queue: (current_key, path_keys, first_timestamp, last_timestamp, total_amount)
+            queue: deque[tuple[str, list[str], float, float, float]] = deque()
+            for neighbor, ts, amt in adj.get(start, []):
+                queue.append((neighbor, [start, neighbor], ts, ts, amt))
+
+            while queue and len(chains) < max_chains and len(queue) < _QUEUE_CAP:
+                current, path, first_ts, last_ts, total_amt = queue.popleft()
+                # Record if >= min_hops
+                if len(path) - 1 >= min_hops:
+                    chain_key = tuple(path)
+                    if chain_key in seen_chains:
+                        continue
+                    seen_chains.add(chain_key)
+                    chain_id_counter += 1
+                    is_cyclic = path[-1] == path[0]
+                    time_span = last_ts - first_ts
+                    chains.append({
+                        "chain_id": f"chain_{chain_id_counter:05d}",
+                        "keys": list(path),
+                        "hop_count": len(path) - 1,
+                        "is_cyclic": is_cyclic,
+                        "time_span_hours": round(time_span / 3600.0, 2) if time_span else 0.0,
+                        "total_amount": round(total_amt, 2),
+                    })
+                # Expand if under max_hops — lazy load adjacency for new keys
+                if len(path) - 1 < max_hops:
+                    if current not in expanded_keys:
+                        expanded_keys.add(current)
+                        new_fwd, new_bwd = _load_temporal_adj([current])
+                        for k, v in new_fwd.items():
+                            fwd[k].extend(v)
+                            fwd[k].sort(key=lambda x: x[1])
+                        for k, v in new_bwd.items():
+                            bwd[k].extend(v)
+                            bwd[k].sort(key=lambda x: x[1])
+                    for neighbor, ts, amt in adj.get(current, []):
+                        if ts >= last_ts and ts <= last_ts + window_secs:
+                            if neighbor not in set(path):  # no revisit
+                                queue.append((
+                                    neighbor,
+                                    path + [neighbor],
+                                    first_ts,
+                                    ts,
+                                    total_amt + amt,
+                                ))
+
+        if direction in ("forward", "both"):
+            _bfs(True, primary_key)
+        if direction in ("backward", "both"):
+            _bfs(False, primary_key)
+
+        # Score chains geometrically — resolve anchor pattern for delta lookups
+        scoring_pattern = self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
+        if chains:
+            all_keys = set()
+            for c in chains:
+                all_keys.update(c["keys"])
+            self._prefetch_deltas(all_keys, scoring_pattern)
+            for c in chains:
+                keys = c["keys"]
+                if len(keys) < 2:
+                    c["geometric_score"] = 0.0
+                    continue
+                total = 0.0
+                for i in range(len(keys) - 1):
+                    total += self._score_hop(keys[i], keys[i + 1], scoring_pattern, "geometric")
+                c["geometric_score"] = round(total / (len(keys) - 1), 4)
+
+        # Sort by geometric_score desc
+        chains.sort(key=lambda c: c.get("geometric_score", 0.0), reverse=True)
+        chains = chains[:max_chains]
+
+        return {
+            "primary_key": primary_key,
+            "pattern_id": pattern_id,
+            "chains": chains,
+            "summary": {
+                "total": len(chains),
+                "cyclic": sum(1 for c in chains if c["is_cyclic"]),
+                "avg_hops": (
+                    round(sum(c["hop_count"] for c in chains) / len(chains), 1)
+                    if chains else 0.0
+                ),
+            },
+        }
+
     def explain_anomaly(
         self,
         primary_key: str,
@@ -5798,8 +7105,11 @@ class GDSNavigator:
 
         result = scanner.scan(entity_line, scoring="count", threshold=1, top_n=top_n)
 
-        # Keep only hits flagged by exactly one source
+        # Keep only hits flagged by exactly one source, limit to top_n
+        # before the expensive per-entity cross_pattern_profile loop.
         single_source_hits = [h for h in result.hits if h.score == 1]
+        single_source_hits.sort(key=lambda h: h.weighted_score, reverse=True)
+        single_source_hits = single_source_hits[:top_n]
 
         output: list[dict] = []
         skipped_errors = 0

@@ -38,6 +38,7 @@ def run_build(
     verbose: bool,
     no_temporal: bool = False,
     no_chains: bool = False,
+    no_edges: bool = False,
 ) -> None:
     """Execute the ``hypertopos build`` command."""
     try:
@@ -65,6 +66,7 @@ def run_build(
         _do_build(
             cfg, base_dir, str(out_path), verbose,
             no_temporal=no_temporal, no_chains=no_chains,
+            no_edges=no_edges,
         )
         print(f"Built: {out_path}")
     except Exception as exc:
@@ -225,6 +227,7 @@ def _do_build(
     verbose: bool,
     no_temporal: bool = False,
     no_chains: bool = False,
+    no_edges: bool = False,
 ) -> None:
     """Core build: loads sources, wires GDSBuilder, calls build + temporal."""
     import time
@@ -361,6 +364,10 @@ def _do_build(
     _add_aliases(builder, cfg.aliases)
 
     # 5. Build
+    # Suppress edge table emission if --no-edges
+    if no_edges:
+        builder._no_edges = True
+
     t_phase = time.time()
     if verbose:
         print("  Building geometry...")
@@ -495,6 +502,17 @@ def _add_pattern(
             ))
     # "auto" or None -> empty relations (derived dims auto-generate)
 
+    # Edge table config (YAML → builder)
+    from hypertopos.builder.builder import EdgeTableConfig as _ETC
+    _et_cfg = None
+    if pat_cfg.edge_table:
+        _et_cfg = _ETC(
+            from_col=pat_cfg.edge_table.from_col,
+            to_col=pat_cfg.edge_table.to_col,
+            timestamp_col=pat_cfg.edge_table.timestamp_col,
+            amount_col=pat_cfg.edge_table.amount_col,
+        )
+
     builder.add_pattern(  # type: ignore[union-attr]
         pid,
         pattern_type=pat_cfg.type,
@@ -507,6 +525,7 @@ def _add_pattern(
         gmm_n_components=pat_cfg.gmm_n_components,
         use_mahalanobis=pat_cfg.use_mahalanobis,
         description=pat_cfg.description,
+        edge_table=_et_cfg,
     )
 
     # Event dimensions

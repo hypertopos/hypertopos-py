@@ -47,6 +47,10 @@ def main() -> None:
         "--no-chains", action="store_true",
         help="Skip chain extraction",
     )
+    build_p.add_argument(
+        "--no-edges", action="store_true",
+        help="Skip edge table emission",
+    )
 
     # --- validate ---
     validate_p = sub.add_parser(
@@ -72,6 +76,7 @@ def main() -> None:
             run_build(
                 args.config, args.output, args.force, args.verbose,
                 no_temporal=args.no_temporal, no_chains=args.no_chains,
+                no_edges=args.no_edges,
             )
     elif args.command == "validate":
         from hypertopos.cli.build import run_validate

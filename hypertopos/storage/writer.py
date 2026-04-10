@@ -495,8 +495,13 @@ class GDSWriter:
                     table.schema.get_field_index("delta"), "delta", fixed_delta
                 )
 
-        mode = "append" if lance_path.exists() else "create"
-        _write_lance(table, str(lance_path), mode=mode)
+        if lance_path.exists():
+            # Upsert: replace existing rows with same primary_key, insert new ones.
+            # Prevents duplicate rows from accumulating after interrupted incremental_update.
+            ds = _lance.dataset(str(lance_path))
+            ds.merge_insert("primary_key").when_matched_update_all().when_not_matched_insert_all().execute(table)
+        else:
+            _write_lance(table, str(lance_path), mode="create")
         self._maybe_reindex_geometry(pattern_id, version=version)
         self.recompute_delta_rank_pct(pattern_id, version=version)
 
@@ -851,6 +856,53 @@ class GDSWriter:
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"{pattern_id}.lance"
         _write_lance(table, str(out_path), mode="overwrite")
+
+    # ── Edge table ──────────────────────────────────────────────
+
+    def write_edges(
+        self,
+        pattern_id: str,
+        edges_table: pa.Table,
+    ) -> None:
+        """Write edge table as Lance dataset with BTREE indexes.
+
+        Schema: from_key, to_key, event_key, timestamp, amount.
+        Used for runtime graph traversal and lazy chain discovery.
+        """
+        lance_dir = self._base / "edges" / pattern_id
+        lance_dir.mkdir(parents=True, exist_ok=True)
+        lance_path = str(lance_dir / "data.lance")
+        _write_lance(edges_table, lance_path, mode="overwrite")
+        self._create_edge_indexes(lance_path)
+
+    def append_edges(
+        self,
+        pattern_id: str,
+        new_edges: pa.Table,
+    ) -> None:
+        """Append new edges to existing Lance dataset (streaming build)."""
+        lance_path = str(self._base / "edges" / pattern_id / "data.lance")
+        _write_lance(new_edges, lance_path, mode="append")
+
+    def create_edge_indexes(self, pattern_id: str) -> None:
+        """Build BTREE indexes on from_key and to_key after streaming writes."""
+        lance_path = str(self._base / "edges" / pattern_id / "data.lance")
+        self._create_edge_indexes(lance_path)
+
+    def _create_edge_indexes(self, lance_path: str) -> None:
+        ds = _lance.dataset(lance_path)
+        if ds.count_rows() == 0:
+            return
+        with suppress(Exception):
+            ds.create_scalar_index("from_key", index_type="BTREE", replace=True)
+        with suppress(Exception):
+            ds.create_scalar_index("to_key", index_type="BTREE", replace=True)
+
+    def write_edge_stats(self, pattern_id: str, stats: dict) -> None:
+        """Cache edge table statistics as JSON for fast reads."""
+        path = self._base / "_gds_meta" / "edge_stats"
+        path.mkdir(parents=True, exist_ok=True)
+        (path / f"{pattern_id}.json").write_text(json.dumps(stats, indent=2))
 
     def write_calibration_tracker(
         self, pattern_id: str, tracker: CalibrationTracker,  # noqa: F821

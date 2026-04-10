@@ -7599,3 +7599,35 @@ def test_aggregate_anomalies_ungrouped_field(tmp_path):
     # invariant: total_anomalies == sum(group counts) + ungrouped_anomalies
     grouped_sum = sum(g["anomaly_count"] for g in result["groups"])
     assert result["total_anomalies"] == grouped_sum + result["ungrouped_anomalies"]
+
+
+def test_find_anomalies_dedup_duplicate_primary_keys(sphere_path):
+    """π5 must deduplicate when Lance geometry has duplicate primary_key rows."""
+    from hypertopos.engine.geometry import GDSEngine
+    from hypertopos.storage.cache import GDSCache
+    from hypertopos.storage.reader import GDSReader
+
+    reader = GDSReader(base_path=sphere_path)
+    cache = GDSCache()
+    engine = GDSEngine(storage=reader, cache=cache)
+    manifest = Manifest(
+        manifest_id="m-1",
+        agent_id="a-1",
+        snapshot_time=datetime(2024, 1, 1, tzinfo=UTC),
+        status="active",
+        line_versions={"customers": 1, "products": 1},
+        pattern_versions={"customer_pattern": 1},
+    )
+    nav = GDSNavigator(
+        engine=engine,
+        storage=reader,
+        manifest=manifest,
+        contract=Contract("m-1", ["customer_pattern"]),
+    )
+
+    results, total, _, _ = nav.π5_attract_anomaly("customer_pattern", top_n=20)
+    pks = [p.primary_key for p in results]
+    assert len(pks) == len(set(pks)), (
+        f"Duplicate primary_keys in find_anomalies results: "
+        f"{[k for k in pks if pks.count(k) > 1]}"
+    )

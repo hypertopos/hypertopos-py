@@ -84,6 +84,14 @@ class HyperSphere:
                     pinned[f"temporal:{pattern_id}"] = _lance.dataset(
                         str(tmp_path)
                     ).latest_version
+            edge_path = (
+                session_reader._base / "edges" / pattern_id / "data.lance"
+            )
+            if edge_path.exists():
+                with suppress(Exception):
+                    pinned[f"edges:{pattern_id}"] = _lance.dataset(
+                        str(edge_path)
+                    ).latest_version
         session_reader._pinned_lance_versions = pinned
 
         engine = GDSEngine(storage=session_reader, cache=self._cache)

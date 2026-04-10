@@ -781,6 +781,14 @@ class GDSReader:
 
         return base_table
 
+    def count_points_rows(self, line_id: str, version: int) -> int:
+        """Count rows in a points table without reading data (Lance count_rows)."""
+        lance_path = self._base / "points" / line_id / f"v={version}" / "data.lance"
+        if not lance_path.exists():
+            return 0
+        ds = _lance.dataset(str(lance_path))
+        return ds.count_rows()
+
     def search_points_fts(
         self,
         line_id: str,
@@ -1189,6 +1197,84 @@ class GDSReader:
                 "anomaly_rate": table["anomaly_rate"][i].as_py(),
             })
         return result
+
+    # ── Edge table ──────────────────────────────────────────────
+
+    def read_edges(
+        self,
+        pattern_id: str,
+        from_keys: list[str] | None = None,
+        to_keys: list[str] | None = None,
+        timestamp_from: float | None = None,
+        timestamp_to: float | None = None,
+        columns: list[str] | None = None,
+    ) -> pa.Table:
+        """Read edge table with Lance BTREE-indexed push-down filters.
+
+        Uses BTREE indexes on from_key/to_key for O(log n) lookups.
+        MVCC: uses pinned Lance version when session isolation is active.
+
+        Returns empty table with correct schema when dataset doesn't exist.
+        """
+        lance_path = self._base / "edges" / pattern_id / "data.lance"
+        if not lance_path.exists():
+            from hypertopos.storage._schemas import EDGE_TABLE_SCHEMA
+            return pa.table(
+                {f.name: pa.array([], type=f.type) for f in EDGE_TABLE_SCHEMA},
+            )
+        pinned = self._pinned_lance_versions.get(f"edges:{pattern_id}")
+        ds = _lance.dataset(str(lance_path))
+        if pinned is not None:
+            ds = _lance.dataset(str(lance_path), version=pinned)
+
+        # Build filter expression
+        parts: list[str] = []
+        if from_keys is not None:
+            escaped = ", ".join(f"'{k.replace(chr(39), chr(39)*2)}'" for k in from_keys)
+            parts.append(f"from_key IN ({escaped})")
+        if to_keys is not None:
+            escaped = ", ".join(f"'{k.replace(chr(39), chr(39)*2)}'" for k in to_keys)
+            parts.append(f"to_key IN ({escaped})")
+        if timestamp_from is not None:
+            parts.append(f"timestamp >= {timestamp_from}")
+        if timestamp_to is not None:
+            parts.append(f"timestamp <= {timestamp_to}")
+
+        filter_expr = " AND ".join(parts) if parts else None
+        scanner = ds.scanner(columns=columns, filter=filter_expr)
+        return scanner.to_table()
+
+    def has_edge_table(self, pattern_id: str) -> bool:
+        """Check if edge table exists for a pattern."""
+        return (self._base / "edges" / pattern_id / "data.lance").exists()
+
+    def edge_table_stats(self, pattern_id: str) -> dict | None:
+        """Quick statistics about the edge table. Returns None if not present."""
+        # Try cached stats first (written at build time)
+        cache_path = self._base / "_gds_meta" / "edge_stats" / f"{pattern_id}.json"
+        if cache_path.exists():
+            return json.loads(cache_path.read_text())
+        # Fall back to live scan
+        lance_path = self._base / "edges" / pattern_id / "data.lance"
+        if not lance_path.exists():
+            return None
+        ds = _lance.dataset(str(lance_path))
+        row_count = ds.count_rows()
+        if row_count == 0:
+            return {"row_count": 0}
+        tbl = ds.to_table(columns=["from_key", "to_key", "timestamp", "amount"])
+        return {
+            "row_count": row_count,
+            "unique_from": pc.count_distinct(tbl["from_key"]).as_py(),
+            "unique_to": pc.count_distinct(tbl["to_key"]).as_py(),
+            "timestamp_min": float(pc.min(tbl["timestamp"]).as_py()),
+            "timestamp_max": float(pc.max(tbl["timestamp"]).as_py()),
+            "amount_min": float(pc.min(tbl["amount"]).as_py()),
+            "amount_max": float(pc.max(tbl["amount"]).as_py()),
+            "avg_out_degree": round(
+                row_count / max(pc.count_distinct(tbl["from_key"]).as_py(), 1), 1
+            ),
+        }
 
     def read_calibration_tracker(
         self, pattern_id: str,

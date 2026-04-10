@@ -29,6 +29,9 @@ hypertopos build --config sphere.yaml [--output DIR] [--force] [--verbose]
 | `--output` | Output directory. Default: `gds_{sphere_id}/` next to the YAML file |
 | `--force` | Overwrite output directory if it exists |
 | `--verbose` | Print progress with per-phase timing (sources, chains, geometry, temporal) |
+| `--no-chains` | Skip chain extraction |
+| `--no-temporal` | Skip temporal snapshot generation |
+| `--no-edges` | Skip edge table emission |
 
 ### `hypertopos validate`
 
@@ -357,6 +360,39 @@ patterns:
 | `precomputed_dimensions` | list | `null` | Columns already on entity table to use as geometry dimensions. |
 | `graph_features` | dict | `null` | Auto-compute graph structural features from event from/to columns. |
 | `description` | string | `null` | Human-readable description. Stored in sphere.json — visible to agents via `get_sphere_info`. |
+| `edge_table` | dict | `null` | Explicit edge table config (see below). Auto-emitted for event patterns with 2+ FK relations to same anchor line. |
+
+### Edge Table
+
+An edge table is a flat Lance dataset linking anchor entities through an event pattern. It enables runtime graph traversal (`find_geometric_path`, `discover_chains`) without pre-computed chain extraction.
+
+**Auto-detection:** When an event pattern has 2+ relations pointing to the same anchor line (e.g. `from_entity` and `to_entity` both referencing the same anchor line), the builder emits an edge table automatically. No YAML config needed.
+
+When auto-detecting, the builder also scans the event line schema for a timestamp column (first match of `timestamp`, `ts`, `event_time`, `created_at`, `tx_date`, `date`) and an amount column (first match of `amount_received`, `amount`, `amount_paid`, `value`, `total`, `amt`). If your columns use different names, declare them explicitly via `edge_table` config below.
+
+**Explicit config:** Use `edge_table` when column names need to be specified manually or when auto-detection does not apply.
+
+```yaml
+patterns:
+  tx_pattern:
+    type: event
+    entity_line: transactions
+    edge_table:
+      from_col: from_account       # Required. Source anchor FK column.
+      to_col: to_account           # Required. Target anchor FK column.
+      timestamp_col: date          # Optional. Epoch seconds for temporal BFS.
+      amount_col: amount           # Optional. Numeric value carried on edges.
+    # ... relations, event_dimensions, etc.
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `from_col` | string | — | **Required.** FK column for source anchor entity. |
+| `to_col` | string | — | **Required.** FK column for target anchor entity. |
+| `timestamp_col` | string | `null` | Timestamp column (epoch seconds). Enables temporal BFS in `discover_chains`. |
+| `amount_col` | string | `null` | Numeric column carried on edges. Enables amount-weighted scoring in `find_geometric_path`. |
+
+To skip edge table emission entirely (e.g. for faster iterative builds), use the `--no-edges` CLI flag.
 
 ### Multiple patterns on the same entity line
 
@@ -430,7 +466,7 @@ pattern's relations. When referencing a line, the FK is inferred from naming con
 (`{anchor_line}_id` → strips trailing 's').
 
 **`anchor_fk` override:** When an event pattern has multiple relations to the same anchor line
-(e.g. `from_account` and `to_account` both pointing to `accounts`), the auto-resolve picks
+(e.g. two FK columns both pointing to the same anchor line), the auto-resolve picks
 the first match. Use `anchor_fk` to disambiguate:
 
 ```yaml
@@ -559,7 +595,7 @@ patterns:
 
 ## Chain Lines
 
-Extract multi-hop transaction chains via seeded BFS and register as an anchor line.
+Extract multi-hop entity chains via seeded BFS and register as an anchor line.
 
 ```yaml
 chain_lines:
@@ -573,16 +609,16 @@ chain_lines:
       - time_span_hours
       - n_distinct_categories
       - amount_decay
-    seed_percentile_fan_out: 95          # Seed accounts with fan-out above p95.
-    seed_multi_currency: 2               # Seed accounts with 2+ currencies.
-    seed_pass_through: true              # Seed pass-through accounts (in>=2, out>=2).
+    seed_percentile_fan_out: 95          # Seed entities with fan-out above p95.
+    seed_multi_currency: 2               # Seed entities with 2+ categories.
+    seed_pass_through: true              # Seed pass-through entities (in>=2, out>=2).
     time_window_hours: 168               # 7-day chain window.
     max_hops: 15
     min_hops: 2
     max_chains: 300000
     bidirectional: true
     anomaly_percentile: 95
-    description: "Transaction chains — multi-hop money flows."
+    description: "Entity chains — multi-hop paths through the event graph."
 ```
 
 Automatically creates an anchor line + pattern (`{line_id}_pattern`).
@@ -594,9 +630,9 @@ Automatically creates an anchor line + pattern (`{line_id}_pattern`).
 | `to_col` | string | — | **Required.** Destination entity FK column. |
 | `features` | list | 4 default | Chain features to use as geometry dimensions. |
 | `seed_percentile_fan_out` | float | `95.0` | Fan-out percentile for seed selection. |
-| `seed_percentile_cross_bank` | float | `90.0` | Cross-bank activity percentile for seed selection. |
-| `seed_multi_currency` | int | `2` | Min currencies for seed selection. |
-| `seed_pass_through` | bool | `true` | Include pass-through accounts as seeds. |
+| `seed_percentile_cross_bank` | float | `90.0` | Cross-category activity percentile for seed selection. |
+| `seed_multi_currency` | int | `2` | Min distinct categories for seed selection. |
+| `seed_pass_through` | bool | `true` | Include pass-through entities as seeds. |
 | `time_window_hours` | int | `168` | Max time span for a chain (hours). |
 | `max_hops` | int | `15` | Max chain length. |
 | `min_hops` | int | `2` | Min chain length. |
@@ -859,9 +895,9 @@ Build total: 527s
 
 ```bash
 # Step 1: Geometry only — fast iteration on dimensions + calibration
-hypertopos build --config sphere.yaml --force --verbose --no-chains --no-temporal
+hypertopos build --config sphere.yaml --force --verbose --no-chains --no-temporal --no-edges
 
-# Step 2: Add temporal
+# Step 2: Add edges + temporal
 hypertopos build --config sphere.yaml --force --verbose --no-chains
 
 # Step 3: Full build with chains

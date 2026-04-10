@@ -5,6 +5,65 @@ All notable changes to hypertopos will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-04-10
+
+### Added
+
+**Edge Table**
+- Lance-based edge table per event pattern — auto-emitted at build time from FK data
+- BTREE indexes on `from_key`/`to_key` — O(log n) lookups at any scale
+- `GDSWriter.write_edges()`, `append_edges()`, `create_edge_indexes()`
+- `GDSReader.read_edges()`, `has_edge_table()`, `edge_table_stats()`
+- MVCC session pinning for edge tables
+- YAML `edge_table` config (optional, auto-detected from graph_features/relations)
+- `--no-edges` CLI flag
+
+**Navigation**
+- `find_geometric_path()` — beam search with geometric/anomaly/shortest/amount scoring
+- `discover_chains()` — runtime temporal BFS on edge table (no build-time extraction needed)
+- `find_counterparties()` — edge table fast path with BTREE lookup and amount aggregates
+- `entity_flow()` — net flow per counterparty via edge table
+- `contagion_score()` / `contagion_score_batch()` — anomaly neighborhood scoring via edge table
+- `degree_velocity()` — temporal connection velocity (degree change over time buckets)
+- `investigation_coverage()` — agent guidance: explored vs unexplored counterparty coverage
+- `propagate_influence()` — BFS influence propagation with geometric decay and tx_count weighting
+- `cluster_bridges()` — geometry+graph fusion: find entities bridging geometric clusters
+- `anomalous_edges()` — event-level scoring between entity pairs (uses event geometry, not anchor)
+- Amount-weighted scoring mode for `find_geometric_path` — `scoring="amount"`
+- Lazy adjacency expansion — never loads full edge table into memory
+- Anchor pattern resolution for geometric scoring (event pattern edge table → anchor pattern deltas)
+- Score interpretation hint in `find_geometric_path` summary
+
+**PassiveScanner**
+- `"graph"` source type — contagion scoring via edge table + geometry anomaly check
+- `add_graph_source()` — register graph contagion source with configurable threshold
+- `auto_discover()` — auto-detects graph sources for event patterns with edge tables
+
+**MCP Tools**
+- `find_geometric_path` — path finding with geometric coherence scoring (+ amount mode)
+- `discover_chains` — runtime chain discovery without pre-built chain lines
+- `edge_stats` — edge table statistics (row count, degree, timestamp/amount range)
+- `entity_flow` — net flow analysis per counterparty
+- `contagion_score` / `contagion_score_batch` — anomaly neighborhood scoring
+- `degree_velocity` — temporal connection velocity
+- `investigation_coverage` — agent guidance for investigation coverage
+- `propagate_influence` — BFS influence propagation with geometric decay and tx_count weighting
+- `cluster_bridges` — geometry+graph fusion cluster bridge analysis
+- `anomalous_edges` — event-level edge scoring between entity pairs
+- Output cap (top 20 paths / top 100 influenced) with warning when truncated
+
+**Builder**
+- Edge table emission in all build paths (standard, streaming, chunked)
+- Adjacency deduplication — one entry per unique neighbor
+- Self-loop filtering in graph traversal and temporal chain BFS
+- Edge stats cached at build time (`_gds_meta/edge_stats/`) for instant reads
+- Timestamp string parsing with sample-based format detection (6 formats supported)
+- Windows timezone database fallback in timestamp parsing
+- Edge table auto-detect infers `timestamp_col` and `amount_col` from common column names (`timestamp`/`ts`/`event_time`/`created_at`/`tx_date`/`date` and `amount_received`/`amount`/`amount_paid`/`value`/`total`/`amt`) when not explicitly configured
+- `sphere.json` edge_table metadata persists full config (`from_col`, `to_col`, plus `timestamp_col`/`amount_col` when set)
+
+---
+
 ## [0.1.0] — 2026-04-07
 
 First public release. Core GDS stack.

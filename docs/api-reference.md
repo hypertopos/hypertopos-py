@@ -118,6 +118,21 @@ with sphere.session("agent-1") as session:
 | π11 | `π11_attract_population_compare(pattern_id, window_a_from, window_a_to, window_b_from, window_b_to)` | Compare population geometry between two time windows | `dict` |
 | π12 | `π12_attract_regime_change(pattern_id, timestamp_from, timestamp_to)` | Detect population geometry regime shifts | `list[dict]` |
 
+### Graph Traversal (Edge Table)
+
+| Method | Description |
+|--------|-------------|
+| `find_geometric_path(from_key, to_key, pattern_id, max_depth=5, beam_width=10, scoring="geometric")` | Beam search for paths between two entities via the edge table, scored by geometric coherence. Scoring modes: `"geometric"` (witness overlap + delta alignment + anomaly preservation), `"amount"` (geometric score modulated by log(transaction amount)), `"anomaly"` (prefer paths through anomalous entities), `"shortest"` (plain BFS, no geometric scoring). Returns best paths with per-hop scores |
+| `discover_chains(primary_key, pattern_id, time_window_hours=168, max_hops=10, min_hops=2, max_chains=100, direction="forward")` | Runtime temporal BFS on the edge table to discover entity chains from a starting point. Unlike `find_chains_for_entity()` which queries pre-computed chains, this performs live traversal -- works without build-time chain extraction |
+| `entity_flow(primary_key, pattern_id, top_n=20)` | Net flow analysis per counterparty via edge table. Two edge lookups (outgoing + incoming), sum amounts, compute per-counterparty net flow. Returns outgoing/incoming totals, net_flow, flow_direction, counterparties sorted by abs(net_flow) |
+| `contagion_score(primary_key, pattern_id)` | Score how many of an entity's counterparties are anomalous via edge table + geometry check. Returns score (0.0–1.0), total/anomalous counterparty counts |
+| `contagion_score_batch(primary_keys, pattern_id, max_keys=200)` | Batch contagion scoring for multiple entities. Returns per-entity scores plus summary (mean, max, high_contagion_count) |
+| `degree_velocity(primary_key, pattern_id, n_buckets=4)` | Temporal connection velocity — buckets edges by timestamp, counts unique counterparties per bucket. Velocity = last_bucket_degree / first_bucket_degree. Returns buckets with out/in degree, velocity metrics |
+| `investigation_coverage(primary_key, pattern_id, explored_keys)` | Agent guidance: how much of an entity's edge neighborhood has been explored. Splits counterparties into explored/unexplored, batch anomaly check on unexplored |
+| `propagate_influence(seed_keys, pattern_id, max_depth=3, decay=0.7, min_threshold=0.001, max_affected=10_000)` | BFS influence propagation from seed entities with geometric decay and tx_count weighting. At each hop: influence = parent_score * decay * geometric_coherence * tx_weight. Returns affected_entities with tx_count per neighbor |
+| `cluster_bridges(pattern_id, n_clusters=5, top_n_bridges=10)` | Find entities bridging geometric clusters via edge table. Runs π8 clustering then identifies cross-cluster edges and bridge entities |
+| `anomalous_edges(from_key, to_key, pattern_id, top_n=10)` | Find edges between two entities enriched with event-level geometry (delta_norm, is_anomaly). Unlike path tools which score entities (anchor), this scores individual transactions (event geometry) |
+
 ### Analysis and Detection
 
 **Entity investigation:**
@@ -131,9 +146,9 @@ with sphere.session("agent-1") as session:
 | `composite_risk(primary_key, line_id)` | Fisher's method combination of conformal p-values across patterns |
 | `composite_risk_batch(primary_keys, line_id)` | Batch Fisher combination for multiple entities |
 | `cross_pattern_profile(primary_key, line_id)` | Anomaly status from all patterns the entity participates in |
-| `find_chains_for_entity(primary_key, pattern_id, top_n)` | Find transaction chains involving a specific entity |
+| `find_chains_for_entity(primary_key, pattern_id, top_n)` | Find chains involving a specific entity |
 | `find_neighborhood(primary_key, pattern_id, max_hops)` | BFS through polygon edges to find reachable entities |
-| `find_counterparties(primary_key, pattern_id, top_n)` | Discover counterparty entities from event data |
+| `find_counterparties(primary_key, line_id, from_col, to_col, pattern_id, top_n, use_edge_table=True)` | Discover counterparty entities from event data. When pattern_id is given and edge table exists, uses BTREE fast path with amount_sum/amount_max per counterparty |
 | `assess_false_positive(primary_key, pattern_id)` | Evaluate likelihood of false positive anomaly classification |
 
 **Detection recipes (population-level patterns):**
@@ -212,6 +227,26 @@ class RelationSpec:
     display_name: str | None = None
     edge_max: int | None = None         # None = binary, int = continuous count cap
 ```
+
+---
+
+## Storage -- GDSReader / GDSWriter
+
+### Edge Table (GDSReader)
+
+| Method | Description |
+|--------|-------------|
+| `read_edges(pattern_id, from_keys=None, to_keys=None, timestamp_from=None, timestamp_to=None, columns=None)` | Read edge table with Lance BTREE-indexed push-down filters. Returns `pa.Table` |
+| `has_edge_table(pattern_id)` | Check if an edge table exists for a pattern. Returns `bool` |
+| `edge_table_stats(pattern_id)` | Quick statistics (row count, unique entities, timestamp/amount ranges). Returns `dict` or `None` |
+
+### Edge Table (GDSWriter)
+
+| Method | Description |
+|--------|-------------|
+| `write_edges(pattern_id, edges_table)` | Write edge table as a Lance dataset with BTREE indexes on `from_key` and `to_key` |
+| `append_edges(pattern_id, new_edges)` | Append new edges to an existing Lance dataset (streaming build) |
+| `create_edge_indexes(pattern_id)` | Build BTREE indexes on `from_key` and `to_key` after streaming writes |
 
 ---
 
@@ -385,7 +420,8 @@ Or use the navigator shortcut: `nav.passive_scan(home_line_id)`.
 | `add_borderline_source(name, pattern_id, rank_threshold)` | Register a near-threshold source (high delta_rank_pct, not anomalous) |
 | `add_points_source(name, line_id, rules, combine)` | Register a points-rule source filtering by column thresholds |
 | `add_compound_source(name, geometry_pattern_id, line_id, rules)` | Geometry expansion intersected with points rules |
-| `auto_discover(home_line_id, include_borderline)` | Auto-register all patterns related to a line |
+| `add_graph_source(name, pattern_id, contagion_threshold=0.3, weight)` | Register a graph contagion source — flags entities whose anomalous counterparty ratio exceeds threshold. Requires event pattern with edge table |
+| `auto_discover(home_line_id, include_borderline)` | Auto-register all patterns related to a line. Also auto-detects graph sources for event patterns with edge tables |
 | `scan(home_line_id, scoring, threshold, top_n)` | Execute batch scan across all registered sources. Returns `ScanResult` |
 
 ### ScanResult

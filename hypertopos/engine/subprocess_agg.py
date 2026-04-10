@@ -655,6 +655,14 @@ def _find_anomalies_table(
     keys = pc.take(filtered["primary_key"], page_indices).to_pylist()
     norms = pc.take(filtered["delta_norm"], page_indices).to_pylist()
 
+    # Deduplicate on primary_key, keeping highest delta_norm
+    seen: dict[str, float] = {}
+    for k, n in zip(keys, norms, strict=False):
+        if k not in seen or n > seen[k]:
+            seen[k] = n
+    keys = list(seen.keys())
+    norms = list(seen.values())
+
     return {"keys": keys, "delta_norms": norms, "total_found": total_found}
 
 

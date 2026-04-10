@@ -53,8 +53,11 @@ This produces a sphere on disk — `sphere.json` + geometry + points — ready f
 my_sphere/
 ├── _gds_meta/sphere.json    # population statistics (μ, σ, θ)
 ├── points/                   # entity data (Lance)
-└── geometry/                 # delta vectors, edges (Lance)
+├── geometry/                 # delta vectors, edges (Lance)
+└── edges/                    # adjacency table per event pattern (Lance, BTREE-indexed)
 ```
+
+To skip edge table emission entirely (faster iterative builds), use `--no-edges`.
 
 ## Validate (optional)
 
@@ -98,6 +101,7 @@ For the full MCP tool reference, see **[hypertopos-mcp documentation](https://gi
 | `sphere.json` | Population statistics: μ (mean), σ (spread), θ (threshold) per pattern |
 | `points/` | Entity data per line (Lance, indexed) |
 | `geometry/` | Delta vectors — each entity's position in population-relative space |
+| `edges/` | Adjacency table per event pattern (`from_key`, `to_key`, `event_key`, `timestamp`, `amount`) — powers runtime graph traversal: `find_geometric_path`, `discover_chains`, `entity_flow`, `contagion_score`, `propagate_influence`, `cluster_bridges` |
 
 The delta vector `δ = (s − μ) ⊘ σ` is the core coordinate. It tells you where an entity sits relative to its population — basis for clustering, similarity, comparison, hub analysis, boundary exploration, drift tracking, and anomaly detection.
 

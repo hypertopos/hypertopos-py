@@ -8,6 +8,7 @@
 [![PyArrow](https://img.shields.io/badge/format-PyArrow-red.svg)](https://arrow.apache.org/docs/python/)
 [![Lance](https://img.shields.io/badge/storage-Lance-blueviolet.svg)](https://github.com/lancedb/lancedb)
 [![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io)
+[![Version](https://img.shields.io/badge/version-0.2.0-blue.svg)](pyproject.toml)
 
 **hypertopos** transforms relational data into navigable geometric space.
 
@@ -37,11 +38,12 @@ Navigation primitives turn this space into a stateful, step-by-step workspace, w
 
 - **Geometry, not queries** — entities live in a population-calibrated coordinate space (μ, σ, θ). Position tells you what's typical. Distance reveals what's unusual, what's similar, and where clusters form.
 - **Navigate, don't search** — twelve primitives (π1–π12) let agents walk lines, jump across relationships, cluster populations, compare groups, find hubs, and track drift. Stateful, composable, geometric.
+- **Graph meets geometry** — edge tables give runtime graph traversal with geometric path scoring. Find paths scored by witness overlap and anomaly propagation — not just hop count. Lazy chain discovery without build-time extraction.
 - **Time is built in** — polygons accumulate into solids. Trajectory similarity, regime change detection, and drift analysis are first-class — not bolted on.
 - **Agents first** — designed for MCP tool-calling. Smart detection recipes, investigation workflows. The sphere is the agent's workspace.
 - **Zero training** — no ML models, no labels, no training pipeline. Population statistics and empirical thresholds. Deploy in minutes.
 
-> **Full power via MCP.** The core library provides the Python API. For the complete experience — guided investigation, smart detection, 55 tools exposed to AI agents — use **[hypertopos-mcp](https://github.com/hypertopos/hypertopos-mcp)** (`pip install hypertopos-mcp`). The MCP server turns navigation primitives into agent-callable tools with automatic context management, tool visibility phases, and detection recipes that chain multiple primitives into end-to-end investigative workflows.
+> **Full power via MCP.** The core library provides the Python API. For the complete experience — guided investigation, smart detection, 66 tools exposed to AI agents — use **[hypertopos-mcp](https://github.com/hypertopos/hypertopos-mcp)** (`pip install hypertopos-mcp`). The MCP server turns navigation primitives into agent-callable tools with automatic context management, tool visibility phases, and detection recipes that chain multiple primitives into end-to-end investigative workflows.
 
 ## How It Compares
 
@@ -52,7 +54,8 @@ Navigation primitives turn this space into a stateful, step-by-step workspace, w
 | **Population-relative** | Yes (μ, σ, θ per population) | No | No | No |
 | **Temporal** | Built-in (solids, drift, regimes) | Snapshot-based | No | No |
 | **Navigation** | 12 stateful primitives | Query-based | KNN search | N/A |
-| **Multi-hop** | Pre-computed chains + neighborhood discovery | Native (Cypher, ad-hoc) | No | No |
+| **Multi-hop** | Edge table (runtime graph + lazy chains) + pre-computed chain geometry | Native (Cypher, ad-hoc) | No | No |
+| **Anomaly propagation** | Contagion scoring + influence BFS in delta-space | No | No | Local neighborhood only |
 | **Agent-native (MCP)** | Yes | No | No | No |
 | **Explains why** | Witness sets, dimension ranking | Centrality scores | Nearest neighbors | Anomaly scores |
 

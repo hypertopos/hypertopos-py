@@ -761,30 +761,31 @@ class GDSEngine:
         n_clusters = max(1, min(n_clusters, N))
         rng = np.random.default_rng(seed)
 
-        # k-means++ initialisation
-        def _row_norms(d: np.ndarray) -> np.ndarray:
-            return np.sqrt(np.einsum('ij,ij->i', d, d))
+        # k-means++ initialisation with running min-distance (O(N) memory)
+        def _sq_norms(d: np.ndarray) -> np.ndarray:
+            return np.einsum('ij,ij->i', d, d)
 
         first = int(rng.integers(0, N))
         centroid_list: list[np.ndarray] = [delta_matrix[first]]
+        min_sq_dists = _sq_norms(delta_matrix - centroid_list[0])
         for _ in range(n_clusters - 1):
-            dists = np.min(
-                np.stack([_row_norms(delta_matrix - c) for c in centroid_list]),
-                axis=0,
-            )
-            sq = dists**2
-            total = sq.sum()
-            probs = sq / total if total > 0 else np.ones(N) / N
+            total = min_sq_dists.sum()
+            probs = min_sq_dists / total if total > 0 else np.ones(N) / N
             idx = int(rng.choice(N, p=probs))
             centroid_list.append(delta_matrix[idx])
+            new_sq = _sq_norms(delta_matrix - centroid_list[-1])
+            min_sq_dists = np.minimum(min_sq_dists, new_sq)
 
         centroids = np.vstack(centroid_list).astype(np.float32)
         labels = np.zeros(N, dtype=np.int32)
 
         for _ in range(max_iter):
-            diffs = delta_matrix[:, np.newaxis, :] - centroids[np.newaxis, :, :]
-            dists = np.sqrt(np.einsum('ijk,ijk->ij', diffs, diffs))
-            new_labels = np.argmin(dists, axis=1).astype(np.int32)
+            # ||x - c||^2 = ||x||^2 - 2*x·c^T + ||c||^2  →  (N,K) not (N,K,D)
+            x_sq = np.einsum('ij,ij->i', delta_matrix, delta_matrix)  # (N,)
+            c_sq = np.einsum('ij,ij->i', centroids, centroids)        # (K,)
+            cross = delta_matrix @ centroids.T                         # (N, K)
+            sq_dists = x_sq[:, None] - 2 * cross + c_sq[None, :]      # (N, K)
+            new_labels = np.argmin(sq_dists, axis=1).astype(np.int32)
             if np.array_equal(new_labels, labels):
                 break
             labels = new_labels

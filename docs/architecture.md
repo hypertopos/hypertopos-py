@@ -30,7 +30,7 @@ The core package is split into a few layers:
 - **Builder**: transforms source data into a complete sphere
 - **CLI**: builds and inspects spheres from the command line
 
-The `hypertopos-mcp` package sits on top of this core library and exposes the same capabilities to agents via 55 MCP tools.
+The `hypertopos-mcp` package sits on top of this core library and exposes the same capabilities to agents via 66 MCP tools.
 
 The split is deliberate:
 
@@ -51,6 +51,7 @@ A sphere is stored as a directory tree. The exact storage rules are defined by t
 - metadata describes the sphere
 - points store source entities
 - geometry stores derived vectors and anomaly labels
+- edges store entity-to-entity relationships (Lance, BTREE indexed) for graph traversal and chain discovery
 - temporal data stores shape history
 - auxiliary caches store precomputed summaries
 
@@ -112,17 +113,20 @@ For a denser top-down view, this stack is a useful shorthand:
 
 ```text
 ┌─────────────────────────────────────┐
-│  MCP Server (hypertopos-mcp)        │  55 tools, smart detection mode
+│  MCP Server (hypertopos-mcp)        │  66 tools, smart detection mode
 ├─────────────────────────────────────┤
 │  PassiveScanner                     │  multi-source batch screening
 ├─────────────────────────────────────┤
-│  Navigation (navigator.py)          │  π1–π12 primitives
+│  Navigation (navigator.py)          │  π1–π12 primitives + edge table graph traversal
+│                                     │  (find_geometric_path, discover_chains, entity_flow,
+│                                     │   contagion_score, propagate_influence, cluster_bridges, ...)
 ├─────────────────────────────────────┤
 │  Engine (geometry.py)               │  delta vectors, metrics, scoring, clustering
 │  CalibrationTracker                 │  online Welford drift stats
 ├─────────────────────────────────────┤
-│  Storage (reader.py, writer.py)     │  Lance storage, PyArrow transport, partition filtering
-│  Manifest / Contract                │  MVCC version pinning
+│  Storage (reader.py, writer.py)     │  Lance storage (points, geometry, edges, temporal),
+│                                     │  PyArrow transport, partition filtering, BTREE edge indexes
+│  Manifest / Contract                │  MVCC version pinning (incl. edge table snapshots)
 ├─────────────────────────────────────┤
 │  Model (sphere.py, objects.py)      │  Point, Edge, Polygon, Solid, Pattern, Alias
 ├─────────────────────────────────────┤
@@ -171,7 +175,7 @@ graph LR
     ST --> E["Engine\ngeometry, delta,\nclustering, DTW"]
     E --> N["Navigator\nπ1–π12, detect_*"]
     N --> PS["PassiveScanner\nmulti-source\nbatch screening"]
-    N --> MCP["MCP Server\n55 tools\nstdio transport"]
+    N --> MCP["MCP Server\n66 tools\nstdio transport"]
     MCP --> Agent["AI Agent"]
     CT["CalibrationTracker\nonline drift\nWelford stats"] -.-> E
     M["Manifest\nMVCC version pin"] -.-> ST
@@ -206,17 +210,20 @@ sessions never interfere with each other or with an ongoing build.
 
 PassiveScanner provides multi-source batch screening on top of the navigation primitives.
 Instead of manually chaining individual attract calls, an agent can request a scan across
-multiple geometric sources in a single operation. The scanner draws candidates from four
+multiple geometric sources in a single operation. The scanner draws candidates from five
 source types:
 
 - **geometry** — anomaly scores from delta vectors (via attract_anomaly)
 - **borderline** — boundary proximity scores (via attract_boundary)
 - **points** — direct point-level attribute filters
 - **compound** — combinations of the above, with configurable weighting
+- **graph** — anomaly contagion through the edge table (an entity is flagged when its
+  graph neighborhood contains anomalous counterparties beyond a configurable threshold)
 
 The scanner collects, deduplicates, and ranks results into a unified candidate list. This
 is the primary entry point for broad screening workflows where the agent does not yet know
-which specific primitive to focus on.
+which specific primitive to focus on. `auto_discover()` registers the appropriate sources
+automatically — graph sources are added for every event pattern that has an edge table.
 
 ## Build Flow
 
@@ -271,7 +278,7 @@ The MCP package is a transport and tool layer.
 It does not define the core GDS model. Instead, it:
 
 - opens and closes spheres
-- exposes 55 navigation and analysis tools
+- exposes 66 navigation and analysis tools
 - formats results as JSON
 - manages session state for an agentic client
 

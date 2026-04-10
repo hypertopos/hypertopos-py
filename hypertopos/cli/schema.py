@@ -112,6 +112,7 @@ class PatternConfig:
     derived_dimensions: list[DerivedDimGroup] | None = None
     precomputed_dimensions: list[PrecomputedDimConfig] | None = None
     graph_features: GraphFeaturesConfig | None = None
+    edge_table: EdgeTableYamlConfig | None = None
     anomaly_percentile: float = 95.0
     dimension_weights: str | list[float] | None = None
     gmm_n_components: int | None = None
@@ -127,6 +128,16 @@ class PrecomputedDimConfig:
     edge_max: int | str = "auto"
     percentile: float = 99.0
     display_name: str | None = None
+
+
+@dataclass
+class EdgeTableYamlConfig:
+    """Optional explicit edge table config in YAML."""
+
+    from_col: str
+    to_col: str
+    timestamp_col: str | None = None
+    amount_col: str | None = None
 
 
 @dataclass
@@ -498,6 +509,17 @@ def _parse_one_pattern(
             features=raw_gf.get("features"),
         )
 
+    # edge_table (optional explicit config)
+    edge_tbl_cfg: EdgeTableYamlConfig | None = None
+    raw_et = spec.get("edge_table")
+    if raw_et and isinstance(raw_et, dict):
+        edge_tbl_cfg = EdgeTableYamlConfig(
+            from_col=str(raw_et.get("from_col", "")),
+            to_col=str(raw_et.get("to_col", "")),
+            timestamp_col=raw_et.get("timestamp_col"),
+            amount_col=raw_et.get("amount_col"),
+        )
+
     # dimension_weights: "kurtosis" | "auto" | [0.5, 0.3, ...]
     dw_raw = spec.get("dimension_weights")
     dim_weights: str | list[float] | None = None
@@ -514,6 +536,7 @@ def _parse_one_pattern(
         derived_dimensions=derived_dims,
         precomputed_dimensions=precomp_dims,
         graph_features=graph_feat,
+        edge_table=edge_tbl_cfg,
         anomaly_percentile=float(spec.get("anomaly_percentile", 95.0)),
         dimension_weights=dim_weights,
         gmm_n_components=spec.get("gmm_n_components"),

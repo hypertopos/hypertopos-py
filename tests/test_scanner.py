@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 import numpy as np
-from hypertopos.builder.builder import GDSBuilder
+import pyarrow as pa
+from hypertopos.builder.builder import GDSBuilder, RelationSpec
 from hypertopos.engine.chains import Chain
 from hypertopos.navigation.scanner import PassiveScanner
+from hypertopos.sphere import HyperSphere
 
 
 def _make_scanner_fixture(tmp_path, n=50, seed=42):
@@ -541,4 +543,105 @@ class TestPassiveScannerBenchmarkParity:
         # (sources with missing columns return 0 hits gracefully)
         result = scanner.scan("accounts", threshold=1)
         assert isinstance(result.total_flagged, int)
+        sess.__exit__(None, None, None)
+
+
+# ── Graph contagion source tests ────────────────────────────
+
+
+def _make_graph_scanner_fixture(tmp_path):
+    """Build sphere with accounts + transactions + edge table for graph source tests."""
+    builder = GDSBuilder("graph_test", str(tmp_path / "gds"))
+
+    accounts = pa.table({
+        "primary_key": [f"A{i:03d}" for i in range(20)],
+        "name": [f"Account {i}" for i in range(20)],
+    })
+    builder.add_line("accounts", accounts, key_col="primary_key",
+                     source_id="accounts", role="anchor")
+
+    n_tx = 200
+    txns = pa.table({
+        "primary_key": [f"TX{i:05d}" for i in range(n_tx)],
+        "sender_id": [f"A{i % 20:03d}" for i in range(n_tx)],
+        "receiver_id": [f"A{(i + 3) % 20:03d}" for i in range(n_tx)],
+        "amount": [float(100 + i) for i in range(n_tx)],
+        "tx_date": pa.array(
+            [1_700_000_000.0 + i * 3600.0 for i in range(n_tx)],
+            type=pa.float64(),
+        ),
+    })
+    builder.add_line("transactions", txns, key_col="primary_key",
+                     source_id="transactions", role="event")
+
+    builder.add_pattern(
+        "tx_pattern",
+        pattern_type="event",
+        entity_line="transactions",
+        relations=[
+            RelationSpec(line_id="accounts", fk_col="sender_id", direction="out"),
+            RelationSpec(line_id="accounts", fk_col="receiver_id", direction="in"),
+        ],
+    )
+    builder.add_pattern(
+        "acct_pattern",
+        pattern_type="anchor",
+        entity_line="accounts",
+        relations=[
+            RelationSpec(line_id="accounts", fk_col=None, direction="self"),
+        ],
+    )
+
+    path = builder.build()
+    hs = HyperSphere.open(path)
+    sess = hs.session("test")
+    reader = sess._reader
+    sphere = reader.read_sphere()
+    manifest = sess._manifest
+    scanner = PassiveScanner(reader, sphere, manifest)
+    return scanner, sess
+
+
+class TestGraphContagionSource:
+    def test_graph_source_flags_contagious(self, tmp_path):
+        """Graph source should flag entities with contagious neighborhoods."""
+        scanner, sess = _make_graph_scanner_fixture(tmp_path)
+        scanner.add_graph_source("graph", "tx_pattern", contagion_threshold=0.0)
+        result = scanner.scan("accounts", threshold=1)
+        # With threshold=0.0, all entities with any neighbor should be flagged
+        assert result.total_flagged > 0
+        sess.__exit__(None, None, None)
+
+    def test_respects_threshold(self, tmp_path):
+        """Higher threshold should flag fewer entities."""
+        scanner_low, sess_low = _make_graph_scanner_fixture(tmp_path)
+        scanner_low.add_graph_source("graph", "tx_pattern", contagion_threshold=0.0)
+        result_low = scanner_low.scan("accounts", threshold=1)
+        sess_low.__exit__(None, None, None)
+
+        scanner_high, sess_high = _make_graph_scanner_fixture(tmp_path / "b")
+        scanner_high.add_graph_source("graph", "tx_pattern", contagion_threshold=0.99)
+        result_high = scanner_high.scan("accounts", threshold=1)
+        sess_high.__exit__(None, None, None)
+
+        assert result_low.total_flagged >= result_high.total_flagged
+
+    def test_hit_has_ratios(self, tmp_path):
+        """Graph hits should have anomalous_count and related_count."""
+        scanner, sess = _make_graph_scanner_fixture(tmp_path)
+        scanner.add_graph_source("graph", "tx_pattern", contagion_threshold=0.0)
+        result = scanner.scan("accounts", threshold=1)
+        if result.hits:
+            hit = result.hits[0]
+            assert "graph" in hit.sources
+            src_hit = hit.sources["graph"]
+            assert src_hit.related_count > 0
+        sess.__exit__(None, None, None)
+
+    def test_auto_discover_includes_graph(self, tmp_path):
+        """auto_discover should detect graph sources for event patterns with edge tables."""
+        scanner, sess = _make_graph_scanner_fixture(tmp_path)
+        scanner.auto_discover("accounts")
+        source_names = [s.name for s in scanner._sources]
+        assert any("graph" in n for n in source_names)
         sess.__exit__(None, None, None)

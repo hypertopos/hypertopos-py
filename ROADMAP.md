@@ -2,7 +2,24 @@
 
 > Planned direction. Priorities may change based on feedback. 
 
-## Current: 0.1.0
+## Current: 0.2.0
+
+**Graph meets geometry.** The main theme is the unified **edge table** — a Lance-based adjacency index per event pattern with BTREE lookups, auto-emitted at build time, giving runtime graph traversal at O(log n) scale.
+
+- **Edge table** — one Lance dataset per event pattern, BTREE indexes on `from_key`/`to_key`, MVCC session pinning, YAML `edge_table` config (auto-detected from `graph_features`/relations), `--no-edges` CLI flag
+- **11 new navigation functions** — `find_geometric_path` (beam search with geometric/anomaly/shortest/amount scoring), `discover_chains` (runtime temporal BFS, no build-time extraction), `entity_flow` (net flow per counterparty), `contagion_score` / `contagion_score_batch` (anomaly neighborhood scoring), `degree_velocity`, `investigation_coverage`, `propagate_influence` (BFS with geometric decay), `cluster_bridges` (geometry+graph fusion), `anomalous_edges` (event-level scoring)
+- **`find_counterparties` fast path** — edge table BTREE lookup with amount aggregates when `pattern_id` given
+- **PassiveScanner graph source** — `"graph"` source type for contagion scoring, `add_graph_source()`, `auto_discover()` auto-detects edge tables
+- **11 new MCP tools** — edge table tools available in Phase 2 (immediately after `open_sphere`), no `sphere_overview` needed. Total: 66 MCP tools (55 → 66)
+- **7 fraud investigation recipes** added to `gds-fraud-investigator` skill — Mirror Transaction, Pass-Through, Burst Detection, Weighted Reciprocity, Financial Profile, Concentration Risk, Benford's Law
+- **All 8 skills updated** — edge table tools integrated across `gds-analyst`, `gds-detective`, `gds-explorer`, `gds-fraud-investigator`, `gds-investigator`, `gds-monitor`, `gds-scanner`, `gds-sphere-designer`
+- **Builder improvements** — adjacency deduplication, self-loop filtering, edge stats cached at build time (`_gds_meta/edge_stats/`), timestamp string parsing with 6-format sample-based detection, Windows timezone database fallback
+- **Performance** — `passive_scan` 84s → <10s, `detect_pattern` 86s → <15s, `cluster_bridges` 31s → <5s
+- **Fixes** — `find_anomalies` Lance duplicate row deduplication, zero-variance `tracked_properties` cleanup in AML benchmark spheres
+
+---
+
+## 0.1.0
 
 Core GDS stack — sphere build, geometry, navigation, MCP server, storage/performance, and maintainability.
 
@@ -24,7 +41,7 @@ Core GDS stack — sphere build, geometry, navigation, MCP server, storage/perfo
 
 ---
 
-## Plan: 0.2.0
+## Plan: 0.3.0
 
 **Storage / performance:**
 - Upgrade `pylance 2.0.1 → 3.0.1` — format 2.2, ~300% faster scans, LZ4/zstd compression
@@ -50,8 +67,6 @@ Core GDS stack — sphere build, geometry, navigation, MCP server, storage/perfo
 
 ## Future
 
-- On-demand chain discovery — replace expensive build-time BFS with per-entity runtime extraction
-- Geometric path finding — multi-hop traversal scored by delta geometry
 - Cross-sphere comparison — dimensionless metrics across independently calibrated coordinate spaces
 - What-if analysis — hypothetical edge changes producing modified coordinate vectors
 - Dimension access control — per-agent visibility constraints on delta dimensions

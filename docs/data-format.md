@@ -16,7 +16,8 @@ gds_{sphere_id}/
 │   ├── sphere.json              # central config (lines, patterns, aliases, storage)
 │   ├── geometry_stats/          # precomputed population summaries
 │   ├── trajectory/              # ANN index for trajectory similarity search
-│   └── temporal_centroids/      # cached population centroids per time window
+│   ├── temporal_centroids/      # cached population centroids per time window
+│   └── edge_stats/              # per-event-pattern edge table summary cache (row count, unique from/to, ts/amount range)
 ├── points/
 │   ├── {line_id}/v={n}/
 │   │   └── data.lance           # entity records for this line version
@@ -24,6 +25,10 @@ gds_{sphere_id}/
 ├── geometry/
 │   ├── {pattern_id}/v={n}/
 │   │   └── data.lance           # delta vectors and edges for this pattern version
+│   └── ...
+├── edges/
+│   ├── {pattern_id}/
+│   │   └── data.lance           # anchor-to-anchor edge table (Lance, BTREE indexed)
 │   └── ...
 └── temporal/
     ├── {pattern_id}/
@@ -65,11 +70,20 @@ Example (abridged pattern entry):
       "mu": [1.0, 1.0, 0.827, 0.259, 0.130, 0.356],
       "sigma_diag": [0.01, 0.01, 0.379, 0.437, 0.209, 0.204],
       "theta": [1.284, 1.284, 1.284, 1.284, 1.284, 1.284],
-      "population_size": 1056320
+      "population_size": 1056320,
+      "has_edge_table": true,
+      "edge_table": {
+        "from_col": "from_account",
+        "to_col": "to_account",
+        "timestamp_col": "timestamp",
+        "amount_col": "amount_received"
+      }
     }
   }
 }
 ```
+
+Event patterns with adjacency structure (`has_edge_table: true`) carry an `edge_table` block describing the source columns used to materialize `edges/{pattern_id}/data.lance`. `timestamp_col` and `amount_col` are present whenever they were resolved from explicit YAML config or auto-detected from the event line schema.
 
 `mu` is the population mean per dimension, `sigma_diag` is the standard deviation used for z-scoring, and `theta` is the per-dimension anomaly threshold vector (entities whose z-scored delta exceeds theta on any dimension are flagged).
 
@@ -98,6 +112,18 @@ Domain columns vary per line. The `primary_key` column is always present and alw
 
 The `delta` vector length equals the number of dimensions in the pattern. Geometry datasets carry an IVF-PQ ANN index on the `delta` column for trajectory similarity search.
 
+### Edges (`edges/{pattern_id}/data.lance`)
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `from_key` | string | Source anchor entity |
+| `to_key` | string | Target anchor entity |
+| `event_key` | string | Event primary key (traceability back to the event polygon) |
+| `timestamp` | float64 | Epoch seconds |
+| `amount` | float64 | Numeric value (nullable) |
+
+Emitted automatically for event patterns with 2+ FK relations to the same anchor line, or explicitly via YAML `edge_table` config. Skipped with `--no-edges` CLI flag. The dataset carries BTREE indexes on `from_key` and `to_key` for O(log n) lookups at any scale.
+
 ### Temporal (`temporal/{pattern_id}/data.lance`)
 
 | Column | Type | Description |
@@ -122,6 +148,7 @@ sequenceDiagram
     participant sphere.json
     participant geometry/
     participant points/
+    participant edges/
     participant temporal/
 
     Agent->>sphere.json: open_sphere (few KB)
@@ -132,6 +159,9 @@ sequenceDiagram
 
     Agent->>points/: goto("CUST-001")
     Note over points/: entity properties, raw data
+
+    Agent->>edges/: find_geometric_path / contagion_score / propagate_influence
+    Note over edges/: BTREE lookup, lazy adjacency expansion
 
     Agent->>temporal/: π3 dive_solid
     Note over temporal/: shape_snapshot[], timestamp[]

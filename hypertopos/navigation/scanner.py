@@ -27,7 +27,7 @@ class ScanSource:
 
     name: str
     pattern_id: str
-    key_type: Literal["direct", "sibling", "composite", "chain", "borderline", "points", "compound"]
+    key_type: Literal["direct", "sibling", "composite", "chain", "borderline", "points", "compound", "graph"]
     weight: float = 1.0
     filter_expr: str | None = None
     # -- borderline --
@@ -40,6 +40,8 @@ class ScanSource:
     geometry_pattern_id: str | None = None
     geometry_key_type: Literal["direct", "composite", "chain"] | None = None
     chain_filter_expr: str | None = None  # Lance SQL filter on chain points table
+    # -- graph --
+    contagion_threshold: float | None = None
 
 
 @dataclass
@@ -228,6 +230,27 @@ class PassiveScanner:
         ))
         return self
 
+    def add_graph_source(
+        self,
+        name: str,
+        pattern_id: str,
+        contagion_threshold: float = 0.3,
+        weight: float = 1.0,
+    ) -> PassiveScanner:
+        """Register a graph contagion source — flags entities whose anomalous
+        counterparty ratio exceeds *contagion_threshold*.
+
+        Requires event pattern with edge table.
+        """
+        self._sources.append(ScanSource(
+            name=name,
+            pattern_id=pattern_id,
+            key_type="graph",
+            weight=weight,
+            contagion_threshold=contagion_threshold,
+        ))
+        return self
+
     def auto_discover(
         self,
         home_line_id: str,
@@ -254,6 +277,14 @@ class PassiveScanner:
                         pat_id,
                         rank_threshold=borderline_rank_threshold,
                     )
+        # Auto-discover graph sources — event patterns with edge tables
+        for pat_id, pat in self._sphere.patterns.items():
+            if pat.pattern_type == "event" and self._reader.has_edge_table(pat_id):
+                # Check if any relation targets home_line_id
+                for rel in pat.relations:
+                    if rel.line_id == home_line_id:
+                        self.add_graph_source(f"{pat_id}_graph", pat_id)
+                        break
         return self
 
     def scan(
@@ -269,14 +300,14 @@ class PassiveScanner:
         """
         t0 = time.time()
 
-        # Phase 1: bulk geometry reads per source
+        # Phase 1: bulk geometry reads per source (parallelized — Lance releases GIL)
         source_hits: dict[str, dict[str, ScanSourceHit]] = {}
         sources_summary: dict[str, int] = {}
 
-        for source in self._sources:
+        def _scan_one(source: ScanSource) -> tuple[str, dict[str, ScanSourceHit]]:
             version = self._resolve_version(source.pattern_id) if source.pattern_id else None
-            if version is None and source.key_type not in ("points",):
-                continue
+            if version is None and source.key_type not in ("points", "graph"):
+                return source.name, {}
 
             if source.key_type in ("direct", "sibling"):
                 hits = self._scan_direct(source, version)
@@ -290,11 +321,21 @@ class PassiveScanner:
                 hits = self._scan_points(source)
             elif source.key_type == "compound":
                 hits = self._scan_compound(source, version)
+            elif source.key_type == "graph":
+                hits = self._scan_graph(source)
             else:
-                continue
+                return source.name, {}
+            return source.name, hits
 
-            source_hits[source.name] = hits
-            sources_summary[source.name] = len(hits)
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        max_workers = min(len(self._sources), 4) if self._sources else 1
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_scan_one, s) for s in self._sources]
+            for future in as_completed(futures):
+                name, hits = future.result()
+                source_hits[name] = hits
+                sources_summary[name] = len(hits)
 
         # Phase 2: multi-source aggregation
         all_entities: dict[str, dict[str, ScanSourceHit]] = defaultdict(dict)
@@ -338,10 +379,9 @@ class PassiveScanner:
             home_line = self._sphere.lines.get(home_line_id)
             if home_line:
                 ver = home_line.current_version()
-                pts = self._reader.read_points(home_line_id, ver)
-                total_entities = pts.num_rows
-        except Exception:
-            pass
+                total_entities = self._reader.count_points_rows(home_line_id, ver)
+        except Exception as e:
+            logger.warning("count_points_rows failed for %s: %s", home_line_id, e)
 
         elapsed = (time.time() - t0) * 1000
         return ScanResult(
@@ -441,7 +481,15 @@ class PassiveScanner:
             return {}
         line_ver = line.current_version()
 
-        pts = self._reader.read_points(entity_line_id, line_ver)
+        # Column projection — only load primary_key + chain_keys (+ filter cols)
+        needed_cols = ["primary_key", "chain_keys"]
+        if source.chain_filter_expr:
+            # Extract column name from filter expression (e.g. "col >= 0.5")
+            import re
+            m = re.match(r"(\w+)\s*[><=!]", source.chain_filter_expr)
+            if m and m.group(1) not in needed_cols:
+                needed_cols.append(m.group(1))
+        pts = self._reader.read_points(entity_line_id, line_ver, columns=needed_cols)
         if "chain_keys" not in pts.schema.names:
             return {}
 
@@ -608,6 +656,83 @@ class PassiveScanner:
 
         return result
 
+    def _scan_graph(
+        self, source: ScanSource,
+    ) -> dict[str, ScanSourceHit]:
+        """Scan graph contagion — flag entities whose anomalous neighbor ratio exceeds threshold.
+
+        Warning: reads the full edge table into memory. Acceptable for batch
+        scanning but may use significant RAM on large spheres (e.g. ~500 MB for 5M edges).
+        """
+        if not self._reader.has_edge_table(source.pattern_id):
+            return {}
+
+        threshold = source.contagion_threshold if source.contagion_threshold is not None else 0.3
+
+        # Read edge table — only from_key/to_key columns (~60% less RAM than full read)
+        edges = self._reader.read_edges(
+            source.pattern_id, columns=["from_key", "to_key"],
+        )
+        neighbors: dict[str, set[str]] = defaultdict(set)
+        from_arr = edges["from_key"].to_pylist()
+        to_arr = edges["to_key"].to_pylist()
+        for f, t in zip(from_arr, to_arr, strict=False):
+            if f != t:
+                neighbors[f].add(t)
+                neighbors[t].add(f)
+
+        if not neighbors:
+            return {}
+
+        # Batch read anomaly status for all unique neighbor keys
+        anomalous_keys: set[str] = set()
+        anchor_id = self._resolve_anchor_for_event(source.pattern_id)
+        if anchor_id is not None:
+            anchor_version = self._resolve_version(anchor_id)
+            if anchor_version is not None:
+                all_neighbor_keys: set[str] = set()
+                for nbs in neighbors.values():
+                    all_neighbor_keys |= nbs
+
+                geo = self._reader.read_geometry(
+                    anchor_id, anchor_version,
+                    point_keys=list(all_neighbor_keys),
+                    columns=["primary_key", "is_anomaly"],
+                )
+                for i in range(geo.num_rows):
+                    if geo["is_anomaly"][i].as_py():
+                        anomalous_keys.add(geo["primary_key"][i].as_py())
+
+        # Score each entity: anomalous_neighbors / total_neighbors
+        result: dict[str, ScanSourceHit] = {}
+        for entity, nbs in neighbors.items():
+            total = len(nbs)
+            anomalous = len(nbs & anomalous_keys)
+            ratio = anomalous / total if total > 0 else 0.0
+            if ratio >= threshold:
+                result[entity] = ScanSourceHit(
+                    anomalous_count=anomalous,
+                    related_count=total,
+                    max_delta_norm=0.0,
+                    anomaly_intensity=ratio,
+                )
+
+        return result
+
+    def _resolve_anchor_for_event(self, event_pattern_id: str) -> str | None:
+        """Find anchor pattern for entities in an event pattern's edge table."""
+        pat = self._sphere.patterns.get(event_pattern_id)
+        if pat is None or pat.pattern_type != "event":
+            # Non-event pattern → use itself (same as navigator's fallback)
+            return event_pattern_id if pat is not None else None
+        for pid, p in self._sphere.patterns.items():
+            if p.pattern_type == "anchor" and pid != event_pattern_id:
+                entity_line = p.entity_line_id
+                for rel in pat.relations:
+                    if rel.line_id == entity_line:
+                        return pid
+        return None
+
     # ------------------------------------------------------------------
     # Private: key type detection
     # ------------------------------------------------------------------
@@ -645,6 +770,21 @@ class PassiveScanner:
         return "direct"
 
     def _classify_for_line(
+        self,
+        pattern_id: str,
+        home_line_id: str,
+    ) -> Literal["direct", "sibling", "composite", "chain"] | None:
+        """Classify pattern relative to a specific home line (cached)."""
+        if not hasattr(self, "_classify_cache"):
+            self._classify_cache: dict[tuple[str, str], str | None] = {}
+        cache_key = (pattern_id, home_line_id)
+        if cache_key in self._classify_cache:
+            return self._classify_cache[cache_key]
+        result = self._classify_for_line_impl(pattern_id, home_line_id)
+        self._classify_cache[cache_key] = result
+        return result
+
+    def _classify_for_line_impl(
         self,
         pattern_id: str,
         home_line_id: str,

@@ -216,6 +216,16 @@ class _LineReg:
 
 
 @dataclass
+class EdgeTableConfig:
+    """Config for edge table emission during build."""
+
+    from_col: str
+    to_col: str
+    timestamp_col: str | None = None
+    amount_col: str | None = None
+
+
+@dataclass
 class _PatternReg:
     pattern_id: str
     pattern_type: Literal["anchor", "event"]
@@ -229,6 +239,7 @@ class _PatternReg:
     use_mahalanobis: bool = False
     event_dimensions: list[EventDimSpec] = field(default_factory=list)
     description: str | None = None
+    edge_table: EdgeTableConfig | None = None  # None = auto-detect or skip
 
 
 @dataclass
@@ -321,6 +332,7 @@ class GDSBuilder:
         self._chain_dims: list = []  # (line_id, feature_name, edge_max) tuples
         self._precomputed_dims: list = []  # PrecomputedDimSpec list
         self._aliases: dict[str, _AliasReg] = {}
+        self._no_edges: bool = False  # set by CLI --no-edges
 
     def add_line(
         self,
@@ -394,6 +406,7 @@ class GDSBuilder:
         gmm_n_components: int | None = None,
         use_mahalanobis: bool = False,
         description: str | None = None,
+        edge_table: EdgeTableConfig | None = None,
     ) -> GDSBuilder:
         _VALID_DW = ("auto", "kurtosis", "uniform")
         if isinstance(dimension_weights, str) and dimension_weights not in _VALID_DW:
@@ -413,6 +426,7 @@ class GDSBuilder:
             gmm_n_components=gmm_n_components,
             use_mahalanobis=use_mahalanobis,
             description=description,
+            edge_table=edge_table,
         )
         return self
 
@@ -1298,6 +1312,200 @@ class GDSBuilder:
         )
         return table, ps
 
+    # ── Edge table helpers ─────────────────────────────────────
+
+    def _resolve_edge_table_config(
+        self, pat: _PatternReg,
+    ) -> EdgeTableConfig | None:
+        """Determine edge table config for a pattern.
+
+        Priority:
+        1. Check _no_edges flag (CLI --no-edges)
+        2. Explicit pat.edge_table
+        3. Auto-detect from graph_features (same event_line)
+        4. Infer from relations (2 FKs to same anchor line)
+        Returns None if pattern doesn't have from/to structure.
+        """
+        if self._no_edges:
+            return None
+        if pat.edge_table is not None:
+            return pat.edge_table
+
+        # Auto-detect from graph_features
+        for gf in self._graph_features:
+            if gf.event_line == pat.entity_line:
+                ts_col, amt_col = self._infer_edge_temporal_amount(
+                    pat.entity_line,
+                )
+                return EdgeTableConfig(
+                    from_col=gf.from_col,
+                    to_col=gf.to_col,
+                    timestamp_col=ts_col,
+                    amount_col=amt_col,
+                )
+
+        # Infer from relations: 2+ FK relations to the same anchor line
+        fk_rels = [
+            r for r in pat.relations
+            if r.fk_col and r.direction != "self"
+        ]
+        by_line: dict[str, list[RelationSpec]] = {}
+        for r in fk_rels:
+            by_line.setdefault(r.line_id, []).append(r)
+        for line_id, rels in by_line.items():
+            if len(rels) >= 2:
+                ts_col, amt_col = self._infer_edge_temporal_amount(
+                    pat.entity_line,
+                )
+                return EdgeTableConfig(
+                    from_col=rels[0].fk_col,
+                    to_col=rels[1].fk_col,
+                    timestamp_col=ts_col,
+                    amount_col=amt_col,
+                )
+
+        return None
+
+    def _infer_edge_temporal_amount(
+        self, entity_line_id: str,
+    ) -> tuple[str | None, str | None]:
+        """Heuristic: pick a timestamp + amount column from event line schema.
+
+        Used when edge_table config is auto-detected (no explicit YAML).
+        Returns (timestamp_col, amount_col), either may be None.
+        """
+        line_reg = self._lines.get(entity_line_id)
+        if line_reg is None:
+            return None, None
+        schema_names = set(line_reg.table.schema.names)
+
+        ts_candidates = (
+            "timestamp", "ts", "event_time", "created_at", "tx_date", "date",
+        )
+        amt_candidates = (
+            "amount_received", "amount", "amount_paid", "value",
+            "total", "amt",
+        )
+
+        ts_col = next(
+            (c for c in ts_candidates if c in schema_names), None,
+        )
+        amt_col = next(
+            (c for c in amt_candidates if c in schema_names), None,
+        )
+        return ts_col, amt_col
+
+    def _extract_edge_table(
+        self,
+        pat: _PatternReg,
+        cfg: EdgeTableConfig,
+    ) -> pa.Table:
+        """Build edge Arrow table from the event line's source data."""
+        import pyarrow.compute as pc
+
+        from hypertopos.storage._schemas import EDGE_TABLE_SCHEMA
+
+        event_table = self._lines[pat.entity_line].table
+        schema_names = set(event_table.schema.names)
+
+        if cfg.from_col not in schema_names or cfg.to_col not in schema_names:
+            return pa.table(
+                {f.name: pa.array([], type=f.type) for f in EDGE_TABLE_SCHEMA},
+            )
+
+        from_arr = event_table[cfg.from_col]
+        to_arr = event_table[cfg.to_col]
+        event_key_arr = event_table["primary_key"]
+
+        # Timestamp
+        ts_arr: pa.Array
+        ts_col = cfg.timestamp_col
+        if ts_col and ts_col in schema_names:
+            ts_arr = self._to_epoch_seconds(event_table[ts_col])
+        else:
+            # Try common column names
+            for name in ("timestamp", "ts", "date", "created_at", "tx_date"):
+                if name in schema_names:
+                    ts_arr = self._to_epoch_seconds(event_table[name])
+                    break
+            else:
+                ts_arr = pa.array(
+                    [0.0] * len(event_table), type=pa.float64(),
+                )
+
+        # Amount
+        amt_arr: pa.Array
+        amt_col = cfg.amount_col
+        if amt_col and amt_col in schema_names:
+            amt_arr = pc.cast(
+                pc.fill_null(event_table[amt_col], 0.0), pa.float64(),
+            )
+        else:
+            # Try common column names
+            for name in ("amount", "value", "total", "amt"):
+                if name in schema_names:
+                    amt_arr = pc.cast(
+                        pc.fill_null(event_table[name], 0.0), pa.float64(),
+                    )
+                    break
+            else:
+                amt_arr = pa.array(
+                    [0.0] * len(event_table), type=pa.float64(),
+                )
+
+        # Filter out rows with null from/to keys
+        valid = pc.and_(pc.is_valid(from_arr), pc.is_valid(to_arr))
+
+        return pa.table(
+            {
+                "from_key": pc.filter(pc.cast(from_arr, pa.string()), valid),
+                "to_key": pc.filter(pc.cast(to_arr, pa.string()), valid),
+                "event_key": pc.filter(pc.cast(event_key_arr, pa.string()), valid),
+                "timestamp": pc.filter(ts_arr, valid),
+                "amount": pc.filter(amt_arr, valid),
+            },
+            schema=EDGE_TABLE_SCHEMA,
+        )
+
+    @staticmethod
+    def _to_epoch_seconds(col: pa.Array) -> pa.Array:
+        """Convert Arrow column to float64 epoch seconds."""
+        import pyarrow.compute as pc
+
+        if pa.types.is_timestamp(col.type):
+            divisors = {"s": 1.0, "ms": 1e3, "us": 1e6, "ns": 1e9}
+            d = divisors.get(col.type.unit, 1e6)
+            epoch = pc.cast(col, pa.int64())
+            return pc.divide(pc.cast(epoch, pa.float64()), d)
+        if pa.types.is_floating(col.type):
+            return pc.cast(col, pa.float64())
+        if pa.types.is_integer(col.type):
+            return pc.cast(col, pa.float64())
+        # String: try common formats on sample, then parse full column
+        _FORMATS = [
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d",
+            "%Y/%m/%d %H:%M:%S",
+            "%Y/%m/%d %H:%M",
+            "%Y/%m/%d",
+        ]
+        sample = col.slice(0, 1)
+        for fmt in _FORMATS:
+            try:
+                pc.strptime(sample, fmt, "us")
+                # Format matched on sample — parse full column
+                parsed = pc.strptime(col, fmt, "us")
+                try:
+                    parsed = pc.assume_timezone(parsed, timezone="UTC")
+                except Exception:
+                    pass  # tz database missing (Windows) — treat as UTC
+                return pc.divide(pc.cast(pc.cast(parsed, pa.int64()), pa.float64()), 1e6)
+            except Exception:
+                continue
+        # Fallback: zeros
+        return pa.array([0.0] * len(col), type=pa.float64())
+
     def _build_aliases(
         self,
         pattern_stats: dict[str, PatternBuildResult],
@@ -1571,6 +1779,21 @@ class GDSBuilder:
                 pat_dict["dim_percentiles"] = pbr.dim_percentiles
             if pat.description:
                 pat_dict["description"] = pat.description
+            # Edge table metadata
+            edge_cfg = self._resolve_edge_table_config(pat)
+            if edge_cfg is not None:
+                edge_path = self.output_path / "edges" / pat_id / "data.lance"
+                if edge_path.exists():
+                    pat_dict["has_edge_table"] = True
+                    edge_meta: dict[str, str] = {
+                        "from_col": edge_cfg.from_col,
+                        "to_col": edge_cfg.to_col,
+                    }
+                    if edge_cfg.timestamp_col:
+                        edge_meta["timestamp_col"] = edge_cfg.timestamp_col
+                    if edge_cfg.amount_col:
+                        edge_meta["amount_col"] = edge_cfg.amount_col
+                    pat_dict["edge_table"] = edge_meta
             patterns_dict[pat_id] = pat_dict
 
         sphere_dict: dict[str, Any] = {
@@ -1953,6 +2176,24 @@ class GDSBuilder:
                 is_anomaly_arr=is_anomaly_arr,
             )
 
+            # Emit edge table for event patterns with from/to structure
+            edge_cfg = self._resolve_edge_table_config(pat)
+            if edge_cfg is not None:
+                edge_table = self._extract_edge_table(pat, edge_cfg)
+                if edge_table.num_rows > 0:
+                    _stats_writer.write_edges(pat_id, edge_table)
+                    # Cache edge stats
+                    import pyarrow.compute as _pc
+                    _stats_writer.write_edge_stats(pat_id, {
+                        "row_count": edge_table.num_rows,
+                        "unique_from": _pc.count_distinct(edge_table["from_key"]).as_py(),
+                        "unique_to": _pc.count_distinct(edge_table["to_key"]).as_py(),
+                        "timestamp_min": float(_pc.min(edge_table["timestamp"]).as_py()),
+                        "timestamp_max": float(_pc.max(edge_table["timestamp"]).as_py()),
+                        "amount_min": float(_pc.min(edge_table["amount"]).as_py()),
+                        "amount_max": float(_pc.max(edge_table["amount"]).as_py()),
+                    })
+
             return pat_id, PatternBuildResult(
                 mu=ps.mu, sigma=ps.sigma, theta=ps.theta,
                 population_size=n,
@@ -2298,6 +2539,24 @@ class GDSBuilder:
             delta_norms=ps.delta_norms, theta_norm=theta_norm,
             is_anomaly_arr=ps.is_anomaly_arr,
         )
+
+        # 5. Emit edge table (chunked path)
+        edge_cfg = self._resolve_edge_table_config(pat)
+        if edge_cfg is not None:
+            edge_table = self._extract_edge_table(pat, edge_cfg)
+            if edge_table.num_rows > 0:
+                stats_writer.write_edges(pat_id, edge_table)
+                # Cache edge stats
+                import pyarrow.compute as _pc
+                stats_writer.write_edge_stats(pat_id, {
+                    "row_count": edge_table.num_rows,
+                    "unique_from": _pc.count_distinct(edge_table["from_key"]).as_py(),
+                    "unique_to": _pc.count_distinct(edge_table["to_key"]).as_py(),
+                    "timestamp_min": float(_pc.min(edge_table["timestamp"]).as_py()),
+                    "timestamp_max": float(_pc.max(edge_table["timestamp"]).as_py()),
+                    "amount_min": float(_pc.min(edge_table["amount"]).as_py()),
+                    "amount_max": float(_pc.max(edge_table["amount"]).as_py()),
+                })
 
         return pat_id, PatternBuildResult(
             mu=ps.mu, sigma=ps.sigma, theta=ps.theta,
@@ -2724,6 +2983,24 @@ class GDSBuilder:
             delta_norms=all_norms, theta_norm=theta_norm,
             is_anomaly_arr=all_is_anomaly,
         )
+
+        # Emit edge table (streaming path)
+        edge_cfg = self._resolve_edge_table_config(pat)
+        if edge_cfg is not None:
+            edge_table = self._extract_edge_table(pat, edge_cfg)
+            if edge_table.num_rows > 0:
+                stats_writer.write_edges(pat_id, edge_table)
+                # Cache edge stats
+                import pyarrow.compute as _pc
+                stats_writer.write_edge_stats(pat_id, {
+                    "row_count": edge_table.num_rows,
+                    "unique_from": _pc.count_distinct(edge_table["from_key"]).as_py(),
+                    "unique_to": _pc.count_distinct(edge_table["to_key"]).as_py(),
+                    "timestamp_min": float(_pc.min(edge_table["timestamp"]).as_py()),
+                    "timestamp_max": float(_pc.max(edge_table["timestamp"]).as_py()),
+                    "amount_min": float(_pc.min(edge_table["amount"]).as_py()),
+                    "amount_max": float(_pc.max(edge_table["amount"]).as_py()),
+                })
 
         return pat_id, PatternBuildResult(
             mu=mu, sigma=sigma, theta=theta,

@@ -4,40 +4,13 @@
 
 ## Current: 0.2.0
 
-**Graph meets geometry.** The main theme is the unified **edge table** — a Lance-based adjacency index per event pattern with BTREE lookups, auto-emitted at build time, giving runtime graph traversal at O(log n) scale.
-
-- **Edge table** — one Lance dataset per event pattern, BTREE indexes on `from_key`/`to_key`, MVCC session pinning, YAML `edge_table` config (auto-detected from `graph_features`/relations), `--no-edges` CLI flag
-- **11 new navigation functions** — `find_geometric_path` (beam search with geometric/anomaly/shortest/amount scoring), `discover_chains` (runtime temporal BFS, no build-time extraction), `entity_flow` (net flow per counterparty), `contagion_score` / `contagion_score_batch` (anomaly neighborhood scoring), `degree_velocity`, `investigation_coverage`, `propagate_influence` (BFS with geometric decay), `cluster_bridges` (geometry+graph fusion), `anomalous_edges` (event-level scoring)
-- **`find_counterparties` fast path** — edge table BTREE lookup with amount aggregates when `pattern_id` given
-- **PassiveScanner graph source** — `"graph"` source type for contagion scoring, `add_graph_source()`, `auto_discover()` auto-detects edge tables
-- **11 new MCP tools** — edge table tools available in Phase 2 (immediately after `open_sphere`), no `sphere_overview` needed. Total: 66 MCP tools (55 → 66)
-- **7 fraud investigation recipes** added to `gds-fraud-investigator` skill — Mirror Transaction, Pass-Through, Burst Detection, Weighted Reciprocity, Financial Profile, Concentration Risk, Benford's Law
-- **All 8 skills updated** — edge table tools integrated across `gds-analyst`, `gds-detective`, `gds-explorer`, `gds-fraud-investigator`, `gds-investigator`, `gds-monitor`, `gds-scanner`, `gds-sphere-designer`
-- **Builder improvements** — adjacency deduplication, self-loop filtering, edge stats cached at build time (`_gds_meta/edge_stats/`), timestamp string parsing with 6-format sample-based detection, Windows timezone database fallback
-- **Performance** — `passive_scan` 84s → <10s, `detect_pattern` 86s → <15s, `cluster_bridges` 31s → <5s
-- **Fixes** — `find_anomalies` Lance duplicate row deduplication, zero-variance `tracked_properties` cleanup in AML benchmark spheres
+**Graph meets geometry.** Lance-based **edge table** per event pattern with BTREE indexes, auto-emitted at build time, gives runtime graph traversal at O(log n) scale. 11 new navigator functions (paths, chains, flow, contagion, influence, bridges, anomalous edges, …) and matching MCP tools available in Phase 2. PassiveScanner gains a `"graph"` contagion source. 7 fraud-investigation recipes added to `gds-fraud-investigator`, all 8 skills refreshed for the new tools. Major perf wins (`passive_scan` 84 s → <10 s, `detect_pattern` 86 s → <15 s, `cluster_bridges` 31 s → <5 s). 66 MCP tools total (55 → 66).
 
 ---
 
 ## 0.1.0
 
-Core GDS stack — sphere build, geometry, navigation, MCP server, storage/performance, and maintainability.
-
-- Sphere builder — declarative YAML config, CLI (`build`, `validate`, `info`), Tier 1-3 sources, derived/precomputed/graph dimensions, composite lines, chain lines
-- Navigation primitives π1–π12 — walk, jump, dive, emerge, attract (anomaly, boundary, hub, cluster), drift, trajectory, population compare, regime change
-- Aliases — cutting-plane sub-populations with derived geometry (W vector, bias, direction)
-- Temporal snapshots — deformation history, solid construction, temporal centroids
-- Investigation — `explain_anomaly`, witness set, anti-witness, reputation scoring
-- Forecasting — trajectory extrapolation, anomaly forecast, segment crossing prediction, pluggable `ForecastProvider` protocol
-- Full-text search — FTS index on points, `search_entities_fts`, hybrid search (semantic + FTS with reciprocal rank fusion)
-- CalibrationTracker — online Welford drift detection with soft/hard thresholds
-- MVCC sessions — Manifest/Contract version pinning, isolated reads per agent
-- PassiveScanner — multi-source batch screening (geometry, borderline, points, compound), auto-discover, density boost
-- Incremental update — `GDSBuilder.incremental_update()` for appending without full rebuild
-- MCP server (55 tools, smart detection mode, 3-phase tool visibility)
-- Validation suite — Berka (skill calibration), NYC Taxi (domain generalization), IBM AML (3-layer benchmark)
-- Storage — Lance vector index, Arrow IPC, LRU cache, append-only writes
-- Docs — quickstart, concepts, architecture, configuration, API reference, data format
+**First public release.** Complete GDS stack: declarative YAML sphere builder with CLI, navigation primitives π1–π12 (walk/jump/dive/attract/drift/trajectory/regime), aliases with cutting planes, temporal solids, investigation tools (`explain_anomaly`, witness/anti-witness, reputation), forecasting, FTS + hybrid search, online calibration tracker, MVCC sessions, multi-source PassiveScanner, incremental builder updates, MCP server (55 tools, smart detection, 3-phase visibility), Lance/Arrow storage, validation suite (Berka, NYC Taxi, IBM AML), full docs.
 
 ---
 

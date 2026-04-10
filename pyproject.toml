@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hypertopos"
-version = "0.2.0"
+version = "0.2.1"
 description = "Navigate your data like space."
 requires-python = ">=3.12"
 license = {text = "BSL-1.1"}

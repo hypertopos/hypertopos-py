@@ -5,6 +5,27 @@ All notable changes to hypertopos will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] — 2026-04-11
+
+### Added
+
+**Witness cohort discovery**
+- `find_witness_cohort()` — rank entities that share the target's witness signature. **Investigative peer ranking, not edge forecasting.**
+- Combines four signals: `exp(-distance/theta)` delta similarity (absolute, pool-independent), witness Jaccard overlap, trajectory cosine alignment (optional), graded anomaly bonus from `delta_rank_pct / 100`
+- Excludes already-connected entities via BTREE edge lookup; bidirectional check by default; `timestamp_cutoff` for as-of evaluation in temporal hold-out
+- Auto-resolves the event pattern with edge table covering an anchor's entity line; explicit `edge_pattern_id` override is validated
+- Trajectory branch decided once per call (not per candidate) — when ref has trajectory, missing candidates get neutral 0.5 instead of mixed renormalization
+- Batch trajectory load via single Lance scan instead of per-candidate (~11× speedup: 3.7s → ~330ms on AML HI-small)
+- `WitnessCohortConfig` and `WitnessCohortWeights` dataclasses group all tunable parameters; navigator API takes a single `config=` keyword
+- `CohortMember` and `WitnessCohortResult` frozen dataclasses with per-component scores, exclusion counts, and reproducibility metadata
+- `GDSEngine.witness_jaccard()`, `GDSEngine.trajectory_cosine()`, `GDSEngine.composite_link_score()` — pure scoring helpers exposed for reuse
+
+**Empirical validation on AML HI-small** (5M edges, 6357 labeled launderers):
+- Co-laundering precision@10: **25.3%** (vs 1.2% base rate = **20.5× lift**)
+- 2.6× improvement over `find_similar_entities + is_anomaly` baseline (which scored 6.5%)
+- Top-10 overlap with that baseline: 15.5% (function returns substantively different entities, not the same ranking)
+- Temporal hold-out recall@10: **0.0%** — confirms the function does NOT forecast future edges; it surfaces existing geometric peers
+
 ## [0.2.0] — 2026-04-10
 
 ### Added

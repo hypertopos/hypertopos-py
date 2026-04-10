@@ -935,6 +935,89 @@ class GDSEngine:
         ]
 
     @staticmethod
+    def witness_jaccard(set_a: set[str], set_b: set[str]) -> float:
+        """Jaccard index over two witness dimension label sets.
+
+        Returns 0.0 if both sets are empty (no signal), otherwise
+        ``|A ∩ B| / |A ∪ B|`` ∈ [0, 1].
+        """
+        if not set_a or not set_b:
+            return 0.0
+        intersection = len(set_a & set_b)
+        union = len(set_a | set_b)
+        if union == 0:
+            return 0.0
+        return intersection / union
+
+    @staticmethod
+    def trajectory_cosine(
+        traj_a: np.ndarray | list[float],
+        traj_b: np.ndarray | list[float],
+    ) -> float:
+        """Cosine similarity remapped to [0, 1].
+
+        Identical trajectories return 1.0, opposite return 0.0, orthogonal
+        return 0.5. Zero-norm vectors yield 0.5 (neutral, no signal).
+        """
+        a = np.asarray(traj_a, dtype=np.float64)
+        b = np.asarray(traj_b, dtype=np.float64)
+        norm_a = float(np.linalg.norm(a))
+        norm_b = float(np.linalg.norm(b))
+        if norm_a == 0.0 or norm_b == 0.0:
+            return 0.5
+        cos = float(np.dot(a, b) / (norm_a * norm_b))
+        cos = max(-1.0, min(1.0, cos))
+        return (cos + 1.0) / 2.0
+
+    @staticmethod
+    def composite_link_score(
+        delta_similarity: float,
+        witness_overlap: float,
+        trajectory_alignment: float | None,
+        anomaly_bonus: float,
+        weights: dict[str, float],
+    ) -> tuple[float, dict[str, float]]:
+        """Blend four signals into a single score in [0, 1].
+
+        When ``trajectory_alignment`` is None, the trajectory weight is
+        redistributed proportionally across the remaining components, so
+        the final score remains in [0, 1] regardless of which signals are
+        present.
+
+        Returns ``(score, components)`` where ``components`` is the
+        per-signal weighted contribution.
+        """
+        w_d = float(weights.get("delta", 0.0))
+        w_w = float(weights.get("witness", 0.0))
+        w_t = float(weights.get("trajectory", 0.0))
+        w_a = float(weights.get("anomaly", 0.0))
+
+        if trajectory_alignment is None:
+            # Redistribute trajectory weight across the rest, proportional
+            # to their original share.
+            remaining_total = w_d + w_w + w_a
+            if remaining_total == 0.0:
+                return 0.0, {}
+            w_d_n = w_d / remaining_total
+            w_w_n = w_w / remaining_total
+            w_a_n = w_a / remaining_total
+            components = {
+                "delta": w_d_n * float(delta_similarity),
+                "witness": w_w_n * float(witness_overlap),
+                "anomaly": w_a_n * float(anomaly_bonus),
+            }
+        else:
+            components = {
+                "delta": w_d * float(delta_similarity),
+                "witness": w_w * float(witness_overlap),
+                "trajectory": w_t * float(trajectory_alignment),
+                "anomaly": w_a * float(anomaly_bonus),
+            }
+
+        score = sum(components.values())
+        return float(score), components
+
+    @staticmethod
     def witness_set(
         delta: list[float] | np.ndarray,
         theta_norm: float,

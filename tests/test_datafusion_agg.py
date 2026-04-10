@@ -20,7 +20,7 @@ from hypertopos.engine.datafusion_agg import (
     is_available,
 )
 
-from packages.hypertopos.tests.conftest import make_edges_column
+from tests.conftest import make_edges_column
 
 
 @pytest.fixture

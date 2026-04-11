@@ -41,9 +41,9 @@ TBD — picked after 0.3.0 lands.
 ## Future
 
 **Detection quality**
-- Edge-derived dimensions + temporal motif matcher (autoresearch-validated, ~95% AML recall on HI-Small / 94% on LI-Small without training; resolves IDEA-178/179)
+- Edge-derived dimensions + temporal motif matcher
 - Confidence scoring, robust estimators, multi-scale resolution — improve anomaly precision and reduce false positives on heavy-tail and multi-modal populations
-- Lazy chain geometry — on-demand chain delta vectors via sampled population calibration; supplements the build-time `chain_lines` path (IDEA-175)
+- Lazy chain geometry — on-demand chain delta vectors via sampled population calibration; supplements the build-time `chain_lines` path
 
 **Builder evolution**
 - Incremental rebuild — geometry-only without `--force` wipe

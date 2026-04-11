@@ -20,12 +20,6 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `CohortMember` and `WitnessCohortResult` frozen dataclasses with per-component scores, exclusion counts, and reproducibility metadata
 - `GDSEngine.witness_jaccard()`, `GDSEngine.trajectory_cosine()`, `GDSEngine.composite_link_score()` — pure scoring helpers exposed for reuse
 
-**Empirical validation on AML HI-small** (5M edges, 6357 labeled launderers):
-- Co-laundering precision@10: **25.3%** (vs 1.2% base rate = **20.5× lift**)
-- 2.6× improvement over `find_similar_entities + is_anomaly` baseline (which scored 6.5%)
-- Top-10 overlap with that baseline: 15.5% (function returns substantively different entities, not the same ranking)
-- Temporal hold-out recall@10: **0.0%** — confirms the function does NOT forecast future edges; it surfaces existing geometric peers
-
 ## [0.2.0] — 2026-04-10
 
 ### Added

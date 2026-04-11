@@ -3389,16 +3389,10 @@ class GDSNavigator:
     ) -> WitnessCohortResult:
         """Rank entities that share ``primary_key``'s witness signature.
 
-        **Investigative peer ranking, not edge forecasting.** Empirical
-        validation on AML HI-small (5M edges, 6357 labeled launderers):
-        25.3% co-laundering precision@10 vs 1.2% random base rate
-        (20.5× lift), 2.6× improvement over ``find_similar_entities +
-        is_anomaly`` baseline (6.5%), 15.5% top-10 overlap with that
-        baseline so results are substantively different. Temporal hold-out
-        recall@10 is 0% — the function does NOT forecast which entities
-        will form future edges; it surfaces entities that share the
-        target's anomaly signature and are likely to belong to the same
-        investigative cohort.
+        **Investigative peer ranking, not edge forecasting.** Surfaces
+        entities that share the target's anomaly signature and are likely
+        to belong to the same investigative cohort. The function does NOT
+        forecast which entities will form future edges.
 
         Combines four signals into a composite score in [0, 1]:
 

@@ -28,31 +28,45 @@ First public release — full GDS stack, π1–π12, builder, MCP server, valida
 
 ## Plan: 0.3.0
 
-**Storage / performance:**
-- Upgrade `pylance 2.0.1 → 3.0.1` — format 2.2, ~300% faster scans, LZ4/zstd compression
-- Replace `shutil.copytree` with `lance.dataset.clone()` in test fixtures (O(1) metadata clone)
-- Builder: incremental rebuild (geometry-only without `--force` wipe)
+**Lance 3.x perf upgrade** — faster scans, smaller storage, native aggregates. Storage layer becomes faster, smaller, and pushes more work into Lance instead of Python; no new features, no orthogonal themes. See CHANGELOG when it ships.
 
-**Code refactoring:**
-- Break up oversized modules into smaller, domain-focused components
-- Reduce coupling between core layers by replacing private cross-layer access with explicit interfaces where practical
-- Tighten error handling in hot paths so failures are surfaced more consistently
-- Consolidate repeated orchestration logic into shared helpers instead of duplicating it across modules
-- Make the refactor pass incremental: preserve behavior, improve structure, then revisit deeper architectural boundaries
+---
 
-**PassiveScanner evolution:**
-- Native temporal source support for direct temporal inputs, without requiring manual dataset plumbing in benchmark scripts
-- Optional weighted scoring mode that uses continuous intensity instead of binary counts
-- **SphereProfiler** — autonomous sphere scanner that profiles all patterns, runs calibration sweeps across source combinations, proposes optimal PassiveScanner composition for Layer 1 surveillance. Core loop: enumerate patterns → single-source anomaly scans → greedy multi-source combination → ranked composition report. No labeled GT needed; optional GT file unlocks supervised calibration.
+## Plan: 0.4.0
 
-**Anomaly detection quality:**
-- Confidence scoring, robust estimators, multi-scale resolution — improve anomaly precision and reduce false positives on heavy-tail and multi-modal populations
+TBD — picked after 0.3.0 lands.
 
 ---
 
 ## Future
 
+**Detection quality**
+- Edge-derived dimensions + temporal motif matcher (autoresearch-validated, ~95% AML recall on HI-Small / 94% on LI-Small without training; resolves IDEA-178/179)
+- Confidence scoring, robust estimators, multi-scale resolution — improve anomaly precision and reduce false positives on heavy-tail and multi-modal populations
+- Lazy chain geometry — on-demand chain delta vectors via sampled population calibration; supplements the build-time `chain_lines` path (IDEA-175)
+
+**Builder evolution**
+- Incremental rebuild — geometry-only without `--force` wipe
+- Generalized (d+m+g+t+s) dimension blocks — geographic / metric / semantic dimension support
+
+**PassiveScanner evolution**
+- Native temporal source support for direct temporal inputs, without requiring manual dataset plumbing in benchmark scripts
+- Optional weighted scoring mode that uses continuous intensity instead of binary counts
+- **SphereProfiler** — autonomous sphere scanner that profiles all patterns, runs calibration sweeps across source combinations, proposes optimal PassiveScanner composition for Layer 1 surveillance. Core loop: enumerate patterns → single-source anomaly scans → greedy multi-source combination → ranked composition report. No labeled GT needed; optional GT file unlocks supervised calibration.
+
+**Code refactoring**
+- Break up oversized modules into smaller, domain-focused components
+- Reduce coupling between core layers by replacing private cross-layer access with explicit interfaces where practical
+- Tighten error handling in hot paths so failures are surfaced more consistently
+- Consolidate repeated orchestration logic into shared helpers instead of duplicating it across modules
+- Incremental refactor: preserve behavior, improve structure, then revisit deeper architectural boundaries
+
+**Cross-sphere capabilities**
 - Cross-sphere comparison — dimensionless metrics across independently calibrated coordinate spaces
 - What-if analysis — hypothetical edge changes producing modified coordinate vectors
+
+**Enterprise / governance**
 - Dimension access control — per-agent visibility constraints on delta dimensions
+
+**Tooling**
 - Runtime latency benchmarks in package docs

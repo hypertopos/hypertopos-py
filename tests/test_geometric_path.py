@@ -123,6 +123,33 @@ class TestFindCounterpartiesEdgeTable:
         for entry in result["outgoing"]:
             assert "amount_sum" not in entry
 
+    def test_timestamp_cutoff_empty_when_before_all_edges(self, nav):
+        """Pre-fixture cutoff → edge-table fast path returns empty lists."""
+        baseline = nav.find_counterparties(
+            "A000", "transactions", "sender_id", "receiver_id",
+            pattern_id="tx_pattern",
+        )
+        assert baseline["summary"]["total_outgoing"] > 0
+        cut = nav.find_counterparties(
+            "A000", "transactions", "sender_id", "receiver_id",
+            pattern_id="tx_pattern",
+            timestamp_cutoff=1_000_000_000.0,
+        )
+        assert cut["outgoing"] == []
+        assert cut["incoming"] == []
+        assert cut["summary"]["total_outgoing"] == 0
+        assert cut["summary"]["total_incoming"] == 0
+
+    def test_timestamp_cutoff_raises_on_points_fallback(self, nav):
+        """Cutoff cannot be honored on the points-scan fallback — must raise."""
+        with pytest.raises(GDSNavigationError, match="edge-table fast path"):
+            nav.find_counterparties(
+                "A000", "transactions", "sender_id", "receiver_id",
+                pattern_id="tx_pattern",
+                use_edge_table=False,
+                timestamp_cutoff=1_700_000_000.0,
+            )
+
     def test_use_edge_table_false(self, nav):
         """Explicit use_edge_table=False should force points scan."""
         result = nav.find_counterparties(
@@ -170,6 +197,27 @@ class TestEntityFlow:
         with pytest.raises(GDSNavigationError, match="no edge table"):
             nav.entity_flow("A000", "acct_pattern")
 
+    def test_timestamp_cutoff_zero_before_all_edges(self, nav):
+        """Cutoff before any edge timestamp → zero totals."""
+        baseline = nav.entity_flow("A000", "tx_pattern")
+        assert baseline["outgoing_total"] > 0 or baseline["incoming_total"] > 0
+        cut = nav.entity_flow(
+            "A000", "tx_pattern", timestamp_cutoff=1_000_000_000.0,
+        )
+        assert cut["outgoing_total"] == 0
+        assert cut["incoming_total"] == 0
+        assert cut["net_flow"] == 0
+        assert cut["counterparties"] == []
+
+    def test_timestamp_cutoff_matches_default_when_after_all_edges(self, nav):
+        """Cutoff after all edges → identical to default."""
+        baseline = nav.entity_flow("A000", "tx_pattern")
+        future = nav.entity_flow(
+            "A000", "tx_pattern", timestamp_cutoff=9_999_999_999.0,
+        )
+        assert future["outgoing_total"] == baseline["outgoing_total"]
+        assert future["incoming_total"] == baseline["incoming_total"]
+
     def test_nonexistent_entity_zeros(self, nav):
         """Nonexistent entity should return zero flows."""
         result = nav.entity_flow("NONEXISTENT", "tx_pattern")
@@ -211,6 +259,34 @@ class TestContagionScore:
         assert "max_score" in result["summary"]
         assert "high_contagion_count" in result["summary"]
 
+    def test_timestamp_cutoff_zero_when_before_all_edges(self, nav):
+        """Cutoff before any edge timestamp → zero counterparties."""
+        baseline = nav.contagion_score("A000", "tx_pattern")
+        assert baseline["total_counterparties"] > 0
+        cutoff_result = nav.contagion_score(
+            "A000", "tx_pattern", timestamp_cutoff=1_000_000_000.0,
+        )
+        assert cutoff_result["total_counterparties"] == 0
+        assert cutoff_result["score"] == 0.0
+
+    def test_timestamp_cutoff_matches_default_when_after_all_edges(self, nav):
+        """Cutoff after all edges → identical to default (no cutoff)."""
+        baseline = nav.contagion_score("A000", "tx_pattern")
+        future = nav.contagion_score(
+            "A000", "tx_pattern", timestamp_cutoff=9_999_999_999.0,
+        )
+        assert future["total_counterparties"] == baseline["total_counterparties"]
+        assert future["score"] == baseline["score"]
+
+    def test_batch_timestamp_cutoff_threaded(self, nav):
+        """Batch must forward timestamp_cutoff to each per-entity call."""
+        result = nav.contagion_score_batch(
+            ["A000", "A001"], "tx_pattern", timestamp_cutoff=1_000_000_000.0,
+        )
+        for entry in result["results"]:
+            assert entry["total_counterparties"] == 0
+            assert entry["score"] == 0.0
+
 
 # ── degree_velocity tests ───────────────────────────────────
 
@@ -243,6 +319,16 @@ class TestDegreeVelocity:
     def test_no_edge_table_raises(self, nav):
         with pytest.raises(GDSNavigationError, match="no edge table"):
             nav.degree_velocity("A000", "acct_pattern")
+
+    def test_timestamp_cutoff_pre_fixture_returns_no_edges_warning(self, nav):
+        """Cutoff before any edge → warning path (same as no edges)."""
+        result = nav.degree_velocity(
+            "A000", "tx_pattern", timestamp_cutoff=1_000_000_000.0,
+        )
+        assert result["velocity_out"] is None
+        assert result["velocity_in"] is None
+        assert "warning" in result
+        assert result["buckets"] == []
 
 
 # ── investigation_coverage tests ────────────────────────────
@@ -339,6 +425,20 @@ class TestPropagateInfluence:
     def test_no_edge_table_raises(self, nav):
         with pytest.raises(GDSNavigationError, match="no edge table"):
             nav.propagate_influence(["A000"], "acct_pattern")
+
+    def test_timestamp_cutoff_blocks_expansion(self, nav):
+        """Pre-fixture cutoff → BFS finds no neighbors."""
+        baseline = nav.propagate_influence(
+            ["A000"], "tx_pattern", min_threshold=0.001,
+        )
+        assert baseline["summary"]["total_affected"] > 0
+        cut = nav.propagate_influence(
+            ["A000"], "tx_pattern",
+            min_threshold=0.001,
+            timestamp_cutoff=1_000_000_000.0,
+        )
+        assert cut["summary"]["total_affected"] == 0
+        assert cut["affected_entities"] == []
 
 
 # ── cluster_bridges tests ───────────────────────────────────

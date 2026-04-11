@@ -86,6 +86,7 @@ class _FakeHit:
     primary_key: str
     score: int
     source_count: int = 1
+    weighted_score: float = 0.0
 
 
 @dataclass
@@ -155,6 +156,30 @@ class TestDetectCrossPatternDiscrepancy:
         assert result[0]["anomalous_pattern"] == "pat_a"
         assert result[0]["normal_patterns"] == ["pat_b"]
         assert result[0]["delta_norm_anomalous"] == 3.5
+
+    def test_skips_graph_sources_in_auto_discover(self):
+        """detect_cross_pattern_discrepancy must not register graph sources.
+
+        Graph contagion plays no role in detecting geometry disagreement
+        between patterns, but full edge-table scans are expensive on large
+        spheres (~37s per pattern on 5M-edge spheres). Confirm the detector
+        passes include_graph=False when calling auto_discover.
+        """
+        nav = _make_navigator()
+
+        fake_scanner = MagicMock()
+        fake_scanner._sources = [MagicMock()]  # only 1 source → early return
+        fake_scanner.auto_discover.return_value = fake_scanner
+
+        with patch(
+            "hypertopos.navigation.scanner.PassiveScanner",
+            return_value=fake_scanner,
+        ):
+            nav.detect_cross_pattern_discrepancy("accounts")
+
+        fake_scanner.auto_discover.assert_called_once_with(
+            "accounts", include_graph=False,
+        )
 
 
 class TestDetectNeighborContamination:

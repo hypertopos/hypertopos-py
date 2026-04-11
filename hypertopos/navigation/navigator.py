@@ -2268,17 +2268,26 @@ class GDSNavigator:
         line_id: str,
         pattern_id: str,
         top_n: int = 20,
+        *,
+        timestamp_cutoff: float | None = None,
     ) -> dict[str, Any]:
         """Fast counterparty lookup via edge table BTREE indexes.
 
         Returns same structure as find_counterparties but with ``amount_sum``
         and ``amount_max`` per counterparty entry.  Anomaly enrichment uses
         the resolved anchor pattern's geometry.
+
+        ``timestamp_cutoff`` restricts the lookup to edges with
+        ``timestamp <= timestamp_cutoff``.
         """
         # Outgoing: from_key == primary_key → counterparties in to_key
-        fwd = self._storage.read_edges(pattern_id, from_keys=[primary_key])
+        fwd = self._storage.read_edges(
+            pattern_id, from_keys=[primary_key], timestamp_to=timestamp_cutoff,
+        )
         # Incoming: to_key == primary_key → counterparties in from_key
-        rev = self._storage.read_edges(pattern_id, to_keys=[primary_key])
+        rev = self._storage.read_edges(
+            pattern_id, to_keys=[primary_key], timestamp_to=timestamp_cutoff,
+        )
 
         def _group(edges: pa.Table, group_col: str) -> list[dict[str, Any]]:
             if edges.num_rows == 0:
@@ -2403,6 +2412,8 @@ class GDSNavigator:
         pattern_id: str | None = None,
         top_n: int = 20,
         use_edge_table: bool = True,
+        *,
+        timestamp_cutoff: float | None = None,
     ) -> dict[str, Any]:
         """Find transaction counterparties of an entity with anomaly enrichment.
 
@@ -2412,6 +2423,13 @@ class GDSNavigator:
 
         If *pattern_id* is provided, each counterparty is enriched with ``is_anomaly``
         and ``delta_rank_pct`` from that pattern's geometry.
+
+        ``timestamp_cutoff`` restricts the lookup to edges with
+        ``timestamp <= timestamp_cutoff``. **Edge-table fast path only.** The
+        points-scan fallback has no timestamp column available and cannot
+        honor the cutoff, so passing it without an edge-table-eligible
+        configuration raises ``GDSNavigationError`` to fail loudly instead of
+        silently returning unfiltered results.
 
         Returns ``{primary_key, outgoing, incoming, summary}``.
         """
@@ -2423,6 +2441,16 @@ class GDSNavigator:
         ):
             return self._find_counterparties_via_edges(
                 primary_key, line_id, pattern_id, top_n,
+                timestamp_cutoff=timestamp_cutoff,
+            )
+
+        # Cutoff is meaningless on the points-scan fallback — fail loudly.
+        if timestamp_cutoff is not None:
+            raise GDSNavigationError(
+                "find_counterparties: timestamp_cutoff is only supported on "
+                "the edge-table fast path. Provide a pattern_id whose edge "
+                "table exists and leave use_edge_table=True, or omit "
+                "timestamp_cutoff."
             )
 
         sphere = self._storage.read_sphere()
@@ -2552,11 +2580,17 @@ class GDSNavigator:
         primary_key: str,
         pattern_id: str,
         top_n: int = 20,
+        *,
+        timestamp_cutoff: float | None = None,
     ) -> dict[str, Any]:
         """Net flow analysis per counterparty via edge table.
 
         Two edge lookups (outgoing + incoming), sum amounts, compute
         per-counterparty net flow.
+
+        When ``timestamp_cutoff`` is set (Unix seconds as float), only edges
+        with ``timestamp <= timestamp_cutoff`` are considered — used for
+        as-of evaluation of flow history up to a given point in time.
 
         Returns ``{outgoing_total, incoming_total, net_flow, flow_direction,
         counterparties: [{key, net_flow, direction}]}``.
@@ -2566,8 +2600,12 @@ class GDSNavigator:
                 f"Pattern '{pattern_id}' has no edge table. "
                 "entity_flow requires an edge table."
             )
-        fwd = self._storage.read_edges(pattern_id, from_keys=[primary_key])
-        rev = self._storage.read_edges(pattern_id, to_keys=[primary_key])
+        fwd = self._storage.read_edges(
+            pattern_id, from_keys=[primary_key], timestamp_to=timestamp_cutoff,
+        )
+        rev = self._storage.read_edges(
+            pattern_id, to_keys=[primary_key], timestamp_to=timestamp_cutoff,
+        )
 
         # Sum outgoing amounts per counterparty
         out_by_cp: dict[str, float] = {}
@@ -2624,11 +2662,18 @@ class GDSNavigator:
         self,
         primary_key: str,
         pattern_id: str,
+        *,
+        timestamp_cutoff: float | None = None,
     ) -> dict[str, Any]:
         """Score how many of an entity's counterparties are anomalous.
 
         Edge lookup for counterparties, batch geometry check on the anchor
         pattern.  Score = anomalous_counterparties / total_counterparties.
+
+        When ``timestamp_cutoff`` is set (Unix seconds as float), only edges
+        with ``timestamp <= timestamp_cutoff`` are considered — used for
+        as-of evaluation, reproducing the state of the graph at a given
+        point in time.
 
         Returns ``{score: 0.0-1.0, total_counterparties,
         anomalous_counterparties, interpretation}``.
@@ -2638,8 +2683,12 @@ class GDSNavigator:
                 f"Pattern '{pattern_id}' has no edge table. "
                 "contagion_score requires an edge table."
             )
-        fwd = self._storage.read_edges(pattern_id, from_keys=[primary_key])
-        rev = self._storage.read_edges(pattern_id, to_keys=[primary_key])
+        fwd = self._storage.read_edges(
+            pattern_id, from_keys=[primary_key], timestamp_to=timestamp_cutoff,
+        )
+        rev = self._storage.read_edges(
+            pattern_id, to_keys=[primary_key], timestamp_to=timestamp_cutoff,
+        )
 
         cp_keys: set[str] = set()
         if fwd.num_rows > 0:
@@ -2688,15 +2737,25 @@ class GDSNavigator:
         primary_keys: list[str],
         pattern_id: str,
         max_keys: int = 200,
+        *,
+        timestamp_cutoff: float | None = None,
     ) -> dict[str, Any]:
         """Contagion score for multiple entities.
+
+        When ``timestamp_cutoff`` is set, forwards it to each per-entity
+        contagion_score call so that only edges with
+        ``timestamp < timestamp_cutoff`` are considered.
 
         Returns per-entity scores plus a summary with mean/max.
         """
         keys = primary_keys[:max_keys]
         results: list[dict[str, Any]] = []
         for pk in keys:
-            results.append(self.contagion_score(pk, pattern_id))
+            results.append(
+                self.contagion_score(
+                    pk, pattern_id, timestamp_cutoff=timestamp_cutoff,
+                )
+            )
 
         scores = [r["score"] for r in results]
         mean_score = round(sum(scores) / len(scores), 4) if scores else 0.0
@@ -2718,11 +2777,18 @@ class GDSNavigator:
         primary_key: str,
         pattern_id: str,
         n_buckets: int = 4,
+        *,
+        timestamp_cutoff: float | None = None,
     ) -> dict[str, Any]:
         """Temporal connection velocity via edge table.
 
         Buckets edges by timestamp, counts unique counterparties per bucket.
         Velocity = degree in last bucket / degree in first bucket.
+
+        When ``timestamp_cutoff`` is set (Unix seconds as float), only edges
+        with ``timestamp <= timestamp_cutoff`` are considered. Buckets are
+        computed from the filtered edge set, so the last bucket endpoint is
+        naturally <= cutoff.
 
         Returns ``{buckets: [{period, out_degree, in_degree}],
         velocity_out, velocity_in, interpretation}``.
@@ -2732,8 +2798,12 @@ class GDSNavigator:
                 f"Pattern '{pattern_id}' has no edge table. "
                 "degree_velocity requires an edge table."
             )
-        fwd = self._storage.read_edges(pattern_id, from_keys=[primary_key])
-        rev = self._storage.read_edges(pattern_id, to_keys=[primary_key])
+        fwd = self._storage.read_edges(
+            pattern_id, from_keys=[primary_key], timestamp_to=timestamp_cutoff,
+        )
+        rev = self._storage.read_edges(
+            pattern_id, to_keys=[primary_key], timestamp_to=timestamp_cutoff,
+        )
 
         # Collect all timestamps
         fwd_ts = fwd["timestamp"].to_pylist() if fwd.num_rows > 0 else []
@@ -2883,12 +2953,20 @@ class GDSNavigator:
         decay: float = 0.7,
         min_threshold: float = 0.001,
         max_affected: int = 10_000,
+        *,
+        timestamp_cutoff: float | None = None,
     ) -> dict[str, Any]:
         """BFS influence propagation from seed entities with geometric decay.
 
         At each hop, influence_score = parent_score * decay * geometric_coherence.
         Stops expanding when score falls below *min_threshold* or when
         *max_affected* entities have been reached.
+
+        When ``timestamp_cutoff`` is set (Unix seconds as float), the BFS only
+        follows edges with ``timestamp <= timestamp_cutoff``. Use this to
+        reconstruct what influence propagation would have surfaced at a prior
+        point in time — e.g. "what was reachable from this seed on the day
+        of the incident?".
 
         Returns ``{seeds, affected_entities, summary}``.
         """
@@ -2913,8 +2991,12 @@ class GDSNavigator:
         def _expand_neighbors(keys: set[str]) -> None:
             """Read edges for keys and aggregate tx_count per neighbor."""
             key_list = list(keys)
-            fwd = self._storage.read_edges(pattern_id, from_keys=key_list)
-            rev = self._storage.read_edges(pattern_id, to_keys=key_list)
+            fwd = self._storage.read_edges(
+                pattern_id, from_keys=key_list, timestamp_to=timestamp_cutoff,
+            )
+            rev = self._storage.read_edges(
+                pattern_id, to_keys=key_list, timestamp_to=timestamp_cutoff,
+            )
             for tbl in (fwd, rev):
                 from_arr = tbl["from_key"].to_pylist()
                 to_arr = tbl["to_key"].to_pylist()
@@ -3304,9 +3386,9 @@ class GDSNavigator:
         BTREE-indexed lookup. When ``bidirectional`` is True (default), inspects both
         outgoing and incoming edges.
 
-        ``timestamp_max`` restricts the lookup to edges with timestamp strictly
-        less than the cutoff — used by hold-out evaluation to reproduce the
-        as-of state of the graph at a given point in time.
+        ``timestamp_max`` restricts the lookup to edges with
+        ``timestamp <= timestamp_max`` — used by hold-out evaluation to
+        reproduce the as-of state of the graph at a given point in time.
         """
         existing: set[str] = set()
         fwd = self._storage.read_edges(
@@ -3415,9 +3497,9 @@ class GDSNavigator:
         so the cohort is denser in unknown peers worth investigating. When
         ``config.bidirectional_check`` is True (default) both outgoing and
         incoming edges count as existing. ``config.timestamp_cutoff`` further
-        restricts the existing-edge filter to edges with ``timestamp < cutoff``
-        — used by hold-out evaluation to reproduce the as-of state of the
-        graph at a given point in time.
+        restricts the existing-edge filter to edges with
+        ``timestamp <= cutoff`` — used by hold-out evaluation to reproduce
+        the as-of state of the graph at a given point in time.
 
         ``edge_pattern_id`` overrides the auto-resolved event pattern; use this
         when multiple event patterns share the same anchor and you want a
@@ -7620,7 +7702,12 @@ class GDSNavigator:
 
         sphere = self._storage.read_sphere()
         scanner = PassiveScanner(self._storage, sphere, self._manifest)
-        scanner.auto_discover(entity_line)
+        # Skip graph sources — this detector measures geometry disagreement
+        # between patterns, not graph contagion. Registering graph sources
+        # here triggers full edge-table reads per pattern (~37s on 5M-edge
+        # spheres, compounding for multi-pattern lines) with zero signal
+        # contribution to the downstream single-source hit check.
+        scanner.auto_discover(entity_line, include_graph=False)
 
         if len(scanner._sources) < 2:
             return []

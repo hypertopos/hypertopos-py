@@ -8,7 +8,7 @@
 [![PyArrow](https://img.shields.io/badge/format-PyArrow-red.svg)](https://arrow.apache.org/docs/python/)
 [![Lance](https://img.shields.io/badge/storage-Lance-blueviolet.svg)](https://github.com/lancedb/lancedb)
 [![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io)
-[![Version](https://img.shields.io/badge/version-0.2.1-blue.svg)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.2.2-blue.svg)](pyproject.toml)
 
 **hypertopos** transforms relational data into navigable geometric space.
 

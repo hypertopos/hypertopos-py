@@ -645,3 +645,15 @@ class TestGraphContagionSource:
         source_names = [s.name for s in scanner._sources]
         assert any("graph" in n for n in source_names)
         sess.__exit__(None, None, None)
+
+    def test_auto_discover_include_graph_false(self, tmp_path):
+        """auto_discover(include_graph=False) should skip graph source registration."""
+        scanner, sess = _make_graph_scanner_fixture(tmp_path)
+        scanner.auto_discover("accounts", include_graph=False)
+        source_names = [s.name for s in scanner._sources]
+        assert not any("graph" in n for n in source_names), (
+            f"graph source registered with include_graph=False: {source_names}"
+        )
+        # Other auto-discovered sources still get registered
+        assert len(scanner._sources) > 0
+        sess.__exit__(None, None, None)

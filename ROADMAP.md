@@ -2,15 +2,27 @@
 
 > Planned direction. Priorities may change based on feedback. 
 
-## Current: 0.2.0
+## Current: 0.2.2
 
-**Graph meets geometry.** Lance-based **edge table** per event pattern with BTREE indexes, auto-emitted at build time, gives runtime graph traversal at O(log n) scale. 11 new navigator functions (paths, chains, flow, contagion, influence, bridges, anomalous edges, …) and matching MCP tools available in Phase 2. PassiveScanner gains a `"graph"` contagion source. 7 fraud-investigation recipes added to `gds-fraud-investigator`, all 8 skills refreshed for the new tools. Major perf wins (`passive_scan` 84 s → <10 s, `detect_pattern` 86 s → <15 s, `cluster_bridges` 31 s → <5 s). 66 MCP tools total (55 → 66).
+As-of graph reconstruction across edge-table graph primitives + latency fix on `detect_cross_pattern_discrepancy`. See CHANGELOG.
+
+---
+
+## 0.2.1
+
+Witness cohort discovery — investigative peer ranking. See CHANGELOG.
+
+---
+
+## 0.2.0
+
+Graph meets geometry — edge table, runtime traversal, contagion/influence, +11 navigator functions. See CHANGELOG.
 
 ---
 
 ## 0.1.0
 
-**First public release.** Complete GDS stack: declarative YAML sphere builder with CLI, navigation primitives π1–π12 (walk/jump/dive/attract/drift/trajectory/regime), aliases with cutting planes, temporal solids, investigation tools (`explain_anomaly`, witness/anti-witness, reputation), forecasting, FTS + hybrid search, online calibration tracker, MVCC sessions, multi-source PassiveScanner, incremental builder updates, MCP server (55 tools, smart detection, 3-phase visibility), Lance/Arrow storage, validation suite (Berka, NYC Taxi, IBM AML), full docs.
+First public release — full GDS stack, π1–π12, builder, MCP server, validation suite. See CHANGELOG.
 
 ---
 

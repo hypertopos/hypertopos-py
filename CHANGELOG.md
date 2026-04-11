@@ -5,6 +5,23 @@ All notable changes to hypertopos will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] — 2026-04-11
+
+### Added
+
+**Temporal as-of reconstruction across edge-table graph primitives**
+- `contagion_score()`, `contagion_score_batch()` — optional keyword-only `timestamp_cutoff: float | None` parameter. When set, only edges with `timestamp <= timestamp_cutoff` are considered. Batch forwards the cutoff to every per-entity call.
+- `entity_flow()` — same `timestamp_cutoff` parameter; both outgoing and incoming edge reads honor the cutoff, so net flow reflects the as-of graph state.
+- `degree_velocity()` — same parameter; buckets derive from the filtered edge set so the last bucket endpoint is naturally `<= timestamp_cutoff`.
+- `propagate_influence()` — same parameter; threaded through the BFS `_expand_neighbors` closure so expansion follows only edges with `timestamp <= cutoff`.
+- `find_counterparties()` — same parameter on the edge-table fast path via `_find_counterparties_via_edges`. The points-scan fallback has no timestamp column and **raises `GDSNavigationError`** when `timestamp_cutoff` is supplied — fail loudly instead of silently returning unfiltered results.
+
+The semantic mirrors the existing `WitnessCohortConfig.timestamp_cutoff` from 0.2.1: edges with `timestamp <= timestamp_cutoff` are included. Enables agents to reconstruct contagion, flow, connection velocity, and influence propagation state at a prior point in time — useful for incident forensics ("what did this neighborhood look like on the day the alert fired?"), retroactive detection validation, and historical-snapshot comparisons.
+
+### Fixed
+
+- `detect_cross_pattern_discrepancy` no longer triggers full edge-table scans through `PassiveScanner.auto_discover`. The scanner gains an `include_graph: bool = True` keyword-only parameter; `detect_cross_pattern_discrepancy` calls it with `include_graph=False` because graph contagion plays no role in the downstream geometry-disagreement check. Eliminates the dominant latency regression on multi-pattern spheres with edge tables — the discrepancy detector previously paid one full edge-table read per event pattern with no signal benefit. Every other `auto_discover` caller (`composite_risk`, explicit scanner use) stays at the graph-enabled default.
+
 ## [0.2.1] — 2026-04-11
 
 ### Added
@@ -15,7 +32,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Excludes already-connected entities via BTREE edge lookup; bidirectional check by default; `timestamp_cutoff` for as-of evaluation in temporal hold-out
 - Auto-resolves the event pattern with edge table covering an anchor's entity line; explicit `edge_pattern_id` override is validated
 - Trajectory branch decided once per call (not per candidate) — when ref has trajectory, missing candidates get neutral 0.5 instead of mixed renormalization
-- Batch trajectory load via single Lance scan instead of per-candidate (~11× speedup: 3.7s → ~330ms on AML HI-small)
+- Batch trajectory load via single Lance scan instead of per-candidate (~11× speedup over the per-candidate path)
 - `WitnessCohortConfig` and `WitnessCohortWeights` dataclasses group all tunable parameters; navigator API takes a single `config=` keyword
 - `CohortMember` and `WitnessCohortResult` frozen dataclasses with per-component scores, exclusion counts, and reproducibility metadata
 - `GDSEngine.witness_jaccard()`, `GDSEngine.trajectory_cosine()`, `GDSEngine.composite_link_score()` — pure scoring helpers exposed for reuse

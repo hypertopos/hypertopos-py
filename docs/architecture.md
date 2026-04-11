@@ -224,6 +224,10 @@ The scanner collects, deduplicates, and ranks results into a unified candidate l
 is the primary entry point for broad screening workflows where the agent does not yet know
 which specific primitive to focus on. `auto_discover()` registers the appropriate sources
 automatically — graph sources are added for every event pattern that has an edge table.
+Callers that do not need graph contagion signal (e.g. `detect_cross_pattern_discrepancy`,
+which measures geometry disagreement between patterns, not neighbor contamination) pass
+`include_graph=False` to skip graph source registration and avoid the per-pattern edge
+table read that would otherwise dominate scan latency on large spheres.
 
 ## Build Flow
 
@@ -278,7 +282,7 @@ The MCP package is a transport and tool layer.
 It does not define the core GDS model. Instead, it:
 
 - opens and closes spheres
-- exposes 66 navigation and analysis tools
+- exposes 67 navigation and analysis tools
 - formats results as JSON
 - manages session state for an agentic client
 

@@ -256,12 +256,17 @@ class PassiveScanner:
         home_line_id: str,
         include_borderline: bool = False,
         borderline_rank_threshold: float = 80,
+        *,
+        include_graph: bool = True,
     ) -> PassiveScanner:
         """Auto-discover all patterns related to home_line_id.
 
         Registers each discovered pattern as a source with auto-detected key_type.
         When include_borderline is True, also registers borderline sources for
-        each direct pattern.
+        each direct pattern. When include_graph is False, skips registering
+        ``{pattern_id}_graph`` sources even if event patterns with edge tables
+        exist — use this when the downstream scan does not need graph contagion
+        (e.g. cross-pattern geometry discrepancy detection).
         """
         for pat_id in self._sphere.patterns:
             key_type = self._classify_for_line(pat_id, home_line_id)
@@ -278,13 +283,14 @@ class PassiveScanner:
                         rank_threshold=borderline_rank_threshold,
                     )
         # Auto-discover graph sources — event patterns with edge tables
-        for pat_id, pat in self._sphere.patterns.items():
-            if pat.pattern_type == "event" and self._reader.has_edge_table(pat_id):
-                # Check if any relation targets home_line_id
-                for rel in pat.relations:
-                    if rel.line_id == home_line_id:
-                        self.add_graph_source(f"{pat_id}_graph", pat_id)
-                        break
+        if include_graph:
+            for pat_id, pat in self._sphere.patterns.items():
+                if pat.pattern_type == "event" and self._reader.has_edge_table(pat_id):
+                    # Check if any relation targets home_line_id
+                    for rel in pat.relations:
+                        if rel.line_id == home_line_id:
+                            self.add_graph_source(f"{pat_id}_graph", pat_id)
+                            break
         return self
 
     def scan(

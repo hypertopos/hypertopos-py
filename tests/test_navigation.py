@@ -9,7 +9,6 @@ from datetime import UTC, datetime
 import numpy as np
 import pyarrow as pa
 import pytest
-from hypertopos.engine.subprocess_agg import _find_anomalies_table
 from hypertopos.model.manifest import Contract, Manifest
 from hypertopos.model.objects import Edge, Point, Polygon, Solid, SolidSlice
 from hypertopos.navigation.navigator import (
@@ -5568,42 +5567,56 @@ class TestContinuousModeIsJumpable:
                 )
 
 
-class TestFindAnomaliesTable:
-    def test_total_found_and_page0(self):
-        """total_found = rows above threshold; offset=0 returns top rows."""
-        table = pa.table(
-            {
+class TestFindAnomaliesLanceSql:
+    """find_anomalies pushdown via lance_sql_agg.find_anomalies."""
+
+    def test_total_found_and_page0(self, tmp_path):
+        import lance as _lance
+        from hypertopos.engine.lance_sql_agg import find_anomalies
+        p = str(tmp_path / "g.lance")
+        _lance.write_dataset(
+            pa.table({
                 "primary_key": ["A", "B", "C", "D"],
                 "delta_norm": [5.0, 4.0, 3.0, 1.0],
-            }
+            }),
+            p,
+            data_storage_version="2.2",
         )
-        result = _find_anomalies_table(table, threshold=2.5, top_n=2, offset=0)
-        assert result["total_found"] == 3  # A, B, C pass threshold
+        result = find_anomalies(p, threshold=2.5, top_n=2, offset=0)
+        assert result["total_found"] == 3
         assert result["keys"] == ["A", "B"]
         assert result["delta_norms"] == [5.0, 4.0]
 
-    def test_offset_skips_rows(self):
-        """offset=1 skips rank-1, returns ranks 2 and 3."""
-        table = pa.table(
-            {
+    def test_offset_skips_rows(self, tmp_path):
+        import lance as _lance
+        from hypertopos.engine.lance_sql_agg import find_anomalies
+        p = str(tmp_path / "g.lance")
+        _lance.write_dataset(
+            pa.table({
                 "primary_key": ["A", "B", "C", "D"],
                 "delta_norm": [5.0, 4.0, 3.0, 1.0],
-            }
+            }),
+            p,
+            data_storage_version="2.2",
         )
-        result = _find_anomalies_table(table, threshold=2.5, top_n=2, offset=1)
+        result = find_anomalies(p, threshold=2.5, top_n=2, offset=1)
         assert result["total_found"] == 3
         assert result["keys"] == ["B", "C"]
         assert result["delta_norms"] == [4.0, 3.0]
 
-    def test_offset_beyond_total_returns_empty(self):
-        """offset >= total_found returns empty keys with correct total_found."""
-        table = pa.table(
-            {
+    def test_offset_beyond_total_returns_empty(self, tmp_path):
+        import lance as _lance
+        from hypertopos.engine.lance_sql_agg import find_anomalies
+        p = str(tmp_path / "g.lance")
+        _lance.write_dataset(
+            pa.table({
                 "primary_key": ["A", "B"],
                 "delta_norm": [5.0, 4.0],
-            }
+            }),
+            p,
+            data_storage_version="2.2",
         )
-        result = _find_anomalies_table(table, threshold=2.5, top_n=2, offset=5)
+        result = find_anomalies(p, threshold=2.5, top_n=2, offset=5)
         assert result["total_found"] == 2
         assert result["keys"] == []
         assert result["delta_norms"] == []

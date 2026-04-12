@@ -144,12 +144,16 @@ class TestBuilderInitializesTracker:
                 "quantity": rng.normal(50, 5, 10).tolist(),
             }
         )
+        from hypertopos.builder.builder import RelationSpec
+
         builder.add_line("test_line", table, key_col="id", source_id="test")
         builder.add_pattern(
             "test_pattern",
             pattern_type="anchor",
             entity_line="test_line",
-            relations=[],
+            relations=[
+                RelationSpec(line_id="test_line", fk_col=None, direction="self"),
+            ],
         )
 
         sphere_path = builder.build()
@@ -166,14 +170,13 @@ class TestBuilderInitializesTracker:
 class TestRecalibrate:
     def test_recalibrate_resets_drift(self, tmp_path: Path):
         """recalibrate() recomputes stats and resets drift to zero."""
-        import shutil
-
         from hypertopos.sphere import HyperSphere
+        from tests.conftest import clone_sphere
 
-        # Copy fixture to tmp_path to avoid corrupting shared fixture
+        # Clone fixture to tmp_path to avoid corrupting shared fixture
         src = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "gds" / "sales_sphere"
         fixture_path = tmp_path / "sales_sphere"
-        shutil.copytree(str(src), str(fixture_path))
+        clone_sphere(src, fixture_path)
 
         hs = HyperSphere.open(str(fixture_path))
         session = hs.session("test")
@@ -197,13 +200,12 @@ class TestRecalibrate:
 
     def test_recalibrate_keeps_zero_thresholds(self, tmp_path: Path):
         """Explicit 0.0 thresholds must not fall back to defaults."""
-        import shutil
-
         from hypertopos.sphere import HyperSphere
+        from tests.conftest import clone_sphere
 
         src = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "gds" / "sales_sphere"
         fixture_path = tmp_path / "sales_sphere"
-        shutil.copytree(str(src), str(fixture_path))
+        clone_sphere(src, fixture_path)
 
         hs = HyperSphere.open(str(fixture_path))
         session = hs.session("test")

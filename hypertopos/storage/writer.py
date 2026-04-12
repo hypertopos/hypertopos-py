@@ -18,11 +18,21 @@ import pyarrow as pa
 from hypertopos.model.objects import SolidSlice
 
 # Lance write defaults — applied to ALL write_dataset calls via _write_lance().
-# data_storage_version="stable" enables v2.1+ format: BSS float compression,
-# cascading codecs, block-level RLE. 30-60% smaller files, faster reads.
+# data_storage_version="2.2" pins the explicit format version. The "stable"
+# alias in pylance 3.x still resolves to 2.0; 2.2 is the current production
+# format and unlocks structural-decode parallelism plus block-level LZ4/zstd
+# compression on top of the 2.1 features (BSS float compression, cascading
+# codecs, RLE). Older spheres written with 2.0/2.1 remain readable transparently.
+#
+# Schema constraint enforced by GDSBuilder: pattern delta vectors must have
+# width >= 1. A zero-width fixed-size-list column triggers a Lance write
+# panic in format 2.1+ (lance-format/lance#5102 — divide-by-zero in
+# DictionaryDataBlock::decode_helper). The builder rejects 0-dimension
+# patterns up front; format 2.0 silently allowed them.
+#
 # max_rows_per_group=8192 reduces metadata overhead vs default 1024.
 _LANCE_WRITE_DEFAULTS: dict[str, Any] = {
-    "data_storage_version": "stable",
+    "data_storage_version": "2.2",
     "max_rows_per_group": 8192,
 }
 
@@ -903,6 +913,28 @@ class GDSWriter:
         path = self._base / "_gds_meta" / "edge_stats"
         path.mkdir(parents=True, exist_ok=True)
         (path / f"{pattern_id}.json").write_text(json.dumps(stats, indent=2))
+
+    def write_contagion_stats(
+        self, pattern_id: str, table: pa.Table,
+    ) -> None:
+        """Persist precomputed per-entity contagion statistics.
+
+        Schema (enforced by caller): primary_key (string), neighbor_count (int32),
+        anomalous_neighbor_count (int32), contagion_ratio (float32). One row per
+        entity that appears as either endpoint in the pattern's edge table. The
+        scanner reads this table directly instead of replaying the full edge
+        table on every passive_scan / composite_risk invocation.
+        """
+        cs_dir = self._base / "_gds_meta" / "contagion_stats"
+        cs_dir.mkdir(parents=True, exist_ok=True)
+        lance_path = str(cs_dir / f"{pattern_id}.lance")
+        _write_lance(table, lance_path, mode="overwrite")
+        ds = _lance.dataset(lance_path)
+        if ds.count_rows() > 0:
+            with suppress(Exception):
+                ds.create_scalar_index(
+                    "primary_key", index_type="BTREE", replace=True,
+                )
 
     def write_calibration_tracker(
         self, pattern_id: str, tracker: CalibrationTracker,  # noqa: F821

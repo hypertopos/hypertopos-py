@@ -5,7 +5,6 @@
 """Tests for incremental geometry updates."""
 
 import json
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -74,10 +73,12 @@ def base_sphere(tmp_path_factory):
 
 
 def _copy_sphere(base_sphere, tmp_path_factory, name):
-    """Copy sphere to a fresh dir so tests don't interfere."""
+    """Clone sphere to a fresh dir so tests don't interfere."""
+    from tests.conftest import clone_sphere
+
     tmp = tmp_path_factory.mktemp(name)
     dest = tmp / "gds_inc"
-    shutil.copytree(base_sphere, str(dest))
+    clone_sphere(base_sphere, dest)
     return str(dest)
 
 

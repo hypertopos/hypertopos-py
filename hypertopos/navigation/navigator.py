@@ -722,58 +722,45 @@ class GDSNavigator:
         except _NAVIGATION_RECOVERABLE_ERRORS:
             _geo_count = 0
         if _geo_count > 500_000 and rank_by_property is None:
-            try:
-                import json as _json
-
-                from hypertopos.engine.aggregation import _get_agg_worker
-
-                worker = _get_agg_worker()
-                geo_lance_path = str(
-                    self._storage._base.resolve()
-                    / "geometry" / pattern_id / f"v={version}" / "data.lance"
+            from hypertopos.engine.lance_sql_agg import (
+                find_anomalies as _lance_sql_find_anomalies,
+            )
+            geo_lance_path = str(
+                self._storage._base.resolve()
+                / "geometry" / pattern_id / f"v={version}" / "data.lance"
+            )
+            resp = _lance_sql_find_anomalies(
+                geo_lance_path,
+                threshold=float(threshold),
+                top_n=offset + top_n,
+                offset=0,
+            )
+            total_found = resp["total_found"]
+            sub_keys = list(dict.fromkeys(resp["keys"][offset:]))
+            sub_norms = resp["delta_norms"][offset:]
+            if sub_keys:
+                light_cols = [
+                    "primary_key", "scale", "delta", "delta_norm",
+                    "delta_rank_pct", "is_anomaly",
+                    "last_refresh_at", "updated_at",
+                ]
+                full_geo = self._storage.read_geometry(
+                    pattern_id, version, point_keys=sub_keys,
+                    columns=light_cols,
                 )
-                cmd = _json.dumps({
-                    "command": "find_anomalies",
-                    "geo_lance_path": geo_lance_path,
-                    "threshold": float(threshold),
-                    "top_n": offset + top_n,
-                    "offset": 0,
-                })
-                worker.stdin.write(cmd + "\n")
-                worker.stdin.flush()
-                resp = _json.loads(worker.stdout.readline())
-                if "error" not in resp:
-                    total_found = resp["total_found"]
-                    # Deduplicate keys (Lance may have duplicate rows)
-                    sub_keys = list(dict.fromkeys(resp["keys"][offset:]))
-                    sub_norms = resp["delta_norms"][offset:]
-                    if sub_keys:
-                        # Skip edge columns — anomaly listing needs only
-                        # delta/norm/rank, not edge structs.
-                        light_cols = [
-                            "primary_key", "scale", "delta", "delta_norm",
-                            "delta_rank_pct", "is_anomaly",
-                            "last_refresh_at", "updated_at",
-                        ]
-                        full_geo = self._storage.read_geometry(
-                            pattern_id, version, point_keys=sub_keys,
-                            columns=light_cols,
-                        )
-                        norm_lookup = dict(zip(sub_keys, sub_norms, strict=False))
-                        results = self._engine.geometry_to_polygons(
-                            full_geo, norm_lookup=norm_lookup, top_n=top_n,
-                            pattern_id=pattern_id,
-                            pattern_type=pattern.pattern_type,
-                            pattern_ver=version,
-                        )
-                    else:
-                        results = []
-                    emerging = self._find_emerging(
-                        pattern_id, version, pattern, include_emerging, offset, top_n,
-                    )
-                    return results, total_found, emerging, None
-            except _NAVIGATION_RECOVERABLE_ERRORS:
-                pass  # Fall through to in-process scan
+                norm_lookup = dict(zip(sub_keys, sub_norms, strict=False))
+                results = self._engine.geometry_to_polygons(
+                    full_geo, norm_lookup=norm_lookup, top_n=top_n,
+                    pattern_id=pattern_id,
+                    pattern_type=pattern.pattern_type,
+                    pattern_ver=version,
+                )
+            else:
+                results = []
+            emerging = self._find_emerging(
+                pattern_id, version, pattern, include_emerging, offset, top_n,
+            )
+            return results, total_found, emerging, None
 
         # ------------------------------------------------------------------
         # In-process full-scan path
@@ -6969,6 +6956,11 @@ class GDSNavigator:
         Edge table lives on event patterns (tx_pattern) but entities (accounts)
         have their geometry in anchor patterns (account_pattern). Scoring needs
         the anchor pattern's deltas, not the event pattern's.
+
+        Resolution strategy:
+        1. Direct match: event relation line_id == anchor entity_line_id.
+        2. Sibling match: event relation line shares source_id with anchor
+           entity_line (e.g. "zones" and "zones_pickup" are siblings).
         """
         if not hasattr(self, "_anchor_pattern_cache"):
             self._anchor_pattern_cache: dict[str, str | None] = {}
@@ -6980,17 +6972,27 @@ class GDSNavigator:
             # Not an event pattern — use itself
             self._anchor_pattern_cache[event_pattern_id] = event_pattern_id
             return event_pattern_id
-        # Find anchor pattern whose entity_line matches from/to target line
-        edge_meta = getattr(event_pat, "edge_table", None)
-        # Look for an anchor pattern that covers the same entities
+
+        rel_line_ids = {rel.line_id for rel in event_pat.relations}
+
+        # Pass 1: direct match — relation line_id == anchor entity_line
         for pid, pat in sphere.patterns.items():
             if pat.pattern_type == "anchor" and pid != event_pattern_id:
                 entity_line = pat.entity_line_id
-                # Check if any of the event pattern's relations point to this line
-                for rel in event_pat.relations:
-                    if rel.line_id == entity_line:
+                if entity_line and entity_line in rel_line_ids:
+                    self._anchor_pattern_cache[event_pattern_id] = pid
+                    return pid
+
+        # Pass 2: sibling match — relation line shares source_id with entity_line
+        for pid, pat in sphere.patterns.items():
+            if pat.pattern_type == "anchor" and pid != event_pattern_id:
+                entity_line = pat.entity_line_id
+                if entity_line:
+                    siblings = set(sphere.sibling_lines(entity_line))
+                    if siblings & rel_line_ids:
                         self._anchor_pattern_cache[event_pattern_id] = pid
                         return pid
+
         self._anchor_pattern_cache[event_pattern_id] = None
         return None
 

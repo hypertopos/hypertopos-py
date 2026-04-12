@@ -5,6 +5,7 @@
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 from hypertopos.builder import GDSBuilder, RelationSpec
 
 
@@ -520,13 +521,34 @@ def test_build_does_not_call_standalone_compaction(tmp_path):
     customers = pa.table({"customer_id": ["C-1", "C-2"], "name": ["A", "B"]})
     builder.add_line("customers", customers, key_col="customer_id", source_id="test")
     builder.add_pattern(
-        "customer_pattern", pattern_type="anchor", entity_line="customers", relations=[]
-    )  # noqa: E501
+        "customer_pattern",
+        pattern_type="anchor",
+        entity_line="customers",
+        relations=[RelationSpec("customers", fk_col=None, direction="self")],
+    )
 
     # Pre-create temporal dir
     (tmp_path / "gds" / "temporal" / "customer_pattern").mkdir(parents=True)
 
     builder.build()  # should succeed without error
+
+
+def test_pattern_with_no_dimensions_raises(tmp_path):
+    """A pattern with zero dimensions has nothing to compute geometry from
+    and must be rejected up front. Format 2.1+ Lance writes panic on
+    fixed_size_list[0] columns; even if they didn't, a zero-dim geometry has
+    no semantic meaning."""
+    builder = GDSBuilder("s", str(tmp_path / "gds"))
+    customers = pa.table({"customer_id": ["C-1", "C-2"], "name": ["A", "B"]})
+    builder.add_line("customers", customers, key_col="customer_id", source_id="test")
+    builder.add_pattern(
+        "naked_pattern",
+        pattern_type="anchor",
+        entity_line="customers",
+        relations=[],
+    )
+    with pytest.raises(ValueError, match="no dimensions"):
+        builder.build()
 
 
 # ---------------------------------------------------------------------------
@@ -1715,19 +1737,19 @@ def test_source_id_persisted_in_sphere_json(tmp_path):
         "acc_pat",
         pattern_type="anchor",
         entity_line="accounts",
-        relations=[],
+        relations=[RelationSpec("accounts", fk_col=None, direction="self")],
     )
     b.add_pattern(
         "stress_pat",
         pattern_type="anchor",
         entity_line="accounts_stress",
-        relations=[],
+        relations=[RelationSpec("accounts_stress", fk_col=None, direction="self")],
     )
     b.add_pattern(
         "cust_pat",
         pattern_type="anchor",
         entity_line="customers",
-        relations=[],
+        relations=[RelationSpec("customers", fk_col=None, direction="self")],
     )
     b.build()
 
@@ -1797,7 +1819,7 @@ def test_builder_dim_percentiles_skips_string_columns(tmp_path):
         "cp",
         pattern_type="anchor",
         entity_line="customers",
-        relations=[],
+        relations=[RelationSpec("customers", fk_col=None, direction="self")],
     )
     b.build()
 

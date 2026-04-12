@@ -299,15 +299,14 @@ class TestDegreeVelocity:
         assert "velocity_out" in result
         assert "velocity_in" in result
 
-    def test_uniform_timestamps_warning(self, nav):
-        """Builder uses build-time as timestamp → uniform → warning."""
-        # Edge table built by GDSBuilder has uniform timestamps (build time),
-        # so degree_velocity correctly reports insufficient temporal spread.
+    def test_real_timestamps_velocity(self, nav):
+        """Builder detects tx_date as timestamp → non-uniform → velocity computed."""
+        # Edge table built by GDSBuilder now correctly detects tx_date
+        # (a business timestamp) instead of created_at (metadata).
         result = nav.degree_velocity("A000", "tx_pattern", n_buckets=3)
-        assert result["velocity_out"] is None
-        assert result["velocity_in"] is None
-        assert "warning" in result
-        assert result["buckets"] == []
+        assert result["velocity_out"] is not None
+        assert result["velocity_in"] is not None
+        assert len(result["buckets"]) == 3
 
     def test_no_edges_warning(self, nav):
         """Entity with no edges should produce warning."""

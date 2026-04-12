@@ -750,6 +750,14 @@ def _add_chain_line(
                 ts_col = col_name
                 needed_cols.append(ts_col)
                 break
+        # Type-based fallback: first column with timestamp type
+        if ts_col is None:
+            import pyarrow as pa
+            for field in event_table.schema:
+                if pa.types.is_timestamp(field.type):
+                    ts_col = field.name
+                    needed_cols.append(ts_col)
+                    break
 
         cat_col = None
         for col in ("receiving_currency", "category", "k_symbol", "type"):
@@ -759,7 +767,7 @@ def _add_chain_line(
                 break
 
         amt_col = None
-        for col in ("amount_received", "amount", "extendedprice"):
+        for col in ("amount_received", "amount", "extendedprice", "fare_amount", "total_amount"):
             if col in event_table.schema.names:
                 amt_col = col
                 needed_cols.append(amt_col)

@@ -1380,16 +1380,24 @@ class GDSBuilder:
         schema_names = set(line_reg.table.schema.names)
 
         ts_candidates = (
-            "timestamp", "ts", "event_time", "created_at", "tx_date", "date",
+            "timestamp", "ts", "event_time", "tx_date", "date",
         )
         amt_candidates = (
             "amount_received", "amount", "amount_paid", "value",
-            "total", "amt",
+            "total", "amt", "fare_amount", "total_amount",
         )
 
         ts_col = next(
             (c for c in ts_candidates if c in schema_names), None,
         )
+        # Type-based fallback: first non-metadata column with timestamp type
+        _META_COLS = {"created_at", "changed_at", "version"}
+        if ts_col is None:
+            import pyarrow as pa
+            for field in line_reg.table.schema:
+                if pa.types.is_timestamp(field.type) and field.name not in _META_COLS:
+                    ts_col = field.name
+                    break
         amt_col = next(
             (c for c in amt_candidates if c in schema_names), None,
         )
@@ -1417,23 +1425,31 @@ class GDSBuilder:
         to_arr = event_table[cfg.to_col]
         event_key_arr = event_table["primary_key"]
 
-        # Timestamp
+        # Timestamp — resolve from config, then name heuristic, then type fallback
         ts_arr: pa.Array
         ts_col = cfg.timestamp_col
         if ts_col and ts_col in schema_names:
             ts_arr = self._to_epoch_seconds(event_table[ts_col])
         else:
-            # Try common column names
             for name in ("timestamp", "ts", "date", "created_at", "tx_date"):
                 if name in schema_names:
                     ts_arr = self._to_epoch_seconds(event_table[name])
                     break
             else:
-                ts_arr = pa.array(
-                    [0.0] * len(event_table), type=pa.float64(),
-                )
+                # Type-based fallback: first non-metadata column with timestamp type
+                _META = {"created_at", "changed_at", "version"}
+                ts_resolved = False
+                for field in event_table.schema:
+                    if pa.types.is_timestamp(field.type) and field.name not in _META:
+                        ts_arr = self._to_epoch_seconds(event_table[field.name])
+                        ts_resolved = True
+                        break
+                if not ts_resolved:
+                    ts_arr = pa.array(
+                        [0.0] * len(event_table), type=pa.float64(),
+                    )
 
-        # Amount
+        # Amount — resolve from config, then name heuristic
         amt_arr: pa.Array
         amt_col = cfg.amount_col
         if amt_col and amt_col in schema_names:
@@ -1441,8 +1457,10 @@ class GDSBuilder:
                 pc.fill_null(event_table[amt_col], 0.0), pa.float64(),
             )
         else:
-            # Try common column names
-            for name in ("amount", "value", "total", "amt"):
+            for name in (
+                "amount", "value", "total", "amt",
+                "fare_amount", "total_amount", "amount_received", "amount_paid",
+            ):
                 if name in schema_names:
                     amt_arr = pc.cast(
                         pc.fill_null(event_table[name], 0.0), pa.float64(),
@@ -2222,6 +2240,12 @@ class GDSBuilder:
                 _, stats = _build_and_write(pat_id, pat)
                 pattern_stats[pat_id] = stats
 
+        # 2.5 Precompute per-entity contagion stats for every pattern with an
+        # edge table. The runtime scanner reads this small table directly
+        # instead of replaying the full edge table on every passive_scan /
+        # composite_risk call.
+        self._build_contagion_stats(_stats_writer)
+
         # 3. Write sphere.json
         sphere_data = self._build_sphere_json(pattern_stats)
         meta_dir = self.output_path / "_gds_meta"
@@ -2240,6 +2264,106 @@ class GDSBuilder:
         # Compaction not needed — temporal uses Lance append mode (one dataset per pattern)
 
         return str(self.output_path)
+
+    def _resolve_anchor_pattern_for_edge_table(
+        self, pat_id: str, pat: _PatternReg,
+    ) -> str | None:
+        """Find which anchor pattern's geometry holds the is_anomaly bitmap
+        for entities appearing in *pat*'s edge table.
+
+        For non-event patterns the pattern is its own anchor (its edges connect
+        entities of its own line). For event patterns we walk the relations and
+        return the anchor that owns the entity line of the first matching
+        relation. Mirrors PassiveScanner._resolve_anchor_for_event so the
+        precomputed table covers exactly the keys the scanner asks about at
+        runtime.
+        """
+        if pat.pattern_type != "event":
+            return pat_id
+        for other_id, other in self._patterns.items():
+            if other.pattern_type != "anchor" or other_id == pat_id:
+                continue
+            for rel in pat.relations:
+                if rel.line_id == other.entity_line:
+                    return other_id
+        return None
+
+    def _build_contagion_stats(self, stats_writer: Any) -> None:
+        """Second pass: precompute per-entity contagion statistics for every
+        pattern that has an edge table on disk. Writes one Lance table per
+        pattern under ``_gds_meta/contagion_stats/{pattern_id}.lance`` with a
+        BTREE index on ``primary_key``.
+
+        Schema: primary_key, neighbor_count (int32), anomalous_neighbor_count
+        (int32), contagion_ratio (float32). Only entities that appear as
+        at least one edge endpoint are included, so neighbor_count is
+        always >= 1 in practice.
+
+        The runtime scanner reads this small table directly instead of replaying
+        the full edge table on every passive_scan / composite_risk call.
+        """
+        import math
+        from collections import defaultdict
+
+        import lance as _lance
+
+        for pat_id, pat in self._patterns.items():
+            edge_path = self.output_path / "edges" / pat_id / "data.lance"
+            if not edge_path.exists():
+                continue
+            anchor_pat_id = self._resolve_anchor_pattern_for_edge_table(pat_id, pat)
+            if anchor_pat_id is None:
+                continue
+            edges_ds = _lance.dataset(str(edge_path))
+            if edges_ds.count_rows() == 0:
+                continue
+            edges_table = edges_ds.scanner(columns=["from_key", "to_key"]).to_table()
+            from_arr = edges_table["from_key"].to_pylist()
+            to_arr = edges_table["to_key"].to_pylist()
+            neighbors: dict[str, set[str]] = defaultdict(set)
+            for f, t in zip(from_arr, to_arr, strict=False):
+                if f != t:
+                    neighbors[f].add(t)
+                    neighbors[t].add(f)
+            if not neighbors:
+                continue
+
+            geom_path = (
+                self.output_path / "geometry" / anchor_pat_id / "v=1" / "data.lance"
+            )
+            if not geom_path.exists():
+                continue
+            anomalous: set[str] = set()
+            geom_table = _lance.dataset(str(geom_path)).scanner(
+                columns=["primary_key", "is_anomaly"],
+            ).to_table()
+            pk_col = geom_table["primary_key"]
+            anom_col = geom_table["is_anomaly"]
+            for i in range(geom_table.num_rows):
+                if anom_col[i].as_py():
+                    anomalous.add(pk_col[i].as_py())
+
+            primary_keys = sorted(neighbors.keys())
+            nbr_counts: list[int] = []
+            anom_counts: list[int] = []
+            ratios: list[float] = []
+            for k in primary_keys:
+                nbs = neighbors[k]
+                total = len(nbs)
+                anom = len(nbs & anomalous)
+                nbr_counts.append(total)
+                anom_counts.append(anom)
+                ratios.append(anom / total if total > 0 else math.nan)
+
+            contagion_table = pa.table(
+                {
+                    "primary_key": pa.array(primary_keys, type=pa.string()),
+                    "neighbor_count": pa.array(nbr_counts, type=pa.int32()),
+                    "anomalous_neighbor_count": pa.array(anom_counts, type=pa.int32()),
+                    "contagion_ratio": pa.array(ratios, type=pa.float32()),
+                },
+            )
+            stats_writer.write_contagion_stats(pat_id, contagion_table)
 
     def incremental_update(
         self,
@@ -3706,3 +3830,22 @@ class GDSBuilder:
                         f"Pattern '{pat_id}' event dimension: "
                         f"column '{edim.column}' must be numeric, got '{col_type}'"
                     )
+
+            # A pattern with zero declared dimensions has no geometry to compute —
+            # delta vectors collapse to width 0. Reject up front: silent acceptance
+            # used to be possible under Lance format 2.0, but format 2.1+ panics on
+            # fixed_size_list[0] columns (lance-format/lance#5102), and an anomaly
+            # geometry without dimensions is meaningless regardless of the storage
+            # format. Tracked properties count as dimension sources because they
+            # become prop_columns in the resolved delta width.
+            if (
+                not pat.relations
+                and not pat.event_dimensions
+                and not pat.tracked_properties
+            ):
+                raise ValueError(
+                    f"Pattern '{pat_id}' has no dimensions: declare at least one "
+                    f"relation, event dimension, derived dimension, or "
+                    f"tracked_properties entry. A pattern with zero dimensions "
+                    f"cannot produce a meaningful geometry."
+                )

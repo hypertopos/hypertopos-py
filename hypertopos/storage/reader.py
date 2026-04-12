@@ -1248,6 +1248,40 @@ class GDSReader:
         """Check if edge table exists for a pattern."""
         return (self._base / "edges" / pattern_id / "data.lance").exists()
 
+    def read_contagion_stats(
+        self,
+        pattern_id: str,
+        primary_keys: list[str] | None = None,
+    ) -> pa.Table | None:
+        """Read precomputed per-entity contagion statistics.
+
+        Returns None when no precomputed file exists (sphere built before this
+        release). The scanner uses this to decide between the precomputed fast
+        path and the legacy edge-table-replay fallback.
+
+        When *primary_keys* is provided, the BTREE index on primary_key is used
+        for direct lookups instead of a full table scan.
+        """
+        lance_path = self._base / "_gds_meta" / "contagion_stats" / f"{pattern_id}.lance"
+        if not lance_path.exists():
+            return None
+        ds = _lance.dataset(str(lance_path))
+        if primary_keys is None:
+            return ds.to_table()
+        if not primary_keys:
+            return ds.to_table().slice(0, 0)
+        from hypertopos.engine.lance_sql_agg import _escape_sql_string
+        escaped = ", ".join(
+            f"'{_escape_sql_string(k)}'" for k in primary_keys
+        )
+        return ds.scanner(filter=f"primary_key IN ({escaped})").to_table()
+
+    def has_contagion_stats(self, pattern_id: str) -> bool:
+        """Check whether a precomputed contagion stats table exists."""
+        return (
+            self._base / "_gds_meta" / "contagion_stats" / f"{pattern_id}.lance"
+        ).exists()
+
     def edge_table_stats(self, pattern_id: str) -> dict | None:
         """Quick statistics about the edge table. Returns None if not present."""
         # Try cached stats first (written at build time)

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pyarrow as pa
 import pytest
-from hypertopos.builder.builder import GDSBuilder
+from hypertopos.builder.builder import GDSBuilder, RelationSpec
 from hypertopos.storage.reader import GDSReader
 
 # ---------------------------------------------------------------------------
@@ -18,6 +18,8 @@ from hypertopos.storage.reader import GDSReader
 
 def _make_fts_builder(tmp_path):
     """Build a minimal sphere with multi-word customer names for FTS testing."""
+    from hypertopos.builder.builder import RelationSpec
+
     b = GDSBuilder("fts_sphere", str(tmp_path / "gds_fts"))
     b.add_line(
         "customers",
@@ -35,7 +37,9 @@ def _make_fts_builder(tmp_path):
         "customer_pattern",
         pattern_type="anchor",
         entity_line="customers",
-        relations=[],
+        relations=[
+            RelationSpec(line_id="customers", fk_col=None, direction="self"),
+        ],
     )
     return b
 
@@ -373,7 +377,9 @@ def test_builder_event_line_no_fts_by_default(tmp_path):
         "cust_pattern",
         pattern_type="anchor",
         entity_line="customers",
-        relations=[],
+        relations=[
+            RelationSpec(line_id="customers", fk_col=None, direction="self"),
+        ],
     )
     out = Path(b.build())
 
@@ -427,7 +433,9 @@ def test_builder_explicit_fts_columns_on_event(tmp_path):
         "cust_pattern",
         pattern_type="anchor",
         entity_line="customers",
-        relations=[],
+        relations=[
+            RelationSpec(line_id="customers", fk_col=None, direction="self"),
+        ],
     )
     out = Path(b.build())
 
@@ -501,7 +509,9 @@ def test_reader_parses_fts_columns(tmp_path):
         "cust_pattern",
         pattern_type="anchor",
         entity_line="customers",
-        relations=[],
+        relations=[
+            RelationSpec(line_id="customers", fk_col=None, direction="self"),
+        ],
     )
     out = b.build()
 

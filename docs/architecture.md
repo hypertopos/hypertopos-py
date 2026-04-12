@@ -24,7 +24,7 @@ The core package is split into a few layers:
 
 - **Model**: sphere, line, pattern, alias, point, edge, polygon, solid, manifest, contract
 - **Storage**: readers, writers, caches, and physical layout handling
-- **Engine**: geometry, anomaly scoring, similarity, drift, forecasting, aggregation, calibration tracking
+- **Engine**: geometry, anomaly scoring, similarity, drift, forecasting, aggregation (Lance SQL pushdown via `lance_sql_agg`), calibration tracking
 - **Navigation**: stateful step-by-step movement through the sphere
 - **PassiveScanner**: multi-source batch screening over navigation primitives
 - **Builder**: transforms source data into a complete sphere

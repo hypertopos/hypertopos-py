@@ -368,13 +368,20 @@ class TestTemporalWindow:
 class TestAddCompositeLine:
     def test_creates_pair_line(self, tmp_path):
         """Composite line creates anchor with composite keys."""
+        from hypertopos.builder.builder import RelationSpec
+
         builder = _make_builder(tmp_path)
         builder.add_composite_line(
             "account_pairs",
             "transactions",
             key_cols=["from_account", "to_account"],
         )
-        builder.add_pattern("pair_pattern", "anchor", "account_pairs", relations=[])
+        builder.add_pattern(
+            "pair_pattern", "anchor", "account_pairs",
+            relations=[
+                RelationSpec(line_id="account_pairs", fk_col=None, direction="self"),
+            ],
+        )
         builder.build()
 
         pairs = builder._lines["account_pairs"].table
@@ -391,6 +398,14 @@ class TestAddCompositeLine:
             "pairs",
             "transactions",
             key_cols=["from_account", "to_account"],
+        )
+        builder.add_derived_dimension(
+            "pairs",
+            "transactions",
+            ["from_account", "to_account"],
+            "count",
+            None,
+            "pair_tx_count",
         )
         builder.add_pattern("p", "anchor", "pairs", relations=[])
         builder.build()
@@ -720,11 +735,11 @@ class TestAddChainLine:
         assert tbl["chain_keys"][0].as_py() == "A,B"
 
     def test_empty_chains(self, tmp_path):
-        """Empty chain list creates empty line — build raises on empty geometry."""
+        """Empty chain list creates empty line — build raises on missing dimensions."""
         builder = GDSBuilder("test", str(tmp_path / "sphere"))
         builder.add_chain_line("chains", [])
         builder.add_pattern("p", "anchor", "chains", relations=[])
-        with pytest.raises(ValueError, match="non-empty"):
+        with pytest.raises(ValueError, match="non-empty|no dimensions"):
             builder.build()
 
     def test_missing_chain_keys_raises(self, tmp_path):

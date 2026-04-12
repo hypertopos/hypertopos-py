@@ -2,10 +2,17 @@
 # Licensed under the Business Source License 1.1 (the "License");
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
-"""Core aggregation engine — count, sum, avg, min, max with filtering."""
+"""Core aggregation engine — count, sum, avg, min, max with filtering.
+
+The fast path for queries above ``_SUBPROCESS_THRESHOLD`` rows pushes
+GROUP BY computation into the Lance scanner via :mod:`hypertopos.engine.lance_sql_agg`.
+Smaller queries and queries that combine the new path with filters
+``lance_sql_agg`` does not yet handle (``filter_by_keys`` /
+``event_filters`` / ``entity_filters``) drop into the in-process pyarrow
+handlers below — those are sibling code paths, not legacy fallbacks.
+"""
 from __future__ import annotations
 
-import json
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -19,8 +26,8 @@ if TYPE_CHECKING:
     from hypertopos.model.sphere import Sphere
     from hypertopos.storage.reader import GDSReader
 
-# Subprocess fast path threshold — geometry tables above this row count use
-# a persistent subprocess worker for sum/max/min/avg with metric columns.
+# Lance SQL fast path threshold — geometry tables above this row count
+# push GROUP BY into the Lance scanner via lance_sql_agg.
 _SUBPROCESS_THRESHOLD = 500_000
 
 # Reversed-scan threshold — reversed scan (per-group Lance count) is faster
@@ -29,40 +36,6 @@ _SUBPROCESS_THRESHOLD = 500_000
 # Benchmarked: reversed scan ~2ms/group, vectorized ~700ms flat cost on 1M rows.
 # Breakeven at ~350 groups; use 500 as conservative threshold.
 _REVERSED_SCAN_MAX_GROUPS = 500
-
-# Persistent subprocess worker — started on first heavy aggregate call,
-# stays alive for the entire session. Eliminates ~5s Python startup
-# overhead on each call (Windows).
-_agg_worker: Any = None  # subprocess.Popen instance
-
-
-def _get_agg_worker() -> Any:
-    """Return or start the persistent aggregate worker subprocess."""
-    global _agg_worker
-    if _agg_worker is not None and _agg_worker.poll() is None:
-        return _agg_worker
-    import subprocess as _sp
-    import sys as _sys
-    _agg_worker = _sp.Popen(
-        [_sys.executable, "-m",
-         "hypertopos.engine.subprocess_agg", "--worker"],
-        stdin=_sp.PIPE, stdout=_sp.PIPE, stderr=_sp.PIPE,
-        text=True, bufsize=1,
-    )
-    # Wait for ready signal
-    ready_line = _agg_worker.stdout.readline()
-    ready = json.loads(ready_line)
-    if not ready.get("ready"):
-        raise RuntimeError(f"Worker failed to start: {ready_line}")
-    return _agg_worker
-
-
-def _datafusion_count(geo: Any, group_by_line: str) -> dict[str, int]:
-    """DataFusion COUNT(*) GROUP BY group_by_line — returns {key: count}."""
-    from hypertopos.engine.datafusion_agg import aggregate_count, is_available
-    if not is_available():
-        raise RuntimeError("datafusion not available")
-    return aggregate_count(geo, group_by_line)
 
 
 def _apply_comparison_filter(table: Any, column: str, spec: dict) -> Any:
@@ -1054,8 +1027,8 @@ def aggregate(
         and has_edge_data
     )
 
-    # E2 block: filtered metric aggregate via subprocess
-    _use_filtered_sub = (
+    # E2 block: filtered metric aggregate via Lance SQL
+    _use_filtered_lance_sql = (
         agg_func in ("sum", "avg", "min", "max")
         and _pct_n is None
         and resolved_filters
@@ -1065,7 +1038,7 @@ def aggregate(
         and not use_sampling
         and not distinct
         and allowed_group_keys is None
-        and has_edges
+        and has_edge_data
         and geo.num_rows > _SUBPROCESS_THRESHOLD
         and filter_by_keys is None
         and event_filters is None
@@ -1131,136 +1104,90 @@ def aggregate(
     # ML block: multi-level GROUP BY (two anchor lines)
     _use_multi_level = group_by_line_2 is not None and has_edge_data
 
-    _df_gbp_done = False
-
     if use_vectorized:
         import pyarrow as pa
         import pyarrow.compute as pc
 
-        # Subprocess fast path: count via persistent worker for large tables
-        _count_sub_done = False
+        # Lance SQL count GROUP BY: pushed directly into Lance scanner via
+        # LanceDataset.sql() with positional UNION over the entity_keys slots
+        # that point at group_by_line. No in-memory geo load, no subprocess
+        # fork, no external datafusion package.
+        _lance_sql_count_done = False
         if (
-            has_edges
-            and geo.num_rows > _SUBPROCESS_THRESHOLD
+            geo.num_rows > _SUBPROCESS_THRESHOLD
             and not resolved_filters
             and filter_by_keys is None
             and event_filters is None
             and entity_filters is None
             and geometry_filters is None
         ):
-            try:
-                worker = _get_agg_worker()
-                _base = reader._base.resolve()
-                geo_lance = str(
-                    _base / "geometry" / event_pattern_id
-                    / f"v={pattern.version}" / "data.lance"
-                )
-                geo_cols = ["primary_key", "edges"]
-                cmd = json.dumps({
-                    "command": "count_aggregate",
-                    "geo_lance_path": geo_lance,
-                    "group_by_line": group_by_line,
-                    "geo_columns": geo_cols,
-                })
-                worker.stdin.write(cmd + "\n")
-                worker.stdin.flush()
-                resp_line = worker.stdout.readline()
-                sub_result = json.loads(resp_line)
-                if "error" not in sub_result:
-                    computed: dict = sub_result["counts"]
-                    group_values: dict = {k: [1] * v for k, v in computed.items()}
-                    actually_sampled = False
-                    _count_sub_done = True
-            except Exception:
-                pass
+            from hypertopos.engine.lance_sql_agg import (
+                aggregate_count as _lance_sql_count,
+            )
+            _base = reader._base.resolve()
+            _geo_lance = str(
+                _base / "geometry" / event_pattern_id
+                / f"v={pattern.version}" / "data.lance"
+            )
+            computed = _lance_sql_count(_geo_lance, pattern, group_by_line)
+            group_values: dict = {k: [1] * v for k, v in computed.items()}
+            actually_sampled = False
+            _lance_sql_count_done = True
 
-        if not _count_sub_done:
-            # DataFusion fast path for count + group_by_line (no filters)
-            _df_count_done = False
-            if (
-                not resolved_filters
-                and geo.num_rows > _SUBPROCESS_THRESHOLD
-                and geometry_filters is None
-            ):
-                try:
-                    computed = _datafusion_count(geo, group_by_line)
-                    group_values: dict = {k: [1] * v for k, v in computed.items()}
-                    actually_sampled = False
-                    _df_count_done = True
-                except Exception:
-                    pass
+        if not _lance_sql_count_done:
+            geo_vc = geo
+            if resolved_filters:
+                _edge_map_fn = _make_edge_map_fn(geo, pattern.relations)
+                bk_list = geo["primary_key"].to_pylist()
+                pass_mask = []
+                for i in range(len(bk_list)):
+                    edge_map = _edge_map_fn(i)
+                    edge_map[event_line_id] = bk_list[i]
+                    pass_mask.append(
+                        all(edge_map.get(ln) in ks for ln, ks in resolved_filters)
+                    )
+                geo_vc = geo.filter(pa.array(pass_mask, type=pa.bool_()))
 
-            if not _df_count_done:
-                geo_vc = geo
-                if resolved_filters:
-                    _edge_map_fn = _make_edge_map_fn(geo, pattern.relations)
-                    bk_list = geo["primary_key"].to_pylist()
-                    pass_mask = []
-                    for i in range(len(bk_list)):
-                        edge_map = _edge_map_fn(i)
-                        edge_map[event_line_id] = bk_list[i]
-                        pass_mask.append(
-                            all(edge_map.get(ln) in ks for ln, ks in resolved_filters)
-                        )
-                    geo_vc = geo.filter(pa.array(pass_mask, type=pa.bool_()))
-
-                computed, _gbl_edge_warning = _vectorized_count_with_warning(
-                    geo_vc, group_by_line, geometry_filters, relations=pattern.relations
-                )
-                group_values: dict = {k: [1] * v for k, v in computed.items()}
-                actually_sampled = False
+            computed, _gbl_edge_warning = _vectorized_count_with_warning(
+                geo_vc, group_by_line, geometry_filters, relations=pattern.relations
+            )
+            group_values: dict = {k: [1] * v for k, v in computed.items()}
+            actually_sampled = False
 
     elif _use_vectorized_agg:
-        # --- E: sum/avg/min/max — subprocess for large tables, in-process Arrow fallback ---
-        _sub_done = False
+        # --- E: sum/avg/min/max — Lance SQL for large tables, in-process pyarrow handler for small / filter-bearing queries ---
+        _lance_sql_metric_done = False
         if (
-            has_edges
-            and geo.num_rows > _SUBPROCESS_THRESHOLD
+            geo.num_rows > _SUBPROCESS_THRESHOLD
             and filter_by_keys is None
             and event_filters is None
             and entity_filters is None
+            and not group_by_line_2
         ):
-            try:
-                worker = _get_agg_worker()
-                _base = reader._base.resolve()
-                geo_lance = str(
-                    _base / "geometry" / event_pattern_id
-                    / f"v={pattern.version}" / "data.lance"
-                )
-                ctx_lance = str(
-                    _base / "points" / event_line_id
-                    / f"v={event_version}" / "data.lance"
-                )
-                geo_cols = [
-                    "primary_key", "edges",
-                ]
-                cmd = json.dumps({
-                    "command": "metric_aggregate",
-                    "geo_lance_path": geo_lance,
-                    "ctx_lance_path": ctx_lance,
-                    "group_by_line": group_by_line,
-                    "metric_col": agg_col,
-                    "agg_fn": agg_func,
-                    "geo_columns": geo_cols,
-                })
-                worker.stdin.write(cmd + "\n")
-                worker.stdin.flush()
-                resp_line = worker.stdout.readline()
-                sub_result = json.loads(resp_line)
-                if "error" in sub_result:
-                    _sub_stderr = sub_result["error"][:300]  # noqa: F841
-                else:
-                    computed: dict = sub_result["metrics"]
-                    group_values: dict = {
-                        k: range(v)
-                        for k, v in sub_result["counts"].items()
-                    }
-                    actually_sampled = False
-                    _sub_done = True
-            except Exception:
-                pass  # Fall back to in-process Arrow path
+            from hypertopos.engine.lance_sql_agg import (
+                aggregate_metric as _lance_sql_metric,
+            )
+            _base = reader._base.resolve()
+            _geo_lance = str(
+                _base / "geometry" / event_pattern_id
+                / f"v={pattern.version}" / "data.lance"
+            )
+            _ctx_lance = str(
+                _base / "points" / event_line_id
+                / f"v={event_version}" / "data.lance"
+            )
+            computed_metric, computed_counts = _lance_sql_metric(
+                _geo_lance, _ctx_lance, pattern, group_by_line,
+                agg_col, agg_func,
+            )
+            computed: dict = computed_metric
+            group_values: dict = {
+                k: range(v) for k, v in computed_counts.items()
+            }
+            actually_sampled = False
+            _lance_sql_metric_done = True
 
-        if not _sub_done:
+        if not _lance_sql_metric_done:
             import pyarrow as pa
             import pyarrow.compute as pc
 
@@ -1300,7 +1227,8 @@ def aggregate(
             actually_sampled = False
 
     elif _use_vectorized_pct:
-        # --- E-pct: median/pct<N> vectorized — DataFusion for anchors, PyArrow+numpy for events ---
+        # --- E-pct: median/pct<N> via Lance SQL approx_percentile_cont
+        # for large tables, in-process pyarrow+numpy (exact) fallback below ---
         import pyarrow as pa
         import pyarrow.compute as pc
 
@@ -1314,27 +1242,32 @@ def aggregate(
 
         _pct_done = False
 
-        # Try DataFusion APPROX_PERCENTILE_CONT for anchor patterns (edges column, large tables)
-        _has_edges_pct = "edges" in geo.schema.names
-        if _has_edges_pct and geo.num_rows >= 500_000:
-            try:
-                from hypertopos.engine.datafusion_agg import (
-                    aggregate_percentile as _df_pct,
-                    is_available as _df_avail,
-                    _percentile_fraction,
-                )
-                if _df_avail():
-                    _pct_frac = _percentile_fraction(agg_func)
-                    computed, _cnt_dict = _df_pct(
-                        geo, group_by_line, ctx_table, agg_col, _pct_frac,
-                    )
-                    group_values = {k: range(v) for k, v in _cnt_dict.items()}
-                    actually_sampled = False
-                    _pct_done = True
-            except Exception:
-                pass  # fall through to PyArrow+numpy path
+        if geo.num_rows >= 500_000:
+            from hypertopos.engine.lance_sql_agg import (
+                aggregate_percentile as _lance_sql_pct,
+            )
+            _pct_frac = (
+                0.5 if agg_func == "median"
+                else int(agg_func[3:]) / 100.0
+            )
+            _base = reader._base.resolve()
+            _geo_lance = str(
+                _base / "geometry" / event_pattern_id
+                / f"v={pattern.version}" / "data.lance"
+            )
+            _ctx_lance = str(
+                _base / "points" / event_line_id
+                / f"v={event_version}" / "data.lance"
+            )
+            computed, _cnt_dict = _lance_sql_pct(
+                _geo_lance, _ctx_lance, pattern, group_by_line,
+                agg_col, _pct_frac,
+            )
+            group_values = {k: range(v) for k, v in _cnt_dict.items()}
+            actually_sampled = False
+            _pct_done = True
 
-        # PyArrow + numpy path — works for both event (entity_keys) and anchor (edges)
+        # Exact pyarrow+numpy path for small tables and as the fallback
         if not _pct_done:
             row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v = _edge_arrays(
                 geo, relations=pattern.relations,
@@ -1361,116 +1294,77 @@ def aggregate(
                 group_values[k] = range(len(group_list))
             actually_sampled = False
 
-    elif _use_filtered_sub:
-        # --- E2: filtered metric aggregate via subprocess ---
-        _sub_done = False
-        try:
-            worker = _get_agg_worker()
-            _base = reader._base.resolve()
-            geo_lance = str(
-                _base / "geometry" / event_pattern_id
-                / f"v={pattern.version}" / "data.lance"
-            )
-            ctx_lance = str(
-                _base / "points" / event_line_id
-                / f"v={event_version}" / "data.lance"
-            )
-            geo_cols = [
-                "primary_key", "edges",
-            ]
-            # Serialize resolved_filters: list of [line_id, list_of_keys]
-            serialized_filters = [
-                [line, sorted(keys)] for line, keys in resolved_filters
-            ]
-            cmd = json.dumps({
-                "command": "filtered_metric_aggregate",
-                "geo_lance_path": geo_lance,
-                "ctx_lance_path": ctx_lance,
-                "group_by_line": group_by_line,
-                "metric_col": agg_col,
-                "agg_fn": agg_func,
-                "geo_columns": geo_cols,
-                "resolved_filters": serialized_filters,
-                "event_line_id": event_line_id,
-            })
-            worker.stdin.write(cmd + "\n")
-            worker.stdin.flush()
-            resp_line = worker.stdout.readline()
-            sub_result = json.loads(resp_line)
-            if "error" not in sub_result:
-                computed: dict = sub_result["metrics"]
-                group_values: dict = {
-                    k: range(v)
-                    for k, v in sub_result["counts"].items()
-                }
-                actually_sampled = False
-                _sub_done = True
-        except Exception:
-            pass  # Fall through to Python loop fallback
-
-        if not _sub_done:
-            pass  # Will be handled by the Python loop fallback below
+    elif _use_filtered_lance_sql:
+        # --- E2: filtered metric aggregate via Lance SQL ---
+        from hypertopos.engine.lance_sql_agg import (
+            aggregate_filtered_metric as _lance_sql_filtered_metric,
+        )
+        _base = reader._base.resolve()
+        _geo_lance = str(
+            _base / "geometry" / event_pattern_id
+            / f"v={pattern.version}" / "data.lance"
+        )
+        _ctx_lance = str(
+            _base / "points" / event_line_id
+            / f"v={event_version}" / "data.lance"
+        )
+        computed_metric, computed_counts = _lance_sql_filtered_metric(
+            _geo_lance, _ctx_lance, pattern, group_by_line,
+            agg_col, agg_func, resolved_filters, event_line_id,
+        )
+        computed: dict = computed_metric
+        group_values: dict = {
+            k: range(v) for k, v in computed_counts.items()
+        }
+        actually_sampled = False
 
     elif _use_vectorized_pivot:
-        # --- F: Vectorized pivot_event_field count ---
-        # Subprocess fast path for large tables, in-process Arrow fallback.
-        _sub_done = False
+        # --- F: Vectorized pivot_event_field count via Lance SQL ---
+        _lance_sql_pivot_done = False
         if (
-            has_edges
-            and geo.num_rows > _SUBPROCESS_THRESHOLD
+            geo.num_rows > _SUBPROCESS_THRESHOLD
             and filter_by_keys is None
             and event_filters is None
             and entity_filters is None
         ):
-            try:
-                worker = _get_agg_worker()
-                _base = reader._base.resolve()
-                geo_lance = str(
-                    _base / "geometry" / event_pattern_id
-                    / f"v={pattern.version}" / "data.lance"
-                )
-                event_lance = str(
+            from hypertopos.engine.lance_sql_agg import (
+                aggregate_pivot as _lance_sql_pivot,
+            )
+            _base = reader._base.resolve()
+            _geo_lance = str(
+                _base / "geometry" / event_pattern_id
+                / f"v={pattern.version}" / "data.lance"
+            )
+            _event_lance = str(
+                _base / "points" / event_line_id
+                / f"v={event_line.versions[-1]}" / "data.lance"
+            )
+            _ctx_lance = None
+            if agg_func:
+                _ctx_lance = str(
                     _base / "points" / event_line_id
-                    / f"v={event_line.versions[-1]}" / "data.lance"
+                    / f"v={event_version}" / "data.lance"
                 )
-                geo_cols = [
-                    "primary_key", "edges",
-                ]
-                cmd_payload: dict = {
-                    "command": "pivot_aggregate",
-                    "geo_lance_path": geo_lance,
-                    "event_lance_path": event_lance,
-                    "group_by_line": group_by_line,
-                    "pivot_field": pivot_event_field,
-                    "geo_columns": geo_cols,
-                }
-                if agg_func:
-                    cmd_payload["ctx_lance_path"] = str(
-                        _base / "points" / event_line_id
-                        / f"v={event_version}" / "data.lance"
-                    )
-                    cmd_payload["metric_col"] = agg_col
-                    cmd_payload["agg_fn"] = agg_func
-                cmd = json.dumps(cmd_payload)
-                worker.stdin.write(cmd + "\n")
-                worker.stdin.flush()
-                resp_line = worker.stdout.readline()
-                sub_result = json.loads(resp_line)
-                if "error" not in sub_result:
-                    computed: dict = {}
-                    group_values: dict = {}
-                    for row in sub_result["results"]:
-                        key = (row["group_key"], row["pivot_val"])
-                        cnt = row["count"]
-                        computed[key] = row.get("metric", cnt)
-                        group_values[key] = range(cnt)
-                    actually_sampled = False
-                    _sub_done = True
-            except Exception:
-                pass  # Fall through to in-process path
+            results = _lance_sql_pivot(
+                _geo_lance, _event_lance, pattern, group_by_line,
+                pivot_event_field,
+                ctx_lance_path=_ctx_lance,
+                metric_col=agg_col if agg_func else None,
+                agg_fn=agg_func,
+            )
+            computed = {}
+            group_values = {}
+            for row in results:
+                key = (row["group_key"], row["pivot_val"])
+                cnt = row["count"]
+                computed[key] = row.get("metric", cnt)
+                group_values[key] = range(cnt)
+            actually_sampled = False
+            _lance_sql_pivot_done = True
 
-        if not _sub_done:
-            # Lazy build: only reached when subprocess path is unavailable or failed.
+        if not _lance_sql_pivot_done:
+            # Lazy build: only reached when the lance_sql_pivot path is gated off
+            # (small geometry or filter-bearing query).
             if event_line is None:
                 raise RuntimeError("Cannot use pivot_event_field: event line not found in sphere.")
             event_points = reader.read_points(event_line_id, event_line.versions[-1])
@@ -1530,114 +1424,58 @@ def aggregate(
         )
     ):
         # --- G/G-distinct: Vectorized group_by_property count ---
-        # Subprocess fast path for large tables, in-process Arrow fallback.
+        # Lance SQL fast path for large tables, in-process pyarrow handler
+        # for small tables and queries with filter_by_keys / event_filters.
         _sub_done = False
 
-        # DataFusion fast path: group_by_property + resolved_filters
-        # collapse_by_property is excluded: DataFusion returns tuple keys; the G in-process
-        # path must handle collapse so it can group by prop_val only.
         if (
-            resolved_filters
-            and metric == "count"
-            and not agg_func
-            and not use_sampling
-            and not distinct
-            and not collapse_by_property
-            and has_edges
-            and geo.num_rows >= 500_000
-        ):
-            try:
-                from hypertopos.engine.datafusion_agg import (
-                    aggregate_filtered_gbp_count as _df_gbp_fn,
-                )
-                from hypertopos.engine.datafusion_agg import (
-                    is_available as _df_avail,
-                )
-                if _df_avail():
-                    _prop_line_meta = s.lines.get(prop_line_id)
-                    if _prop_line_meta is not None:
-                        _prop_tbl = reader.read_points(
-                            prop_line_id,
-                            _prop_line_meta.versions[-1],
-                        )
-                        _df_gbp_result = _df_gbp_fn(
-                            geo,
-                            group_by_line,
-                            _prop_tbl,
-                            prop_name,
-                            prop_line_id,
-                            resolved_filters,
-                        )
-                        computed = _df_gbp_result
-                        group_values = {k: range(v) for k, v in _df_gbp_result.items()}
-                        actually_sampled = False
-                        _df_gbp_done = True
-            except Exception:
-                pass  # fall through to subprocess/in-process
-
-        if (
-            not _df_gbp_done
-            and has_edges
-            and geo.num_rows > _SUBPROCESS_THRESHOLD
+            geo.num_rows > _SUBPROCESS_THRESHOLD
             and filter_by_keys is None
             and event_filters is None
             and entity_filters is None
             and not collapse_by_property
         ):
-            try:
-                worker = _get_agg_worker()
-                _base = reader._base.resolve()
-                geo_lance = str(
-                    _base / "geometry" / event_pattern_id
-                    / f"v={pattern.version}" / "data.lance"
+            from hypertopos.engine.lance_sql_agg import (
+                aggregate_property as _lance_sql_property,
+            )
+            _base = reader._base.resolve()
+            _geo_lance = str(
+                _base / "geometry" / event_pattern_id
+                / f"v={pattern.version}" / "data.lance"
+            )
+            _prop_lance = str(
+                _base / "points" / prop_line_id
+                / f"v={s.lines[prop_line_id].versions[-1]}" / "data.lance"
+            )
+            _ctx_lance = None
+            if agg_func:
+                _ctx_lance = str(
+                    _base / "points" / event_line_id
+                    / f"v={event_version}" / "data.lance"
                 )
-                prop_lance = str(
-                    _base / "points" / prop_line_id
-                    / f"v={s.lines[prop_line_id].versions[-1]}" / "data.lance"
-                )
-                geo_cols = [
-                    "primary_key", "edges",
-                ]
-                cmd_payload: dict = {
-                    "command": "property_aggregate",
-                    "geo_lance_path": geo_lance,
-                    "prop_lance_path": prop_lance,
-                    "group_by_line": group_by_line,
-                    "prop_line_id": prop_line_id,
-                    "prop_name": prop_name,
-                    "geo_columns": geo_cols,
-                    "distinct": distinct,
-                }
-                if agg_func:
-                    cmd_payload["ctx_lance_path"] = str(
-                        _base / "points" / event_line_id
-                        / f"v={event_version}" / "data.lance"
-                    )
-                    cmd_payload["metric_col"] = agg_col
-                    cmd_payload["agg_fn"] = agg_func
-                cmd = json.dumps(cmd_payload)
-                worker.stdin.write(cmd + "\n")
-                worker.stdin.flush()
-                resp_line = worker.stdout.readline()
-                sub_result = json.loads(resp_line)
-                if "error" not in sub_result:
-                    if "distinct_results" in sub_result:
-                        computed = sub_result["distinct_results"]
-                        group_values = {}
-                    else:
-                        computed: dict = {}
-                        group_values: dict = {}
-                        for row in sub_result["results"]:
-                            key = (row["group_key"], row["prop_val"])
-                            cnt = row["count"]
-                            computed[key] = row.get("metric", cnt)
-                            group_values[key] = range(cnt)
-                    actually_sampled = False
-                    _sub_done = True
-            except Exception:
-                pass  # Fall through to in-process path
+            sub_result = _lance_sql_property(
+                _geo_lance, _prop_lance, pattern, group_by_line,
+                prop_line_id, prop_name,
+                distinct=distinct,
+                ctx_lance_path=_ctx_lance,
+                metric_col=agg_col if agg_func else None,
+                agg_fn=agg_func,
+            )
+            if "distinct_results" in sub_result:
+                computed = sub_result["distinct_results"]
+                group_values = {}
+            else:
+                computed: dict = {}
+                group_values: dict = {}
+                for row in sub_result["results"]:
+                    key = (row["group_key"], row["prop_val"])
+                    cnt = row["count"]
+                    computed[key] = row.get("metric", cnt)
+                    group_values[key] = range(cnt)
+            actually_sampled = False
+            _sub_done = True
 
-        if not _df_gbp_done and not _sub_done and _use_vectorized_gbp:
+        if not _sub_done and _use_vectorized_gbp:
             # --- G in-process: group_by_property count ---
             import pyarrow as pa
             import pyarrow.compute as pc
@@ -1686,7 +1524,7 @@ def aggregate(
             group_values: dict = {k: range(v) for k, v in computed.items()}
             actually_sampled = False
 
-        elif not _df_gbp_done and not _sub_done and _use_vectorized_gbp_distinct:
+        elif not _sub_done and _use_vectorized_gbp_distinct:
             # --- G-distinct in-process: distinct count by property value ---
             import pyarrow as pa
             import pyarrow.compute as pc
@@ -1792,147 +1630,90 @@ def aggregate(
         or _use_vectorized_gbp or _use_vectorized_gbp_distinct
         or _use_vectorized_cd
     ):
-        _sub_done_ml = False
+        # Multi-level GROUP BY runs in-process pyarrow only — there is no
+        # Lance SQL fast path for two-level grouping in 0.3.0.
+        import pyarrow as pa
+        import pyarrow.compute as pc
 
-        # Subprocess path for large tables with sum/avg/min/max metrics
-        if (
-            agg_func in ("sum", "avg", "min", "max")
-            and has_edges
-            and geo.num_rows > _SUBPROCESS_THRESHOLD
-            and filter_by_keys is None
-            and event_filters is None
-            and entity_filters is None
-            and not resolved_filters
-        ):
-            try:
-                worker = _get_agg_worker()
-                _base = reader._base.resolve()
-                geo_lance = str(
-                    _base / "geometry" / event_pattern_id
-                    / f"v={pattern.version}" / "data.lance"
-                )
-                ctx_lance = str(
-                    _base / "points" / event_line_id
-                    / f"v={event_version}" / "data.lance"
-                )
-                geo_cols = [
-                    "primary_key", "edges",
-                ]
-                cmd = json.dumps({
-                    "command": "metric_aggregate",
-                    "geo_lance_path": geo_lance,
-                    "ctx_lance_path": ctx_lance,
-                    "group_by_line": group_by_line,
-                    "group_by_line_2": group_by_line_2,
-                    "metric_col": agg_col,
-                    "agg_fn": agg_func,
-                    "geo_columns": geo_cols,
-                })
-                worker.stdin.write(cmd + "\n")
-                worker.stdin.flush()
-                resp_line = worker.stdout.readline()
-                sub_result = json.loads(resp_line)
-                if "error" not in sub_result:
-                    # Parse composite keys: "key1\x00key2" -> (key1, key2)
-                    computed = {}
-                    group_values = {}
-                    for ck, val in sub_result["metrics"].items():
-                        parts = ck.split("\x00")
-                        k = (parts[0], parts[1]) if len(parts) == 2 else (ck, "")
-                        computed[k] = val
-                    for ck, cnt in sub_result["counts"].items():
-                        parts = ck.split("\x00")
-                        k = (parts[0], parts[1]) if len(parts) == 2 else (ck, "")
-                        group_values[k] = range(cnt)
-                    actually_sampled = False
-                    _sub_done_ml = True
-            except Exception:
-                pass
+        row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v = _edge_arrays(geo, relations=pattern.relations)
+        gbl_row_idx, gbl_keys = _gbl_edge_arrays(
+            group_by_line, row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v
+        )
+        gbl2_row_idx, gbl2_keys = _gbl_edge_arrays(
+            group_by_line_2, row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v
+        )
 
-        if not _sub_done_ml:
-            # In-process Arrow path
-            import pyarrow as pa
-            import pyarrow.compute as pc
+        # Join on row_idx to pair the two group keys per polygon
+        gbl_join = pa.table({"row_idx": gbl_row_idx, "key_1": gbl_keys})
+        gbl2_join = pa.table({"row_idx": gbl2_row_idx, "key_2": gbl2_keys})
+        joined = gbl_join.join(gbl2_join, keys="row_idx", join_type="inner")
 
-            row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v = _edge_arrays(geo, relations=pattern.relations)
-            gbl_row_idx, gbl_keys = _gbl_edge_arrays(
-                group_by_line, row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v
-            )
-            gbl2_row_idx, gbl2_keys = _gbl_edge_arrays(
-                group_by_line_2, row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v
-            )
-
-            # Join on row_idx to pair the two group keys per polygon
-            gbl_join = pa.table({"row_idx": gbl_row_idx, "key_1": gbl_keys})
-            gbl2_join = pa.table({"row_idx": gbl2_row_idx, "key_2": gbl2_keys})
-            joined = gbl_join.join(gbl2_join, keys="row_idx", join_type="inner")
-
-            if agg_func and agg_func in ("sum", "avg", "min", "max"):
-                # Need metric values from event entity line
-                if _ctx_table_filtered is not None:
-                    ctx_table = _ctx_table_filtered
-                else:
-                    ctx_table = reader.read_points(
-                        event_line_id, event_version,
-                        columns=["primary_key", agg_col],
-                    )
-
-                idx = pc.index_in(geo["primary_key"], ctx_table["primary_key"])
-                polygon_amounts = pc.cast(
-                    pc.take(ctx_table[agg_col], idx), pa.float64()
-                )
-                edge_amounts = pc.take(polygon_amounts, joined["row_idx"])
-
-                valid = pc.is_valid(edge_amounts)
-                _agg_op_map = {
-                    "sum": "sum", "avg": "mean", "min": "min", "max": "max",
-                }
-                agg_op = _agg_op_map[agg_func]
-                agg_tbl = pa.table({
-                    "key_1": joined["key_1"].filter(valid),
-                    "key_2": joined["key_2"].filter(valid),
-                    "amount": edge_amounts.filter(valid),
-                })
-                result_ml = agg_tbl.group_by(["key_1", "key_2"]).aggregate([
-                    ("amount", agg_op),
-                    ("amount", "count"),
-                ])
-                computed = {
-                    (row["key_1"], row["key_2"]): row[f"amount_{agg_op}"]
-                    for row in result_ml.to_pylist()
-                }
-                group_values = {
-                    (row["key_1"], row["key_2"]): range(row["amount_count"])
-                    for row in result_ml.to_pylist()
-                }
+        if agg_func and agg_func in ("sum", "avg", "min", "max"):
+            # Need metric values from event entity line
+            if _ctx_table_filtered is not None:
+                ctx_table = _ctx_table_filtered
             else:
-                # Count metric (no context needed)
-                count_tbl = pa.table({
-                    "key_1": joined["key_1"],
-                    "key_2": joined["key_2"],
-                })
-                result_ml = count_tbl.group_by(["key_1", "key_2"]).aggregate([
-                    ("key_1", "count"),
-                ])
-                computed = {
-                    (row["key_1"], row["key_2"]): row["key_1_count"]
-                    for row in result_ml.to_pylist()
-                }
-                group_values = {k: [1] * v for k, v in computed.items()}
+                ctx_table = reader.read_points(
+                    event_line_id, event_version,
+                    columns=["primary_key", agg_col],
+                )
 
-            actually_sampled = False
+            idx = pc.index_in(geo["primary_key"], ctx_table["primary_key"])
+            polygon_amounts = pc.cast(
+                pc.take(ctx_table[agg_col], idx), pa.float64()
+            )
+            edge_amounts = pc.take(polygon_amounts, joined["row_idx"])
 
+            valid = pc.is_valid(edge_amounts)
+            _agg_op_map = {
+                "sum": "sum", "avg": "mean", "min": "min", "max": "max",
+            }
+            agg_op = _agg_op_map[agg_func]
+            agg_tbl = pa.table({
+                "key_1": joined["key_1"].filter(valid),
+                "key_2": joined["key_2"].filter(valid),
+                "amount": edge_amounts.filter(valid),
+            })
+            result_ml = agg_tbl.group_by(["key_1", "key_2"]).aggregate([
+                ("amount", agg_op),
+                ("amount", "count"),
+            ])
+            computed = {
+                (row["key_1"], row["key_2"]): row[f"amount_{agg_op}"]
+                for row in result_ml.to_pylist()
+            }
+            group_values = {
+                (row["key_1"], row["key_2"]): range(row["amount_count"])
+                for row in result_ml.to_pylist()
+            }
+        else:
+            # Count metric (no context needed)
+            count_tbl = pa.table({
+                "key_1": joined["key_1"],
+                "key_2": joined["key_2"],
+            })
+            result_ml = count_tbl.group_by(["key_1", "key_2"]).aggregate([
+                ("key_1", "count"),
+            ])
+            computed = {
+                (row["key_1"], row["key_2"]): row["key_1_count"]
+                for row in result_ml.to_pylist()
+            }
+            group_values = {k: [1] * v for k, v in computed.items()}
+
+        actually_sampled = False
         _ml_done = True
 
     # Guard: skip sample/fallback if a vectorized path already computed results.
-    # E2 (_use_filtered_sub) only counts as done when subprocess succeeded;
-    # _sub_done is scoped inside elif branches so check _use_filtered_sub first.
+    # The lance_sql_agg helpers in the elif branches above always set computed
+    # when their gating predicate is True (no try/except, no internal failure
+    # mode), so each branch's gating boolean is sufficient — no need to thread
+    # an internal "_sub_done" through.
     _agg_done = (
         use_vectorized or _use_vectorized_agg or _use_vectorized_pct
         or _use_vectorized_pivot
         or _use_vectorized_gbp or _use_vectorized_gbp_distinct
-        or (_use_filtered_sub and _sub_done)
-        or _df_gbp_done
+        or _use_filtered_lance_sql
         or _use_vectorized_cd
         or _ml_done
     )
@@ -2022,31 +1803,9 @@ def aggregate(
                         if rel.line_id == cd_target_line and j < len(keys or []) and keys[j]:
                             _cd_tgt_by_row[i].append(keys[j])
 
-        # DataFusion fast path: filtered + pivot + metric (no sampling, no distinct)
-        if (
-            agg_func and pivot_event_field and resolved_filters
-            and not use_sampling and not distinct and not prop_line_id
-            and allowed_group_keys is None and has_edges
-        ):
-            try:
-                from hypertopos.engine.datafusion_agg import (
-                    aggregate_filtered_pivot_metric_with_count as _df_pivot_fn,
-                )
-                from hypertopos.engine.datafusion_agg import (
-                    is_available as _df_avail,
-                )
-                if _df_avail():
-                    _df_rows = _df_pivot_fn(
-                        geo, group_by_line, ctx_table, agg_col, agg_func,
-                        pivot_event_field, resolved_filters,
-                    )
-                    for _row in _df_rows:
-                        _k = (_row["group_key"], _row["pivot_val"])
-                        group_values[_k] = [_row["metric"]]
-                    actually_sampled = False
-                    bk_col = []  # skip the Python loop below
-            except Exception:
-                pass
+        # Legacy edges-struct datafusion fast path for filtered + pivot + metric
+        # was retired in 0.3.0 — the in-process pyarrow path below handles
+        # both schemas.
 
         if pivot_event_field and not pivot_lookup and bk_col:
             if event_line is None:

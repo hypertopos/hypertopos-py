@@ -2,11 +2,12 @@
 # Licensed under the Business Source License 1.1 (the "License");
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-import pyarrow as pa
+import lance
 import pytest
 
 FIXTURES_PATH = Path(__file__).parent / "fixtures" / "gds" / "sales_sphere"
@@ -40,44 +41,49 @@ def sphere_path(fixtures_path) -> str:
     return str(fixtures_path)
 
 
-# ── Shared test helpers for building geometry tables with edges struct ──
-
-EDGE_STRUCT_TYPE = pa.struct(
-    [
-        pa.field("line_id", pa.string()),
-        pa.field("point_key", pa.string()),
-        pa.field("status", pa.string()),
-        pa.field("direction", pa.string()),
-    ]
-)
+# ── Sphere cloning for tests that mutate the copy ──
 
 
-def make_edges_column(
-    edge_line_ids: list[list[str]],
-    edge_point_keys: list[list[str]],
-    edge_alive_mask: list[list[bool]] | None = None,
-) -> pa.Array:
-    """Build an ``edges`` struct column from flat per-row line_ids/point_keys.
+def clone_sphere(src: Path | str, dst: Path | str) -> Path:
+    """Copy a sphere directory tree from *src* to *dst*, fast.
 
-    When *edge_alive_mask* is provided, edges where the mask is False get
-    status="dead"; otherwise all edges are "alive".
+    For every Lance dataset directory found inside the tree (any directory
+    that contains a ``_versions/`` child) ``shallow_clone`` writes only
+    metadata and references — no data file rewrite. Non-Lance bits
+    (sphere.json, calibration JSONs, traj indexes, FTS indexes living
+    next to data.lance, etc.) fall through to ``shutil.copy2``.
 
-    This is a test-only helper that bridges the old flat-column test format
-    to the canonical ``edges`` struct schema.
+    The win is most visible on Windows, where deep ``copytree`` over a sphere
+    that contains many small Lance fragment files is dominated by per-file
+    NTFS overhead.
     """
-    rows: list[list[dict]] = []
-    for i in range(len(edge_line_ids)):
-        lids = edge_line_ids[i]
-        pks = edge_point_keys[i]
-        alive = edge_alive_mask[i] if edge_alive_mask else [True] * len(lids)
-        row = [
-            {
-                "line_id": lid,
-                "point_key": pk,
-                "status": "alive" if a else "dead",
-                "direction": "in",
-            }
-            for lid, pk, a in zip(lids, pks, alive, strict=False)
-        ]
-        rows.append(row)
-    return pa.array(rows, type=pa.list_(EDGE_STRUCT_TYPE))
+    src_path = Path(src)
+    dst_path = Path(dst)
+    if dst_path.exists():
+        raise FileExistsError(f"clone_sphere target already exists: {dst_path}")
+    dst_path.mkdir(parents=True)
+
+    for entry in src_path.iterdir():
+        _clone_entry(entry, dst_path / entry.name)
+    return dst_path
+
+
+def _is_lance_dataset_dir(path: Path) -> bool:
+    return path.is_dir() and (path / "_versions").exists()
+
+
+def _clone_entry(src: Path, dst: Path) -> None:
+    if src.is_file():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        return
+    if _is_lance_dataset_dir(src):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        ds = lance.dataset(str(src))
+        ds.shallow_clone(str(dst), reference=ds.version)
+        return
+    dst.mkdir(parents=True, exist_ok=True)
+    for child in src.iterdir():
+        _clone_entry(child, dst / child.name)
+
+

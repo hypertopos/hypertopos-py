@@ -2,7 +2,13 @@
 
 > Planned direction. Priorities may change based on feedback. 
 
-## Current: 0.2.2
+## Current: 0.3.0
+
+Lance 3.x perf upgrade — aggregate engine rewritten around Lance SQL, precomputed contagion stats, format 2.2, contagion anchor resolution fix, edge table auto-detect fix. See CHANGELOG.
+
+---
+
+## 0.2.2
 
 As-of graph reconstruction across edge-table graph primitives + latency fix on `detect_cross_pattern_discrepancy`. See CHANGELOG.
 
@@ -26,15 +32,25 @@ First public release — full GDS stack, π1–π12, builder, MCP server, valida
 
 ---
 
-## Plan: 0.3.0
+## Plan: 0.3.1
 
-**Lance 3.x perf upgrade** — faster scans, smaller storage, native aggregates. Storage layer becomes faster, smaller, and pushes more work into Lance instead of Python; no new features, no orthogonal themes. See CHANGELOG when it ships.
+Two production-quality improvements on top of the 0.3.0 storage layer:
+
+- **FDR control on anomaly queries** — Benjamini–Hochberg `fdr_alpha` parameter + per-row `q_value` column on `find_anomalies` and friends. Replaces unbounded "top-K by `delta_norm`" with a set whose false-discovery rate is bounded by α.
+- **Diverse-coverage anomaly summarisation** — `select="diverse"` option using lazy-greedy submodular maximisation, plus a `representativeness` column ("this 1 anomaly stands in for 38 cases").
+- **Temporal build optimization** — pre-aggregate event counts before the temporal loop, eliminating per-window event table rescans.
+
+---
+
+## Plan: 0.3.2
+
+README and docs narrative restructure.
 
 ---
 
 ## Plan: 0.4.0
 
-TBD — picked after 0.3.0 lands.
+TBD — picked after 0.3.2 lands.
 
 ---
 

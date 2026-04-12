@@ -665,79 +665,56 @@ class PassiveScanner:
     def _scan_graph(
         self, source: ScanSource,
     ) -> dict[str, ScanSourceHit]:
-        """Scan graph contagion — flag entities whose anomalous neighbor ratio exceeds threshold.
+        """Scan graph contagion — flag entities whose anomalous neighbor ratio
+        exceeds threshold. Reads the precomputed
+        ``_gds_meta/contagion_stats/{pattern_id}.lance`` table directly.
 
-        Warning: reads the full edge table into memory. Acceptable for batch
-        scanning but may use significant RAM on large spheres (e.g. ~500 MB for 5M edges).
+        Spheres built before 0.3.0 do not carry this table; they must be
+        rebuilt. There is no edge-table-replay fallback in this release —
+        instead the scanner logs a warning and returns an empty hit set so
+        composite_risk / passive_scan over multi-pattern spheres can still
+        produce hits from sources whose precomputed table is present.
         """
-        if not self._reader.has_edge_table(source.pattern_id):
+        if not self._reader.has_contagion_stats(source.pattern_id):
+            logger.warning(
+                "Graph contagion source for pattern '%s' returned 0 hits: "
+                "_gds_meta/contagion_stats/%s.lance is missing. Rebuild the "
+                "sphere under hypertopos >= 0.3.0 to enable graph contagion "
+                "for this pattern.",
+                source.pattern_id, source.pattern_id,
+            )
             return {}
 
         threshold = source.contagion_threshold if source.contagion_threshold is not None else 0.3
 
-        # Read edge table — only from_key/to_key columns (~60% less RAM than full read)
-        edges = self._reader.read_edges(
-            source.pattern_id, columns=["from_key", "to_key"],
-        )
-        neighbors: dict[str, set[str]] = defaultdict(set)
-        from_arr = edges["from_key"].to_pylist()
-        to_arr = edges["to_key"].to_pylist()
-        for f, t in zip(from_arr, to_arr, strict=False):
-            if f != t:
-                neighbors[f].add(t)
-                neighbors[t].add(f)
+        import pyarrow.compute as pc
 
-        if not neighbors:
+        table = self._reader.read_contagion_stats(source.pattern_id)
+        if table is None or table.num_rows == 0:
             return {}
-
-        # Batch read anomaly status for all unique neighbor keys
-        anomalous_keys: set[str] = set()
-        anchor_id = self._resolve_anchor_for_event(source.pattern_id)
-        if anchor_id is not None:
-            anchor_version = self._resolve_version(anchor_id)
-            if anchor_version is not None:
-                all_neighbor_keys: set[str] = set()
-                for nbs in neighbors.values():
-                    all_neighbor_keys |= nbs
-
-                geo = self._reader.read_geometry(
-                    anchor_id, anchor_version,
-                    point_keys=list(all_neighbor_keys),
-                    columns=["primary_key", "is_anomaly"],
-                )
-                for i in range(geo.num_rows):
-                    if geo["is_anomaly"][i].as_py():
-                        anomalous_keys.add(geo["primary_key"][i].as_py())
-
-        # Score each entity: anomalous_neighbors / total_neighbors
+        valid = pc.and_(
+            pc.is_valid(table["contagion_ratio"]),
+            pc.greater_equal(table["contagion_ratio"], threshold),
+        )
+        filtered = table.filter(valid)
+        if filtered.num_rows == 0:
+            return {}
+        rows = filtered.to_pydict()
         result: dict[str, ScanSourceHit] = {}
-        for entity, nbs in neighbors.items():
-            total = len(nbs)
-            anomalous = len(nbs & anomalous_keys)
-            ratio = anomalous / total if total > 0 else 0.0
-            if ratio >= threshold:
-                result[entity] = ScanSourceHit(
-                    anomalous_count=anomalous,
-                    related_count=total,
-                    max_delta_norm=0.0,
-                    anomaly_intensity=ratio,
-                )
-
+        for pk, nbr, anom, ratio in zip(
+            rows["primary_key"],
+            rows["neighbor_count"],
+            rows["anomalous_neighbor_count"],
+            rows["contagion_ratio"],
+            strict=False,
+        ):
+            result[pk] = ScanSourceHit(
+                anomalous_count=int(anom),
+                related_count=int(nbr),
+                max_delta_norm=0.0,
+                anomaly_intensity=float(ratio),
+            )
         return result
-
-    def _resolve_anchor_for_event(self, event_pattern_id: str) -> str | None:
-        """Find anchor pattern for entities in an event pattern's edge table."""
-        pat = self._sphere.patterns.get(event_pattern_id)
-        if pat is None or pat.pattern_type != "event":
-            # Non-event pattern → use itself (same as navigator's fallback)
-            return event_pattern_id if pat is not None else None
-        for pid, p in self._sphere.patterns.items():
-            if p.pattern_type == "anchor" and pid != event_pattern_id:
-                entity_line = p.entity_line_id
-                for rel in pat.relations:
-                    if rel.line_id == entity_line:
-                        return pid
-        return None
 
     # ------------------------------------------------------------------
     # Private: key type detection

@@ -5,6 +5,44 @@ All notable changes to hypertopos will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-04-12
+
+> **Theme:** Lance 3.x perf upgrade. Aggregate engine moves from a persistent subprocess worker plus an optional external DataFusion package to the Lance scanner's built-in DataFusion executor via `LanceDataset.sql(...)`. The build-time contagion stats table replaces the runtime edge-table replay in the graph contagion scanner. Format 2.2 is the new write default.
+>
+> **Mandatory rebuild for spheres built before this release.** See the Migration section below.
+
+### Changed
+
+- `pylance` minimum bumped to 4.x. New writes target Lance format 2.2 with structural-decode parallelism, BSS float compression, cascading codecs, and block-level RLE on top of the previous baseline. Older spheres written with format 2.0 / 2.1 remain readable transparently.
+- The aggregate engine now pushes GROUP BY computation directly into the Lance scanner. The new `lance_sql_agg` module hosts `aggregate_count`, `aggregate_metric` (sum / avg / min / max), `aggregate_filtered_metric`, `aggregate_pivot`, `aggregate_property`, `aggregate_percentile`, and `find_anomalies`. Each helper streams the columns it needs from the geometry / event-line / property-line Lance datasets through `LanceDataset.sql(...)` and finishes the join + aggregate in pyarrow on the small post-projection result. The full geometry table is never loaded into Python memory and the persistent subprocess worker is no longer involved for any of these paths.
+- Test fixture cloning uses `lance.LanceDataset.shallow_clone` for every Lance dataset directory inside a sphere tree, with a thin `clone_sphere` helper in `tests/conftest.py` that walks the directory and falls back to `shutil.copy2` for non-Lance files. Shallow clone copies only metadata and references — measurably faster on Windows where deep `copytree` over a sphere built from many small Lance fragment files is dominated by per-file NTFS overhead.
+
+### Added
+
+- `GDSBuilder` rejects patterns with zero declared dimensions (no relations, no event dimensions, no derived dimensions, no tracked properties) at validation time. A pattern with width-0 delta vectors had no meaningful geometry to compute even before this release; format 2.0 silently allowed the construct, format 2.1+ refuses to encode the resulting `fixed_size_list[0]` columns at all. The validation surfaces a typed error up front instead of letting the call descend into an opaque write-time panic.
+- Builder precomputes per-entity contagion statistics for every pattern with an edge table and writes them to `_gds_meta/contagion_stats/{pattern_id}.lance` with a BTREE index on `primary_key`. The table holds `(primary_key, neighbor_count, anomalous_neighbor_count, contagion_ratio)` snapshotted at build time against the just-calibrated anchor geometry.
+
+### Fixed
+
+- `_scan_graph` (the graph contagion source feeding `passive_scan` and `composite_risk`) reads the precomputed `_gds_meta/contagion_stats/{pattern_id}.lance` table directly and threshold-filters inline. The legacy edge-table-replay path is gone; spheres built before 0.3.0 must be rebuilt to get graph contagion hits.
+- `contagion_score` anchor pattern resolution now correctly resolves via sibling lines when the anchor pattern is not directly associated with the target entity's line. Previously crashed with `KeyError` on spheres where the anchor pattern entity line differed from the navigated line.
+- Edge table auto-detect excludes metadata columns (`created_at`, `changed_at`, `version`) from the timestamp type-based fallback, preventing incorrect timestamp column selection on entity lines with versioning columns. Amount candidate list widened to cover `fare_amount`, `total_amount`, `amount_received`, `amount_paid`.
+
+### Security
+
+- `lance_sql_agg` validates user-controlled SQL inputs up front. Lance's `LanceDataset.sql(...)` does not expose parameter binding, so values and identifiers are inlined into the query string. Filter values (entity primary keys) are escaped with `_escape_sql_string`, which doubles single quotes and rejects backslash and ASCII control characters. Column-name identifiers (`metric_col`, `pivot_field`, `prop_name`) are validated against `^[A-Za-z_][A-Za-z0-9_]*$` via `_validate_sql_identifier` before being inlined into SQL strings — anything outside that pattern raises immediately. Both helpers fail loud rather than silently produce wrong results or pass injected SQL through to the parser.
+
+### Removed
+
+- `hypertopos.engine.subprocess_agg` (the persistent subprocess worker and its JSON command protocol) is deleted; every entry point it served is now routed through `lance_sql_agg`.
+- `hypertopos.engine.datafusion_agg` (the in-memory external-DataFusion fast path for count / metric / pivot / gbp / percentile) is deleted along with the optional `datafusion` extra in `pyproject.toml`. Lance 4.x's built-in DataFusion executor covers every query the external package was carrying.
+- The matching `tests/test_subprocess_agg.py` and `tests/test_datafusion_agg.py` are deleted. Aggregate semantics are exercised through `tests/test_aggregation_engine.py` and the MCP tool tests.
+
+### Migration
+
+- **Rebuild required.** Spheres built before 0.3.0 are still openable but degrade gracefully on graph contagion — the precomputed `contagion_stats` table is created at build time only, and the runtime scanner returns zero hits without it. Rebuild with `hypertopos build --config sphere.yaml --force`. There are no in-place upgrade paths.
+- The optional `datafusion` package is no longer a dependency of any aggregate path. If your environment installed it via `pip install hypertopos[datafusion]`, that extra now resolves to nothing — you can drop it from your install command.
+
 ## [0.2.2] — 2026-04-11
 
 ### Added

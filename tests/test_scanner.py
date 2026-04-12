@@ -657,3 +657,48 @@ class TestGraphContagionSource:
         # Other auto-discovered sources still get registered
         assert len(scanner._sources) > 0
         sess.__exit__(None, None, None)
+
+    def test_builder_writes_contagion_stats(self, tmp_path):
+        """Builder must precompute _gds_meta/contagion_stats/{pattern}.lance for
+        every pattern with an edge table."""
+        from pathlib import Path
+
+        scanner, sess = _make_graph_scanner_fixture(tmp_path)
+        cs_path = (
+            Path(sess._reader._base) / "_gds_meta" / "contagion_stats"
+            / "tx_pattern.lance"
+        )
+        assert cs_path.exists(), (
+            f"contagion_stats file missing for tx_pattern at {cs_path}"
+        )
+        # Schema sanity
+        import lance
+        ds = lance.dataset(str(cs_path))
+        names = ds.schema.names
+        assert "primary_key" in names
+        assert "neighbor_count" in names
+        assert "anomalous_neighbor_count" in names
+        assert "contagion_ratio" in names
+        assert ds.count_rows() > 0
+        sess.__exit__(None, None, None)
+
+    def test_scan_graph_returns_empty_when_precomputed_missing(self, tmp_path):
+        """A sphere built without precomputed contagion stats produces zero
+        graph-source hits — there is no edge-table-replay fallback in 0.3.0,
+        spheres must be rebuilt to get graph contagion."""
+        from pathlib import Path
+        import shutil
+
+        scanner, sess = _make_graph_scanner_fixture(tmp_path)
+        cs_path = (
+            Path(sess._reader._base) / "_gds_meta" / "contagion_stats"
+            / "tx_pattern.lance"
+        )
+        shutil.rmtree(cs_path)
+        assert not sess._reader.has_contagion_stats("tx_pattern")
+        scanner.add_graph_source("graph", "tx_pattern", contagion_threshold=0.0)
+        result = scanner.scan("accounts", threshold=1)
+        # Without precomputed table the graph source contributes nothing.
+        for hit in result.hits:
+            assert "graph" not in hit.sources
+        sess.__exit__(None, None, None)

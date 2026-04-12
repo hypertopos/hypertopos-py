@@ -17,7 +17,8 @@ gds_{sphere_id}/
 │   ├── geometry_stats/          # precomputed population summaries
 │   ├── trajectory/              # ANN index for trajectory similarity search
 │   ├── temporal_centroids/      # cached population centroids per time window
-│   └── edge_stats/              # per-event-pattern edge table summary cache (row count, unique from/to, ts/amount range)
+│   ├── edge_stats/              # per-event-pattern edge table summary cache (row count, unique from/to, ts/amount range)
+│   └── contagion_stats/         # per-pattern (primary_key, neighbor_count, anomalous_neighbor_count, contagion_ratio) — feeds the graph contagion scanner directly, BTREE-indexed on primary_key
 ├── points/
 │   ├── {line_id}/v={n}/
 │   │   └── data.lance           # entity records for this line version

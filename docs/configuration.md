@@ -871,6 +871,7 @@ hypertopos build --config sphere.yaml --force --verbose
 The builder parallelizes where possible:
 - **Points write** — parallel across lines (ThreadPoolExecutor, up to 4 workers)
 - **Geometry build** — parallel across patterns (one thread per pattern)
+- **Temporal build** — parallel across patterns; adaptive memory chunking when the shape tensor exceeds available RAM (auto-detected via platform API, 4 GB fallback)
 
 ### Build timing
 

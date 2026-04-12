@@ -58,6 +58,16 @@ where μ = E[s] is the population mean, σ = max(std(s), ε) the clamped standar
 - **Cross-sphere comparison** *(planned)* — dimensionless scalar metrics from independently calibrated coordinate spaces enable comparison across separate data systems
 - **What-if analysis** *(planned)* — hypothetical edge changes produce a modified coordinate vector showing the geometric effect
 
+## Statistical Guarantees
+
+Two opt-in post-processing stages can be applied to any attract primitive that scans a population (pi5, pi6, pi7, pi9). Both are off by default — omitting them preserves the legacy behavior exactly.
+
+**FDR control.** When `fdr_alpha` is set, the result set passes through a Benjamini-Hochberg (BH) procedure. Each entity's empirical-null p-value is derived from its population rank percentile: `p = 1 - rank_pct / 100`, where `rank_pct` is the entity's position in the full population sorted by the primitive's ranking metric (delta norm for pi5/pi6, hub score for pi7, displacement for pi9). The BH procedure guarantees `E[FDR] <= alpha` under independence or positive regression dependency (PRDS). Every retained entity carries a q-value — the minimum alpha at which it would still be retained. Entities with `q_value > alpha` are removed before the top-N / selection step.
+
+**Diverse selection.** When `select="diverse"`, the top-N step is replaced by a lazy-greedy facility location algorithm that maximizes a monotone submodular objective over pairwise cosine similarity of delta vectors. The greedy selection achieves a `(1 - 1/e)` approximation to the optimal K-subset. Each selected entity reports a representativeness count — how many population members are closest to it among the selected set. The result is K entities that cover the geometric space of the result set rather than clustering around a single extreme region.
+
+Both stages compose: `fdr_alpha=0.05, select="diverse"` first filters to FDR-controlled discoveries, then picks the K most geometrically diverse among them.
+
 ## Three Scales
 
 ![Three Scales](images/three-scales.svg)

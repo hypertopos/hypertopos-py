@@ -116,12 +116,17 @@ def compute_stats_grouped(
     shape_vectors: np.ndarray,
     group_ids: np.ndarray,
     anomaly_percentile: float = 95.0,
+    prop_dim_start: int | None = None,
 ) -> tuple[
     dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, int]],
     np.ndarray,
     np.ndarray,
 ]:
     """Compute per-group population statistics.
+
+    prop_dim_start: if set, apply SIGMA_EPS_PROP floor to sigma[prop_dim_start:]
+    for each group before computing deltas. Eliminates the need for a separate
+    re-run pass in the caller.
 
     Returns:
         group_results: {group_name: (mu, sigma, theta, population_size)}
@@ -140,9 +145,12 @@ def compute_stats_grouped(
         group_shape = shape_vectors[mask]
 
         if len(group_shape) < 2:
-            # Too few entities for meaningful stats — use global-like single point
             mu_g = group_shape.mean(axis=0).astype(np.float32)
             sigma_g = np.full(D, SIGMA_EPS, dtype=np.float32)
+            if prop_dim_start is not None:
+                sigma_g[prop_dim_start:] = np.maximum(
+                    sigma_g[prop_dim_start:], SIGMA_EPS_PROP,
+                )
             theta_g = np.zeros(D, dtype=np.float32)
             deltas[mask] = ((group_shape - mu_g) / sigma_g).astype(np.float32)
             _masked = deltas[mask]
@@ -155,6 +163,22 @@ def compute_stats_grouped(
         mu_g, sigma_g, theta_g, group_deltas, group_norms, _ = compute_stats(
             group_shape, anomaly_percentile,
         )
+
+        if prop_dim_start is not None:
+            sigma_g[prop_dim_start:] = np.maximum(
+                sigma_g[prop_dim_start:], SIGMA_EPS_PROP,
+            )
+            group_deltas = ((group_shape - mu_g) / sigma_g).astype(np.float32)
+            group_norms = np.sqrt(
+                np.einsum('ij,ij->i', group_deltas, group_deltas),
+            ).astype(np.float32)
+            g_theta_scalar = (
+                float(np.percentile(group_norms, anomaly_percentile))
+                if len(group_norms) > 1 else 0.0
+            )
+            g_comp = g_theta_scalar / np.sqrt(D) if D > 0 else 0.0
+            theta_g = np.full(D, g_comp, dtype=np.float32)
+
         deltas[mask] = group_deltas
         delta_norms[mask] = group_norms
         group_results[gid_str] = (mu_g, sigma_g, theta_g, int(mask.sum()))

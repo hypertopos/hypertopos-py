@@ -103,9 +103,9 @@ with sphere.session("agent-1") as session:
 
 | Primitive | Method | What it does | Returns |
 |-----------|--------|--------------|---------|
-| π5 | `π5_attract_anomaly(pattern_id, radius, top_n)` | Find most anomalous polygons | `(list[Polygon], int, list, dict)` |
-| π6 | `π6_attract_boundary(alias_id, pattern_id, direction, top_n)` | Find entities nearest to alias cutting plane | `list[(Polygon, float)]` |
-| π7 | `π7_attract_hub(pattern_id, top_n, line_id_filter)` | Find entities with highest connectivity | `list[(str, int, float)]` |
+| π5 | `π5_attract_anomaly(pattern_id, radius, top_n, fdr_alpha, fdr_method, select)` | Find most anomalous polygons | `(list[Polygon], int, list, dict)` |
+| π6 | `π6_attract_boundary(alias_id, pattern_id, direction, top_n, fdr_alpha, fdr_method, select)` | Find entities nearest to alias cutting plane | `list[(Polygon, float)]` |
+| π7 | `π7_attract_hub(pattern_id, top_n, line_id_filter, fdr_alpha, fdr_method, select)` | Find entities with highest connectivity | `list[(str, int, float)]` |
 | π7+ | `π7_attract_hub_and_stats(pattern_id, top_n, line_id_filter)` | Hub ranking + population hub score statistics in one scan | `(list, dict)` |
 | π8 | `π8_attract_cluster(pattern_id, n_clusters, top_n, sample_size)` | Discover geometric archetypes via k-means++ | `list[dict]` |
 
@@ -113,7 +113,7 @@ with sphere.session("agent-1") as session:
 
 | Primitive | Method | What it does | Returns |
 |-----------|--------|--------------|---------|
-| π9 | `π9_attract_drift(pattern_id, top_n, sample_size)` | Find entities with highest temporal drift | `list[dict]` |
+| π9 | `π9_attract_drift(pattern_id, top_n, sample_size, fdr_alpha, fdr_method, select)` | Find entities with highest temporal drift | `list[dict]` |
 | π10 | `π10_attract_trajectory(primary_key, pattern_id, top_n)` | Find entities with similar temporal trajectory | `list[dict]` |
 | π11 | `π11_attract_population_compare(pattern_id, window_a_from, window_a_to, window_b_from, window_b_to)` | Compare population geometry between two time windows | `dict` |
 | π12 | `π12_attract_regime_change(pattern_id, timestamp_from, timestamp_to)` | Detect population geometry regime shifts | `list[dict]` |

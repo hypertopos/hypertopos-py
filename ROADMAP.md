@@ -2,7 +2,13 @@
 
 > Planned direction. Priorities may change based on feedback. 
 
-## Current: 0.3.0
+## Current: 0.3.1
+
+FDR control, diverse anomaly summarisation, and build pipeline optimization — Benjamini-Hochberg multiple-testing correction, submodular facility location, vectorized build with adaptive memory chunking. See CHANGELOG.
+
+---
+
+## 0.3.0
 
 Lance 3.x perf upgrade — aggregate engine rewritten around Lance SQL, precomputed contagion stats, format 2.2, contagion anchor resolution fix, edge table auto-detect fix. See CHANGELOG.
 
@@ -38,19 +44,19 @@ Two production-quality improvements on top of the 0.3.0 storage layer:
 
 - **FDR control on anomaly queries** — Benjamini–Hochberg `fdr_alpha` parameter + per-row `q_value` column on `find_anomalies` and friends. Replaces unbounded "top-K by `delta_norm`" with a set whose false-discovery rate is bounded by α.
 - **Diverse-coverage anomaly summarisation** — `select="diverse"` option using lazy-greedy submodular maximisation, plus a `representativeness` column ("this 1 anomaly stands in for 38 cases").
-- **Temporal build optimization** — pre-aggregate event counts before the temporal loop, eliminating per-window event table rescans.
+- **Build pipeline optimization** — vectorized scatter (Arrow `pc.index_in` + numpy), Welford rolling z-score, Arrow-native contagion stats, adaptive memory chunking for temporal build, pre-sorted graph dims bucketing.
 
 ---
 
 ## Plan: 0.3.2
 
-README and docs narrative restructure.
+TBD.
 
 ---
 
 ## Plan: 0.4.0
 
-TBD — picked after 0.3.2 lands.
+TBD.
 
 ---
 

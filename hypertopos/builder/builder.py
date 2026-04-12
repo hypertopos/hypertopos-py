@@ -907,9 +907,14 @@ class GDSBuilder:
                 full_shape_vectors, pat.anomaly_percentile
             )
 
-            # Per-group stats
+            # Per-group stats — prop_dim_start applies SIGMA_EPS_PROP inside
+            # the grouped loop, eliminating a separate re-run pass
+            n_rel = len(pat.relations)
+            n_event = len(pat.event_dimensions) if pat.event_dimensions else 0
+            _prop_start = (n_rel + n_event) if prop_columns else None
             group_stats_dict, deltas, delta_norms = compute_stats_grouped(
-                full_shape_vectors, group_ids, pat.anomaly_percentile
+                full_shape_vectors, group_ids, pat.anomaly_percentile,
+                prop_dim_start=_prop_start,
             )
 
             # Pre-compute boolean masks once — reused in all three group loops
@@ -918,13 +923,11 @@ class GDSBuilder:
                 gid: group_ids == gid for gid in unique_groups
             }
 
-            # Prop_columns sigma override applies to grouped stats too
-            n_rel = len(pat.relations)
+            # Prop_columns sigma override for global stats
             if prop_columns:
                 from hypertopos.builder._stats import SIGMA_EPS_PROP
 
                 sigma[n_rel:] = np.maximum(sigma[n_rel:], SIGMA_EPS_PROP)
-                # Re-run global stats with corrected sigma
                 global_deltas = ((full_shape_vectors - mu) / sigma).astype(np.float32)
                 global_norms = np.sqrt(
                     np.einsum('ij,ij->i', global_deltas, global_deltas),
@@ -933,24 +936,6 @@ class GDSBuilder:
                 D_full = full_shape_vectors.shape[1]
                 component = theta_scalar / np.sqrt(D_full) if D_full > 0 else 0.0
                 theta = np.full(D_full, component, dtype=np.float32)
-
-                # Re-run per-group with corrected sigma for prop columns
-                for gid, (mu_g, sigma_g, _theta_g, pop_g) in group_stats_dict.items():
-                    sigma_g[n_rel:] = np.maximum(sigma_g[n_rel:], SIGMA_EPS_PROP)
-                    mask = group_mask_map[gid]
-                    group_shape = full_shape_vectors[mask]
-                    g_deltas = ((group_shape - mu_g) / sigma_g).astype(np.float32)
-                    g_norms = np.sqrt(np.einsum('ij,ij->i', g_deltas, g_deltas)).astype(np.float32)
-                    deltas[mask] = g_deltas
-                    delta_norms[mask] = g_norms
-                    g_theta_scalar = (
-                        float(np.percentile(g_norms, pat.anomaly_percentile))
-                        if len(g_norms) > 1 else 0.0
-                    )
-                    D_full = full_shape_vectors.shape[1]
-                    g_comp = g_theta_scalar / np.sqrt(D_full) if D_full > 0 else 0.0
-                    g_theta_new = np.full(D_full, g_comp, dtype=np.float32)
-                    group_stats_dict[gid] = (mu_g, sigma_g, g_theta_new, pop_g)
         else:
             mu, sigma, theta, deltas, delta_norms, mah_cov_inv = compute_stats(
                 full_shape_vectors, pat.anomaly_percentile,
@@ -1537,6 +1522,7 @@ class GDSBuilder:
 
         result: dict[str, Any] = {}
         now_str = datetime.now(UTC).isoformat()
+        _delta_cache: dict[str, np.ndarray] = {}
 
         for alias_id, areg in self._aliases.items():
             pat = self._patterns[areg.base_pattern_id]
@@ -1565,25 +1551,27 @@ class GDSBuilder:
 
             cp = CuttingPlane(normal=normal, bias=bias)
 
-            # Read geometry deltas from Lance
+            # Read geometry deltas from Lance (cached per base pattern)
             import lance
 
-            geo_path = (
-                self.output_path / "geometry" / areg.base_pattern_id
-                / "v=1" / "data.lance"
-            )
-            ds = lance.dataset(str(geo_path))
-            delta_col = ds.to_table(columns=["delta"])["delta"]
-            if hasattr(delta_col, "combine_chunks"):
-                delta_col = delta_col.combine_chunks()
-            list_size = (
-                delta_col.type.list_size
-                if hasattr(delta_col.type, "list_size")
-                else D
-            )
-            deltas = delta_col.values.to_numpy(
-                zero_copy_only=False,
-            ).reshape(-1, list_size).astype(np.float32)
+            if areg.base_pattern_id not in _delta_cache:
+                geo_path = (
+                    self.output_path / "geometry" / areg.base_pattern_id
+                    / "v=1" / "data.lance"
+                )
+                ds = lance.dataset(str(geo_path))
+                delta_col = ds.to_table(columns=["delta"])["delta"]
+                if hasattr(delta_col, "combine_chunks"):
+                    delta_col = delta_col.combine_chunks()
+                list_size = (
+                    delta_col.type.list_size
+                    if hasattr(delta_col.type, "list_size")
+                    else D
+                )
+                _delta_cache[areg.base_pattern_id] = delta_col.values.to_numpy(
+                    zero_copy_only=False,
+                ).reshape(-1, list_size).astype(np.float32)
+            deltas = _delta_cache[areg.base_pattern_id]
 
             # Filter by cutting plane: signed_distance >= 0 means inside
             inside_mask = cp.signed_distances_batch(deltas) >= 0
@@ -2288,23 +2276,108 @@ class GDSBuilder:
                     return other_id
         return None
 
-    def _build_contagion_stats(self, stats_writer: Any) -> None:
-        """Second pass: precompute per-entity contagion statistics for every
-        pattern that has an edge table on disk. Writes one Lance table per
-        pattern under ``_gds_meta/contagion_stats/{pattern_id}.lance`` with a
-        BTREE index on ``primary_key``.
-
-        Schema: primary_key, neighbor_count (int32), anomalous_neighbor_count
-        (int32), contagion_ratio (float32). Only entities that appear as
-        at least one edge endpoint are included, so neighbor_count is
-        always >= 1 in practice.
-
-        The runtime scanner reads this small table directly instead of replaying
-        the full edge table on every passive_scan / composite_risk call.
-        """
+    @staticmethod
+    def _compute_contagion_arrow(
+        edges_table: pa.Table,
+        geom_table: pa.Table,
+    ) -> pa.Table:
+        """Arrow-native contagion stats — no Python loops over rows."""
         import math
-        from collections import defaultdict
 
+        _empty = pa.table({
+            "primary_key": pa.array([], type=pa.string()),
+            "neighbor_count": pa.array([], type=pa.int32()),
+            "anomalous_neighbor_count": pa.array([], type=pa.int32()),
+            "contagion_ratio": pa.array([], type=pa.float32()),
+        })
+
+        if edges_table.num_rows == 0:
+            return _empty
+
+        # Filter self-loops
+        not_self = pc.not_equal(
+            edges_table["from_key"], edges_table["to_key"],
+        )
+        edges_table = edges_table.filter(not_self)
+        if edges_table.num_rows == 0:
+            return _empty
+
+        # Bidirectional edges
+        fwd = edges_table.select(["from_key", "to_key"])
+        rev = edges_table.select(["to_key", "from_key"]).rename_columns(
+            ["from_key", "to_key"],
+        )
+        all_edges = pa.concat_tables([fwd, rev])
+
+        # Neighbor counts (distinct)
+        neighbor_counts = all_edges.group_by("from_key").aggregate(
+            [("to_key", "count_distinct")],
+        )
+
+        # Anomalous neighbors
+        anom_mask = geom_table["is_anomaly"]
+        anomalous_keys = pc.filter(geom_table["primary_key"], anom_mask)
+
+        anom_edges = all_edges.filter(
+            pc.is_in(all_edges["to_key"], value_set=anomalous_keys),
+        )
+        if anom_edges.num_rows > 0:
+            anom_counts = anom_edges.group_by("from_key").aggregate(
+                [("to_key", "count_distinct")],
+            )
+        else:
+            anom_counts = pa.table({
+                "from_key": pa.array([], type=pa.string()),
+                "to_key_count_distinct": pa.array([], type=pa.int64()),
+            })
+
+        # Join
+        joined = neighbor_counts.join(
+            anom_counts, keys="from_key", join_type="left outer",
+            right_suffix="_anom",
+        )
+
+        pk = joined["from_key"]
+        nc = joined["to_key_count_distinct"]
+        ac_col_name = None
+        if "to_key_count_distinct_anom" in joined.schema.names:
+            ac_col_name = "to_key_count_distinct_anom"
+        else:
+            anom_cols = [n for n in joined.schema.names if n.endswith("_anom")]
+            if anom_cols:
+                ac_col_name = anom_cols[0]
+
+        if ac_col_name is not None:
+            ac_raw = joined.column(ac_col_name)
+            ac = pc.if_else(
+                pc.is_valid(ac_raw),
+                pc.cast(ac_raw, pa.int64()),
+                pa.scalar(0, type=pa.int64()),
+            )
+        else:
+            ac = pa.array(
+                np.zeros(joined.num_rows, dtype=np.int64), type=pa.int64(),
+            )
+
+        nc_np = nc.to_numpy(zero_copy_only=False).astype(np.float32)
+        ac_np = ac.to_numpy(zero_copy_only=False).astype(np.float32)
+        ratio = np.where(nc_np > 0, ac_np / nc_np, float("nan"))
+
+        return pa.table({
+            "primary_key": pk,
+            "neighbor_count": pa.array(
+                nc.to_numpy(zero_copy_only=False), type=pa.int32(),
+            ),
+            "anomalous_neighbor_count": pa.array(
+                ac.to_numpy(zero_copy_only=False), type=pa.int32(),
+            ),
+            "contagion_ratio": pa.array(ratio, type=pa.float32()),
+        })
+
+    def _build_contagion_stats(self, stats_writer: Any) -> None:
+        """Precompute per-entity contagion statistics for every pattern that
+        has an edge table on disk. Arrow-native — no Python loops.
+        """
         import lance as _lance
 
         for pat_id, pat in self._patterns.items():
@@ -2317,52 +2390,20 @@ class GDSBuilder:
             edges_ds = _lance.dataset(str(edge_path))
             if edges_ds.count_rows() == 0:
                 continue
-            edges_table = edges_ds.scanner(columns=["from_key", "to_key"]).to_table()
-            from_arr = edges_table["from_key"].to_pylist()
-            to_arr = edges_table["to_key"].to_pylist()
-            neighbors: dict[str, set[str]] = defaultdict(set)
-            for f, t in zip(from_arr, to_arr, strict=False):
-                if f != t:
-                    neighbors[f].add(t)
-                    neighbors[t].add(f)
-            if not neighbors:
-                continue
+            edges_table = edges_ds.scanner(
+                columns=["from_key", "to_key"],
+            ).to_table()
 
             geom_path = (
                 self.output_path / "geometry" / anchor_pat_id / "v=1" / "data.lance"
             )
             if not geom_path.exists():
                 continue
-            anomalous: set[str] = set()
             geom_table = _lance.dataset(str(geom_path)).scanner(
                 columns=["primary_key", "is_anomaly"],
             ).to_table()
-            pk_col = geom_table["primary_key"]
-            anom_col = geom_table["is_anomaly"]
-            for i in range(geom_table.num_rows):
-                if anom_col[i].as_py():
-                    anomalous.add(pk_col[i].as_py())
 
-            primary_keys = sorted(neighbors.keys())
-            nbr_counts: list[int] = []
-            anom_counts: list[int] = []
-            ratios: list[float] = []
-            for k in primary_keys:
-                nbs = neighbors[k]
-                total = len(nbs)
-                anom = len(nbs & anomalous)
-                nbr_counts.append(total)
-                anom_counts.append(anom)
-                ratios.append(anom / total if total > 0 else math.nan)
-
-            contagion_table = pa.table(
-                {
-                    "primary_key": pa.array(primary_keys, type=pa.string()),
-                    "neighbor_count": pa.array(nbr_counts, type=pa.int32()),
-                    "anomalous_neighbor_count": pa.array(anom_counts, type=pa.int32()),
-                    "contagion_ratio": pa.array(ratios, type=pa.float32()),
-                },
-            )
+            contagion_table = self._compute_contagion_arrow(edges_table, geom_table)
             stats_writer.write_contagion_stats(pat_id, contagion_table)
 
     def incremental_update(
@@ -3171,6 +3212,88 @@ class GDSBuilder:
         from hypertopos.builder.derived import _parse_time_window
         from hypertopos.storage.writer import _write_lance
 
+        def _tensor_to_lance(
+            shape_tensor: np.ndarray,
+            keys_list: list[str],
+            n_ent: int,
+            non_empty: np.ndarray,
+            lance_p: Any,
+            _min_ts: float,
+            _win_secs: float,
+            _D: int,
+        ) -> None:
+            n_w = len(non_empty)
+            if n_w == 0:
+                return
+            total = n_ent * n_w
+            flat = shape_tensor[:, non_empty, :].reshape(total, _D)
+            pk_idx = np.repeat(np.arange(n_ent), n_w)
+            bkt_idx = np.tile(non_empty, n_ent)
+            bkt_ts = [
+                datetime.fromtimestamp(_min_ts + int(b) * _win_secs, tz=UTC)
+                for b in non_empty
+            ]
+            pk_c = pa.array([keys_list[i] for i in pk_idx], type=pa.string())
+            ts_c = pa.array(
+                [bkt_ts[i % n_w] for i in range(total)],
+                type=pa.timestamp("us", tz="UTC"),
+            )
+            sc = (
+                pa.FixedSizeListArray.from_arrays(
+                    pa.array(flat.ravel(), type=pa.float32()), list_size=_D,
+                ).cast(pa.list_(pa.float32()))
+                if _D > 0
+                else pa.array([[] for _ in range(total)], type=pa.list_(pa.float32()))
+            )
+            tbl = pa.table({
+                "primary_key": pk_c,
+                "slice_index": pa.array(bkt_idx.astype(np.int32), type=pa.int32()),
+                "timestamp": ts_c,
+                "deformation_type": pa.array(["window_snapshot"] * total),
+                "shape_snapshot": sc,
+                "pattern_ver": pa.array(np.full(total, 1, dtype=np.int32)),
+                "changed_property": pa.nulls(total, type=pa.string()),
+                "changed_line_id": pa.nulls(total, type=pa.string()),
+            }, schema=_TEMPORAL_SCHEMA)
+            mode = "append" if lance_p.exists() else "create"
+            _write_lance(tbl, str(lance_p), mode=mode)
+
+        def _build_traj_chunk(
+            traj_tables: list,
+            tensor: np.ndarray,
+            pks: list[str],
+            bkt_ts: list,
+            mu_a: np.ndarray | None,
+            sig_a: np.ndarray | None,
+        ) -> None:
+            nt, nb, dt = tensor.shape
+            if nt == 0 or nb < 2:
+                return
+            d2 = dt * 2
+            _s = np.maximum(sig_a, 1e-2) if sig_a is not None else None
+            d = (tensor - mu_a) / _s if mu_a is not None and _s is not None else tensor
+            tv = np.concatenate([d.mean(axis=1), d.std(axis=1)], axis=1).astype(np.float32)
+            disp = np.linalg.norm(d[:, -1, :] - d[:, 0, :], axis=1).astype(np.float32)
+            ts = pa.schema([
+                pa.field("primary_key", pa.string()),
+                pa.field("trajectory_vector", pa.list_(pa.float32(), d2)),
+                pa.field("displacement", pa.float32()),
+                pa.field("num_slices", pa.int32()),
+                pa.field("first_timestamp", pa.timestamp("us", tz="UTC")),
+                pa.field("last_timestamp", pa.timestamp("us", tz="UTC")),
+            ])
+            tvc = pa.FixedSizeListArray.from_arrays(
+                pa.array(tv.ravel(), type=pa.float32()), list_size=d2,
+            ).cast(pa.list_(pa.float32(), d2))
+            traj_tables.append(pa.table({
+                "primary_key": pa.array(pks, type=pa.string()),
+                "trajectory_vector": tvc,
+                "displacement": pa.array(disp, type=pa.float32()),
+                "num_slices": pa.array(np.full(nt, nb, dtype=np.int32)),
+                "first_timestamp": pa.array([bkt_ts[0]] * nt, type=pa.timestamp("us", tz="UTC")),
+                "last_timestamp": pa.array([bkt_ts[-1]] * nt, type=pa.timestamp("us", tz="UTC")),
+            }, schema=ts))
+
         # 1. Precondition: build() must have been called
         sphere_json_path = self.output_path / "_gds_meta" / "sphere.json"
         if not sphere_json_path.exists():
@@ -3272,77 +3395,99 @@ class GDSBuilder:
             lance_dir.mkdir(parents=True, exist_ok=True)
             lance_path = lance_dir / "data.lance"
 
-            # Pre-compute the full shape tensor: (n_anchor, n_buckets, D)
-            shape_tensor = self._precompute_shape_tensor(
-                pat_id, event_table, bucket_np, n_buckets,
-                anchor_keys, anchor_keys_list, n_anchor,
-                relations_meta, prop_columns,
+            D = len(relations_meta) + len(prop_columns)
+            non_empty_buckets = np.unique(bucket_np)
+            slices_written = len(non_empty_buckets)
+
+            # Adaptive chunking
+            mem_budget = self._detect_available_memory()
+            chunk_size = self._compute_chunk_size(
+                n_anchor, n_buckets, D, int(mem_budget * 0.5),
             )
 
-            # Build all bucket tables then write in a single Lance append
-            D = shape_tensor.shape[2]
-            pk_col = pa.array(anchor_keys_list, type=pa.string())
-            _zeros = pa.array(np.zeros(n_anchor, dtype=np.int32))
-            deform_broadcast = pa.array(
-                ["window_snapshot"], type=pa.string(),
-            ).take(_zeros)
-            ver_broadcast = pa.array([1], type=pa.int32()).take(_zeros)
-            null_str_col = pa.array([None] * n_anchor, type=pa.string())
+            all_bkt_ts = [
+                datetime.fromtimestamp(min_ts + b * window_secs, tz=UTC)
+                for b in range(n_buckets)
+            ]
+            _mu_arr = (
+                np.array(pat_meta["mu"], dtype=np.float32)
+                if pat_meta.get("mu") else None
+            )
+            _sig_arr = (
+                np.array(pat_meta["sigma_diag"], dtype=np.float32)
+                if pat_meta.get("sigma_diag") else None
+            )
 
-            all_tables: list[pa.Table] = []
-            for bucket_idx in range(n_buckets):
-                mask = bucket_np == bucket_idx
-                if not mask.any():
-                    continue
-
-                window_start_epoch = min_ts + bucket_idx * window_secs
-                window_start = datetime.fromtimestamp(
-                    window_start_epoch, tz=UTC,
+            if chunk_size >= n_anchor:
+                # ── Single-pass (fits in RAM) ──
+                shape_tensor = self._precompute_shape_tensor(
+                    pat_id, event_table, bucket_np, n_buckets,
+                    anchor_keys, anchor_keys_list, n_anchor,
+                    relations_meta, prop_columns,
+                )
+                _tensor_to_lance(
+                    shape_tensor, anchor_keys_list, n_anchor,
+                    non_empty_buckets, lance_path, min_ts, window_secs, D,
                 )
 
-                # Shape column from pre-computed tensor via FixedSizeListArray
-                shape_data = shape_tensor[:, bucket_idx, :]  # (n_anchor, D)
-                if D > 0:
-                    shape_col = pa.FixedSizeListArray.from_arrays(
-                        pa.array(shape_data.ravel(), type=pa.float32()),
-                        list_size=D,
-                    ).cast(pa.list_(pa.float32()))
-                else:
-                    shape_col = pa.array(
-                        [[] for _ in range(n_anchor)],
-                        type=pa.list_(pa.float32()),
+                # Centroids
+                if slices_written > 0:
+                    mu = np.array(pat_meta["mu"], dtype=np.float32)
+                    sigma = np.array(pat_meta["sigma_diag"], dtype=np.float32)
+                    sigma_safe = np.where(sigma < 1e-6, 1.0, sigma)
+                    theta_norm = float(np.linalg.norm(
+                        np.array(pat_meta["theta"], dtype=np.float32),
+                    ))
+                    centroids: list[dict] = []
+                    for b in range(n_buckets):
+                        ws = shape_tensor[:, b, :]
+                        am = np.any(ws != 0, axis=1)
+                        na = int(am.sum())
+                        if na == 0:
+                            continue
+                        ad = (ws[am] - mu) / sigma_safe
+                        c = ad.mean(axis=0).tolist()
+                        ar = 0.0
+                        if theta_norm > 0:
+                            nr = np.sqrt(np.einsum('ij,ij->i', ad, ad))
+                            ar = float((nr > theta_norm).sum() / len(nr))
+                        centroids.append({
+                            "window_start": datetime.fromtimestamp(
+                                min_ts + b * window_secs, tz=UTC),
+                            "window_end": datetime.fromtimestamp(
+                                min_ts + (b + 1) * window_secs, tz=UTC),
+                            "centroid": c, "entity_count": na,
+                            "anomaly_rate": ar,
+                        })
+                    if centroids:
+                        writer.write_temporal_centroids(pat_id, centroids)
+
+                # Rolling z
+                if slices_written >= 3:
+                    mz = self._compute_max_rolling_z(
+                        shape_tensor, n_anchor, n_buckets,
                     )
+                    self._write_max_rolling_z(pat_id, anchor_keys_list, mz)
 
-                # Broadcast constant columns
-                slice_col = pa.array(
-                    [int(bucket_idx)], type=pa.int32(),
-                ).take(_zeros)
-                ts_col_out = pa.array(
-                    [window_start], type=pa.timestamp("us", tz="UTC"),
-                ).take(_zeros)
+                # Trajectory
+                if slices_written >= 2:
+                    am = np.any(
+                        shape_tensor.reshape(n_anchor, -1) != 0, axis=1,
+                    )
+                    if am.any():
+                        writer.write_trajectory_from_tensor(
+                            pat_id, shape_tensor[am],
+                            [anchor_keys_list[i] for i in np.flatnonzero(am)],
+                            bucket_timestamps=all_bkt_ts,
+                            mu=_mu_arr, sigma_diag=_sig_arr,
+                        )
 
-                all_tables.append(pa.table(
-                    {
-                        "primary_key": pk_col,
-                        "slice_index": slice_col,
-                        "timestamp": ts_col_out,
-                        "deformation_type": deform_broadcast,
-                        "shape_snapshot": shape_col,
-                        "pattern_ver": ver_broadcast,
-                        "changed_property": null_str_col,
-                        "changed_line_id": null_str_col,
-                    },
-                    schema=_TEMPORAL_SCHEMA,
-                ))
-
-            slices_written = len(all_tables)
-            if all_tables:
-                combined = pa.concat_tables(all_tables)
-                mode = "append" if lance_path.exists() else "create"
-                _write_lance(combined, str(lance_path), mode=mode)
-
-            # 8. Compute per-window population centroids for pi11/pi12
-            if slices_written > 0:
+            else:
+                # ── Chunked path (adaptive memory) ──
+                logger.info(
+                    "Temporal %s: chunking %d entities into chunks of %d",
+                    pat_id, n_anchor, chunk_size,
+                )
                 mu = np.array(pat_meta["mu"], dtype=np.float32)
                 sigma = np.array(pat_meta["sigma_diag"], dtype=np.float32)
                 sigma_safe = np.where(sigma < 1e-6, 1.0, sigma)
@@ -3350,79 +3495,118 @@ class GDSBuilder:
                     np.array(pat_meta["theta"], dtype=np.float32),
                 ))
 
-                centroids: list[dict] = []
-                for b in range(n_buckets):
-                    window_shapes = shape_tensor[:, b, :]
-                    active_mask = np.any(window_shapes != 0, axis=1)
-                    n_active = int(active_mask.sum())
-                    if n_active == 0:
-                        continue
-                    active_shapes = window_shapes[active_mask]
-                    active_deltas = (active_shapes - mu) / sigma_safe
-                    centroid = active_deltas.mean(axis=0).tolist()
+                c_n_active = np.zeros(n_buckets, dtype=np.int64)
+                c_sum_delta = np.zeros((n_buckets, D), dtype=np.float64)
+                c_n_anom = np.zeros(n_buckets, dtype=np.int64)
+                all_max_z = np.zeros(n_anchor, dtype=np.float32)
+                traj_tables: list[pa.Table] = []
 
-                    anom_rate = 0.0
-                    if theta_norm > 0:
-                        norms = np.sqrt(np.einsum('ij,ij->i', active_deltas, active_deltas))
-                        anom_rate = float(
-                            (norms > theta_norm).sum() / len(norms),
+                orig_table = self._lines[pat.entity_line].table
+                try:
+                    for cs in range(0, n_anchor, chunk_size):
+                        ce = min(cs + chunk_size, n_anchor)
+                        nc = ce - cs
+                        ckl = anchor_keys_list[cs:ce]
+                        cka = pa.array(ckl, type=pa.string())
+
+                        self._lines[pat.entity_line].table = (
+                            orig_table.slice(cs, nc)
                         )
 
-                    ws_epoch = min_ts + b * window_secs
-                    we_epoch = min_ts + (b + 1) * window_secs
-                    centroids.append({
-                        "window_start": datetime.fromtimestamp(
-                            ws_epoch, tz=UTC,
-                        ),
-                        "window_end": datetime.fromtimestamp(
-                            we_epoch, tz=UTC,
-                        ),
-                        "centroid": centroid,
-                        "entity_count": n_active,
-                        "anomaly_rate": anom_rate,
-                    })
+                        ct = self._precompute_shape_tensor(
+                            pat_id, event_table, bucket_np, n_buckets,
+                            cka, ckl, nc,
+                            relations_meta, prop_columns,
+                        )
 
-                if centroids:
-                    writer.write_temporal_centroids(pat_id, centroids)
+                        _tensor_to_lance(
+                            ct, ckl, nc, non_empty_buckets,
+                            lance_path, min_ts, window_secs, D,
+                        )
 
-            # 9. Compute rolling z-scores from shape tensor
-            if slices_written >= 3:
-                max_rolling_z = self._compute_max_rolling_z(
-                    shape_tensor, n_anchor, n_buckets,
-                )
-                # Write max_rolling_z to geometry (update existing Lance)
-                self._write_max_rolling_z(
-                    pat_id, anchor_keys_list, max_rolling_z,
-                )
+                        # Accumulate centroids
+                        for b in range(n_buckets):
+                            sh = ct[:, b, :]
+                            act = np.any(sh != 0, axis=1)
+                            if not act.any():
+                                continue
+                            ad = ((sh[act] - mu) / sigma_safe).astype(
+                                np.float64,
+                            )
+                            nr = np.sqrt(np.einsum('ij,ij->i', ad, ad))
+                            c_n_active[b] += int(act.sum())
+                            c_sum_delta[b] += ad.sum(axis=0)
+                            if theta_norm > 0:
+                                c_n_anom[b] += int(
+                                    (nr > theta_norm).sum(),
+                                )
 
-            # 10. Build trajectory vectors directly from shape tensor
-            if slices_written >= 2:
-                active_mask = np.any(
-                    shape_tensor.reshape(n_anchor, -1) != 0, axis=1,
-                )
-                if active_mask.any():
-                    active_tensor = shape_tensor[active_mask]  # (n_active, n_buckets, D)
-                    active_pks = [
-                        anchor_keys_list[i] for i in np.flatnonzero(active_mask)
-                    ]
-                    _mu = (
-                        np.array(pat_meta["mu"], dtype=np.float32)
-                        if pat_meta.get("mu") else None
+                        all_max_z[cs:ce] = self._compute_max_rolling_z(
+                            ct, nc, n_buckets,
+                        )
+
+                        if slices_written >= 2:
+                            am = np.any(
+                                ct.reshape(nc, -1) != 0, axis=1,
+                            )
+                            if am.any():
+                                _build_traj_chunk(
+                                    traj_tables, ct[am],
+                                    [ckl[i] for i in np.flatnonzero(am)],
+                                    all_bkt_ts, _mu_arr, _sig_arr,
+                                )
+
+                        del ct
+                finally:
+                    self._lines[pat.entity_line].table = orig_table
+
+                # Finalize centroids
+                if slices_written > 0:
+                    centroids = []
+                    for b in range(n_buckets):
+                        if c_n_active[b] == 0:
+                            continue
+                        cv = (c_sum_delta[b] / c_n_active[b]).tolist()
+                        ar = float(c_n_anom[b] / c_n_active[b])
+                        centroids.append({
+                            "window_start": datetime.fromtimestamp(
+                                min_ts + b * window_secs, tz=UTC),
+                            "window_end": datetime.fromtimestamp(
+                                min_ts + (b + 1) * window_secs, tz=UTC),
+                            "centroid": cv,
+                            "entity_count": int(c_n_active[b]),
+                            "anomaly_rate": ar,
+                        })
+                    if centroids:
+                        writer.write_temporal_centroids(pat_id, centroids)
+
+                if slices_written >= 3:
+                    self._write_max_rolling_z(
+                        pat_id, anchor_keys_list, all_max_z,
                     )
-                    _sig = (
-                        np.array(pat_meta["sigma_diag"], dtype=np.float32)
-                        if pat_meta.get("sigma_diag") else None
-                    )
-                    writer.write_trajectory_from_tensor(
-                        pat_id, active_tensor, active_pks,
-                        bucket_timestamps=[
-                            datetime.fromtimestamp(min_ts + b * window_secs, tz=UTC)
-                            for b in range(n_buckets)
-                        ],
-                        mu=_mu, sigma_diag=_sig,
-                    )
 
-            # 11. Finalize — compact + BTREE index
+                if traj_tables:
+                    ct_traj = pa.concat_tables(traj_tables)
+                    tp = (
+                        self.output_path / "_gds_meta" / "trajectory"
+                        / f"{pat_id}.lance"
+                    )
+                    tp.parent.mkdir(parents=True, exist_ok=True)
+                    _write_lance(ct_traj, str(tp), mode="overwrite")
+                    nt = ct_traj.num_rows
+                    if nt >= 256:
+                        import lance as _ltr
+
+                        tds = _ltr.dataset(str(tp))
+                        np_ = min(64, max(16, int(nt ** 0.5)))
+                        with suppress(Exception):
+                            tds.create_index(
+                                "trajectory_vector",
+                                index_type="IVF_FLAT",
+                                num_partitions=np_,
+                            )
+
+            # Finalize — compact + BTREE index
             if slices_written > 0:
                 writer.compact_temporal(pat_id)
                 writer.build_temporal_index(pat_id)
@@ -3447,6 +3631,79 @@ class GDSBuilder:
         return result
 
     @staticmethod
+    def _compute_chunk_size(
+        n_entities: int,
+        n_buckets: int,
+        n_dims: int,
+        memory_budget_bytes: int,
+    ) -> int:
+        bytes_per_entity = n_buckets * n_dims * 4  # float32
+        overhead_per_entity = n_dims * 8 * 3 + 64  # Welford + indices
+        total_per_entity = bytes_per_entity + overhead_per_entity
+        chunk_size = memory_budget_bytes // max(total_per_entity, 1)
+        floor = min(1000, n_entities)
+        return max(floor, min(chunk_size, n_entities))
+
+    @staticmethod
+    def _plan_execution(
+        patterns_info: dict[str, tuple[int, int, int]],
+        available_ram: int,
+    ) -> tuple[int, dict[str, int]]:
+        budget = int(available_ram * 0.5)
+        pattern_sizes = {
+            pid: n * b * d * 4
+            for pid, (n, b, d) in patterns_info.items()
+        }
+        total_full = sum(pattern_sizes.values())
+
+        if total_full <= budget:
+            return len(patterns_info), {
+                pid: info[0] for pid, info in patterns_info.items()
+            }
+
+        largest = max(pattern_sizes.values()) if pattern_sizes else 1
+        n_workers = max(1, min(budget // max(largest, 1), len(patterns_info)))
+        per_worker_budget = budget // max(n_workers, 1)
+        chunk_sizes = {}
+        for pid, (n, b, d) in patterns_info.items():
+            bpe = b * d * 4
+            chunk_sizes[pid] = max(1000, min(per_worker_budget // max(bpe, 1), n))
+
+        return n_workers, chunk_sizes
+
+    @staticmethod
+    def _detect_available_memory() -> int:
+        try:
+            import ctypes
+            if hasattr(ctypes, "windll"):
+                class _MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+                stat = _MEMORYSTATUSEX()
+                stat.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+                return int(stat.ullAvailPhys)
+        except Exception:
+            pass
+        try:
+            import os
+            pages = os.sysconf("SC_AVPHYS_PAGES")
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            return pages * page_size
+        except Exception:
+            pass
+        return 4 * 1024**3  # 4 GB fallback
+
+    @staticmethod
     def _compute_max_rolling_z(
         shape_tensor: np.ndarray,
         n_anchor: int,
@@ -3454,22 +3711,38 @@ class GDSBuilder:
     ) -> np.ndarray:
         """Compute max rolling z-score across temporal windows.
 
-        For each entity, for each time step t >= 2, compute:
-          z[t] = |shape[t] - mean(shape[0..t-1])| / std(shape[0..t-1])
-        Return the maximum z-score across all (t, dim) per entity.
+        Uses Welford online algorithm: O(n_buckets × n_anchor × D) time,
+        O(n_anchor × D) constant memory. Semantics match the naive
+        expanding-window implementation: zeros for inactive buckets are
+        included in running stats (detects re-activation), z is computed
+        against PRIOR history before updating, population std (ddof=0)
+        with floor at 0.01.
         """
+        D = shape_tensor.shape[2]
+        count = 0
+        mean = np.zeros((n_anchor, D), dtype=np.float64)
+        M2 = np.zeros((n_anchor, D), dtype=np.float64)
         max_z = np.zeros(n_anchor, dtype=np.float32)
-        for t in range(2, n_buckets):
-            # Skip empty buckets (all-zero shape = no data in this window)
-            current = shape_tensor[:, t, :]
+
+        for t in range(n_buckets):
+            current = shape_tensor[:, t, :].astype(np.float64)
             if current.sum() == 0:
                 continue
-            window = shape_tensor[:, :t, :]
-            mu_w = window.mean(axis=1)
-            std_w = np.maximum(window.std(axis=1), 0.01)
-            z = np.abs((current - mu_w) / std_w)
-            z_max = z.max(axis=1)
-            max_z = np.maximum(max_z, z_max)
+
+            # Z against PRIOR history (before updating with current)
+            if count >= 2:
+                std = np.maximum(np.sqrt(np.maximum(M2 / count, 0.0)), 0.01)
+                z = np.abs((current - mean) / std)
+                z_max_t = z.max(axis=1).astype(np.float32)
+                max_z = np.maximum(max_z, z_max_t)
+
+            # Update running stats WITH current
+            count += 1
+            delta = current - mean
+            mean += delta / count
+            delta2 = current - mean
+            M2 += delta * delta2
+
         return max_z
 
     def _write_max_rolling_z(
@@ -3695,28 +3968,23 @@ class GDSBuilder:
                     [fk_group_col, "_bucket"],
                 ).aggregate(agg_exprs)
 
-                # Materialize FK + bucket columns once
-                gk = grouped[fk_group_col].to_pylist()
-                gb_col = grouped["_bucket"].to_numpy(
-                    zero_copy_only=False,
-                ).astype(np.int64)
+                # Vectorized scatter — Arrow pc.index_in + numpy fancy indexing
+                from hypertopos.builder._scatter import vectorized_scatter
 
-                # Scatter each dim's results
+                anchor_keys_arr = pa.array(anchor_keys_list)
+                gk_col = grouped[fk_group_col]
+                gb_col = grouped["_bucket"]
+
                 for j, (result_col, em) in dim_to_result.items():
-                    gv = grouped[result_col].to_numpy(
-                        zero_copy_only=False,
-                    ).astype(np.float64)
-                    for row_idx in range(len(gk)):
-                        idx = key_to_idx.get(gk[row_idx])
-                        if idx is None:
-                            continue
-                        b = int(gb_col[row_idx])
-                        if 0 <= b < n_buckets:
-                            v = gv[row_idx]
-                            if not np.isnan(v):
-                                shape_tensor[idx, b, j] = (
-                                    max(0.0, min(v, em)) / em
-                                )
+                    vectorized_scatter(
+                        tensor=shape_tensor,
+                        dim_idx=j,
+                        edge_max=em,
+                        anchor_keys_arr=anchor_keys_arr,
+                        grouped_fk_col=gk_col,
+                        grouped_bucket_col=gb_col,
+                        grouped_values_col=grouped[result_col],
+                    )
 
         # --- D. Graph features: batch all features per window ---
         if graph_dims:
@@ -3730,12 +3998,20 @@ class GDSBuilder:
                     spec_map[spec_key] = gf_spec
                 spec_to_dims[spec_key].append((j, rel_meta, rel))
 
+            # Pre-sort for O(1) per-bucket slicing (replaces O(E) scan per bucket)
+            _sort_order = np.argsort(bucket_np)
+            _sorted_buckets = bucket_np[_sort_order]
+            _bucket_boundaries = np.searchsorted(
+                _sorted_buckets, np.arange(n_buckets + 1),
+            )
+
             for bucket_idx in range(n_buckets):
-                mask = bucket_np == bucket_idx
-                if not mask.any():
+                b_start = _bucket_boundaries[bucket_idx]
+                b_end = _bucket_boundaries[bucket_idx + 1]
+                if b_start == b_end:
                     continue
 
-                indices = np.where(mask)[0]
+                indices = _sort_order[b_start:b_end]
                 filtered_events = event_table.take(
                     pa.array(indices, type=pa.int64()),
                 )

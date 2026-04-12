@@ -627,26 +627,23 @@ def compute_derived_batch(
     # Single group_by with all aggregate expressions
     grouped = event_table.group_by(group_col).aggregate(agg_exprs)
 
-    # Materialise the FK column once — shared across all specs
-    grouped_keys = grouped[group_col].to_pylist()
+    # Build result for each spec — vectorized scatter via Arrow pc.index_in
+    from hypertopos.builder._scatter import vectorized_scatter_1d
 
-    # Build result for each spec
     results: dict[str, tuple[np.ndarray, int]] = {}
-    # Cache already-materialised result columns to avoid repeated to_pylist()
-    _col_cache: dict[str, list] = {}
+    anchor_keys_arr = pa.array(anchor_list)
+    grouped_fk_pa = grouped[group_col]
 
     for spec in specs:
         result_col_name = spec_to_result_col[spec.dimension_name]
 
-        if result_col_name not in _col_cache:
-            _col_cache[result_col_name] = grouped[result_col_name].to_pylist()
-        grouped_vals = _col_cache[result_col_name]
-
         values = np.zeros(n_anchor, dtype=np.float64)
-        for k, v in zip(grouped_keys, grouped_vals, strict=False):
-            idx = key_to_idx.get(k)
-            if idx is not None:
-                values[idx] = float(v) if v is not None else 0.0
+        vectorized_scatter_1d(
+            values,
+            anchor_keys_arr=anchor_keys_arr,
+            grouped_fk_col=grouped_fk_pa,
+            grouped_values_col=grouped[result_col_name],
+        )
 
         em = _resolve_edge_max(values, spec.edge_max, spec.percentile)
         results[spec.dimension_name] = (values, em)
@@ -662,13 +659,20 @@ def _scatter_grouped(
     n: int,
 ) -> np.ndarray:
     """Map grouped Arrow result to anchor-aligned numpy array."""
+    from hypertopos.builder._scatter import vectorized_scatter_1d
+
     vals = np.zeros(n, dtype=np.float64)
-    gk = grouped[key_col].to_pylist()
-    gv = grouped[val_col].to_pylist()
-    for k, v in zip(gk, gv, strict=False):
-        idx = key_to_idx.get(k)
-        if idx is not None:
-            vals[idx] = float(v) if v is not None else 0.0
+    # Build ordered anchor keys array matching key_to_idx
+    anchor_keys_ordered = [""] * n
+    for k, i in key_to_idx.items():
+        anchor_keys_ordered[i] = k
+    anchor_keys_arr = pa.array(anchor_keys_ordered)
+    vectorized_scatter_1d(
+        vals,
+        anchor_keys_arr=anchor_keys_arr,
+        grouped_fk_col=grouped[key_col],
+        grouped_values_col=grouped[val_col],
+    )
     return vals
 
 

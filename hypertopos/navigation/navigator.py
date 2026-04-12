@@ -671,6 +671,57 @@ class GDSNavigator:
     ]
     _CENTROID_AUTO_SAMPLE: int = 100_000
 
+    @staticmethod
+    def _apply_fdr_select_polygons(
+        polygons: list[Polygon],
+        *,
+        fdr_alpha: float | None,
+        select: str,
+        top_n: int,
+    ) -> list[Polygon]:
+        """Apply FDR filtering and diverse selection to a list of Polygons.
+
+        Mutates Polygon objects in-place (sets q_value / representativeness)
+        and returns the filtered/reordered list.
+        """
+        # --- FDR filtering (opt-in) ---
+        if fdr_alpha is not None and len(polygons) > 0:
+            from hypertopos.engine.fdr import (
+                benjamini_hochberg,
+                empirical_p_values_from_rank,
+            )
+            rank_pct = np.array(
+                [p.delta_rank_pct if p.delta_rank_pct is not None else 0.0
+                 for p in polygons],
+                dtype=np.float64,
+            )
+            p_values = empirical_p_values_from_rank(rank_pct)
+            rejected, q_values = benjamini_hochberg(p_values, fdr_alpha)
+            for poly, q in zip(polygons, q_values):
+                poly.q_value = float(q)  # type: ignore[attr-defined]
+            polygons = [p for p, keep in zip(polygons, rejected) if keep]
+
+        # --- Diverse selection (opt-in) ---
+        if select not in ("top_norm", "diverse"):
+            raise ValueError(f"unknown select mode: {select!r}")
+        if select == "diverse" and len(polygons) > 0:
+            from hypertopos.engine.selection import lazy_greedy_facility_location
+            delta_vectors = np.array(
+                [p.delta for p in polygons], dtype=np.float64,
+            )
+            k = min(top_n, len(polygons))
+            selected_idx, representativeness = lazy_greedy_facility_location(
+                delta_vectors, k,
+            )
+            out: list[Polygon] = []
+            for i, idx in enumerate(selected_idx):
+                poly = polygons[int(idx)]
+                poly.representativeness = int(representativeness[i])  # type: ignore[attr-defined]
+                out.append(poly)
+            polygons = out
+
+        return polygons
+
     def π5_attract_anomaly(
         self,
         pattern_id: str,
@@ -681,6 +732,9 @@ class GDSNavigator:
         include_emerging: bool = False,
         rank_by_property: str | None = None,
         property_filters: dict | None = None,
+        fdr_alpha: float | None = None,
+        fdr_method: str = "bh",
+        select: str = "top_norm",
     ) -> tuple[list[Polygon], int, list[dict] | None, dict | None]:
         """Find the most anomalous polygons in a pattern.
 
@@ -690,6 +744,10 @@ class GDSNavigator:
         with ``total_anomalies_unfiltered`` when *property_filters* is set,
         or ``None`` otherwise.
         """
+        if fdr_method != "bh":
+            raise NotImplementedError(
+                f"Only fdr_method='bh' is supported, got {fdr_method!r}"
+            )
         version = self._resolve_version(pattern_id)
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns[pattern_id]
@@ -757,6 +815,9 @@ class GDSNavigator:
                 )
             else:
                 results = []
+            results = self._apply_fdr_select_polygons(
+                results, fdr_alpha=fdr_alpha, select=select, top_n=top_n,
+            )
             emerging = self._find_emerging(
                 pattern_id, version, pattern, include_emerging, offset, top_n,
             )
@@ -935,12 +996,16 @@ class GDSNavigator:
             if p.primary_key not in seen or p.delta_norm > seen[p.primary_key].delta_norm:
                 seen[p.primary_key] = p
         results = sorted(seen.values(), key=lambda p: p.delta_norm, reverse=True)
+        results = results[offset:offset + top_n]
+        results = self._apply_fdr_select_polygons(
+            results, fdr_alpha=fdr_alpha, select=select, top_n=top_n,
+        )
 
         emerging = self._find_emerging(
             pattern_id, version, pattern, include_emerging, offset, top_n,
         )
         meta = {"total_anomalies_unfiltered": total_anomalies_unfiltered} if property_filters else None
-        return results[offset:offset + top_n], total_found, emerging, meta
+        return results, total_found, emerging, meta
 
     def _find_emerging(
         self,
@@ -1585,12 +1650,19 @@ class GDSNavigator:
         pattern_id: str,
         direction: Literal["in", "out", "both"] = "both",
         top_n: int = 10,
+        fdr_alpha: float | None = None,
+        fdr_method: str = "bh",
+        select: str = "top_norm",
     ) -> list[tuple[Polygon, float]]:
         """Find entities closest to an alias segment boundary (cutting plane).
 
         Returns (polygon, signed_distance) pairs sorted by |signed_distance|.
         signed_distance >= 0 → inside segment, < 0 → outside segment.
         """
+        if fdr_method != "bh":
+            raise NotImplementedError(
+                f"Only fdr_method='bh' is supported, got {fdr_method!r}"
+            )
         sphere = self._storage.read_sphere()
         alias = sphere.aliases.get(alias_id)
         if alias is None:
@@ -1676,6 +1748,17 @@ class GDSNavigator:
             )
             results.append((polygon, signed_dist))
         results.sort(key=lambda x: abs(x[1]))
+
+        # --- FDR + diverse selection post-processing ---
+        if fdr_alpha is not None or select != "top_norm":
+            polygons = [p for p, _ in results]
+            polygons = self._apply_fdr_select_polygons(
+                polygons, fdr_alpha=fdr_alpha, select=select, top_n=top_n,
+            )
+            kept_keys = {p.primary_key for p in polygons}
+            dist_lookup = {p.primary_key: d for p, d in results}
+            results = [(p, dist_lookup[p.primary_key]) for p in polygons]
+
         return results
 
     def contrast_populations(
@@ -3885,6 +3968,9 @@ class GDSNavigator:
         pattern_id: str,
         top_n: int = 10,
         line_id_filter: str | None = None,
+        fdr_alpha: float | None = None,
+        fdr_method: str = "bh",
+        select: str = "top_norm",
     ) -> list[tuple[str, int, float]]:
         """π7 — Find entities with highest geometric connectivity (hub score).
 
@@ -3897,6 +3983,10 @@ class GDSNavigator:
 
         Use line_id_filter to rank by edges to a specific line only.
         """
+        if fdr_method != "bh":
+            raise NotImplementedError(
+                f"Only fdr_method='bh' is supported, got {fdr_method!r}"
+            )
         version = self._resolve_version(pattern_id)
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns[pattern_id]
@@ -3913,10 +4003,12 @@ class GDSNavigator:
             return []
 
         keys = table["primary_key"].to_pylist()
+        _hub_deltas: np.ndarray | None = None
 
         if pattern.edge_max is not None:
             # --- Continuous path: numpy vectorized ---
             deltas = delta_matrix_from_arrow(table)
+            _hub_deltas = deltas
             sigma = np.maximum(pattern.sigma_diag, 1e-2)
             shape_matrix = np.clip(deltas * sigma + pattern.mu, 0.0, 1.0)
 
@@ -3941,13 +4033,13 @@ class GDSNavigator:
             top_indices = np.argpartition(scores, -n)[-n:]
             top_indices = top_indices[np.argsort(scores[top_indices])[::-1]]
 
-            return [
+            results: list[tuple[str, int, float]] = [
                 (keys[i], int(edge_counts[i]), float(scores[i]))
                 for i in top_indices
             ]
         elif "edges" in table.schema.names:
             # --- Binary fallback: JSON edge count ---
-            results: list[tuple[str, int, float]] = []
+            results = []
             for i in range(table.num_rows):
                 bk = keys[i]
                 edges = table["edges"][i].as_py() or []
@@ -3958,7 +4050,7 @@ class GDSNavigator:
                 )
                 results.append((bk, count, float(count)))
             results.sort(key=lambda r: r[2], reverse=True)
-            return results[:top_n]
+            results = results[:top_n]
         else:
             # --- entity_keys fallback: reconstruct from relations ---
             line_ids_col, _ = _table_edge_line_and_point_keys(
@@ -3973,7 +4065,39 @@ class GDSNavigator:
                 )
                 results.append((bk, count, float(count)))
             results.sort(key=lambda r: r[2], reverse=True)
-            return results[:top_n]
+            results = results[:top_n]
+
+        # --- FDR filtering (opt-in) ---
+        if fdr_alpha is not None and len(results) > 0:
+            from hypertopos.engine.fdr import (
+                benjamini_hochberg,
+                empirical_p_values_from_rank,
+            )
+            N = len(results)
+            # p-value from hub_score ranking: rank 1 (highest) → lowest p
+            p_values = np.array(
+                [(N - i) / N for i in range(N)], dtype=np.float64,
+            )
+            rejected, q_values = benjamini_hochberg(p_values, fdr_alpha)
+            results = [
+                r for r, keep in zip(results, rejected) if keep
+            ]
+
+        # --- Diverse selection (opt-in) ---
+        if select not in ("top_norm", "diverse"):
+            raise ValueError(f"unknown select mode: {select!r}")
+        if select == "diverse" and len(results) > 0 and _hub_deltas is not None:
+            from hypertopos.engine.selection import lazy_greedy_facility_location
+            # Build delta matrix for the result keys
+            key_to_idx = {k: i for i, k in enumerate(keys)}
+            result_indices = [key_to_idx[r[0]] for r in results if r[0] in key_to_idx]
+            if result_indices:
+                delta_vectors = _hub_deltas[result_indices].astype(np.float64)
+                k = min(top_n, len(delta_vectors))
+                selected_idx, _ = lazy_greedy_facility_location(delta_vectors, k)
+                results = [results[int(idx)] for idx in selected_idx]
+
+        return results
 
     def hub_score_stats(
         self, pattern_id: str, line_id_filter: str | None = None
@@ -4064,6 +4188,9 @@ class GDSNavigator:
         pattern_id: str,
         top_n: int = 10,
         line_id_filter: str | None = None,
+        fdr_alpha: float | None = None,
+        fdr_method: str = "bh",
+        select: str = "top_norm",
     ) -> tuple[list[tuple[str, int, float, float | None]], dict]:
         """π7 variant — returns (top_n_results, score_stats) in ONE geometry scan.
 
@@ -4073,6 +4200,10 @@ class GDSNavigator:
         hub_score_pct is the score as a percentage of max_hub_score (None in binary mode).
         stats dict includes max_hub_score for continuous patterns.
         """
+        if fdr_method != "bh":
+            raise NotImplementedError(
+                f"Only fdr_method='bh' is supported, got {fdr_method!r}"
+            )
         version = self._resolve_version(pattern_id)
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns[pattern_id]
@@ -4094,6 +4225,9 @@ class GDSNavigator:
 
         keys = table["primary_key"].to_pylist()
         scores = self._compute_hub_scores(table, pattern, line_id_filter)
+        _hub_deltas: np.ndarray | None = None
+        if pattern.edge_max is not None:
+            _hub_deltas = delta_matrix_from_arrow(table)
 
         # Top-N results
         if pattern.edge_max is not None:
@@ -4112,6 +4246,40 @@ class GDSNavigator:
             )
             for i in top_indices
         ]
+
+        # --- FDR filtering (opt-in) ---
+        if fdr_alpha is not None and len(results) > 0:
+            from hypertopos.engine.fdr import (
+                benjamini_hochberg,
+                empirical_p_values_from_rank,
+            )
+
+            # Population rank percentile from the full scores array
+            total = len(scores)
+            rank_pcts = np.array(
+                [float(np.sum(scores <= r[2])) / total * 100
+                 for r in results],
+                dtype=np.float64,
+            )
+            p_values = empirical_p_values_from_rank(rank_pcts)
+            rejected, q_values = benjamini_hochberg(p_values, fdr_alpha)
+            results = [
+                r for r, keep in zip(results, rejected) if keep
+            ]
+
+        # --- Diverse selection (opt-in) ---
+        if select not in ("top_norm", "diverse"):
+            raise ValueError(f"unknown select mode: {select!r}")
+        if select == "diverse" and len(results) > 0 and _hub_deltas is not None:
+            from hypertopos.engine.selection import lazy_greedy_facility_location
+
+            key_to_idx = {k: i for i, k in enumerate(keys)}
+            result_indices = [key_to_idx[r[0]] for r in results if r[0] in key_to_idx]
+            if result_indices:
+                delta_vectors = _hub_deltas[result_indices].astype(np.float64)
+                k = min(top_n, len(delta_vectors))
+                selected_idx, _ = lazy_greedy_facility_location(delta_vectors, k)
+                results = [results[int(idx)] for idx in selected_idx]
 
         # Stats (full population)
         stats: dict[str, Any] = {
@@ -4197,6 +4365,9 @@ class GDSNavigator:
         filters: dict[str, str | list[str]] | None = None,
         forecast_horizon: int | None = None,
         rank_by_dimension: str | None = None,
+        fdr_alpha: float | None = None,
+        fdr_method: str = "bh",
+        select: str = "top_norm",
     ) -> list[dict]:
         """π9 — Find entities with highest geometric drift (temporal velocity).
 
@@ -4218,6 +4389,10 @@ class GDSNavigator:
         dimension_diffs and dimension_diffs_current still include prop_columns as
         informational context so agents can see property acquisition separately.
         """
+        if fdr_method != "bh":
+            raise NotImplementedError(
+                f"Only fdr_method='bh' is supported, got {fdr_method!r}"
+            )
         import random
 
         sphere = self._storage.read_sphere()
@@ -4413,6 +4588,7 @@ class GDSNavigator:
             )
         else:
             results.sort(key=lambda r: r["displacement"], reverse=True)
+        total_drift_population = len(results)
         results = results[:top_n]
 
         # Add slice_window_days to each entry
@@ -4477,6 +4653,47 @@ class GDSNavigator:
                 last_ts = _dt2.fromisoformat(entry["last_timestamp"])
                 forecast = check_stale_forecast(last_ts, forecast)
                 entry["drift_forecast"] = forecast
+
+        # --- FDR filtering (opt-in) ---
+        if fdr_alpha is not None and len(results) > 0:
+            from hypertopos.engine.fdr import (
+                benjamini_hochberg,
+                empirical_p_values_from_rank,
+            )
+            # Population rank percentile: rank i (0-based) in sorted top
+            # corresponds to position i in total_drift_population
+            rank_pcts = np.array(
+                [(total_drift_population - i) / total_drift_population * 100
+                 for i in range(len(results))],
+                dtype=np.float64,
+            )
+            p_values = empirical_p_values_from_rank(rank_pcts)
+            rejected, q_values = benjamini_hochberg(p_values, fdr_alpha)
+            for row, q in zip(results, q_values):
+                row["q_value"] = float(q)
+            results = [row for row, keep in zip(results, rejected) if keep]
+
+        # --- Diverse selection (opt-in) ---
+        if select not in ("top_norm", "diverse"):
+            raise ValueError(f"unknown select mode: {select!r}")
+        if select == "diverse" and len(results) > 0:
+            from hypertopos.engine.selection import lazy_greedy_facility_location
+            dim_keys = list(results[0].get("dimension_diffs", {}).keys())
+            if dim_keys:
+                delta_vectors = np.array(
+                    [[r["dimension_diffs"].get(d, 0.0) for d in dim_keys] for r in results],
+                    dtype=np.float64,
+                )
+                k = min(top_n, len(results))
+                selected_idx, representativeness = lazy_greedy_facility_location(
+                    delta_vectors, k,
+                )
+                out: list[dict] = []
+                for i, idx in enumerate(selected_idx):
+                    row = dict(results[int(idx)])
+                    row["representativeness"] = int(representativeness[i])
+                    out.append(row)
+                results = out
 
         return results
 

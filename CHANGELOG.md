@@ -5,6 +5,29 @@ All notable changes to hypertopos will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-04-12
+
+### Added
+
+- Benjamini-Hochberg FDR control on attract primitives. `fdr_alpha` parameter on `pi5_attract_anomaly`, `pi6_attract_boundary`, `pi7_attract_hub`, and `pi9_attract_drift` applies BH multiple-testing correction to empirical-null p-values derived from delta rank percentile. Entities with `q_value > alpha` are removed before the top-N step. Guarantees `E[FDR] <= alpha`. Each retained entity carries a `q_value` — the minimum alpha at which it would still be retained. Off by default; legacy behavior preserved when omitted.
+- Diverse selection via submodular facility location. `select="diverse"` on the same four primitives replaces top-N ranking with a lazy-greedy maximisation of the facility location objective over pairwise cosine similarity of delta vectors. Achieves `(1 - 1/e)` approximation to the optimal K-subset. Each selected entity reports a `representativeness` count — how many population members are nearest to it among the selected set. Covers the geometric space of the result set instead of clustering around a single extreme region.
+- `engine/fdr.py` module: `benjamini_hochberg`, `empirical_p_values_from_rank`, `q_values_from_p_values` — pure NumPy, no state, no I/O.
+- `engine/selection.py` module: `lazy_greedy_facility_location`, `compute_similarity_matrix` — pure NumPy, Nemhauser-Wolsey-Fisher optimality guarantee.
+
+### Changed
+
+- Build pipeline: derived dimension scatter loops replaced with Arrow `pc.index_in` + numpy fancy indexing. Eliminates per-row Python iteration in both static (`compute_derived_batch`) and temporal (`_precompute_shape_tensor`) build paths.
+- Build pipeline: contagion stats computation (`_build_contagion_stats`) rewritten from Python loops over edge table to Arrow group_by + join. Eliminates O(E+N) Python iterations.
+- Build pipeline: rolling z-score (`_compute_max_rolling_z`) uses Welford online algorithm. Reduces time complexity from O(n_buckets² × N × D) to O(n_buckets × N × D) and memory from O(N × n_buckets × D) to O(N × D).
+- Build pipeline: temporal Arrow assembly uses single numpy reshape instead of per-bucket table construction loop.
+- Build pipeline: graph dims temporal computation uses pre-sorted event table with `searchsorted` for O(1) per-bucket slicing instead of O(E) scan per bucket.
+- Build pipeline: `build_temporal` adaptively chunks entities when the shape tensor would exceed available RAM. Auto-detects memory via platform APIs, falls back to 4 GB budget. Single-pass path (zero overhead) when tensor fits.
+
+### Fixed
+
+- `empirical_p_values_from_rank` used a `1/N` floor where N was the input array length. When the input was a small `top_n` slice (e.g. 5 entities), the floor clipped all p-values to 0.2, causing BH to reject everything at `alpha=0.05`. Now uses a fixed `1e-10` floor — the rank percentile is already computed against the full population, so the floor only needs to prevent exact zero for numerical stability.
+- `π7_attract_hub` and `π9_attract_drift` FDR computed p-values as `(N-i)/N` where N was the `top_n` result count (e.g. 10), making the best possible p-value `1/top_n` — mathematically unable to pass BH at any `alpha < 1/top_n`. Now uses population-level rank percentiles: hubs use the empirical CDF from the full scores array, drift uses the rank position relative to the total pre-truncation population.
+
 ## [0.3.0] — 2026-04-12
 
 > **Theme:** Lance 3.x perf upgrade. Aggregate engine moves from a persistent subprocess worker plus an optional external DataFusion package to the Lance scanner's built-in DataFusion executor via `LanceDataset.sql(...)`. The build-time contagion stats table replaces the runtime edge-table replay in the graph contagion scanner. Format 2.2 is the new write default.

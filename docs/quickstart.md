@@ -1,6 +1,10 @@
 # Quick Start
 
-> Build a sphere from your data, then let AI agents navigate it.
+> From zero to a navigable geometric space.
+
+This guide walks you through building a sphere from a relational dataset and connecting it to an AI agent. You will define entity types and their relationships in YAML, compute population-relative coordinates for every entity, and produce a sphere that agents can explore.
+
+For the idea behind this, see [Introduction](introduction.md).
 
 ## Install
 

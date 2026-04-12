@@ -1,38 +1,22 @@
 # hypertopos Documentation
 
-> Package documentation for hypertopos — the AI-first geometric data sphere.
+hypertopos turns relational data into navigable geometric space — a coordinate system where structure, anomalies, and change become directly observable.
 
-## Reading Paths
+**New here?** Read the [Introduction](introduction.md) for the idea, then [Quick Start](quickstart.md) to try it.
 
-**New to hypertopos?** Start here:
+**Want depth?** [Core Concepts](concepts.md) covers the mathematical foundation, objects, and vocabulary.
 
-1. [Quick Start](quickstart.md) — install, build, navigate
-2. [Core Concepts](concepts.md) — the GDS mental model
-3. [Configuration](configuration.md) — sphere.yaml reference
+**Building something?** Jump to the reference docs below.
 
-**Building a sphere?**
-→ [Configuration](configuration.md) — full YAML reference with examples
+## Documents
 
-**Writing Python code?**
-→ [API Reference](api-reference.md) — classes, methods, error types
-
-**Understanding the format?**
-→ [Data Format](data-format.md) — directory layout, Arrow schemas, sphere.json
-
-**Understanding the design?**
-→ [Architecture](architecture.md) — package structure, runtime flow
-
-**Checking the evidence?**
-→ [Benchmarks](benchmarks.md) — validation results across three domains
-
-## All Documents
-
-| Document | Description |
-|----------|-------------|
-| [quickstart.md](quickstart.md) | From zero to navigating a sphere |
-| [concepts.md](concepts.md) | Core GDS mental model and vocabulary |
-| [architecture.md](architecture.md) | Package structure, layers, design principles |
-| [configuration.md](configuration.md) | Sphere builder YAML reference |
-| [api-reference.md](api-reference.md) | Python API — classes, methods, errors |
-| [data-format.md](data-format.md) | Physical storage format on disk |
-| [benchmarks.md](benchmarks.md) | Validation results — Berka, IBM AML, NYC Taxi |
+| Document | What it covers |
+|----------|----------------|
+| [Introduction](introduction.md) | The idea, how it works, where it stands |
+| [Quick Start](quickstart.md) | Install, build a sphere, connect an agent |
+| [Core Concepts](concepts.md) | Mathematical foundation, objects, population model |
+| [Architecture](architecture.md) | Package layers, runtime flow, design decisions |
+| [Configuration](configuration.md) | Sphere builder YAML reference |
+| [API Reference](api-reference.md) | Python API — classes, methods, errors |
+| [Data Format](data-format.md) | On-disk layout, Arrow schemas, sphere.json |
+| [Benchmarks](benchmarks.md) | Validation results — banking, AML, transportation |

@@ -1,53 +1,6 @@
 # hypertopos — Roadmap
 
-> Planned direction. Priorities may change based on feedback. 
-
-## Current: 0.3.1
-
-FDR control, diverse anomaly summarisation, and build pipeline optimization — Benjamini-Hochberg multiple-testing correction, submodular facility location, vectorized build with adaptive memory chunking. See CHANGELOG.
-
----
-
-## 0.3.0
-
-Lance 3.x perf upgrade — aggregate engine rewritten around Lance SQL, precomputed contagion stats, format 2.2, contagion anchor resolution fix, edge table auto-detect fix. See CHANGELOG.
-
----
-
-## 0.2.2
-
-As-of graph reconstruction across edge-table graph primitives + latency fix on `detect_cross_pattern_discrepancy`. See CHANGELOG.
-
----
-
-## 0.2.1
-
-Witness cohort discovery — investigative peer ranking. See CHANGELOG.
-
----
-
-## 0.2.0
-
-Graph meets geometry — edge table, runtime traversal, contagion/influence, +11 navigator functions. See CHANGELOG.
-
----
-
-## 0.1.0
-
-First public release — full GDS stack, π1–π12, builder, MCP server, validation suite. See CHANGELOG.
-
----
-
-## 0.3.2
-
-Builder intelligence — smarter geometry, faster builds.
-
-- **Temporal build performance** — NumPy graph features, chunked pre-computation, Lance compact tuning. Combined speedup across benchmark spheres.
-- **Geometry build performance** — per-dimension BTREE indices replaced with zone-map filtering, streaming re-read eliminated.
-- **Generalized (d+m+g+t+s) dimension blocks** — geographic, metric, and semantic dimension support in the builder beyond the current anchor/event model.
-- **Geometric heredity for cold-start entities** — `find_novel_entities` scores entities by deviation from neighbor-expected geometry using edge table adjacency.
-
----
+> Planned direction. Priorities may change based on feedback.
 
 ## Plan: 0.3.3
 
@@ -70,6 +23,32 @@ Edge-derived geometry — the edge table becomes a first-class geometric citizen
 
 ---
 
+## 0.3.0
+
+Lance perf upgrade, FDR control, builder intelligence.
+
+- **0.3.0** — Aggregate engine rewritten around Lance SQL, precomputed contagion stats, format 2.2, edge table auto-detect fix.
+- **0.3.1** — Benjamini-Hochberg FDR control, submodular facility location, vectorized build with adaptive memory chunking.
+- **0.3.2** — NumPy graph features, chunked pre-computation, Lance compact tuning, per-dim index removal. Generalized dimension blocks (g/t/s), geometric heredity (`find_novel_entities`).
+
+---
+
+## 0.2.0
+
+Graph meets geometry — edge table, runtime traversal, contagion/influence.
+
+- **0.2.0** — Edge table, +11 navigator functions, contagion/influence primitives.
+- **0.2.1** — Witness cohort discovery, investigative peer ranking.
+- **0.2.2** — As-of graph reconstruction, `detect_cross_pattern_discrepancy` latency fix.
+
+---
+
+## 0.1.0
+
+First public release — full GDS stack, π1–π12, builder, MCP server, validation suite.
+
+---
+
 ## Future
 
 **Detection quality**
@@ -79,19 +58,16 @@ Edge-derived geometry — the edge table becomes a first-class geometric citizen
 
 **Builder evolution**
 - Incremental rebuild — geometry-only without `--force` wipe
-- Generalized (d+m+g+t+s) dimension blocks — geographic / metric / semantic dimension support
 
 **PassiveScanner evolution**
 - Native temporal source support for direct temporal inputs, without requiring manual dataset plumbing in benchmark scripts
 - Optional weighted scoring mode that uses continuous intensity instead of binary counts
-- **SphereProfiler** — autonomous sphere scanner that profiles all patterns, runs calibration sweeps across source combinations, proposes optimal PassiveScanner composition for Layer 1 surveillance. Core loop: enumerate patterns → single-source anomaly scans → greedy multi-source combination → ranked composition report. No labeled GT needed; optional GT file unlocks supervised calibration.
+- **SphereProfiler** — autonomous sphere scanner that profiles all patterns, runs calibration sweeps across source combinations, proposes optimal PassiveScanner composition for Layer 1 surveillance.
 
 **Code refactoring**
 - Break up oversized modules into smaller, domain-focused components
-- Reduce coupling between core layers by replacing private cross-layer access with explicit interfaces where practical
-- Tighten error handling in hot paths so failures are surfaced more consistently
-- Consolidate repeated orchestration logic into shared helpers instead of duplicating it across modules
-- Incremental refactor: preserve behavior, improve structure, then revisit deeper architectural boundaries
+- Reduce coupling between core layers
+- Consolidate repeated orchestration logic into shared helpers
 
 **Cross-sphere capabilities**
 - Cross-sphere comparison — dimensionless metrics across independently calibrated coordinate spaces

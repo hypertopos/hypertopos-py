@@ -7,6 +7,15 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.3] — 2026-04-13
+
+### Added
+
+- `dim_mask` parameter on `find_similar_entities` — compute distance only on named dimensions. Focuses similarity search on specific aspects of geometry (e.g., only the dimensions driving an anomaly).
+- `metric` parameter on `find_similar_entities` — `"L2"` (default Euclidean) or `"cosine"` (shape similarity ignoring magnitude). Cosine compares anomaly profile direction, not severity.
+- `metric` parameter on `find_anomalies` (π5) — `"L2"` (default, pre-computed) or `"Linf"` (max single-dimension |delta|, runtime scan). Linf catches single-dimension spikes that L2 dilutes.
+- `push-mirrors.sh --from-ref` mode for incremental mirror pushes between tagged releases, with pre/post author verification guard.
+
 ## [0.3.2] — 2026-04-13
 
 ### Added

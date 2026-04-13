@@ -2,24 +2,28 @@
 
 > Planned direction. Priorities may change based on feedback.
 
-## Plan: 0.3.3
+## Plan: 0.4.0
 
-Agent navigation policy — skill-level changes to make agents effective navigators of geometric space.
+Investigation depth + detection quality — new geometric primitives, agent trust, calibration.
 
-- **Graph confirmation flow** — add witness_cohort + contagion confirmation step to investigator and fraud-investigator skills after explain_anomaly.
-- **Investigation memory** — instruct agents to track checked entities, dead ends, and promising leads in conversation state.
-- **Failure mode guards** — depth limits, anomaly strength thresholds, and force-switch after N consecutive calls on same entity.
-- **Decision scoring** — priority queue heuristic (anomaly_strength + graph_support + temporal_signal + novelty) for iterative re-ranking of investigation targets.
+- **Lazy chain geometry** — on-demand chain delta vectors via sampled population calibration; `discover_chains(include_geometry=True)` supplements build-time `chain_lines` for per-entity investigation without rebuild cost.
+- **Multi-hop anomaly explanation chains** — automate the trace-to-root-cause workflow: anomalous entity → top dimension → edge entity → hub check → neighbor check → explanation chain with per-hop evidence. Collapses 4–6 tool calls into one.
+- **Theta calibration fix** — builder writes correct theta_norm to sphere.json at build time; eliminates miscalibration on mixed-type patterns.
+- **Geometric edge potential** — relationship anomaly scoring via endpoint geometric distance; flags edges connecting geometrically distant entities.
+- **Geometric dark matter** — population density gap detection; identifies coordinate-space regions that should have entities but are empty (anomaly by absence).
+- **Gradient alignment on drift** — drift direction signal (normalizing vs deteriorating) on `find_drifting_entities` and `dive_solid`.
+- **Interpretive MCP output** — computed interpretation fields on tool responses (`passive_scan`, `find_similar_entities`, `dive_solid`, `find_regime_changes`) so agents stop misreading raw numbers.
+- **Anomaly confidence via bootstrap** — `anomaly_confidence: 0–1` per entity quantifying how stable the anomaly verdict is under population perturbation.
 
 ---
 
-## Plan: 0.4.0
+## Plan: 0.5.0
 
-Edge-derived geometry — the edge table becomes a first-class geometric citizen.
+Edge-derived geometry + advanced analytics.
 
-- **Edge-derived dimensions on event patterns** — degree, flow, velocity computed at build time as geometric dimensions. Edges feed geometry.
-- **`find_motif` — structural pattern matching on edge table** — per-hop predicates, new navigation primitive for subgraph patterns invisible to flat queries.
-- **Geometric edge potential** — relationship anomaly scoring via endpoint geometric distance. Geometry feeds edge scoring.
+- **Edge-derived dimensions on event patterns** — pair-level and node-derived features computed at build time as geometric dimensions.
+- **`find_motif` — structural pattern matching on edge table** — per-hop predicates for subgraph patterns invisible to flat queries.
+- **Advanced coordinate space analytics** — new methods leveraging properties unique to population-relative coordinate construction.
 
 ---
 
@@ -30,6 +34,7 @@ Lance perf upgrade, FDR control, builder intelligence.
 - **0.3.0** — Aggregate engine rewritten around Lance SQL, precomputed contagion stats, format 2.2, edge table auto-detect fix.
 - **0.3.1** — Benjamini-Hochberg FDR control, submodular facility location, vectorized build with adaptive memory chunking.
 - **0.3.2** — NumPy graph features, chunked pre-computation, Lance compact tuning, per-dim index removal. Generalized dimension blocks (g/t/s), geometric heredity (`find_novel_entities`).
+- **0.3.3** — Agent navigation policy (investigation memory, failure guards, decision scoring). Dimension-selective similarity (`dim_mask`, `metric="cosine"`, `metric="Linf"`). Sphere-specific hardcoding removed from 6 skill guidance texts.
 
 ---
 
@@ -54,7 +59,6 @@ First public release — full GDS stack, π1–π12, builder, MCP server, valida
 **Detection quality**
 - Edge-derived dimensions + temporal motif matcher
 - Confidence scoring, robust estimators, multi-scale resolution — improve anomaly precision and reduce false positives on heavy-tail and multi-modal populations
-- Lazy chain geometry — on-demand chain delta vectors via sampled population calibration; supplements the build-time `chain_lines` path
 
 **Builder evolution**
 - Incremental rebuild — geometry-only without `--force` wipe

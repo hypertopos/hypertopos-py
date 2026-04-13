@@ -553,44 +553,105 @@ class GDSEngine:
         top_n: int = 5,
         exclude_keys: set[str] | None = None,
         filter_expr: str | None = None,
+        dim_mask_indices: list[int] | None = None,
+        metric: str = "L2",
     ) -> list[tuple[str, float]]:
         """Find top-n nearest entities. Uses Lance ANN index when available.
 
-        filter_expr: optional Lance SQL predicate passed to ANN (e.g. 'is_anomaly = true').
-        On the NumPy fallback path the expression is ignored (caller responsibility).
+        filter_expr: optional Lance SQL predicate passed to ANN.
+        dim_mask_indices: compute distance only on these dimension indices.
+        metric: "L2" (Euclidean) or "cosine" (1 - cos_sim).
         """
-        # Fast path: Lance IVF_FLAT ANN
+        need_rerank = dim_mask_indices is not None or metric != "L2"
+
+        # Fast path: Lance IVF_FLAT ANN (L2 only, full vector)
         _ann_fn = getattr(self._storage, "find_nearest_lance", None)
-        if _ann_fn is not None:
+        if _ann_fn is not None and not need_rerank:
             ann = _ann_fn(pattern_id, version, ref_delta, top_n, exclude_keys, filter_expr)
             if ann is not None:
                 return ann
 
-        # Fallback: brute-force NumPy (non-indexed Lance)
+        # Over-fetch from ANN when we need to re-rank
+        if _ann_fn is not None and need_rerank:
+            ann = _ann_fn(
+                pattern_id, version, ref_delta, top_n * 5,
+                exclude_keys, filter_expr,
+            )
+            if ann is not None:
+                ann_keys = {k for k, _ in ann}
+                geo = self._storage.read_geometry(
+                    pattern_id, version,
+                    columns=["primary_key", "delta"],
+                    point_keys=list(ann_keys),
+                )
+                keys = geo["primary_key"].to_pylist()
+                deltas = delta_matrix_from_arrow(geo)
+                distances = self._compute_distances(
+                    ref_delta, deltas, dim_mask_indices, metric,
+                )
+                if exclude_keys:
+                    mask = np.array([k in exclude_keys for k in keys])
+                    distances[mask] = np.inf
+                return self._top_n_from_distances(keys, distances, top_n)
+
+        # Fallback: brute-force NumPy
         geo = self._storage.read_geometry(
             pattern_id, version, columns=["primary_key", "delta"],
         )
         keys = geo["primary_key"].to_pylist()
         deltas = delta_matrix_from_arrow(geo)
 
-        _diff = deltas - ref_delta.astype(np.float32)
-        distances = np.sqrt(np.einsum('ij,ij->i', _diff, _diff))
+        distances = self._compute_distances(
+            ref_delta, deltas, dim_mask_indices, metric,
+        )
 
         if exclude_keys:
             mask = np.array([k in exclude_keys for k in keys])
             distances[mask] = np.inf
 
+        return self._top_n_from_distances(keys, distances, top_n)
+
+    @staticmethod
+    def _compute_distances(
+        ref: np.ndarray,
+        candidates: np.ndarray,
+        dim_mask_indices: list[int] | None,
+        metric: str,
+    ) -> np.ndarray:
+        ref_f = ref.astype(np.float32)
+        cand = candidates
+
+        if dim_mask_indices is not None:
+            idx = np.array(dim_mask_indices, dtype=np.intp)
+            ref_f = ref_f[idx]
+            cand = cand[:, idx]
+
+        if metric == "cosine":
+            ref_norm = np.linalg.norm(ref_f)
+            cand_norms = np.linalg.norm(cand, axis=1)
+            safe_denom = np.maximum(ref_norm * cand_norms, 1e-10)
+            cos_sim = cand @ ref_f / safe_denom
+            return 1.0 - cos_sim
+
+        # L2 (default)
+        diff = cand - ref_f
+        return np.sqrt(np.einsum('ij,ij->i', diff, diff))
+
+    @staticmethod
+    def _top_n_from_distances(
+        keys: list[str],
+        distances: np.ndarray,
+        top_n: int,
+    ) -> list[tuple[str, float]]:
         finite_count = int(np.sum(np.isfinite(distances)))
         n = min(top_n, finite_count)
         if n == 0:
             return []
-
         if n >= len(distances):
             top_indices = np.argsort(distances)[:n]
         else:
             top_indices = np.argpartition(distances, n)[:n]
             top_indices = top_indices[np.argsort(distances[top_indices])]
-
         return [(keys[i], float(distances[i])) for i in top_indices]
 
     def find_clusters(

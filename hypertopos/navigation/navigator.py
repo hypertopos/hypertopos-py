@@ -735,6 +735,7 @@ class GDSNavigator:
         fdr_alpha: float | None = None,
         fdr_method: str = "bh",
         select: str = "top_norm",
+        metric: str = "L2",
     ) -> tuple[list[Polygon], int, list[dict] | None, dict | None]:
         """Find the most anomalous polygons in a pattern.
 
@@ -748,6 +749,8 @@ class GDSNavigator:
             raise NotImplementedError(
                 f"Only fdr_method='bh' is supported, got {fdr_method!r}"
             )
+        if metric not in ("L2", "Linf"):
+            raise ValueError(f"metric must be 'L2' or 'Linf', got '{metric}'")
         version = self._resolve_version(pattern_id)
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns[pattern_id]
@@ -779,7 +782,7 @@ class GDSNavigator:
             )
         except _NAVIGATION_RECOVERABLE_ERRORS:
             _geo_count = 0
-        if _geo_count > 500_000 and rank_by_property is None:
+        if _geo_count > 500_000 and rank_by_property is None and metric == "L2":
             from hypertopos.engine.lance_sql_agg import (
                 find_anomalies as _lance_sql_find_anomalies,
             )
@@ -828,13 +831,19 @@ class GDSNavigator:
         # ------------------------------------------------------------------
 
         # Pass 1: light scan — push delta_norm >= threshold to Lance scanner
+        # Linf metric: can't use pre-computed delta_norm, read all geometry
         cols = list(self._LIGHT_COLUMNS)
         if missing_edge_to:
             cols.append("edges")
-        light = self._storage.read_geometry(
-            pattern_id, version, columns=cols,
-            filter=f"delta_norm >= {threshold}",
-        )
+        if metric == "Linf":
+            light = self._storage.read_geometry(
+                pattern_id, version, columns=cols,
+            )
+        else:
+            light = self._storage.read_geometry(
+                pattern_id, version, columns=cols,
+                filter=f"delta_norm >= {threshold}",
+            )
         if light.num_rows == 0:
             emerging = self._find_emerging(
                 pattern_id, version, pattern, include_emerging, offset, top_n,
@@ -854,7 +863,10 @@ class GDSNavigator:
 
         # Vectorized recompute + rank
         delta_matrix = delta_matrix_from_arrow(light)
-        norms = np.sqrt(np.einsum('ij,ij->i', delta_matrix, delta_matrix)).astype(np.float32)
+        if metric == "Linf":
+            norms = np.max(np.abs(delta_matrix), axis=1).astype(np.float32)
+        else:
+            norms = np.sqrt(np.einsum('ij,ij->i', delta_matrix, delta_matrix)).astype(np.float32)
         valid = norms >= threshold
         if not np.any(valid):
             emerging = self._find_emerging(
@@ -2119,6 +2131,8 @@ class GDSNavigator:
         top_n: int = 5,
         filter_expr: str | None = None,
         missing_edge_to: str | None = None,
+        dim_mask: list[str] | None = None,
+        metric: str = "L2",
     ) -> SimilarityResult:
         """Find top_n entities most similar to primary_key by delta vector distance.
 
@@ -2158,6 +2172,25 @@ class GDSNavigator:
             raise KeyError(f"Entity '{primary_key}' not found in {pattern_id} v{version}")
         ref_delta = np.array(table["delta"][0].as_py(), dtype=np.float32)
 
+        # Resolve dim_mask names → indices
+        dim_mask_indices: list[int] | None = None
+        if dim_mask is not None:
+            if not dim_mask:
+                raise ValueError("dim_mask must be non-empty")
+            pattern = sphere.patterns[pattern_id]
+            labels = pattern.dim_labels
+            dim_mask_indices = []
+            for name in dim_mask:
+                if name in labels:
+                    dim_mask_indices.append(labels.index(name))
+                else:
+                    raise ValueError(
+                        f"Unknown dimension '{name}' in dim_mask. "
+                        f"Available: {labels}"
+                    )
+        if metric not in ("L2", "cosine"):
+            raise ValueError(f"metric must be 'L2' or 'cosine', got '{metric}'")
+
         # Over-fetch when post-filter will remove some results
         fetch_n = top_n * 5 if missing_edge_to else top_n
 
@@ -2168,6 +2201,8 @@ class GDSNavigator:
             top_n=fetch_n,
             exclude_keys={primary_key},
             filter_expr=filter_expr,
+            dim_mask_indices=dim_mask_indices,
+            metric=metric,
         )
 
         if missing_edge_to and results:

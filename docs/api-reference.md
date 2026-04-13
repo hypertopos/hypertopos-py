@@ -143,7 +143,7 @@ with sphere.session("agent-1") as session:
 |--------|-------------|
 | `explain_anomaly(primary_key, pattern_id)` | Structured investigation: severity, witness set, repair set, conformal p-value, reputation |
 | `explain_anomaly_chain(primary_key, pattern_id, max_hops)` | Trace anomaly propagation through geometric neighbors |
-| `find_similar_entities(primary_key, pattern_id, top_n)` | ANN search for nearest entities in delta-space. Returns `SimilarityResult` |
+| `find_similar_entities(primary_key, pattern_id, top_n, dim_mask, metric)` | ANN search for nearest entities in delta-space. `dim_mask`: list of dimension names to restrict distance. `metric`: `"L2"` or `"cosine"`. Returns `SimilarityResult` |
 | `contrast_populations(pattern_id, group_a, group_b)` | Dimension-by-dimension comparison of two entity groups (Cohen's d) |
 | `composite_risk(primary_key, line_id)` | Fisher's method combination of conformal p-values across patterns |
 | `composite_risk_batch(primary_keys, line_id)` | Batch Fisher combination for multiple entities |

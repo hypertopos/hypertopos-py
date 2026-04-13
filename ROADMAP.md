@@ -50,13 +50,33 @@ Two production-quality improvements on top of the 0.3.0 storage layer:
 
 ## Plan: 0.3.2
 
-TBD.
+Builder intelligence — smarter geometry, faster builds.
+
+- **Temporal build phase optimization** — pre-aggregated event matrix eliminates O(n × windows) rescans; 5–10× speedup on temporal phase, enabling practical iteration on richer sphere configurations.
+- **Generalized (d+m+g+t+s) dimension blocks** — geographic, metric, and semantic dimension support in the builder beyond the current anchor/event model.
+- **Geometric heredity for cold-start entities** — inherited geometric positioning for entities without sufficient history, using population priors and neighbor geometry.
+
+---
+
+## Plan: 0.3.3
+
+Agent navigation policy — skill-level changes to make agents effective navigators of geometric space.
+
+- **Graph confirmation flow** — add witness_cohort + contagion confirmation step to investigator and fraud-investigator skills after explain_anomaly.
+- **Investigation memory** — instruct agents to track checked entities, dead ends, and promising leads in conversation state.
+- **Failure mode guards** — depth limits, anomaly strength thresholds, and force-switch after N consecutive calls on same entity.
+- **Decision scoring** — priority queue heuristic (anomaly_strength + graph_support + temporal_signal + novelty) for iterative re-ranking of investigation targets.
 
 ---
 
 ## Plan: 0.4.0
 
-TBD.
+Edge-derived geometry — the edge table becomes a first-class geometric citizen.
+
+- **Edge-derived dimensions on event patterns** — degree, flow, velocity computed at build time as geometric dimensions. Edges feed geometry.
+- **`find_motif` — structural pattern matching on edge table** — per-hop predicates, new navigation primitive for subgraph patterns invisible to flat queries.
+- **Geometric edge potential** — relationship anomaly scoring via endpoint geometric distance. Geometry feeds edge scoring.
+- **Temporal build phase optimization** — pre-aggregated event matrix eliminates O(n × windows) rescans, enabling practical rebuilds with richer edge-derived dimensions.
 
 ---
 

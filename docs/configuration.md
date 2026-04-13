@@ -394,6 +394,40 @@ patterns:
 
 To skip edge table emission entirely (e.g. for faster iterative builds), use the `--no-edges` CLI flag.
 
+### Generalized Dimension Blocks
+
+Patterns optionally accept three additional dimension block fields that inject geographic, metric, or semantic columns from the entity line into the delta vector. All three are optional — existing configs are unaffected.
+
+```yaml
+patterns:
+  account_pattern:
+    type: anchor
+    entity_line: accounts
+    # ... existing fields (derived_dimensions, relations, etc.) ...
+
+    # Generalized dimension blocks (optional)
+    geo_properties:          # list of geographic column names from entity line
+      - latitude
+      - longitude
+    metric_properties:       # list of numeric column names from entity line
+      - balance
+      - credit_limit
+    semantic_dim:            # embedding dimensionality reduction
+      columns:
+        - description_embedding
+      n_components: 8        # target PCA dimensions
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `geo_properties` | list | `null` | Geographic columns. Normalized with empirical mu/sigma. Dimensions prefixed `g:` (e.g. `g:lat`). |
+| `metric_properties` | list | `null` | Numeric columns. Normalized with empirical mu/sigma. Dimensions prefixed `t:` (e.g. `t:balance`). |
+| `semantic_dim` | dict | `null` | Embedding columns reduced via SVD-based PCA. Dimensions prefixed `s:` (e.g. `s:pc0`). |
+| `semantic_dim.columns` | list | — | **Required** (within `semantic_dim`). List of embedding column names. |
+| `semantic_dim.n_components` | int | — | **Required** (within `semantic_dim`). Target number of PCA dimensions. |
+
+Dimension prefixes (`g:`, `t:`, `s:`) appear in `explain_anomaly` output, making it clear which block a dimension belongs to.
+
 ### Multiple patterns on the same entity line
 
 You can define multiple patterns for the same anchor line with different calibration:

@@ -38,13 +38,14 @@ First public release — full GDS stack, π1–π12, builder, MCP server, valida
 
 ---
 
-## Plan: 0.3.2
+## 0.3.2
 
 Builder intelligence — smarter geometry, faster builds.
 
-- **Temporal build phase optimization** — pre-aggregated event matrix eliminates O(n × windows) rescans; 5–10× speedup on temporal phase, enabling practical iteration on richer sphere configurations.
+- **Temporal build performance** — NumPy graph features, chunked pre-computation, Lance compact tuning. Combined speedup across benchmark spheres.
+- **Geometry build performance** — per-dimension BTREE indices replaced with zone-map filtering, streaming re-read eliminated.
 - **Generalized (d+m+g+t+s) dimension blocks** — geographic, metric, and semantic dimension support in the builder beyond the current anchor/event model.
-- **Geometric heredity for cold-start entities** — inherited geometric positioning for entities without sufficient history, using population priors and neighbor geometry.
+- **Geometric heredity for cold-start entities** — `find_novel_entities` scores entities by deviation from neighbor-expected geometry using edge table adjacency.
 
 ---
 
@@ -66,7 +67,6 @@ Edge-derived geometry — the edge table becomes a first-class geometric citizen
 - **Edge-derived dimensions on event patterns** — degree, flow, velocity computed at build time as geometric dimensions. Edges feed geometry.
 - **`find_motif` — structural pattern matching on edge table** — per-hop predicates, new navigation primitive for subgraph patterns invisible to flat queries.
 - **Geometric edge potential** — relationship anomaly scoring via endpoint geometric distance. Geometry feeds edge scoring.
-- **Temporal build phase optimization** — pre-aggregated event matrix eliminates O(n × windows) rescans, enabling practical rebuilds with richer edge-derived dimensions.
 
 ---
 

@@ -9287,3 +9287,113 @@ class GDSNavigator:
         )
 
         return resp
+
+    # ------------------------------------------------------------------
+    # Geometric heredity — novelty scoring
+    # ------------------------------------------------------------------
+
+    def find_novel_entities(
+        self,
+        pattern_id: str,
+        top_n: int = 10,
+        *,
+        sample_size: int = 5000,
+    ) -> list[dict]:
+        """Find entities whose geometry diverges most from their graph neighbors.
+
+        For each entity the *expected* delta is the mean of its neighbors'
+        deltas (looked up via the edge table). The novelty score is the L2
+        distance between the entity's actual delta and that expected delta.
+
+        Parameters
+        ----------
+        pattern_id:
+            Pattern whose edge table defines the neighborhood graph. May be
+            an event pattern — the anchor pattern is resolved automatically
+            for geometry lookup.
+        top_n:
+            Number of top-scoring entities to return.
+        sample_size:
+            Max entities to evaluate. When the population exceeds this,
+            a random sample is drawn.
+
+        Returns
+        -------
+        list[dict]
+            Sorted descending by ``novelty_score``. Each entry contains
+            ``{primary_key, novelty_score, n_neighbors}``.
+
+        Raises
+        ------
+        GDSNavigationError
+            If *pattern_id* has no edge table.
+        """
+        if not self._storage.has_edge_table(pattern_id):
+            raise GDSNavigationError(
+                f"Pattern '{pattern_id}' has no edge table. "
+                "find_novel_entities requires an edge table."
+            )
+
+        from hypertopos.engine.heredity import (
+            compute_expected_delta,
+            compute_novelty_score,
+        )
+
+        # Resolve anchor pattern that holds entity geometry
+        scoring_pattern = (
+            self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
+        )
+        version = self._resolve_version(scoring_pattern)
+
+        # Load geometry (sampled if large)
+        geo = self._storage.read_geometry(
+            scoring_pattern, version,
+            columns=["primary_key", "delta"],
+            sample_size=sample_size,
+        )
+        if geo.num_rows == 0:
+            return []
+
+        # Build delta lookup: primary_key → np.ndarray
+        pk_list = geo["primary_key"].to_pylist()
+        delta_list = geo["delta"].to_pylist()
+        delta_lookup: dict[str, np.ndarray] = {}
+        for pk, d in zip(pk_list, delta_list, strict=False):
+            if d is not None:
+                delta_lookup[pk] = np.array(d, dtype=np.float32)
+
+        if not delta_lookup:
+            return []
+
+        entity_keys = set(delta_lookup.keys())
+
+        # Build adjacency for sampled entities
+        adj = self._build_adjacency(pattern_id, keys=entity_keys)
+
+        # Score each entity
+        scored: list[tuple[str, float, int]] = []
+        for pk, actual_delta in delta_lookup.items():
+            neighbors = adj.get(pk, [])
+            # Collect neighbor deltas — only those present in our delta_lookup
+            neighbor_deltas_list = []
+            for nb_key, _ek, _ts, _amt in neighbors:
+                nb_delta = delta_lookup.get(nb_key)
+                if nb_delta is not None:
+                    neighbor_deltas_list.append(nb_delta)
+            n_neighbors = len(neighbor_deltas_list)
+            if n_neighbors == 0:
+                continue
+            neighbor_deltas = np.array(neighbor_deltas_list, dtype=np.float32)
+            expected = compute_expected_delta(neighbor_deltas)
+            score = compute_novelty_score(actual_delta, expected)
+            scored.append((pk, score, n_neighbors))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [
+            {
+                "primary_key": pk,
+                "novelty_score": round(score, 6),
+                "n_neighbors": n_nb,
+            }
+            for pk, score, n_nb in scored[:top_n]
+        ]

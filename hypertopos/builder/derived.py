@@ -826,7 +826,274 @@ def compute_graph_features(
 
         # Jaccard = |intersection| / |union| = bidir / (out + in - bidir)
         union_size = out_vals + in_vals - bidir_vals
-        vals = np.where(union_size > 0, bidir_vals / union_size, 0.0)
+        safe_union = np.where(union_size > 0, union_size, 1.0)
+        vals = np.where(union_size > 0, bidir_vals / safe_union, 0.0)
         results["counterpart_overlap"] = (vals, 1)
 
     return results
+
+
+def compute_graph_features_temporal(
+    event_table: pa.Table,
+    anchor_keys: pa.Array,
+    from_col: str,
+    to_col: str,
+    features: list[str],
+    bucket_assignments: np.ndarray,
+    n_buckets: int,
+) -> np.ndarray:
+    """Compute graph features across all temporal buckets in a single pass.
+
+    For ``in_degree`` and ``out_degree``, uses Arrow group_by with a
+    bucket column so all buckets are computed in one aggregation.
+    For ``reciprocity``, ``counterpart_overlap``, and unknown features,
+    falls back to per-window :func:`compute_graph_features` calls.
+
+    Returns an (n_anchor, n_buckets, n_features) float32 array of raw
+    counts (not normalised — caller handles edge_max scaling).
+    """
+    anchor_list = anchor_keys.to_pylist()
+    key_to_idx = {k: i for i, k in enumerate(anchor_list)}
+    n = len(anchor_list)
+    n_feats = len(features)
+
+    result = np.zeros((n, n_buckets, n_feats), dtype=np.float32)
+
+    # Classify features
+    FAST_FEATURES = {"in_degree", "out_degree"}
+    NUMPY_FEATURES = {"reciprocity", "counterpart_overlap"}
+    fast_indices = [i for i, f in enumerate(features) if f in FAST_FEATURES]
+    need_recip = "reciprocity" in features
+    need_overlap = "counterpart_overlap" in features
+    need_numpy = need_recip or need_overlap
+    unknown_indices = [
+        i for i, f in enumerate(features)
+        if f not in FAST_FEATURES and f not in NUMPY_FEATURES
+    ]
+
+    # --- Shared: null-filter and integer-encode once ---
+    f_arr: pa.Array | None = None
+    t_arr: pa.Array | None = None
+    valid_mask: np.ndarray | None = None
+    anchor_keys_arr: pa.Array | None = None
+
+    if fast_indices or need_numpy:
+        f_col = event_table[from_col]
+        t_col = event_table[to_col]
+        both_valid = pc.and_(pc.is_valid(f_col), pc.is_valid(t_col))
+        valid_mask = both_valid.to_numpy(zero_copy_only=False)
+
+        f_arr = pc.filter(f_col, both_valid)
+        t_arr = pc.filter(t_col, both_valid)
+
+        # Build ordered anchor keys array for vectorized scatter
+        anchor_keys_ordered = [""] * n
+        for k, i in key_to_idx.items():
+            anchor_keys_ordered[i] = k
+        anchor_keys_arr = pa.array(anchor_keys_ordered)
+
+    # --- Degree features: single-pass Arrow group_by ---
+    if fast_indices:
+        b_arr = pa.array(bucket_assignments[valid_mask], type=pa.int32())
+        edges_tbl = pa.table({"_f": f_arr, "_t": t_arr, "_b": b_arr})
+
+        if "out_degree" in features:
+            out_grouped = edges_tbl.group_by(["_f", "_b"]).aggregate(
+                [("_t", "count_distinct")],
+            )
+            _scatter_temporal(
+                result, features.index("out_degree"), out_grouped,
+                "_f", "_b", "_t_count_distinct",
+                anchor_keys_arr, n,
+            )
+
+        if "in_degree" in features:
+            in_grouped = edges_tbl.group_by(["_t", "_b"]).aggregate(
+                [("_f", "count_distinct")],
+            )
+            _scatter_temporal(
+                result, features.index("in_degree"), in_grouped,
+                "_t", "_b", "_f_count_distinct",
+                anchor_keys_arr, n,
+            )
+
+    # --- NumPy fast path for reciprocity / counterpart_overlap ---
+    if need_numpy:
+        b_np = bucket_assignments[valid_mask]
+
+        # Anchor-space integer indices via pc.index_in (null → NaN → -1)
+        f_anchor_raw = pc.index_in(f_arr, anchor_keys_arr)
+        t_anchor_raw = pc.index_in(t_arr, anchor_keys_arr)
+        f_anchor_idx = pc.fill_null(f_anchor_raw, -1).to_numpy(
+            zero_copy_only=False,
+        ).astype(np.intp)
+        t_anchor_idx = pc.fill_null(t_anchor_raw, -1).to_numpy(
+            zero_copy_only=False,
+        ).astype(np.intp)
+        f_anchor = f_anchor_idx
+        t_anchor = t_anchor_idx
+
+        # Pre-sort by bucket for O(1) slicing
+        sort_order = np.argsort(b_np)
+        sorted_b = b_np[sort_order]
+        sorted_f_anchor = f_anchor[sort_order]
+        sorted_t_anchor = t_anchor[sort_order]
+        boundaries = np.searchsorted(sorted_b, np.arange(n_buckets + 1))
+
+        # Global integer encoding for overlap (all entities, not just anchors)
+        if need_overlap:
+            # f_arr/t_arr may be ChunkedArray from pc.filter
+            f_flat = f_arr.combine_chunks() if hasattr(f_arr, "combine_chunks") else f_arr
+            t_flat = t_arr.combine_chunks() if hasattr(t_arr, "combine_chunks") else t_arr
+            all_uniq = pc.unique(pa.concat_arrays([f_flat, t_flat]))
+            n_global = len(all_uniq)
+            # Map from/to → global int via pc.index_in
+            f_global = pc.index_in(f_arr, all_uniq).to_numpy(
+                zero_copy_only=False,
+            ).astype(np.int64)
+            t_global = pc.index_in(t_arr, all_uniq).to_numpy(
+                zero_copy_only=False,
+            ).astype(np.int64)
+            sorted_f_global = f_global[sort_order]
+            sorted_t_global = t_global[sort_order]
+            # Anchor mapping: global_idx → anchor_idx (-1 if not anchor)
+            global_to_anchor = np.full(n_global, -1, dtype=np.intp)
+            anchor_global = pc.fill_null(
+                pc.index_in(anchor_keys_arr, all_uniq), -1,
+            ).to_numpy(zero_copy_only=False).astype(np.intp)
+            for ai in range(n):
+                gi = anchor_global[ai]
+                if gi >= 0:
+                    global_to_anchor[gi] = ai
+
+        recip_feat_idx = features.index("reciprocity") if need_recip else -1
+        overlap_feat_idx = features.index("counterpart_overlap") if need_overlap else -1
+
+        for bucket_idx in range(n_buckets):
+            b_start = boundaries[bucket_idx]
+            b_end = boundaries[bucket_idx + 1]
+            if b_start == b_end:
+                continue
+
+            if need_recip:
+                bf = sorted_f_anchor[b_start:b_end]
+                bt = sorted_t_anchor[b_start:b_end]
+                senders = np.unique(bf[bf >= 0])
+                receivers = np.unique(bt[bt >= 0])
+                reciprocal = np.intersect1d(senders, receivers)
+                if len(reciprocal) > 0:
+                    result[reciprocal, bucket_idx, recip_feat_idx] = 1.0
+
+            if need_overlap:
+                bfg = sorted_f_global[b_start:b_end]
+                btg = sorted_t_global[b_start:b_end]
+                # Packed int64 edge encoding for fast set ops
+                fwd_packed = np.unique(bfg * n_global + btg)
+                rev_packed = np.unique(btg * n_global + bfg)
+                bidir_packed = np.intersect1d(fwd_packed, rev_packed)
+
+                # Per-anchor counts via np.bincount
+                # out_degree: unique targets per anchor sender
+                fwd_senders = fwd_packed // n_global
+                fwd_s_anchor = global_to_anchor[fwd_senders]
+                valid_fwd = fwd_s_anchor >= 0
+                out_count = np.bincount(
+                    fwd_s_anchor[valid_fwd], minlength=n,
+                ).astype(np.float32)
+
+                # in_degree: unique sources per anchor receiver
+                fwd_targets = fwd_packed % n_global
+                fwd_t_anchor = global_to_anchor[fwd_targets]
+                valid_in = fwd_t_anchor >= 0
+                in_count = np.bincount(
+                    fwd_t_anchor[valid_in], minlength=n,
+                ).astype(np.float32)
+
+                # bidir_count: per anchor sender in bidirectional edges
+                if len(bidir_packed) > 0:
+                    bidir_senders = bidir_packed // n_global
+                    bidir_s_anchor = global_to_anchor[bidir_senders]
+                    valid_bidir = bidir_s_anchor >= 0
+                    bidir_count = np.bincount(
+                        bidir_s_anchor[valid_bidir], minlength=n,
+                    ).astype(np.float32)
+                else:
+                    bidir_count = np.zeros(n, dtype=np.float32)
+
+                union = out_count + in_count - bidir_count
+                safe_union = np.where(union > 0, union, 1.0)
+                jaccard = np.where(union > 0, bidir_count / safe_union, 0.0)
+                result[:, bucket_idx, overlap_feat_idx] = jaccard
+
+    # --- Fallback: per-window for truly unknown features ---
+    if unknown_indices:
+        unknown_features = [features[i] for i in unknown_indices]
+
+        sort_order_fb = np.argsort(bucket_assignments)
+        sorted_buckets_fb = bucket_assignments[sort_order_fb]
+        boundaries_fb = np.searchsorted(
+            sorted_buckets_fb, np.arange(n_buckets + 1),
+        )
+
+        for bucket_idx in range(n_buckets):
+            b_start = boundaries_fb[bucket_idx]
+            b_end = boundaries_fb[bucket_idx + 1]
+            if b_start == b_end:
+                continue
+
+            indices = sort_order_fb[b_start:b_end]
+            filtered = event_table.take(pa.array(indices, type=pa.int64()))
+            feature_results = compute_graph_features(
+                filtered, anchor_keys, from_col, to_col, unknown_features,
+            )
+            for fi, feat in zip(
+                unknown_indices, unknown_features, strict=False,
+            ):
+                if feat in feature_results:
+                    values, _ = feature_results[feat]
+                    result[:, bucket_idx, fi] = values
+
+    return result
+
+
+def _scatter_temporal(
+    tensor: np.ndarray,
+    feat_idx: int,
+    grouped: pa.Table,
+    key_col: str,
+    bucket_col: str,
+    val_col: str,
+    anchor_keys_arr: pa.Array,
+    n: int,
+) -> None:
+    """Scatter grouped (key, bucket, value) into the 3D tensor."""
+    if len(grouped) == 0:
+        return
+
+    entity_idx_arr = pc.index_in(grouped[key_col], anchor_keys_arr)
+    valid = pc.and_(
+        pc.is_valid(entity_idx_arr),
+        pc.is_valid(grouped[val_col]),
+    )
+
+    entity_indices = (
+        entity_idx_arr.filter(valid)
+        .to_numpy(zero_copy_only=False)
+        .astype(np.intp)
+    )
+    bucket_indices = (
+        grouped[bucket_col]
+        .filter(valid)
+        .to_numpy(zero_copy_only=False)
+        .astype(np.intp)
+    )
+    values = (
+        grouped[val_col]
+        .filter(valid)
+        .to_numpy(zero_copy_only=False)
+        .astype(np.float32)
+    )
+
+    tensor[entity_indices, bucket_indices, feat_idx] = values
+
+

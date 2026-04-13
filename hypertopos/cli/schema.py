@@ -120,6 +120,10 @@ class PatternConfig:
     tracked_properties: list[str] | None = None
     use_mahalanobis: bool = False
     description: str | None = None
+    # --- Generalized dimension blocks ---
+    geo_properties: list[str] | None = None
+    metric_properties: list[str] | None = None
+    semantic_dim: dict | None = None  # {"columns": [...], "n_components": int}
 
 
 @dataclass
@@ -528,6 +532,44 @@ def _parse_one_pattern(
     elif isinstance(dw_raw, list):
         dim_weights = [float(w) for w in dw_raw]
 
+    # Generalized dimension blocks
+    geo_props: list[str] | None = None
+    raw_geo = spec.get("geo_properties")
+    if raw_geo:
+        if not isinstance(raw_geo, list):
+            raise ValueError(
+                f"Pattern '{pid}' geo_properties must be a list, "
+                f"got {type(raw_geo).__name__}"
+            )
+        geo_props = [str(c) for c in raw_geo]
+
+    metric_props: list[str] | None = None
+    raw_mp = spec.get("metric_properties")
+    if raw_mp:
+        if not isinstance(raw_mp, list):
+            raise ValueError(
+                f"Pattern '{pid}' metric_properties must be a list, "
+                f"got {type(raw_mp).__name__}"
+            )
+        metric_props = [str(c) for c in raw_mp]
+
+    semantic_dim: dict | None = None
+    raw_sd = spec.get("semantic_dim")
+    if raw_sd:
+        if not isinstance(raw_sd, dict):
+            raise ValueError(
+                f"Pattern '{pid}' semantic_dim must be a mapping, "
+                f"got {type(raw_sd).__name__}"
+            )
+        if "columns" not in raw_sd or "n_components" not in raw_sd:
+            raise ValueError(
+                f"Pattern '{pid}' semantic_dim must have 'columns' and 'n_components'"
+            )
+        semantic_dim = {
+            "columns": [str(c) for c in raw_sd["columns"]],
+            "n_components": int(raw_sd["n_components"]),
+        }
+
     return PatternConfig(
         type=ptype,
         entity_line=str(entity_line),
@@ -544,6 +586,9 @@ def _parse_one_pattern(
         tracked_properties=spec.get("tracked_properties"),
         use_mahalanobis=bool(spec.get("use_mahalanobis", False)),
         description=spec.get("description"),
+        geo_properties=geo_props,
+        metric_properties=metric_props,
+        semantic_dim=semantic_dim,
     )
 
 

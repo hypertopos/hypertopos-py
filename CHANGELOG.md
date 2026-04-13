@@ -5,6 +5,26 @@ All notable changes to hypertopos will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.3.2] — 2026-04-13
+
+### Added
+
+- Generalized dimension blocks (g/t/s). `geo_properties`, `metric_properties`, and `semantic_dim` optional fields on pattern config. Geographic and metric blocks use empirical mu/sigma normalization; semantic block applies SVD-based PCA dimensionality reduction. Dimension names are prefixed (`g:lat`, `t:balance`, `s:pc0`) for identification in `explain_anomaly` output. All optional — existing configs unaffected.
+- `find_novel_entities(pattern_id)` navigator method. Ranks entities by geometric deviation from neighbor-expected position using edge table adjacency. High novelty_score = entity doesn't behave like its neighborhood. Requires a pattern with an edge table.
+- `engine/heredity.py` module: `compute_expected_delta`, `compute_novelty_score`, `compute_novelty_decomposition` — pure NumPy scoring functions for geometric heredity.
+- `builder/dim_blocks.py` module: `normalize_metric_block`, `normalize_geo_block`, `normalize_semantic_block` — normalization helpers for generalized dimension blocks.
+
+### Changed
+
+- Temporal build: `reciprocity` and `counterpart_overlap` graph features replaced per-window Arrow fallback with NumPy integer-encoded set operations. One-time entity encoding via `pc.index_in`, then per-bucket `np.unique` + `np.intersect1d` + `np.bincount`. Eliminates Arrow table construction and hash joins per temporal window.
+- Temporal build: `in_degree`/`out_degree` use single-pass Arrow `group_by([key, bucket]).aggregate([count_distinct])` across all buckets. Eliminates O(n_buckets) per-window iterations.
+- Temporal build: chunked path pre-computes derived-dim groupby tables and graph feature tensors once before the entity chunk loop. Eliminates redundant full event-table scans per chunk.
+- Geometry build: per-dimension BTREE scalar indices (`delta_dim_0` through `delta_dim_N`) replaced with Lance zone-map filtering. Saves sequential index builds proportional to dimension count.
+- Geometry build: streaming path keeps `is_anomaly` in memory instead of re-reading from Lance after finalization.
+- Lance compaction `target_rows_per_fragment` raised from 1M to 4M for temporal, geometry, and geometry chunk finalization — fewer fragments to merge during compaction.
+
 ## [0.3.1] — 2026-04-12
 
 ### Added

@@ -148,6 +148,12 @@ def run_validate(config_path: str) -> None:
         if pat.derived_dimensions:
             for group in pat.derived_dimensions:
                 dim_names.extend(f.dimension_name for f in group.features)
+        if pat.geo_properties:
+            dim_names.extend(pat.geo_properties)
+        if pat.metric_properties:
+            dim_names.extend(pat.metric_properties)
+        if pat.semantic_dim:
+            dim_names.extend(pat.semantic_dim.get("columns", []))
         seen: set[str] = set()
         for dn in dim_names:
             if dn in seen:
@@ -526,6 +532,9 @@ def _add_pattern(
         use_mahalanobis=pat_cfg.use_mahalanobis,
         description=pat_cfg.description,
         edge_table=_et_cfg,
+        geo_properties=pat_cfg.geo_properties,
+        metric_properties=pat_cfg.metric_properties,
+        semantic_dim=pat_cfg.semantic_dim,
     )
 
     # Event dimensions

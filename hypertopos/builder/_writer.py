@@ -179,9 +179,9 @@ def finalize_geometry_chunks(
         return
 
     # Compact fragments from multiple appends into fewer files.
-    # target_rows_per_fragment=1M merges small chunks into large fragments
+    # target_rows_per_fragment=4M merges small chunks into large fragments
     # for better sequential scan performance (fewer random I/O ops).
-    ds.optimize.compact_files(target_rows_per_fragment=1_048_576)
+    ds.optimize.compact_files(target_rows_per_fragment=4_194_304)
     ds = _lance.dataset(str(lance_path))  # re-open after compaction
 
     # Detect list_size for index building

@@ -240,6 +240,10 @@ class _PatternReg:
     event_dimensions: list[EventDimSpec] = field(default_factory=list)
     description: str | None = None
     edge_table: EdgeTableConfig | None = None  # None = auto-detect or skip
+    # Generalized dimension blocks (g/t/s)
+    geo_properties: list[str] | None = None
+    metric_properties: list[str] | None = None
+    semantic_dim: dict | None = None  # {"columns": [...], "n_components": int}
 
 
 @dataclass
@@ -275,6 +279,8 @@ class PopulationStats:
     gmm_components: list | None
     cholesky_inv: np.ndarray | None
     n_anom_dims: np.ndarray
+    dim_block_names: list[str] = field(default_factory=list)
+    dim_block_stats: dict[str, Any] | None = None
 
 
 @dataclass
@@ -294,6 +300,8 @@ class PatternBuildResult:
     gmm_components: list | None
     cholesky_inv: np.ndarray | None
     dim_percentiles: dict[str, dict[str, float]] | None = None
+    dim_block_names: list[str] = field(default_factory=list)
+    dim_block_stats: dict[str, Any] | None = None
 
 
 @dataclass
@@ -407,6 +415,9 @@ class GDSBuilder:
         use_mahalanobis: bool = False,
         description: str | None = None,
         edge_table: EdgeTableConfig | None = None,
+        geo_properties: list[str] | None = None,
+        metric_properties: list[str] | None = None,
+        semantic_dim: dict | None = None,
     ) -> GDSBuilder:
         _VALID_DW = ("auto", "kurtosis", "uniform")
         if isinstance(dimension_weights, str) and dimension_weights not in _VALID_DW:
@@ -427,6 +438,9 @@ class GDSBuilder:
             use_mahalanobis=use_mahalanobis,
             description=description,
             edge_table=edge_table,
+            geo_properties=geo_properties,
+            metric_properties=metric_properties,
+            semantic_dim=semantic_dim,
         )
         return self
 
@@ -851,12 +865,113 @@ class GDSBuilder:
                 ]
                 prop_fill_matrix = candidate_fill[:, included_indices]
 
-        # 3. Concatenate edge + event dims + prop fill into full shape matrix
+        # 2c. Build generalized dimension blocks (g/t/s)
+        from hypertopos.builder.dim_blocks import (
+            normalize_geo_block,
+            normalize_metric_block,
+            normalize_semantic_block,
+        )
+
+        dim_block_matrices: list[np.ndarray] = []
+        dim_block_names: list[str] = []
+        dim_block_stats: dict[str, Any] = {}  # stored in sphere.json
+        schema_names = set(entity_table.schema.names)
+
+        # Geographic block (g)
+        if pat.geo_properties:
+            geo_cols = []
+            for col_name in pat.geo_properties:
+                if col_name not in schema_names:
+                    raise ValueError(
+                        f"geo_properties column '{col_name}' not found on "
+                        f"entity table '{pat.entity_line}'. "
+                        f"Available: {sorted(schema_names)}"
+                    )
+                col = entity_table[col_name]
+                geo_cols.append(
+                    pc.fill_null(col, 0).to_numpy(
+                        zero_copy_only=False,
+                    ).astype(np.float32)
+                )
+            geo_raw = np.column_stack(geo_cols)
+            geo_norm, geo_mu, geo_sigma = normalize_geo_block(geo_raw)
+            dim_block_matrices.append(geo_norm)
+            dim_block_names.extend(f"g:{c}" for c in pat.geo_properties)
+            dim_block_stats["geo"] = {
+                "columns": list(pat.geo_properties),
+                "mu": geo_mu.tolist(),
+                "sigma": geo_sigma.tolist(),
+            }
+
+        # Metric block (t)
+        if pat.metric_properties:
+            metric_cols = []
+            for col_name in pat.metric_properties:
+                if col_name not in schema_names:
+                    raise ValueError(
+                        f"metric_properties column '{col_name}' not found on "
+                        f"entity table '{pat.entity_line}'. "
+                        f"Available: {sorted(schema_names)}"
+                    )
+                col = entity_table[col_name]
+                metric_cols.append(
+                    pc.fill_null(col, 0).to_numpy(
+                        zero_copy_only=False,
+                    ).astype(np.float32)
+                )
+            metric_raw = np.column_stack(metric_cols)
+            metric_norm, metric_mu, metric_sigma = normalize_metric_block(
+                metric_raw,
+            )
+            dim_block_matrices.append(metric_norm)
+            dim_block_names.extend(f"t:{c}" for c in pat.metric_properties)
+            dim_block_stats["metric"] = {
+                "columns": list(pat.metric_properties),
+                "mu": metric_mu.tolist(),
+                "sigma": metric_sigma.tolist(),
+            }
+
+        # Semantic block (s)
+        if pat.semantic_dim:
+            sem_cols_list = pat.semantic_dim["columns"]
+            sem_n_comp = pat.semantic_dim["n_components"]
+            sem_raw_cols = []
+            for col_name in sem_cols_list:
+                if col_name not in schema_names:
+                    raise ValueError(
+                        f"semantic_dim column '{col_name}' not found on "
+                        f"entity table '{pat.entity_line}'. "
+                        f"Available: {sorted(schema_names)}"
+                    )
+                col = entity_table[col_name]
+                sem_raw_cols.append(
+                    pc.fill_null(col, 0).to_numpy(
+                        zero_copy_only=False,
+                    ).astype(np.float32)
+                )
+            sem_raw = np.column_stack(sem_raw_cols)
+            sem_norm, sem_mu, sem_sigma, sem_pca = normalize_semantic_block(
+                sem_raw, n_components=sem_n_comp,
+            )
+            dim_block_matrices.append(sem_norm)
+            actual_n_comp = sem_norm.shape[1]
+            dim_block_names.extend(f"s:pc{k}" for k in range(actual_n_comp))
+            dim_block_stats["semantic"] = {
+                "columns": list(sem_cols_list),
+                "n_components": actual_n_comp,
+                "mu": sem_mu.tolist(),
+                "sigma": sem_sigma.tolist(),
+                "pca_components": sem_pca.tolist(),
+            }
+
+        # 3. Concatenate edge + event dims + prop fill + dim blocks into full shape matrix
         parts = [shape_vectors]
         if event_dim_matrix.shape[1] > 0:
             parts.append(event_dim_matrix)
         if prop_fill_matrix.shape[1] > 0:
             parts.append(prop_fill_matrix)
+        for blk in dim_block_matrices:
+            parts.append(blk)
         full_shape_vectors = (
             np.concatenate(parts, axis=1) if len(parts) > 1
             else shape_vectors
@@ -1072,6 +1187,8 @@ class GDSBuilder:
             gmm_components=gmm_components_result,
             cholesky_inv=cov_inv,
             n_anom_dims=n_anom_dims,
+            dim_block_names=dim_block_names,
+            dim_block_stats=dim_block_stats if dim_block_stats else None,
         )
 
     def _build_geometry_slice(
@@ -1748,6 +1865,10 @@ class GDSBuilder:
                 "prop_columns": pbr.prop_columns,
                 "excluded_properties": pbr.excluded_properties,
             }
+            if pbr.dim_block_names:
+                pat_dict["dim_block_names"] = pbr.dim_block_names
+            if pbr.dim_block_stats:
+                pat_dict["dim_block_stats"] = pbr.dim_block_stats
             if pbr.group_stats:
                 pat_dict["group_by_property"] = (
                     pat.group_by_property
@@ -2212,6 +2333,8 @@ class GDSBuilder:
                 dim_percentiles=self._compute_dim_percentiles(
                     pat.entity_line,
                 ),
+                dim_block_names=ps.dim_block_names,
+                dim_block_stats=ps.dim_block_stats,
             )
 
         if len(self._patterns) > 1:
@@ -2735,6 +2858,8 @@ class GDSBuilder:
             dim_percentiles=self._compute_dim_percentiles(
                 pat.entity_line,
             ),
+            dim_block_names=ps.dim_block_names,
+            dim_block_stats=ps.dim_block_stats,
         )
 
     def _build_shape_chunk(
@@ -3068,6 +3193,7 @@ class GDSBuilder:
         # the current chunk so that start=0, end=cn addresses the chunk.
 
         orig_entity_table = entity_line.table
+        all_is_anomaly = np.empty(n, dtype=bool)
 
         try:
             for start in range(0, n, chunk_size):
@@ -3100,10 +3226,11 @@ class GDSBuilder:
                 chunk_ranks = delta_rank_pcts[start:end]
                 chunk_conformal = conformal_p[start:end]
 
-                # is_anomaly
+                # is_anomaly — keep in all_is_anomaly to avoid Lance re-read
                 is_anomaly_arr = (
                     (theta_norm > 0.0) & (chunk_norms >= theta_norm)
                 )
+                all_is_anomaly[start:end] = is_anomaly_arr
 
                 # Per-dim anomaly count using reservoir thresholds
                 abs_chunk_deltas = np.abs(chunk_deltas)
@@ -3135,14 +3262,7 @@ class GDSBuilder:
         # Finalize: compact fragments, build indices
         finalize_fn(self.output_path, pat_id, version=1)
 
-        # Persist geometry stats cache — read stored is_anomaly from finalized Lance
-        import lance as _lance
-        _geom_ds = _lance.dataset(
-            str(self.output_path / "geometry" / pat_id / "v=1" / "data.lance"),
-        )
-        all_is_anomaly = _geom_ds.to_table(
-            columns=["is_anomaly"],
-        )["is_anomaly"].to_numpy(zero_copy_only=False)
+        # Persist geometry stats cache — use in-memory is_anomaly from Pass 3
         stats_writer.write_geometry_stats(
             pat_id, version=1,
             delta_norms=all_norms, theta_norm=theta_norm,
@@ -3501,6 +3621,15 @@ class GDSBuilder:
                 all_max_z = np.zeros(n_anchor, dtype=np.float32)
                 traj_tables: list[pa.Table] = []
 
+                # Pre-compute event aggregates ONCE for all entities
+                _pre_grouped = self._precompute_derived_grouped(
+                    pat_id, event_table, bucket_np, relations_meta,
+                )
+                _pre_graph = self._precompute_graph_features(
+                    pat_id, event_table, anchor_keys, bucket_np,
+                    n_buckets, relations_meta,
+                )
+
                 orig_table = self._lines[pat.entity_line].table
                 try:
                     for cs in range(0, n_anchor, chunk_size):
@@ -3513,10 +3642,17 @@ class GDSBuilder:
                             orig_table.slice(cs, nc)
                         )
 
+                        # Slice pre-computed graph tensors for this chunk
+                        _chunk_graph: dict[int, np.ndarray] = {}
+                        for sk, full_t in _pre_graph.items():
+                            _chunk_graph[sk] = full_t[cs:ce]
+
                         ct = self._precompute_shape_tensor(
                             pat_id, event_table, bucket_np, n_buckets,
                             cka, ckl, nc,
                             relations_meta, prop_columns,
+                            pre_grouped=_pre_grouped,
+                            pre_graph=_chunk_graph,
                         )
 
                         _tensor_to_lance(
@@ -3774,6 +3910,196 @@ class GDSBuilder:
             "primary_key",
         )
 
+    def _precompute_derived_grouped(
+        self,
+        pat_id: str,
+        event_table: pa.Table,
+        bucket_np: np.ndarray,
+        relations_meta: list[dict[str, Any]],
+    ) -> dict[str, pa.Table]:
+        """Pre-compute derived-dim groupby tables once for chunked reuse.
+
+        Returns {fk_key: grouped_arrow_table} for each FK batch.
+        """
+        pat = self._patterns[pat_id]
+        derived_dim_names: dict[str, Any] = {}
+        for spec in self._derived_dims:
+            if spec.anchor_line == pat.entity_line:
+                derived_dim_names[spec.dimension_name] = spec
+
+        from collections import defaultdict as _ddict
+        fk_batches: dict[str, list] = _ddict(list)
+        for _j, rel_meta in enumerate(relations_meta):
+            direction = rel_meta.get("direction", "in")
+            line_id = rel_meta.get("line_id", "")
+            if direction == "self":
+                continue
+            matching_rel = None
+            for rel in pat.relations:
+                if rel.line_id == line_id and rel.direction == direction:
+                    matching_rel = rel
+                    break
+            if matching_rel is None or matching_rel.fk_col is None:
+                continue
+            fk_col_name = matching_rel.fk_col
+            if fk_col_name not in derived_dim_names:
+                continue
+            spec = derived_dim_names[fk_col_name]
+            if spec.metric.startswith("iet_"):
+                continue
+            anchor_fk = spec.anchor_fk
+            fk_key = "|".join(anchor_fk) if isinstance(anchor_fk, list) else anchor_fk
+            if fk_key not in fk_batches:
+                fk_batches[fk_key] = spec
+
+        if not fk_batches:
+            return {}
+
+        _agg_map = {
+            "count": lambda _mc: ("primary_key", "count"),
+            "count_distinct": lambda mc: (mc, "count_distinct"),
+            "sum": lambda mc: (mc, "sum"),
+            "max": lambda mc: (mc, "max"),
+            "mean": lambda mc: (mc, "mean"),
+            "std": lambda mc: (mc, "stddev"),
+        }
+
+        bucket_pa = pa.array(bucket_np, type=pa.int64())
+        work_table = event_table.append_column("_bucket", bucket_pa)
+
+        result: dict[str, pa.Table] = {}
+        # Collect all specs per fk_key, then compute
+        fk_to_specs: dict[str, list] = _ddict(list)
+        for _j, rel_meta in enumerate(relations_meta):
+            direction = rel_meta.get("direction", "in")
+            line_id = rel_meta.get("line_id", "")
+            if direction == "self":
+                continue
+            matching_rel = None
+            for rel in pat.relations:
+                if rel.line_id == line_id and rel.direction == direction:
+                    matching_rel = rel
+                    break
+            if matching_rel is None or matching_rel.fk_col is None:
+                continue
+            fk_col_name = matching_rel.fk_col
+            if fk_col_name not in derived_dim_names:
+                continue
+            spec = derived_dim_names[fk_col_name]
+            if spec.metric.startswith("iet_"):
+                continue
+            anchor_fk = spec.anchor_fk
+            fk_key = "|".join(anchor_fk) if isinstance(anchor_fk, list) else anchor_fk
+            fk_to_specs[fk_key].append(spec)
+
+        for fk_key, specs in fk_to_specs.items():
+            sample_spec = specs[0]
+            anchor_fk = sample_spec.anchor_fk
+
+            if isinstance(anchor_fk, list):
+                separator = "→"
+                for cs in self._composite_lines:
+                    if cs.line_id == sample_spec.anchor_line:
+                        separator = cs.separator
+                        break
+                str_cols = [
+                    pc.cast(work_table[col], pa.string())
+                    for col in anchor_fk
+                ]
+                composite_fk = pc.binary_join_element_wise(
+                    *str_cols, separator,
+                )
+                gb_table = work_table.append_column(
+                    "_composite_fk", composite_fk,
+                )
+                fk_group_col = "_composite_fk"
+            else:
+                gb_table = work_table
+                fk_group_col = anchor_fk
+
+            # Build agg exprs from all specs sharing this FK
+            agg_exprs: list[tuple[str, str]] = []
+            seen: set[tuple[str, str]] = set()
+            for spec in specs:
+                agg_col, agg_func = _agg_map[spec.metric](spec.metric_col)
+                key = (agg_col, agg_func)
+                if key not in seen:
+                    seen.add(key)
+                    agg_exprs.append(key)
+
+            result[fk_key] = gb_table.group_by(
+                [fk_group_col, "_bucket"],
+            ).aggregate(agg_exprs)
+
+        return result
+
+    def _precompute_graph_features(
+        self,
+        pat_id: str,
+        event_table: pa.Table,
+        anchor_keys: pa.Array,
+        bucket_np: np.ndarray,
+        n_buckets: int,
+        relations_meta: list[dict[str, Any]],
+    ) -> dict[int, np.ndarray]:
+        """Pre-compute graph features once for chunked reuse.
+
+        Returns {spec_key: (n_anchor, n_buckets, n_feats)} tensor per spec.
+        Keys use id(spec) matching _precompute_shape_tensor's lookup.
+        """
+        from hypertopos.builder.derived import compute_graph_features_temporal
+
+        pat = self._patterns[pat_id]
+        graph_feature_names: dict[str, Any] = {}
+        for spec in self._graph_features:
+            if spec.anchor_line == pat.entity_line:
+                for feat in spec.features:
+                    graph_feature_names[feat] = spec
+
+        # Classify graph dims (mirroring _precompute_shape_tensor logic)
+        graph_dims: list[tuple[int, dict, Any, Any]] = []
+        for j, rel_meta in enumerate(relations_meta):
+            direction = rel_meta.get("direction", "in")
+            line_id = rel_meta.get("line_id", "")
+            if direction == "self":
+                continue
+            matching_rel = None
+            for rel in pat.relations:
+                if rel.line_id == line_id and rel.direction == direction:
+                    matching_rel = rel
+                    break
+            if matching_rel is None or matching_rel.fk_col is None:
+                continue
+            if matching_rel.fk_col in graph_feature_names:
+                graph_dims.append(
+                    (j, rel_meta, matching_rel,
+                     graph_feature_names[matching_rel.fk_col]),
+                )
+
+        if not graph_dims:
+            return {}
+
+        spec_to_dims: dict[int, list[tuple[int, dict, Any]]] = {}
+        spec_map: dict[int, Any] = {}
+        for j, rel_meta, rel, gf_spec in graph_dims:
+            spec_key = id(gf_spec)
+            if spec_key not in spec_to_dims:
+                spec_to_dims[spec_key] = []
+                spec_map[spec_key] = gf_spec
+            spec_to_dims[spec_key].append((j, rel_meta, rel))
+
+        result: dict[int, np.ndarray] = {}
+        for spec_key, dims_list in spec_to_dims.items():
+            gf_spec = spec_map[spec_key]
+            all_features = [rel.fk_col for _, _, rel in dims_list]
+            result[spec_key] = compute_graph_features_temporal(
+                event_table, anchor_keys,
+                gf_spec.from_col, gf_spec.to_col,
+                all_features, bucket_np, n_buckets,
+            )
+
+        return result
+
     def _precompute_shape_tensor(
         self,
         pat_id: str,
@@ -3785,6 +4111,9 @@ class GDSBuilder:
         n_anchor: int,
         relations_meta: list[dict[str, Any]],
         prop_columns: list[str],
+        *,
+        pre_grouped: dict[str, pa.Table] | None = None,
+        pre_graph: dict[int, np.ndarray] | None = None,
     ) -> np.ndarray:
         """Pre-compute shape tensor (n_anchor, n_buckets, D) in single-pass.
 
@@ -3792,12 +4121,12 @@ class GDSBuilder:
         all windows at once. For graph features: one batched call per
         window. Static dims and props are filled once and broadcast.
 
+        When called from the chunked path, *pre_grouped* and *pre_graph*
+        provide pre-computed aggregates so the expensive event-table scans
+        happen only once (outside the chunk loop).
+
         Returns (n_anchor, n_buckets, D) float32 array.
         """
-        from hypertopos.builder.derived import (
-            compute_graph_features,
-        )
-
         pat = self._patterns[pat_id]
         n_rel = len(relations_meta)
         n_prop = len(prop_columns)
@@ -3899,10 +4228,6 @@ class GDSBuilder:
         # --- C. Derived dims: batched groupby(anchor_fk, bucket) ---
         # Group derived dims by FK column, one multi-aggregate group_by per FK
         if derived_dims:
-            bucket_pa = pa.array(bucket_np, type=pa.int64())
-            work_table = event_table.append_column("_bucket", bucket_pa)
-
-            # Group by FK column for batching
             from collections import defaultdict as _ddict
             fk_batches: dict[str, list] = _ddict(list)
             for j, rel_meta, rel, spec in derived_dims:
@@ -3922,32 +4247,10 @@ class GDSBuilder:
             }
 
             for _fk_key, batch_dims in fk_batches.items():
-                # Resolve FK column
                 sample_spec = batch_dims[0][3]
                 anchor_fk = sample_spec.anchor_fk
 
-                if isinstance(anchor_fk, list):
-                    separator = "→"
-                    for cs in self._composite_lines:
-                        if cs.line_id == sample_spec.anchor_line:
-                            separator = cs.separator
-                            break
-                    str_cols = [
-                        pc.cast(work_table[col], pa.string())
-                        for col in anchor_fk
-                    ]
-                    composite_fk = pc.binary_join_element_wise(
-                        *str_cols, separator,
-                    )
-                    gb_table = work_table.append_column(
-                        "_composite_fk", composite_fk,
-                    )
-                    fk_group_col = "_composite_fk"
-                else:
-                    gb_table = work_table
-                    fk_group_col = anchor_fk
-
-                # Build multi-aggregate expression list (dedup identical cols)
+                # Build dim→result mapping (needed for both paths)
                 agg_exprs: list[tuple[str, str]] = []
                 seen_exprs: set[tuple[str, str]] = set()
                 dim_to_result: dict[int, tuple[str, float]] = {}
@@ -3963,10 +4266,41 @@ class GDSBuilder:
                         seen_exprs.add(expr_key)
                         agg_exprs.append(expr_key)
 
-                # ONE group_by for all dims sharing this FK
-                grouped = gb_table.group_by(
-                    [fk_group_col, "_bucket"],
-                ).aggregate(agg_exprs)
+                # Use pre-computed grouped table or compute fresh
+                if pre_grouped is not None and _fk_key in pre_grouped:
+                    grouped = pre_grouped[_fk_key]
+                    fk_group_col = (
+                        "_composite_fk"
+                        if isinstance(anchor_fk, list) else anchor_fk
+                    )
+                else:
+                    bucket_pa = pa.array(bucket_np, type=pa.int64())
+                    work_table = event_table.append_column("_bucket", bucket_pa)
+
+                    if isinstance(anchor_fk, list):
+                        separator = "→"
+                        for cs in self._composite_lines:
+                            if cs.line_id == sample_spec.anchor_line:
+                                separator = cs.separator
+                                break
+                        str_cols = [
+                            pc.cast(work_table[col], pa.string())
+                            for col in anchor_fk
+                        ]
+                        composite_fk = pc.binary_join_element_wise(
+                            *str_cols, separator,
+                        )
+                        gb_table = work_table.append_column(
+                            "_composite_fk", composite_fk,
+                        )
+                        fk_group_col = "_composite_fk"
+                    else:
+                        gb_table = work_table
+                        fk_group_col = anchor_fk
+
+                    grouped = gb_table.group_by(
+                        [fk_group_col, "_bucket"],
+                    ).aggregate(agg_exprs)
 
                 # Vectorized scatter — Arrow pc.index_in + numpy fancy indexing
                 from hypertopos.builder._scatter import vectorized_scatter
@@ -3986,9 +4320,10 @@ class GDSBuilder:
                         grouped_values_col=grouped[result_col],
                     )
 
-        # --- D. Graph features: batch all features per window ---
+        # --- D. Graph features: batched across all windows ---
         if graph_dims:
-            # Group graph dims by spec (same from_col/to_col) for batching
+            from hypertopos.builder.derived import compute_graph_features_temporal
+
             spec_to_dims: dict[int, list[tuple[int, dict, Any]]] = {}
             spec_map: dict[int, Any] = {}
             for j, rel_meta, rel, gf_spec in graph_dims:
@@ -3998,41 +4333,25 @@ class GDSBuilder:
                     spec_map[spec_key] = gf_spec
                 spec_to_dims[spec_key].append((j, rel_meta, rel))
 
-            # Pre-sort for O(1) per-bucket slicing (replaces O(E) scan per bucket)
-            _sort_order = np.argsort(bucket_np)
-            _sorted_buckets = bucket_np[_sort_order]
-            _bucket_boundaries = np.searchsorted(
-                _sorted_buckets, np.arange(n_buckets + 1),
-            )
+            for spec_key, dims_list in spec_to_dims.items():
+                gf_spec = spec_map[spec_key]
+                all_features = [rel.fk_col for _, _, rel in dims_list]
 
-            for bucket_idx in range(n_buckets):
-                b_start = _bucket_boundaries[bucket_idx]
-                b_end = _bucket_boundaries[bucket_idx + 1]
-                if b_start == b_end:
-                    continue
-
-                indices = _sort_order[b_start:b_end]
-                filtered_events = event_table.take(
-                    pa.array(indices, type=pa.int64()),
-                )
-
-                for spec_key, dims_list in spec_to_dims.items():
-                    gf_spec = spec_map[spec_key]
-                    # Batch all features for this spec in one call
-                    all_features = [rel.fk_col for _, _, rel in dims_list]
-                    feature_results = compute_graph_features(
-                        filtered_events, anchor_keys,
-                        gf_spec.from_col, gf_spec.to_col, all_features,
+                if pre_graph is not None and spec_key in pre_graph:
+                    tensor_block = pre_graph[spec_key]
+                else:
+                    tensor_block = compute_graph_features_temporal(
+                        event_table, anchor_keys,
+                        gf_spec.from_col, gf_spec.to_col,
+                        all_features, bucket_np, n_buckets,
                     )
-                    for j, rel_meta, rel in dims_list:
-                        feat_name = rel.fk_col
-                        if feat_name in feature_results:
-                            values, _em = feature_results[feat_name]
-                            edge_max = rel_meta.get("edge_max")
-                            em = edge_max if edge_max is not None else 1
-                            shape_tensor[
-                                :, bucket_idx, j
-                            ] = np.clip(values, 0, em) / em
+
+                for f_idx, (j, rel_meta, rel) in enumerate(dims_list):
+                    edge_max = rel_meta.get("edge_max")
+                    em = edge_max if edge_max is not None else 1
+                    shape_tensor[:, :, j] = np.clip(
+                        tensor_block[:, :, f_idx], 0, em,
+                    ) / em
 
         return shape_tensor
 

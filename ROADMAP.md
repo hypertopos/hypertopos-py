@@ -38,16 +38,6 @@ First public release — full GDS stack, π1–π12, builder, MCP server, valida
 
 ---
 
-## Plan: 0.3.1
-
-Two production-quality improvements on top of the 0.3.0 storage layer:
-
-- **FDR control on anomaly queries** — Benjamini–Hochberg `fdr_alpha` parameter + per-row `q_value` column on `find_anomalies` and friends. Replaces unbounded "top-K by `delta_norm`" with a set whose false-discovery rate is bounded by α.
-- **Diverse-coverage anomaly summarisation** — `select="diverse"` option using lazy-greedy submodular maximisation, plus a `representativeness` column ("this 1 anomaly stands in for 38 cases").
-- **Build pipeline optimization** — vectorized scatter (Arrow `pc.index_in` + numpy), Welford rolling z-score, Arrow-native contagion stats, adaptive memory chunking for temporal build, pre-sorted graph dims bucketing.
-
----
-
 ## Plan: 0.3.2
 
 Builder intelligence — smarter geometry, faster builds.

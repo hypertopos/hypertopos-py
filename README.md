@@ -8,7 +8,7 @@
 [![PyArrow](https://img.shields.io/badge/format-PyArrow-red.svg)](https://arrow.apache.org/docs/python/)
 [![Lance](https://img.shields.io/badge/storage-Lance-blueviolet.svg)](https://github.com/lance-format/lance)
 [![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io)
-[![Version](https://img.shields.io/badge/version-0.3.1-%235500FF.svg)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.3.3-%235500FF.svg)](pyproject.toml)
 
 hypertopos transforms relational data into a geometric space where every entity gets a coordinate derived from its relationships. Distance from the population center reveals anomalies. Proximity between entities reveals similarity. Movement over time reveals drift. No training, no labels — geometry is computed from the data.
 

@@ -945,10 +945,17 @@ hypertopos build --config sphere.yaml --force --verbose
 
 | Sphere | First run | Cached run |
 |--------|-----------|-----------|
-| Berka (4.5K accounts, 1M tx) | 24s | 24s |
-| TPCH SF1 (150K cust, 6M tx) | 2.9 min | 2.9 min |
-| AML HI-Small (515K accts, 5M tx, 300K chains) | ~22 min | ~9.5 min |
-| AML LI-Small (712K accts, 7M tx, 300K chains) | ~13.4 min | ~9.4 min |
+| Berka (4.5K accounts, 1M tx) | 42s | 40s |
+| NYC Taxi (265 zones, 7.5M trips) | 5.1 min | 4.8 min |
+| AML HI-Small (515K accts, 5M tx, 300K chains) | ~16.7 min | ~6.6 min |
+
+### Benchmark sphere configurations
+
+| Sphere | Edge table | Chains | Temporal | Composites | Key features |
+|--------|-----------|--------|----------|------------|--------------|
+| Berka | none | none | 3 patterns (90d) | account×bank pairs | NB-Split (accounts + accounts_stress + loan_accounts), precomputed dims, group_by_property |
+| NYC Taxi | auto-detected (trip_pattern: pu_zone → do_zone) | none | 2 patterns (7d) | none | NB-Split (zones_pickup + zones_dropoff), 6 event dims, 2 anchor patterns |
+| AML HI-Small | explicit (tx_pattern: from_account → to_account, timestamp, amount) | 300K (seeded BFS) | 3 patterns (2d) | account pairs | graph_features, precomputed ratios, IET metrics, Mahalanobis |
 
 ### Parallel chain extraction
 

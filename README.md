@@ -37,20 +37,20 @@ Each capability below emerges from treating entities as points in a shared, popu
 
 | Capability | What it does | Compared to | Since |
 |---|---|---|---|
-| Population-relative coordinates | `delta = (shape - mu) / sigma` — one coordinate for anomaly, clustering, drift | node2vec/GNN: latent dims, retraining on shift | 0.1.0 |
-| Self-calibrating threshold | `theta = percentile(norms, 95)` — no tuning, no labels | PyOD: choose contamination rate | 0.1.0 |
-| Named dimension attribution | `explain_anomaly` → `loan_count: +3.2σ (42%)`. Sums to 100% | SHAP/LIME: approximate, model-dependent | 0.1.0 |
-| Temporal deformation | Append-only delta log. Displacement, path length, directionality | Time-series DBs: metric values, not trajectories | 0.1.0 |
-| Stateful navigation | 12 typed primitives. Position type constrains valid ops | SQL/GraphQL: stateless queries | 0.1.0 |
-| Cross-sphere comparison | `\|\|delta\|\|` is dimensionless — 4.2σ means the same in any domain | Requires shared features or joint embeddings | 0.1.0 |
-| Counterfactual simulation | `simulate_edges` recomputes delta against fixed baseline | Causal inference: explicit DAG required | 0.1.0 |
-| Regime change detection | Per-bucket centroids, self-calibrating shift threshold | Evidently/NannyML: model prediction drift | 0.1.0 |
-| Graph contagion | Mean `\|\|delta\|\|` of neighbors. Cohen's d vs control group | PageRank: topology, not behavioral propagation | 0.2.0 |
-| Witness cohort | Similar deltas, NOT connected. Validates pattern vs one-off | k-NN on features (includes neighbors) | 0.2.1 |
-| FDR-controlled detection | Benjamini-Hochberg on rank p-values. Per-entity q-values | BH not combined with geometric detection | 0.3.1 |
-| Diverse anomaly selection | Facility location covers distinct anomaly regions | Top-N returns redundant extremes | 0.3.1 |
-| Distribution-aware scoring | Per-dim Bregman divergence (gaussian/poisson/bernoulli). Additive | PyOD/sklearn: uniform metric across all features | 0.4.0 |
-| Anomaly confidence | Bootstrap `anomaly_confidence: 0-1`. `min_confidence` filter | No equivalent — binary verdict, no stability signal | 0.4.0 |
+| Population-relative coordinates | `delta = (shape - mu) / sigma` — one coordinate for anomaly, clustering, drift | node2vec/GNN: latent dims, retraining on shift | `0.1.0` |
+| Self-calibrating threshold | `theta = percentile(norms, 95)` — no tuning, no labels | PyOD: choose contamination rate | `0.1.0` |
+| Named dimension attribution | `explain_anomaly` → `loan_count: +3.2σ (42%)`. Sums to 100% | SHAP/LIME: approximate, model-dependent | `0.1.0` |
+| Temporal deformation | Append-only delta log. Displacement, path length, directionality | Time-series DBs: metric values, not trajectories | `0.1.0` |
+| Stateful navigation | 12 typed primitives. Position type constrains valid ops | SQL/GraphQL: stateless queries | `0.1.0` |
+| Cross-sphere comparison | `\|\|delta\|\|` is dimensionless — 4.2σ means the same in any domain | Requires shared features or joint embeddings | `0.1.0` |
+| Counterfactual simulation | `simulate_edges` recomputes delta against fixed baseline | Causal inference: explicit DAG required | `0.1.0` |
+| Regime change detection | Per-bucket centroids, self-calibrating shift threshold | Evidently/NannyML: model prediction drift | `0.1.0` |
+| Graph contagion | Mean `\|\|delta\|\|` of neighbors. Cohen's d vs control group | PageRank: topology, not behavioral propagation | `0.2.0` |
+| Witness cohort | Similar deltas, NOT connected. Validates pattern vs one-off | k-NN on features (includes neighbors) | `0.2.1` |
+| FDR-controlled detection | Benjamini-Hochberg on rank p-values. Per-entity q-values | BH not combined with geometric detection | `0.3.1` |
+| Diverse anomaly selection | Facility location covers distinct anomaly regions | Top-N returns redundant extremes | `0.3.1` |
+| Distribution-aware scoring | Per-dim Bregman divergence (gaussian/poisson/bernoulli). Additive | PyOD/sklearn: uniform metric across all features | `0.4.0` |
+| Anomaly confidence | Bootstrap `anomaly_confidence: 0-1`. `min_confidence` filter | No equivalent — binary verdict, no stability signal | `0.4.0` |
 
 ### What changes in practice
 

@@ -18,8 +18,18 @@ def build_explanation(
     conformal_p: float | None = None,
     temporal_slices: int | None = None,
     reputation: dict | None = None,
+    dimension_kinds: list[str] | None = None,
+    sigma: np.ndarray | None = None,
+    mu: np.ndarray | None = None,
+    dimension_weights: np.ndarray | None = None,
 ) -> dict:
-    """Build structured anomaly explanation combining all available signals."""
+    """Build structured anomaly explanation combining all available signals.
+
+    When *dimension_kinds*, *sigma*, and *mu* are provided, the
+    ``top_dimensions`` section is replaced by per-dimension Bregman
+    contributions, which more accurately attribute anomaly mass across
+    mixed-family dimensions (Bernoulli, Poisson, Gaussian).
+    """
     delta = np.asarray(delta, dtype=np.float64)
 
     if delta_norm <= theta_norm:
@@ -40,8 +50,37 @@ def build_explanation(
         severity = "low"
 
     witness = GDSEngine.witness_set(delta, theta_norm, dim_labels)
-    top_dims = GDSEngine.anomaly_dimensions(delta, dim_labels, top_n=5)
     anti_w = GDSEngine.anti_witness(delta, theta_norm, dim_labels)
+
+    if dimension_kinds is not None and sigma is not None and mu is not None:
+        if len(dimension_kinds) != len(delta):
+            # Dimension count mismatch — fall through to legacy abs_delta path
+            dimension_kinds = None
+
+    if dimension_kinds is not None and sigma is not None and mu is not None:
+        from hypertopos.builder._bregman import bregman_divergence
+        d_arr = np.array(delta)
+        if dimension_weights is not None:
+            w = np.maximum(np.array(dimension_weights), 1e-9)
+            d_arr = d_arr / w
+        shape = d_arr * np.array(sigma) + np.array(mu)
+        contribs = bregman_divergence(shape, np.array(mu), np.array(sigma), dimension_kinds)
+        total = float(contribs.sum())
+        top_dims = sorted(
+            [
+                {
+                    "dim": dim_labels[i],
+                    "kind": dimension_kinds[i],
+                    "bregman": round(float(contribs[i]), 4),
+                    "pct_of_total": round(float(contribs[i]) / total, 4) if total > 0 else 0.0,
+                }
+                for i in range(min(len(dim_labels), len(contribs)))
+            ],
+            key=lambda x: x["bregman"],
+            reverse=True,
+        )
+    else:
+        top_dims = GDSEngine.anomaly_dimensions(delta, dim_labels, top_n=5)
 
     result: dict = {
         "severity": severity,

@@ -361,6 +361,7 @@ patterns:
 | `graph_features` | dict | `null` | Auto-compute graph structural features from event from/to columns. |
 | `description` | string | `null` | Human-readable description. Stored in sphere.json — visible to agents via `get_sphere_info`. |
 | `edge_table` | dict | `null` | Explicit edge table config (see below). Auto-emitted for event patterns with 2+ FK relations to same anchor line. |
+| `bootstrap_iterations` | int | `200` | Number of bootstrap resamples used to compute `anomaly_confidence` per entity. Skipped automatically for N > 50K, `group_by_property`, or `use_mahalanobis`. |
 
 ### Edge Table
 
@@ -529,6 +530,44 @@ derived_dimensions:
 IET requires a `temporal` config for the pattern (provides `timestamp_col`).
 Temporal column is auto-resolved from the temporal config — no explicit time_col needed.
 
+**Dimension `kind` on derived dimensions:** Each derived feature can carry an explicit `kind` tag to override auto-detection. Add it as an extra property alongside the feature spec:
+
+```yaml
+derived_dimensions:
+  - from_pattern: tx_pattern
+    features:
+      - tx_count: count
+        kind: poisson           # override auto-detection
+      - total_spend: sum:amount
+        kind: gaussian
+      - has_foreign: count_distinct:country
+        kind: bernoulli         # treat as 0/1 presence indicator
+```
+
+When omitted, `kind` is auto-detected from the metric type — see below.
+
+---
+
+### Dimension Kind Auto-Detection
+
+The builder assigns a `kind` tag to every dimension at build time. The tag drives Bregman divergence scoring: each dimension contributes an anomaly score calibrated to its own distribution family rather than a single global metric.
+
+**Auto-detection rules:**
+
+| Dimension source | Inferred kind | Rationale |
+|-----------------|---------------|-----------|
+| Binary FK (`edge_max = null`) | `bernoulli` | 0/1 presence indicator |
+| `count`, `count_distinct`, `count:window=*` | `poisson` | Event counts follow Poisson arrival models |
+| `sum:col`, `avg:col`, `std:col`, `iet_*` | `gaussian` | Continuous magnitudes |
+| `max:col`, `min:col` | `gaussian` | Extremal statistics |
+| `precomputed_dimension` with `edge_max: 1` | `bernoulli` | Binary column indicator |
+| `precomputed_dimension`, otherwise | `gaussian` | Default continuous |
+| `graph_features` (`in_degree`, `out_degree`) | `poisson` | Degree counts (`edge_max > 1`) |
+| `graph_features` (`reciprocity`, `counterpart_overlap`) | `bernoulli` | Binary presence (`edge_max = 1`) |
+| `geo_properties`, `metric_properties` | `gaussian` | Continuous measurements |
+
+**Override via `kind:`** on individual dimension entries (precomputed, derived). Override takes precedence over auto-detection. Event dimensions use auto-detection only.
+
 ---
 
 ## Composite Lines
@@ -595,6 +634,7 @@ patterns:
 | `edge_max` | int or `"auto"` | `"auto"` | Fixed normalization cap, or auto-compute from percentile. |
 | `percentile` | float | `99.0` | Percentile for auto edge_max computation. |
 | `display_name` | string | `null` | Human-readable dimension label. |
+| `kind` | string | auto | Distribution family for Bregman scoring: `"gaussian"`, `"poisson"`, or `"bernoulli"`. Auto-detected when omitted. |
 
 ---
 
@@ -904,8 +944,9 @@ hypertopos build --config sphere.yaml --force --verbose
 
 The builder parallelizes where possible:
 - **Points write** — parallel across lines (ThreadPoolExecutor, up to 4 workers)
-- **Geometry build** — parallel across patterns (one thread per pattern)
-- **Temporal build** — parallel across patterns; adaptive memory chunking when the shape tensor exceeds available RAM (auto-detected via platform API, 4 GB fallback)
+- **Pipeline mode** (when `temporal:` is configured) — each pattern runs geometry → temporal as a sequential pipeline, with up to 4 patterns executing concurrently. Temporal for a pattern starts immediately after its geometry completes, without waiting for other patterns.
+- **Geometry-only mode** (no `temporal:` or `--no-temporal`) — geometry runs in parallel across patterns (up to 4 threads)
+- **Temporal adaptive chunking** — when the shape tensor exceeds available RAM, the temporal phase uses adaptive memory chunking (auto-detected via platform API, 4 GB fallback)
 
 ### Build timing
 
@@ -915,15 +956,11 @@ Source 'transactions': 5,078,345 rows, 18 cols
 Source 'accounts': 515,080 rows, 11 cols
 Sources total: 0.6s
 Extracting chains for 'tx_chains'...
-  Seeds: 109,718
-  Chains cached to chains_tx_chains_ed008d26354b42ee.pkl
-  Chains extracted: 300,000
-Chains total: 336s
-Building geometry...
-Geometry total: 263s
-Building temporal for 'account_pattern' (2d windows)...
-Temporal total: 305s
-Build total: 527s
+  Chains extracted: 290,784
+Chains total: 9.5s
+Building geometry + temporal (pipeline)...
+Geometry + temporal total: 304.9s
+Build total: 315.5s
 ```
 
 ### Skip flags (iterative build)
@@ -945,9 +982,9 @@ hypertopos build --config sphere.yaml --force --verbose
 
 | Sphere | First run | Cached run |
 |--------|-----------|-----------|
-| Berka (4.5K accounts, 1M tx) | 42s | 40s |
-| NYC Taxi (265 zones, 7.5M trips) | 5.1 min | 4.8 min |
-| AML HI-Small (515K accts, 5M tx, 300K chains) | ~16.7 min | ~6.6 min |
+| Berka (4.5K accounts, 1M tx) | ~35s | ~25s |
+| NYC Taxi (265 zones, 7.5M trips) | ~3.2 min | ~2.8 min |
+| AML HI-Small (515K accts, 5M tx, 300K chains) | ~5.3 min | ~6.7 min |
 
 ### Benchmark sphere configurations
 

@@ -310,6 +310,7 @@ def find_anomalies(
     top_n: int,
     offset: int = 0,
     lance_version: int | None = None,
+    min_confidence: float = 0.0,
 ) -> dict:
     """Top-N polygons by ``delta_norm`` above ``threshold`` via Lance SQL.
 
@@ -320,6 +321,9 @@ def find_anomalies(
     in the geometry table. Callers paging with ``offset`` should treat
     ``total_found`` as an upper bound, not an exact page count.
     Mirrors the historical subprocess find_anomalies output.
+
+    When *min_confidence* > 0.0, only rows with ``anomaly_confidence >=
+    min_confidence`` are included.
     """
     import math
     if not math.isfinite(threshold):
@@ -334,14 +338,18 @@ def find_anomalies(
     else:
         ds = _lance.dataset(geo_lance_path)
 
-    total_found = ds.count_rows(filter=f"delta_norm >= {threshold}")
+    base_filter = f"delta_norm >= {threshold}"
+    if min_confidence > 0.0:
+        base_filter += f" AND anomaly_confidence >= {min_confidence}"
+
+    total_found = ds.count_rows(filter=base_filter)
     if total_found == 0 or offset >= total_found:
         return {"keys": [], "delta_norms": [], "total_found": total_found}
 
     sql = (
         f"SELECT primary_key, delta_norm "
         f"FROM dataset "
-        f"WHERE delta_norm >= {threshold} "
+        f"WHERE {base_filter} "
         f"ORDER BY delta_norm DESC "
         f"LIMIT {offset + top_n}"
     )

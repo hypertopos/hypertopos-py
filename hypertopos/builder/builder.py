@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 MIN_FILL_RATE: float = 0.05  # props with lower fill rate excluded from delta
 MAX_FILL_RATE: float = 0.999  # props with higher fill rate excluded (zero-variance)
 GEOMETRY_CHUNK_SIZE: int = 500_000  # entities above this threshold trigger chunked writes
+_BOOTSTRAP_MAX_N: int = 50_000  # bootstrap skipped for populations above this size
 
 _INTERNAL_COLUMNS = {"version", "status", "created_at", "changed_at"}
 
@@ -240,6 +241,7 @@ class _PatternReg:
     event_dimensions: list[EventDimSpec] = field(default_factory=list)
     description: str | None = None
     edge_table: EdgeTableConfig | None = None  # None = auto-detect or skip
+    bootstrap_iterations: int = 200
     # Generalized dimension blocks (g/t/s)
     geo_properties: list[str] | None = None
     metric_properties: list[str] | None = None
@@ -279,6 +281,9 @@ class PopulationStats:
     gmm_components: list | None
     cholesky_inv: np.ndarray | None
     n_anom_dims: np.ndarray
+    bregman_norms: np.ndarray | None = None
+    dimension_kinds: list[str] | None = None
+    theta_per_dim: np.ndarray | None = None
     dim_block_names: list[str] = field(default_factory=list)
     dim_block_stats: dict[str, Any] | None = None
 
@@ -300,6 +305,7 @@ class PatternBuildResult:
     gmm_components: list | None
     cholesky_inv: np.ndarray | None
     dim_percentiles: dict[str, dict[str, float]] | None = None
+    dimension_kinds: list[str] | None = None
     dim_block_names: list[str] = field(default_factory=list)
     dim_block_stats: dict[str, Any] | None = None
 
@@ -316,6 +322,95 @@ class IncrementalUpdateResult:
     recalibrated: bool
     theta_norm: float
     population_size: int
+
+
+# ── Temporal helpers (extracted from build_temporal closure) ──────────
+
+
+def _temporal_tensor_to_lance(
+    shape_tensor: np.ndarray,
+    keys_list: list[str],
+    n_ent: int,
+    non_empty: np.ndarray,
+    lance_p: Any,
+    min_ts: float,
+    win_secs: float,
+    D: int,
+) -> None:
+    from hypertopos.storage.writer import _TEMPORAL_SCHEMA, _write_lance
+
+    n_w = len(non_empty)
+    if n_w == 0:
+        return
+    total = n_ent * n_w
+    flat = shape_tensor[:, non_empty, :].reshape(total, D)
+    pk_idx = np.repeat(np.arange(n_ent), n_w)
+    bkt_idx = np.tile(non_empty, n_ent)
+    bkt_ts = [
+        datetime.fromtimestamp(min_ts + int(b) * win_secs, tz=UTC)
+        for b in non_empty
+    ]
+    pk_c = pa.array([keys_list[i] for i in pk_idx], type=pa.string())
+    ts_c = pa.array(
+        [bkt_ts[i % n_w] for i in range(total)],
+        type=pa.timestamp("us", tz="UTC"),
+    )
+    sc = (
+        pa.FixedSizeListArray.from_arrays(
+            pa.array(flat.ravel(), type=pa.float32()), list_size=D,
+        ).cast(pa.list_(pa.float32()))
+        if D > 0
+        else pa.array([[] for _ in range(total)], type=pa.list_(pa.float32()))
+    )
+    tbl = pa.table({
+        "primary_key": pk_c,
+        "slice_index": pa.array(bkt_idx.astype(np.int32), type=pa.int32()),
+        "timestamp": ts_c,
+        "deformation_type": pa.array(["window_snapshot"] * total),
+        "shape_snapshot": sc,
+        "pattern_ver": pa.array(np.full(total, 1, dtype=np.int32)),
+        "changed_property": pa.nulls(total, type=pa.string()),
+        "changed_line_id": pa.nulls(total, type=pa.string()),
+    }, schema=_TEMPORAL_SCHEMA)
+    mode = "append" if lance_p.exists() else "create"
+    _write_lance(tbl, str(lance_p), mode=mode)
+
+
+def _build_traj_chunk(
+    traj_tables: list,
+    tensor: np.ndarray,
+    pks: list[str],
+    bkt_ts: list,
+    mu_a: np.ndarray | None,
+    sig_a: np.ndarray | None,
+) -> None:
+    nt, nb, dt = tensor.shape
+    if nt == 0 or nb < 2:
+        return
+    d2 = dt * 2
+    _s = np.maximum(sig_a, 1e-2) if sig_a is not None else None
+    d = (tensor - mu_a) / _s if mu_a is not None and _s is not None else tensor
+    tv = np.concatenate([d.mean(axis=1), d.std(axis=1)], axis=1).astype(np.float32)
+    disp = np.linalg.norm(d[:, -1, :] - d[:, 0, :], axis=1).astype(np.float32)
+    ts = pa.schema([
+        pa.field("primary_key", pa.string()),
+        pa.field("trajectory_vector", pa.list_(pa.float32(), d2)),
+        pa.field("displacement", pa.float32()),
+        pa.field("num_slices", pa.int32()),
+        pa.field("first_timestamp", pa.timestamp("us", tz="UTC")),
+        pa.field("last_timestamp", pa.timestamp("us", tz="UTC")),
+    ])
+    tvc = pa.FixedSizeListArray.from_arrays(
+        pa.array(tv.ravel(), type=pa.float32()), list_size=d2,
+    ).cast(pa.list_(pa.float32(), d2))
+    traj_tables.append(pa.table({
+        "primary_key": pa.array(pks, type=pa.string()),
+        "trajectory_vector": tvc,
+        "displacement": pa.array(disp, type=pa.float32()),
+        "num_slices": pa.array(np.full(nt, nb, dtype=np.int32)),
+        "first_timestamp": pa.array([bkt_ts[0]] * nt, type=pa.timestamp("us", tz="UTC")),
+        "last_timestamp": pa.array([bkt_ts[-1]] * nt, type=pa.timestamp("us", tz="UTC")),
+    }, schema=ts))
 
 
 class GDSBuilder:
@@ -418,6 +513,7 @@ class GDSBuilder:
         geo_properties: list[str] | None = None,
         metric_properties: list[str] | None = None,
         semantic_dim: dict | None = None,
+        bootstrap_iterations: int = 200,
     ) -> GDSBuilder:
         _VALID_DW = ("auto", "kurtosis", "uniform")
         if isinstance(dimension_weights, str) and dimension_weights not in _VALID_DW:
@@ -438,6 +534,7 @@ class GDSBuilder:
             use_mahalanobis=use_mahalanobis,
             description=description,
             edge_table=edge_table,
+            bootstrap_iterations=bootstrap_iterations,
             geo_properties=geo_properties,
             metric_properties=metric_properties,
             semantic_dim=semantic_dim,
@@ -977,6 +1074,88 @@ class GDSBuilder:
             else shape_vectors
         )
 
+        # 3.2 Auto-detect Bregman dimension kinds
+        from hypertopos.builder._bregman import (
+            detect_kinds_for_pattern,
+            format_kinds_summary,
+        )
+
+        # Gather dimension kinds — one per dimension in delta vector order:
+        # [relations (incl. _d_* derived/precomputed)] → [event_dims] → [prop_fill] → [dim_blocks]
+        from hypertopos.builder._bregman import (
+            detect_kind_for_column,
+        )
+
+        # Build lookup: dimension_name → metric for derived dims
+        _derived_metric_map: dict[str, str] = {}
+        for dspec in self._derived_dims:
+            _derived_metric_map[dspec.dimension_name] = dspec.metric
+
+        # Build lookup: dimension_name → edge_max for precomputed dims
+        _precomputed_map: dict[str, int | float | str | None] = {}
+        for pspec in self._precomputed_dims:
+            _precomputed_map[pspec.dimension_name] = pspec.edge_max
+
+        _POISSON_METRICS = {"count", "count_distinct"}
+
+        dimension_kinds: list[str] = []
+        for rel in pat.relations:
+            dim_name = rel.fk_col
+            if dim_name in _derived_metric_map:
+                # Derived dim — classify by metric
+                metric = _derived_metric_map[dim_name]
+                base_metric = metric.split(":")[0]
+                dimension_kinds.append("poisson" if base_metric in _POISSON_METRICS else "gaussian")
+            elif dim_name in _precomputed_map:
+                # Precomputed dim — bernoulli if edge_max=1 (ratio), else gaussian
+                em = _precomputed_map[dim_name]
+                dimension_kinds.append(
+                    "bernoulli" if isinstance(em, (int, float)) and int(em) == 1 else "gaussian"
+                )
+            else:
+                # Regular FK or graph feature relation.
+                # edge_max=1 means a 0-1 ratio (bernoulli), edge_max>1 or
+                # auto-resolved means count-like (poisson), None means binary.
+                em = rel.edge_max
+                if isinstance(em, (int, float)) and int(em) == 1:
+                    dimension_kinds.append("bernoulli")
+                elif em is not None and em != "auto":
+                    dimension_kinds.append("poisson")
+                else:
+                    dimension_kinds.append("bernoulli")
+
+        # Event dimensions
+        for edim in pat.event_dimensions:
+            kind_override = getattr(edim, "kind", None)
+            if kind_override:
+                dimension_kinds.append(kind_override)
+            else:
+                col = entity_table[edim.column]
+                vals = pc.fill_null(col, 0).to_numpy(zero_copy_only=False).astype(np.float64)
+                dimension_kinds.append(detect_kind_for_column(vals))
+
+        # Prop fill (binary 0/1)
+        dimension_kinds.extend(["bernoulli"] * len(prop_columns))
+
+        # Dim blocks (geo/metric/semantic — all gaussian)
+        _dim_block_count = sum(blk.shape[1] for blk in dim_block_matrices)
+        dimension_kinds.extend(["gaussian"] * _dim_block_count)
+
+        # Validate kind count matches shape dimension count
+        D_full = full_shape_vectors.shape[1]
+        if len(dimension_kinds) != D_full:
+            logger.warning(
+                "Bregman kind count (%d) != shape dim count (%d) for %s — "
+                "falling back to uniform gaussian kinds",
+                len(dimension_kinds), D_full, pat.pattern_id,
+            )
+            dimension_kinds = ["gaussian"] * D_full
+
+        logger.info(
+            "Bregman kinds for %s: %s (D=%d)",
+            pat.pattern_id, format_kinds_summary(dimension_kinds), D_full,
+        )
+
         # 3.5 Resolve dimension weights
         from hypertopos.builder._stats import compute_dimension_weights
 
@@ -1019,7 +1198,7 @@ class GDSBuilder:
 
             # Global stats (for backward compat + fallback)
             mu, sigma, theta, global_deltas, global_norms, _ = compute_stats(
-                full_shape_vectors, pat.anomaly_percentile
+                full_shape_vectors, pat.anomaly_percentile,
             )
 
             # Per-group stats — prop_dim_start applies SIGMA_EPS_PROP inside
@@ -1042,7 +1221,10 @@ class GDSBuilder:
             if prop_columns:
                 from hypertopos.builder._stats import SIGMA_EPS_PROP
 
-                sigma[n_rel:] = np.maximum(sigma[n_rel:], SIGMA_EPS_PROP)
+                prop_start = n_rel + n_event
+                sigma[prop_start:prop_start + len(prop_columns)] = np.maximum(
+                    sigma[prop_start:prop_start + len(prop_columns)], SIGMA_EPS_PROP
+                )
                 global_deltas = ((full_shape_vectors - mu) / sigma).astype(np.float32)
                 global_norms = np.sqrt(
                     np.einsum('ij,ij->i', global_deltas, global_deltas),
@@ -1059,10 +1241,14 @@ class GDSBuilder:
 
             # Prop_columns are binary (0/1) — use higher sigma floor
             n_rel = len(pat.relations)
+            n_event = len(pat.event_dimensions) if pat.event_dimensions else 0
             if prop_columns:
                 from hypertopos.builder._stats import SIGMA_EPS_PROP
 
-                sigma[n_rel:] = np.maximum(sigma[n_rel:], SIGMA_EPS_PROP)
+                prop_start = n_rel + n_event
+                sigma[prop_start:prop_start + len(prop_columns)] = np.maximum(
+                    sigma[prop_start:prop_start + len(prop_columns)], SIGMA_EPS_PROP
+                )
                 deltas = ((full_shape_vectors - mu) / sigma).astype(np.float32)
                 delta_norms = np.sqrt(np.einsum('ij,ij->i', deltas, deltas)).astype(np.float32)
                 theta_scalar = float(
@@ -1095,6 +1281,28 @@ class GDSBuilder:
                     g_theta = np.full(D_full, g_comp, dtype=np.float32)
                     group_stats_dict[gid] = (mu_g, sigma_g, g_theta, pop_g)
 
+        # 4.55 Compute Bregman norms (reuse dimension_kinds from step 3.2)
+        bregman_norms_arr: np.ndarray | None = None
+        theta_per_dim_arr: np.ndarray | None = None
+
+        if dimension_kinds is not None:
+            from hypertopos.builder._bregman import (
+                bregman_norms as _bregman_norms_fn,
+                per_dim_theta as _per_dim_theta_fn,
+            )
+
+            # Global Bregman — always scored against population mu/sigma.
+            # Per-group calibration is already captured in is_anomaly (L2).
+            # Bregman as supplementary metric uses global for consistent ranking.
+            bregman_norms_arr = _bregman_norms_fn(
+                full_shape_vectors, mu, sigma, dimension_kinds,
+                weights=dim_weights,
+            ).astype(np.float32)
+            theta_per_dim_arr = _per_dim_theta_fn(
+                full_shape_vectors, mu, sigma, dimension_kinds,
+                anomaly_percentile=pat.anomaly_percentile,
+            )
+
         # 4.6 GMM per-cluster theta
         gmm_components_result: list[tuple[np.ndarray, np.ndarray, np.ndarray, int]] | None = None
         if pat.gmm_n_components:
@@ -1108,6 +1316,8 @@ class GDSBuilder:
 
             # Re-compute deltas per cluster
             n_rel_gmm = len(pat.relations)
+            n_event_gmm = len(pat.event_dimensions) if pat.event_dimensions else 0
+            prop_start_gmm = n_rel_gmm + n_event_gmm
             for c_idx, (mu_c, sigma_c, theta_c, pop_c) in enumerate(gmm_components_result):
                 mask = gmm_assignments == c_idx
                 if mask.sum() == 0:
@@ -1115,7 +1325,9 @@ class GDSBuilder:
                 # Apply SIGMA_EPS_PROP floor to prop dims in cluster sigma
                 if prop_columns:
                     sigma_c = sigma_c.copy()
-                    sigma_c[n_rel_gmm:] = np.maximum(sigma_c[n_rel_gmm:], SIGMA_EPS_PROP)
+                    sigma_c[prop_start_gmm:prop_start_gmm + len(prop_columns)] = np.maximum(
+                        sigma_c[prop_start_gmm:prop_start_gmm + len(prop_columns)], SIGMA_EPS_PROP
+                    )
                     gmm_components_result[c_idx] = (mu_c, sigma_c, theta_c, pop_c)
                 c_shapes = full_shape_vectors[mask]
                 c_deltas = ((c_shapes - mu_c) / sigma_c).astype(np.float32)
@@ -1144,6 +1356,21 @@ class GDSBuilder:
                 [c[3] for c in gmm_components_result],
             )
 
+            # Recompute Bregman norms per cluster (each entity scored against
+            # its cluster's mu_c/sigma_c, not the global mu/sigma)
+            if bregman_norms_arr is not None and dimension_kinds is not None:
+                from hypertopos.builder._bregman import (
+                    bregman_norms as _bregman_norms_fn,
+                )
+                bregman_norms_arr = np.zeros(n, dtype=np.float32)
+                for c_idx, (c_mu, c_sigma, _c_theta, _c_pop) in enumerate(gmm_components_result):
+                    mask = gmm_assignments == c_idx
+                    if mask.any():
+                        bregman_norms_arr[mask] = _bregman_norms_fn(
+                            full_shape_vectors[mask], c_mu, c_sigma,
+                            dimension_kinds, weights=dim_weights,
+                        ).astype(np.float32)
+
         # 5. Compute delta_rank_pct (population-level percentile rank)
         sorted_norms = np.sort(delta_norms)
         ranks = np.searchsorted(sorted_norms, delta_norms, side="left")
@@ -1153,19 +1380,26 @@ class GDSBuilder:
         conformal_p = compute_conformal_p(delta_norms, sorted_norms=sorted_norms)
 
         # 7. Compute is_anomaly (per-cluster if GMM, per-group if grouped, else global)
+        #    When Bregman norms are available, use sum(theta_per_dim) as the
+        #    anomaly threshold instead of the L2 theta_norm of the uniform theta.
         is_anomaly_arr: np.ndarray | None = None
         if gmm_components_result is not None:
             is_anomaly_arr = np.zeros(n, dtype=bool)
-            for c_idx, (_, _, c_theta, _) in enumerate(gmm_components_result):
+            for c_idx, (_c_mu, _c_sigma, c_theta, _c_pop) in enumerate(gmm_components_result):
                 c_theta_norm = float(np.linalg.norm(c_theta))
                 mask = gmm_assignments == c_idx
                 is_anomaly_arr[mask] = (c_theta_norm > 0.0) & (delta_norms[mask] >= c_theta_norm)
         elif group_stats_dict:
             is_anomaly_arr = np.zeros(n, dtype=bool)
-            for gid, (_, _, g_theta, _) in group_stats_dict.items():
+            for gid, (_g_mu, _g_sigma, g_theta, _g_pop) in group_stats_dict.items():
                 g_theta_norm = float(np.linalg.norm(g_theta))
                 mask = group_mask_map[gid]
                 is_anomaly_arr[mask] = (g_theta_norm > 0.0) & (delta_norms[mask] >= g_theta_norm)
+
+        # 7b. Bregman-based anomaly flag — computed and stored on
+        #     PopulationStats for downstream use (geometry columns, navigator),
+        #     but does NOT override the delta_norms-based is_anomaly yet.
+        #     Full switchover deferred until threshold calibration is validated.
 
         # Mahalanobis cholesky_inv (only set in non-grouped path)
         cov_inv = mah_cov_inv if not pat.group_by_property else None
@@ -1187,6 +1421,9 @@ class GDSBuilder:
             gmm_components=gmm_components_result,
             cholesky_inv=cov_inv,
             n_anom_dims=n_anom_dims,
+            bregman_norms=bregman_norms_arr,
+            dimension_kinds=dimension_kinds,
+            theta_per_dim=theta_per_dim_arr,
             dim_block_names=dim_block_names,
             dim_block_stats=dim_block_stats if dim_block_stats else None,
         )
@@ -1204,12 +1441,19 @@ class GDSBuilder:
         conformal_p: np.ndarray | None = None,
         is_anomaly_precomputed: np.ndarray | None = None,
         n_anom_dims: np.ndarray | None = None,
+        bregman_norms_arr: np.ndarray | None = None,
+        anomaly_confidence_arr: np.ndarray | None = None,
+        entity_table_override: pa.Table | None = None,
     ) -> pa.Table:
         """Build a geometry Arrow table for entities [start:end).
 
         Uses pre-computed deltas/norms/ranks from full population stats.
         """
-        entity_table = self._lines[pat.entity_line].table
+        entity_table = (
+            entity_table_override
+            if entity_table_override is not None
+            else self._lines[pat.entity_line].table
+        )
         chunk_table = entity_table.slice(start, end - start)
         cn = end - start
         D = len(pat.relations)
@@ -1370,6 +1614,16 @@ class GDSBuilder:
             "delta_rank_pct":  pa.array(chunk_ranks, type=pa.float32()),
             "is_anomaly":      pa.array(is_anomaly_arr, type=pa.bool_()),
             "conformal_p":     chunk_conformal,
+            "bregman_divergence": (
+                pa.array(bregman_norms_arr[start:end], type=pa.float32())
+                if bregman_norms_arr is not None
+                else pa.array(np.zeros(cn, dtype=np.float32), type=pa.float32())
+            ),
+            "anomaly_confidence": (
+                pa.array(anomaly_confidence_arr[start:end], type=pa.float32())
+                if anomaly_confidence_arr is not None
+                else pa.array(np.zeros(cn, dtype=np.float32), type=pa.float32())
+            ),
             "n_anomalous_dims": (
                 pa.array(n_anom_dims[start:end], type=pa.int32())
                 if n_anom_dims is not None
@@ -1406,11 +1660,48 @@ class GDSBuilder:
         n = len(self._lines[pat.entity_line].table)
         ps = self._compute_population_stats(pat)
 
+        # Bootstrap confidence — requires full shape vectors in memory.
+        # Skip when: use_mahalanobis, population > _BOOTSTRAP_MAX_N
+        # (conformal_p sufficient), or bootstrap_iterations=0.
+        confidence_arr: np.ndarray | None = None
+        n = len(ps.deltas)
+        if (
+            pat.bootstrap_iterations > 0
+            and ps.dimension_kinds is not None
+            and not pat.use_mahalanobis
+            and not pat.group_by_property
+            and n <= _BOOTSTRAP_MAX_N
+        ):
+            raw_deltas = ps.deltas
+            if ps.dim_weights is not None:
+                raw_deltas = (raw_deltas / ps.dim_weights).astype(np.float32)
+            shape_vectors = (raw_deltas * ps.sigma + ps.mu).astype(np.float32)
+
+            from hypertopos.builder._bootstrap import (
+                compute_bootstrap_confidence,
+            )
+
+            confidence_arr = compute_bootstrap_confidence(
+                shape_vectors=shape_vectors,
+                kinds=ps.dimension_kinds,
+                anomaly_percentile=pat.anomaly_percentile,
+                B=pat.bootstrap_iterations,
+                weights=ps.dim_weights,
+                seed=42,
+            )
+        elif n > _BOOTSTRAP_MAX_N and pat.bootstrap_iterations > 0:
+            logger.info(
+                "Bootstrap skipped for '%s' (n=%d > %d) — use conformal_p",
+                pat.pattern_id, n, _BOOTSTRAP_MAX_N,
+            )
+
         theta_norm = float(np.linalg.norm(ps.theta))
         table = self._build_geometry_slice(
             pat, 0, n, ps.deltas, ps.delta_norms,
             ps.delta_rank_pcts, theta_norm, ps.fk_arrays,
             ps.conformal_p, ps.is_anomaly_arr, ps.n_anom_dims,
+            bregman_norms_arr=ps.bregman_norms,
+            anomaly_confidence_arr=confidence_arr,
         )
         return table, ps
 
@@ -1902,6 +2193,8 @@ class GDSBuilder:
                 pat_dict["cholesky_inv"] = (
                     pbr.cholesky_inv.tolist()
                 )
+            if pbr.dimension_kinds is not None:
+                pat_dict["dimension_kinds"] = pbr.dimension_kinds
             if pbr.dim_percentiles:
                 pat_dict["dim_percentiles"] = pbr.dim_percentiles
             if pat.description:
@@ -1925,6 +2218,7 @@ class GDSBuilder:
 
         sphere_dict: dict[str, Any] = {
             "sphere_id": self.sphere_id,
+            "format_version": "2.3",
             "name": self._name or self.sphere_id,
             "lines": lines_dict,
             "patterns": patterns_dict,
@@ -2207,9 +2501,20 @@ class GDSBuilder:
                         edge_max=em,
                     ))
 
-    def build(self) -> str:
-        """Validate, compute stats, write all files. Returns output_path as string."""
-        from concurrent.futures import ThreadPoolExecutor
+    def build(
+        self,
+        *,
+        temporal_configs: list[dict[str, str]] | None = None,
+    ) -> str:
+        """Validate, compute stats, write all files. Returns output_path as string.
+
+        Args:
+            temporal_configs: When provided, runs per-pattern pipeline
+                (geometry → temporal) in parallel instead of geometry-only.
+                Each dict: {"time_col", "time_window"} and optionally
+                {"event_line", "anchor_pattern"}.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         self._resolve_derived()
         self._resolve_chain_dims()
@@ -2227,10 +2532,8 @@ class GDSBuilder:
         from hypertopos.storage.writer import GDSWriter
 
         def _write_line_points(line_id: str, line_reg: _LineReg) -> None:
-            # Skip internal dummy dimension lines (_d_*) — single-row placeholders
             if line_id.startswith("_d_"):
                 return
-            # Resolve FTS columns: None → auto (anchor=all, event=none)
             fts = line_reg.fts_columns
             if fts is None:
                 fts = [] if line_reg.role == "event" else "all"
@@ -2243,7 +2546,6 @@ class GDSBuilder:
                 fts_columns=fts,
             )
 
-        # Parallel write for independent lines
         real_lines = [
             (lid, lr) for lid, lr in self._lines.items()
             if not lid.startswith("_d_")
@@ -2260,7 +2562,7 @@ class GDSBuilder:
             for lid, lr in real_lines:
                 _write_line_points(lid, lr)
 
-        # 2. Build and write geometry for each pattern (parallel when >1)
+        # 2. Build geometry (and optionally temporal) per pattern
         _stats_writer = GDSWriter(str(self.output_path))
 
         def _build_and_write(
@@ -2269,9 +2571,6 @@ class GDSBuilder:
             n = len(self._lines[pat.entity_line].table)
 
             if n > GEOMETRY_CHUNK_SIZE:
-                # Complex modes (group_by, GMM, Mahalanobis) need full
-                # population in memory; use chunked fallback.
-                # Simple mode uses streaming three-pass with O(chunk) RAM.
                 if (pat.group_by_property
                         or pat.gmm_n_components
                         or pat.use_mahalanobis):
@@ -2289,7 +2588,6 @@ class GDSBuilder:
                 self.output_path, pat_id, geom_table, version=1,
             )
 
-            # Persist geometry stats cache
             delta_norms = geom_table["delta_norm"].to_numpy(
                 zero_copy_only=False,
             )
@@ -2303,13 +2601,11 @@ class GDSBuilder:
                 is_anomaly_arr=is_anomaly_arr,
             )
 
-            # Emit edge table for event patterns with from/to structure
             edge_cfg = self._resolve_edge_table_config(pat)
             if edge_cfg is not None:
                 edge_table = self._extract_edge_table(pat, edge_cfg)
                 if edge_table.num_rows > 0:
                     _stats_writer.write_edges(pat_id, edge_table)
-                    # Cache edge stats
                     import pyarrow.compute as _pc
                     _stats_writer.write_edge_stats(pat_id, {
                         "row_count": edge_table.num_rows,
@@ -2333,28 +2629,63 @@ class GDSBuilder:
                 dim_percentiles=self._compute_dim_percentiles(
                     pat.entity_line,
                 ),
+                dimension_kinds=ps.dimension_kinds,
                 dim_block_names=ps.dim_block_names,
                 dim_block_stats=ps.dim_block_stats,
             )
 
-        if len(self._patterns) > 1:
-            with ThreadPoolExecutor(max_workers=len(self._patterns)) as pool:
-                futures = [
-                    pool.submit(_build_and_write, pid, p)
-                    for pid, p in self._patterns.items()
-                ]
-                for fut in futures:
-                    pat_id, stats = fut.result()
+        # ── Pipeline mode: geometry → temporal per-pattern ──
+        if temporal_configs:
+            temporal_ctx = self._prepare_temporal_context(temporal_configs)
+            temporal_writer = GDSWriter(str(self.output_path))
+
+            def _pipeline(pid: str, p: _PatternReg) -> tuple[str, PatternBuildResult]:
+                pat_id, stats = _build_and_write(pid, p)
+                ctx = temporal_ctx.get(pat_id)
+                if ctx is not None and p.pattern_type == "anchor":
+                    pat_meta = self._build_pat_meta_for_temporal(p, stats)
+                    self._build_temporal_one(
+                        pat_id, p, pat_meta, ctx["event_table"],
+                        ctx["bucket_np"], ctx["n_buckets"],
+                        ctx["min_ts"], ctx["window_secs"],
+                        temporal_writer,
+                    )
+                return pat_id, stats
+
+            if len(self._patterns) > 1:
+                with ThreadPoolExecutor(
+                    max_workers=min(4, len(self._patterns)),
+                ) as pool:
+                    futs = {
+                        pool.submit(_pipeline, pid, p): pid
+                        for pid, p in self._patterns.items()
+                    }
+                    for fut in as_completed(futs):
+                        pat_id, stats = fut.result()
+                        pattern_stats[pat_id] = stats
+            else:
+                for pat_id, pat in self._patterns.items():
+                    _, stats = _pipeline(pat_id, pat)
                     pattern_stats[pat_id] = stats
         else:
-            for pat_id, pat in self._patterns.items():
-                _, stats = _build_and_write(pat_id, pat)
-                pattern_stats[pat_id] = stats
+            # ── Original mode: geometry only ──
+            if len(self._patterns) > 1:
+                with ThreadPoolExecutor(
+                    max_workers=min(4, len(self._patterns)),
+                ) as pool:
+                    futures = [
+                        pool.submit(_build_and_write, pid, p)
+                        for pid, p in self._patterns.items()
+                    ]
+                    for fut in futures:
+                        pat_id, stats = fut.result()
+                        pattern_stats[pat_id] = stats
+            else:
+                for pat_id, pat in self._patterns.items():
+                    _, stats = _build_and_write(pat_id, pat)
+                    pattern_stats[pat_id] = stats
 
-        # 2.5 Precompute per-entity contagion stats for every pattern with an
-        # edge table. The runtime scanner reads this small table directly
-        # instead of replaying the full edge table on every passive_scan /
-        # composite_risk call.
+        # 2.5 Precompute per-entity contagion stats
         self._build_contagion_stats(_stats_writer)
 
         # 3. Write sphere.json
@@ -2372,9 +2703,63 @@ class GDSBuilder:
             )
             _stats_writer.write_calibration_tracker(pid, tracker)
 
-        # Compaction not needed — temporal uses Lance append mode (one dataset per pattern)
-
         return str(self.output_path)
+
+    def _prepare_temporal_context(
+        self,
+        temporal_configs: list[dict[str, str]],
+    ) -> dict[str, dict[str, Any]]:
+        """Pre-compute shared temporal state for pipeline mode.
+
+        Returns mapping: pattern_id → {event_table, bucket_np, n_buckets,
+        min_ts, window_secs}.
+        """
+        result: dict[str, dict[str, Any]] = {}
+
+        for tc in temporal_configs:
+            time_col = tc["time_col"]
+            time_window = tc["time_window"]
+            event_line_id = tc.get("event_line")
+            anchor_pattern = tc.get("anchor_pattern")
+
+            if event_line_id is None:
+                event_lines = [
+                    lid for lid, lr in self._lines.items()
+                    if lr.role == "event"
+                ]
+                if len(event_lines) == 0:
+                    raise ValueError("No event lines registered")
+                if len(event_lines) > 1:
+                    raise ValueError(
+                        f"Multiple event lines found: {event_lines}. "
+                        "Specify event_line explicitly."
+                    )
+                event_line_id = event_lines[0]
+
+            event_table = self._lines[event_line_id].table
+            bucket_np, n_buckets, min_ts, window_secs = (
+                self._parse_event_buckets(event_table, time_col, time_window)
+            )
+            if n_buckets == 0:
+                continue
+
+            ctx = {
+                "event_table": event_table,
+                "bucket_np": bucket_np,
+                "n_buckets": n_buckets,
+                "min_ts": min_ts,
+                "window_secs": window_secs,
+            }
+
+            # Map to target patterns
+            if anchor_pattern is not None:
+                result[anchor_pattern] = ctx
+            else:
+                for pid, pat in self._patterns.items():
+                    if pat.pattern_type == "anchor":
+                        result[pid] = ctx
+
+        return result
 
     def _resolve_anchor_pattern_for_edge_table(
         self, pat_id: str, pat: _PatternReg,
@@ -2695,6 +3080,13 @@ class GDSBuilder:
                 "delta_rank_pct": pa.array(delta_rank_pcts, type=pa.float32()),
                 "is_anomaly": pa.array(is_anomaly, type=pa.bool_()),
                 "conformal_p": pa.array(conformal_p, type=pa.float32()),
+                "bregman_divergence": pa.array(
+                    self._compute_incremental_bregman(
+                        deltas, mu, sigma, pat_meta, n_new,
+                    ),
+                    type=pa.float32(),
+                ),
+                "anomaly_confidence": pa.array(np.zeros(n_new, dtype=np.float32), type=pa.float32()),
                 "n_anomalous_dims": pa.array(n_anom_dims, type=pa.int32()),
                 "entity_keys": pa.array(entity_key_lists, type=pa.list_(pa.string())),
                 "last_refresh_at": pa.array([now] * n_new, type=ts_type),
@@ -2785,6 +3177,28 @@ class GDSBuilder:
             population_size=new_pop,
         )
 
+    @staticmethod
+    def _compute_incremental_bregman(
+        deltas: np.ndarray,
+        mu: np.ndarray,
+        sigma: np.ndarray,
+        pat_meta: dict,
+        n: int,
+    ) -> np.ndarray:
+        """Compute Bregman norms for incrementally-added entities.
+
+        Reconstructs shape vectors from deltas and the stored mu/sigma,
+        then scores against the pattern's dimension_kinds. Returns zeros
+        when dimension_kinds is unavailable (pre-0.4 spheres).
+        """
+        dim_kinds = pat_meta.get("dimension_kinds")
+        if dim_kinds is not None:
+            from hypertopos.builder._bregman import bregman_norms as _bregman_norms_fn
+
+            shapes = (deltas * sigma + mu).astype(np.float32)
+            return _bregman_norms_fn(shapes, mu, sigma, dim_kinds).astype(np.float32)
+        return np.zeros(n, dtype=np.float32)
+
     def _build_and_write_chunked(
         self,
         pat_id: str,
@@ -2805,6 +3219,35 @@ class GDSBuilder:
 
         theta_norm = float(np.linalg.norm(ps.theta))
 
+        # 1b. Bootstrap confidence (chunked path keeps full deltas in memory)
+        # Skip when: use_mahalanobis, population > _BOOTSTRAP_MAX_N,
+        # group_by_property, or bootstrap_iterations=0
+        confidence_arr: np.ndarray | None = None
+        if (
+            pat.bootstrap_iterations > 0
+            and ps.dimension_kinds is not None
+            and not pat.use_mahalanobis
+            and not pat.group_by_property
+            and n <= _BOOTSTRAP_MAX_N
+        ):
+            raw_deltas = ps.deltas
+            if ps.dim_weights is not None:
+                raw_deltas = (raw_deltas / ps.dim_weights).astype(np.float32)
+            shape_vectors = (raw_deltas * ps.sigma + ps.mu).astype(np.float32)
+
+            from hypertopos.builder._bootstrap import (
+                compute_bootstrap_confidence,
+            )
+
+            confidence_arr = compute_bootstrap_confidence(
+                shape_vectors=shape_vectors,
+                kinds=ps.dimension_kinds,
+                anomaly_percentile=pat.anomaly_percentile,
+                B=pat.bootstrap_iterations,
+                weights=ps.dim_weights,
+                seed=42,
+            )
+
         # 2. Write geometry in chunks
         for start in range(0, n, GEOMETRY_CHUNK_SIZE):
             end = min(start + GEOMETRY_CHUNK_SIZE, n)
@@ -2813,6 +3256,8 @@ class GDSBuilder:
                 ps.deltas, ps.delta_norms, ps.delta_rank_pcts,
                 theta_norm, ps.fk_arrays, ps.conformal_p,
                 ps.is_anomaly_arr, ps.n_anom_dims,
+                bregman_norms_arr=ps.bregman_norms,
+                anomaly_confidence_arr=confidence_arr,
             )
             write_chunk_fn(
                 self.output_path, pat_id, chunk_table, version=1,
@@ -2858,6 +3303,7 @@ class GDSBuilder:
             dim_percentiles=self._compute_dim_percentiles(
                 pat.entity_line,
             ),
+            dimension_kinds=ps.dimension_kinds,
             dim_block_names=ps.dim_block_names,
             dim_block_stats=ps.dim_block_stats,
         )
@@ -3085,7 +3531,10 @@ class GDSBuilder:
 
         D_full = len(mu)
 
-        # Apply SIGMA_EPS_PROP for binary prop columns
+        # Apply SIGMA_EPS_PROP for binary prop columns.
+        # In the streaming path D_base = n_rel + n_event + n_dim_block, and
+        # sigma[D_base:] covers only prop_columns (no additional dim blocks
+        # are appended after props in this path).
         if prop_columns:
             sigma[D_base:] = np.maximum(sigma[D_base:], SIGMA_EPS_PROP)
 
@@ -3127,6 +3576,78 @@ class GDSBuilder:
                     f"dimension_weights length ({len(dim_weights)}) != "
                     f"shape dimensions ({D_full})"
                 )
+
+        # ── Detect dimension kinds (needed for Bregman norms in Pass 3) ──
+        from hypertopos.builder._bregman import (
+            bregman_norms as _bregman_norms_fn,
+            detect_kind_for_column as _detect_kind_for_column,
+            format_kinds_summary,
+        )
+
+        # Build lookup maps for derived/precomputed dims (same as in-memory path)
+        _derived_metric_map_s: dict[str, str] = {}
+        for dspec in self._derived_dims:
+            _derived_metric_map_s[dspec.dimension_name] = dspec.metric
+
+        _precomputed_map_s: dict[str, int | float | str | None] = {}
+        for pspec in self._precomputed_dims:
+            _precomputed_map_s[pspec.dimension_name] = pspec.edge_max
+
+        _POISSON_METRICS_S = {"count", "count_distinct"}
+
+        dimension_kinds: list[str] = []
+        for rel in pat.relations:
+            dim_name = rel.fk_col
+            if dim_name in _derived_metric_map_s:
+                metric = _derived_metric_map_s[dim_name]
+                base_metric = metric.split(":")[0]
+                dimension_kinds.append(
+                    "poisson" if base_metric in _POISSON_METRICS_S else "gaussian",
+                )
+            elif dim_name in _precomputed_map_s:
+                em = _precomputed_map_s[dim_name]
+                dimension_kinds.append(
+                    "bernoulli" if isinstance(em, (int, float)) and int(em) == 1 else "gaussian"
+                )
+            else:
+                # Regular FK or graph feature relation.
+                # edge_max=1 → 0-1 ratio (bernoulli), edge_max>1 → count (poisson),
+                # None → binary FK (bernoulli).
+                em = rel.edge_max
+                if isinstance(em, (int, float)) and int(em) == 1:
+                    dimension_kinds.append("bernoulli")
+                elif em is not None and em != "auto":
+                    dimension_kinds.append("poisson")
+                else:
+                    dimension_kinds.append("bernoulli")
+
+        # Event dimensions
+        for edim in pat.event_dimensions:
+            kind_override = getattr(edim, "kind", None)
+            if kind_override:
+                dimension_kinds.append(kind_override)
+            else:
+                col = entity_table[edim.column]
+                vals = pc.fill_null(col, 0).to_numpy(
+                    zero_copy_only=False,
+                ).astype(np.float64)
+                dimension_kinds.append(_detect_kind_for_column(vals))
+
+        # Prop fill (binary 0/1)
+        dimension_kinds.extend(["bernoulli"] * len(prop_columns))
+
+        if len(dimension_kinds) != D_full:
+            logger.warning(
+                "Bregman kind count (%d) != shape dim count (%d) for %s — "
+                "falling back to uniform gaussian kinds",
+                len(dimension_kinds), D_full, pat.pattern_id,
+            )
+            dimension_kinds = ["gaussian"] * D_full
+
+        logger.info(
+            "Bregman kinds for %s (streaming): %s (D=%d)",
+            pat.pattern_id, format_kinds_summary(dimension_kinds), D_full,
+        )
 
         # ── Pass 2: Compute all norms (O(N) float32) + reservoir ──
 
@@ -3188,76 +3709,75 @@ class GDSBuilder:
             per_dim_thresholds = np.zeros(D_full, dtype=np.float32)
 
         # ── Pass 3: Write geometry chunks ──
-        # _build_geometry_slice reads entity_table via self._lines and
-        # slices [start:end]. We temporarily swap the entity table to
-        # the current chunk so that start=0, end=cn addresses the chunk.
-
-        orig_entity_table = entity_line.table
+        entity_table_full = entity_line.table
         all_is_anomaly = np.empty(n, dtype=bool)
 
-        try:
-            for start in range(0, n, chunk_size):
-                end = min(start + chunk_size, n)
-                chunk_entity_table = orig_entity_table.slice(
-                    start, end - start,
+        for start in range(0, n, chunk_size):
+            end = min(start + chunk_size, n)
+            chunk_entity_table = entity_table_full.slice(
+                start, end - start,
+            )
+            cn = end - start
+            shapes, fk_slices = self._build_shape_chunk(
+                pat, chunk_entity_table,
+            )
+            if prop_columns:
+                prop_fill = self._build_prop_fill_chunk(
+                    pat, chunk_entity_table, prop_columns,
                 )
-                cn = end - start
-                shapes, fk_slices = self._build_shape_chunk(
-                    pat, chunk_entity_table,
+                full_chunk = np.concatenate(
+                    [shapes, prop_fill], axis=1,
                 )
-                if prop_columns:
-                    prop_fill = self._build_prop_fill_chunk(
-                        pat, chunk_entity_table, prop_columns,
-                    )
-                    full_chunk = np.concatenate(
-                        [shapes, prop_fill], axis=1,
-                    )
-                else:
-                    full_chunk = shapes
+            else:
+                full_chunk = shapes
 
+            chunk_deltas = (
+                (full_chunk - mu) / sigma
+            ).astype(np.float32)
+            if dim_weights is not None:
                 chunk_deltas = (
-                    (full_chunk - mu) / sigma
+                    chunk_deltas * dim_weights
                 ).astype(np.float32)
-                if dim_weights is not None:
-                    chunk_deltas = (
-                        chunk_deltas * dim_weights
-                    ).astype(np.float32)
-                chunk_norms = all_norms[start:end]
-                chunk_ranks = delta_rank_pcts[start:end]
-                chunk_conformal = conformal_p[start:end]
+            chunk_norms = all_norms[start:end]
+            chunk_ranks = delta_rank_pcts[start:end]
+            chunk_conformal = conformal_p[start:end]
 
-                # is_anomaly — keep in all_is_anomaly to avoid Lance re-read
-                is_anomaly_arr = (
-                    (theta_norm > 0.0) & (chunk_norms >= theta_norm)
-                )
-                all_is_anomaly[start:end] = is_anomaly_arr
+            is_anomaly_arr = (
+                (theta_norm > 0.0) & (chunk_norms >= theta_norm)
+            )
+            all_is_anomaly[start:end] = is_anomaly_arr
 
-                # Per-dim anomaly count using reservoir thresholds
-                abs_chunk_deltas = np.abs(chunk_deltas)
-                exceeds = (
-                    abs_chunk_deltas > per_dim_thresholds
-                ).astype(np.int32)
-                chunk_n_anom_dims = exceeds.sum(axis=1).astype(np.int32)
+            abs_chunk_deltas = np.abs(chunk_deltas)
+            exceeds = (
+                abs_chunk_deltas > per_dim_thresholds
+            ).astype(np.int32)
+            chunk_n_anom_dims = exceeds.sum(axis=1).astype(np.int32)
 
-                # Swap entity table to chunk for _build_geometry_slice
-                entity_line.table = chunk_entity_table
-                geom_table = self._build_geometry_slice(
-                    pat, start=0, end=cn,
-                    deltas=chunk_deltas,
-                    delta_norms=chunk_norms,
-                    delta_rank_pcts=chunk_ranks,
-                    theta_norm=theta_norm,
-                    fk_arrays=fk_slices,
-                    conformal_p=chunk_conformal,
-                    is_anomaly_precomputed=is_anomaly_arr,
-                    n_anom_dims=chunk_n_anom_dims,
-                )
+            chunk_bregman: np.ndarray | None = None
+            if dimension_kinds is not None:
+                chunk_bregman = _bregman_norms_fn(
+                    full_chunk, mu, sigma, dimension_kinds,
+                    weights=dim_weights,
+                ).astype(np.float32)
 
-                write_chunk_fn(
-                    self.output_path, pat_id, geom_table, version=1,
-                )
-        finally:
-            entity_line.table = orig_entity_table
+            geom_table = self._build_geometry_slice(
+                pat, start=0, end=cn,
+                deltas=chunk_deltas,
+                delta_norms=chunk_norms,
+                delta_rank_pcts=chunk_ranks,
+                theta_norm=theta_norm,
+                fk_arrays=fk_slices,
+                conformal_p=chunk_conformal,
+                is_anomaly_precomputed=is_anomaly_arr,
+                n_anom_dims=chunk_n_anom_dims,
+                bregman_norms_arr=chunk_bregman,
+                anomaly_confidence_arr=None,
+                entity_table_override=chunk_entity_table,
+            )
+
+            write_chunk_fn(
+                self.output_path, pat_id, geom_table, version=1,
+            )
 
         # Finalize: compact fragments, build indices
         finalize_fn(self.output_path, pat_id, version=1)
@@ -3299,7 +3819,328 @@ class GDSBuilder:
             dim_percentiles=self._compute_dim_percentiles(
                 pat.entity_line,
             ),
+            dimension_kinds=dimension_kinds,
         )
+
+    @staticmethod
+    def _parse_event_buckets(
+        event_table: pa.Table,
+        time_col: str,
+        time_window: str,
+    ) -> tuple[np.ndarray, int, float, float]:
+        """Parse timestamps into bucket indices. Returns (bucket_np, n_buckets, min_ts, window_secs)."""
+        from hypertopos.builder.derived import _parse_time_window
+
+        ts_col = event_table[time_col]
+        if pa.types.is_timestamp(ts_col.type):
+            unit = ts_col.type.unit
+            divisors = {"s": 1.0, "ms": 1e3, "us": 1e6, "ns": 1e9}
+            divisor = divisors.get(unit, 1e6)
+            epoch_arr = pc.divide(
+                pc.cast(pc.cast(ts_col, pa.int64()), pa.float64()),
+                divisor,
+            )
+        elif pa.types.is_floating(ts_col.type) or pa.types.is_integer(ts_col.type):
+            epoch_arr = pc.cast(ts_col, pa.float64())
+        else:
+            from hypertopos.engine.chains import parse_timestamps_to_epoch
+            epoch_arr = pa.chunked_array([pa.array(
+                parse_timestamps_to_epoch(ts_col.to_pylist()),
+                type=pa.float64(),
+            )])
+
+        window_secs = _parse_time_window(time_window)
+        min_ts = pc.min(epoch_arr).as_py()
+        if min_ts is None:
+            return np.array([], dtype=np.int64), 0, 0.0, window_secs
+        diff = pc.subtract(epoch_arr, min_ts)
+        bucket_arr = pc.cast(
+            pc.floor(pc.divide(pc.cast(diff, pa.float64()), window_secs)),
+            pa.int64(),
+        )
+        bucket_np = bucket_arr.to_numpy(zero_copy_only=False).astype(np.int64)
+        n_buckets = int(bucket_np.max()) + 1
+        return bucket_np, n_buckets, min_ts, window_secs
+
+    @staticmethod
+    def _build_pat_meta_for_temporal(
+        pat: _PatternReg,
+        pbr: PatternBuildResult,
+    ) -> dict[str, Any]:
+        """Build the pattern metadata dict needed by _build_temporal_one.
+
+        Produces the same keys that build_temporal() reads from sphere.json:
+        relations, prop_columns, mu, sigma_diag, theta.
+        """
+        return {
+            "relations": [
+                {
+                    "line_id": rel.line_id,
+                    "direction": rel.direction,
+                    "required": rel.required,
+                    **({"edge_max": rel.edge_max} if rel.edge_max is not None else {}),
+                    **({"display_name": rel.display_name} if rel.display_name else {}),
+                }
+                for rel in pat.relations
+            ],
+            "prop_columns": pbr.prop_columns,
+            "mu": pbr.mu.tolist(),
+            "sigma_diag": pbr.sigma.tolist(),
+            "theta": pbr.theta.tolist(),
+        }
+
+    def _build_temporal_one(
+        self,
+        pat_id: str,
+        pat: _PatternReg,
+        pat_meta: dict[str, Any],
+        event_table: pa.Table,
+        bucket_np: np.ndarray,
+        n_buckets: int,
+        min_ts: float,
+        window_secs: float,
+        writer: Any,
+    ) -> tuple[str, int]:
+        """Build temporal data for a single pattern.
+
+        Extracted from build_temporal closure for reuse in pipeline mode.
+        """
+        from contextlib import suppress
+
+        from hypertopos.storage.writer import _write_lance
+
+        relations_meta = pat_meta.get("relations", [])
+        prop_columns = pat_meta.get("prop_columns", [])
+
+        anchor_line_reg = self._lines[pat.entity_line]
+        anchor_table_full = anchor_line_reg.table
+        anchor_keys = anchor_table_full["primary_key"]
+        anchor_keys_list = anchor_keys.to_pylist()
+        n_anchor = len(anchor_keys_list)
+
+        lance_dir = self.output_path / "temporal" / pat_id
+        lance_dir.mkdir(parents=True, exist_ok=True)
+        lance_path = lance_dir / "data.lance"
+
+        D = len(relations_meta) + len(prop_columns)
+        non_empty_buckets = np.unique(bucket_np)
+        slices_written = len(non_empty_buckets)
+
+        mem_budget = self._detect_available_memory()
+        chunk_size = self._compute_chunk_size(
+            n_anchor, n_buckets, D, int(mem_budget * 0.5),
+        )
+
+        all_bkt_ts = [
+            datetime.fromtimestamp(min_ts + b * window_secs, tz=UTC)
+            for b in range(n_buckets)
+        ]
+        _mu_arr = (
+            np.array(pat_meta["mu"], dtype=np.float32)
+            if pat_meta.get("mu") else None
+        )
+        _sig_arr = (
+            np.array(pat_meta["sigma_diag"], dtype=np.float32)
+            if pat_meta.get("sigma_diag") else None
+        )
+
+        if chunk_size >= n_anchor:
+            # ── Single-pass (fits in RAM) ──
+            shape_tensor = self._precompute_shape_tensor(
+                pat_id, event_table, bucket_np, n_buckets,
+                anchor_keys, anchor_keys_list, n_anchor,
+                relations_meta, prop_columns,
+            )
+            _temporal_tensor_to_lance(
+                shape_tensor, anchor_keys_list, n_anchor,
+                non_empty_buckets, lance_path, min_ts, window_secs, D,
+            )
+
+            if slices_written > 0:
+                mu = np.array(pat_meta["mu"], dtype=np.float32)
+                sigma = np.array(pat_meta["sigma_diag"], dtype=np.float32)
+                sigma_safe = np.where(sigma < 1e-6, 1.0, sigma)
+                theta_norm = float(np.linalg.norm(
+                    np.array(pat_meta["theta"], dtype=np.float32),
+                ))
+                centroids: list[dict] = []
+                for b in range(n_buckets):
+                    ws = shape_tensor[:, b, :]
+                    am = np.any(ws != 0, axis=1)
+                    na = int(am.sum())
+                    if na == 0:
+                        continue
+                    ad = (ws[am] - mu) / sigma_safe
+                    c = ad.mean(axis=0).tolist()
+                    ar = 0.0
+                    if theta_norm > 0:
+                        nr = np.sqrt(np.einsum('ij,ij->i', ad, ad))
+                        ar = float((nr > theta_norm).sum() / len(nr))
+                    centroids.append({
+                        "window_start": datetime.fromtimestamp(
+                            min_ts + b * window_secs, tz=UTC),
+                        "window_end": datetime.fromtimestamp(
+                            min_ts + (b + 1) * window_secs, tz=UTC),
+                        "centroid": c, "entity_count": na,
+                        "anomaly_rate": ar,
+                    })
+                if centroids:
+                    writer.write_temporal_centroids(pat_id, centroids)
+
+            if slices_written >= 3:
+                mz = self._compute_max_rolling_z(
+                    shape_tensor, n_anchor, n_buckets,
+                )
+                self._write_max_rolling_z(pat_id, anchor_keys_list, mz)
+
+            if slices_written >= 2:
+                am = np.any(
+                    shape_tensor.reshape(n_anchor, -1) != 0, axis=1,
+                )
+                if am.any():
+                    writer.write_trajectory_from_tensor(
+                        pat_id, shape_tensor[am],
+                        [anchor_keys_list[i] for i in np.flatnonzero(am)],
+                        bucket_timestamps=all_bkt_ts,
+                        mu=_mu_arr, sigma_diag=_sig_arr,
+                    )
+
+        else:
+            # ── Chunked path (adaptive memory) ──
+            logger.info(
+                "Temporal %s: chunking %d entities into chunks of %d",
+                pat_id, n_anchor, chunk_size,
+            )
+            mu = np.array(pat_meta["mu"], dtype=np.float32)
+            sigma = np.array(pat_meta["sigma_diag"], dtype=np.float32)
+            sigma_safe = np.where(sigma < 1e-6, 1.0, sigma)
+            theta_norm = float(np.linalg.norm(
+                np.array(pat_meta["theta"], dtype=np.float32),
+            ))
+
+            c_n_active = np.zeros(n_buckets, dtype=np.int64)
+            c_sum_delta = np.zeros((n_buckets, D), dtype=np.float64)
+            c_n_anom = np.zeros(n_buckets, dtype=np.int64)
+            all_max_z = np.zeros(n_anchor, dtype=np.float32)
+            traj_tables: list[pa.Table] = []
+
+            _pre_grouped = self._precompute_derived_grouped(
+                pat_id, event_table, bucket_np, relations_meta,
+            )
+            _pre_graph = self._precompute_graph_features(
+                pat_id, event_table, anchor_keys, bucket_np,
+                n_buckets, relations_meta,
+            )
+
+            for cs in range(0, n_anchor, chunk_size):
+                ce = min(cs + chunk_size, n_anchor)
+                nc = ce - cs
+                ckl = anchor_keys_list[cs:ce]
+                cka = pa.array(ckl, type=pa.string())
+
+                chunk_table = anchor_table_full.slice(cs, nc)
+
+                _chunk_graph: dict[int, np.ndarray] = {}
+                for sk, full_t in _pre_graph.items():
+                    _chunk_graph[sk] = full_t[cs:ce]
+
+                ct = self._precompute_shape_tensor(
+                    pat_id, event_table, bucket_np, n_buckets,
+                    cka, ckl, nc,
+                    relations_meta, prop_columns,
+                    pre_grouped=_pre_grouped,
+                    pre_graph=_chunk_graph,
+                    anchor_table_override=chunk_table,
+                )
+
+                _temporal_tensor_to_lance(
+                    ct, ckl, nc, non_empty_buckets,
+                    lance_path, min_ts, window_secs, D,
+                )
+
+                for b in range(n_buckets):
+                    sh = ct[:, b, :]
+                    act = np.any(sh != 0, axis=1)
+                    if not act.any():
+                        continue
+                    ad = ((sh[act] - mu) / sigma_safe).astype(
+                        np.float64,
+                    )
+                    nr = np.sqrt(np.einsum('ij,ij->i', ad, ad))
+                    c_n_active[b] += int(act.sum())
+                    c_sum_delta[b] += ad.sum(axis=0)
+                    if theta_norm > 0:
+                        c_n_anom[b] += int(
+                            (nr > theta_norm).sum(),
+                        )
+
+                all_max_z[cs:ce] = self._compute_max_rolling_z(
+                    ct, nc, n_buckets,
+                )
+
+                if slices_written >= 2:
+                    am = np.any(
+                        ct.reshape(nc, -1) != 0, axis=1,
+                    )
+                    if am.any():
+                        _build_traj_chunk(
+                            traj_tables, ct[am],
+                            [ckl[i] for i in np.flatnonzero(am)],
+                            all_bkt_ts, _mu_arr, _sig_arr,
+                        )
+
+                del ct
+
+            if slices_written > 0:
+                centroids = []
+                for b in range(n_buckets):
+                    if c_n_active[b] == 0:
+                        continue
+                    cv = (c_sum_delta[b] / c_n_active[b]).tolist()
+                    ar = float(c_n_anom[b] / c_n_active[b])
+                    centroids.append({
+                        "window_start": datetime.fromtimestamp(
+                            min_ts + b * window_secs, tz=UTC),
+                        "window_end": datetime.fromtimestamp(
+                            min_ts + (b + 1) * window_secs, tz=UTC),
+                        "centroid": cv,
+                        "entity_count": int(c_n_active[b]),
+                        "anomaly_rate": ar,
+                    })
+                if centroids:
+                    writer.write_temporal_centroids(pat_id, centroids)
+
+            if slices_written >= 3:
+                self._write_max_rolling_z(
+                    pat_id, anchor_keys_list, all_max_z,
+                )
+
+            if traj_tables:
+                ct_traj = pa.concat_tables(traj_tables)
+                tp = (
+                    self.output_path / "_gds_meta" / "trajectory"
+                    / f"{pat_id}.lance"
+                )
+                tp.parent.mkdir(parents=True, exist_ok=True)
+                _write_lance(ct_traj, str(tp), mode="overwrite")
+                nt = ct_traj.num_rows
+                if nt >= 256:
+                    import lance as _ltr
+
+                    tds = _ltr.dataset(str(tp))
+                    np_ = min(64, max(16, int(nt ** 0.5)))
+                    with suppress(Exception):
+                        tds.create_index(
+                            "trajectory_vector",
+                            index_type="IVF_FLAT",
+                            num_partitions=np_,
+                        )
+
+        if slices_written > 0:
+            writer.compact_temporal(pat_id)
+            writer.build_temporal_index(pat_id)
+
+        return pat_id, slices_written
 
     def build_temporal(
         self,
@@ -3329,91 +4170,6 @@ class GDSBuilder:
         Returns:
             {pattern_id: n_slices_written}
         """
-        from hypertopos.builder.derived import _parse_time_window
-        from hypertopos.storage.writer import _write_lance
-
-        def _tensor_to_lance(
-            shape_tensor: np.ndarray,
-            keys_list: list[str],
-            n_ent: int,
-            non_empty: np.ndarray,
-            lance_p: Any,
-            _min_ts: float,
-            _win_secs: float,
-            _D: int,
-        ) -> None:
-            n_w = len(non_empty)
-            if n_w == 0:
-                return
-            total = n_ent * n_w
-            flat = shape_tensor[:, non_empty, :].reshape(total, _D)
-            pk_idx = np.repeat(np.arange(n_ent), n_w)
-            bkt_idx = np.tile(non_empty, n_ent)
-            bkt_ts = [
-                datetime.fromtimestamp(_min_ts + int(b) * _win_secs, tz=UTC)
-                for b in non_empty
-            ]
-            pk_c = pa.array([keys_list[i] for i in pk_idx], type=pa.string())
-            ts_c = pa.array(
-                [bkt_ts[i % n_w] for i in range(total)],
-                type=pa.timestamp("us", tz="UTC"),
-            )
-            sc = (
-                pa.FixedSizeListArray.from_arrays(
-                    pa.array(flat.ravel(), type=pa.float32()), list_size=_D,
-                ).cast(pa.list_(pa.float32()))
-                if _D > 0
-                else pa.array([[] for _ in range(total)], type=pa.list_(pa.float32()))
-            )
-            tbl = pa.table({
-                "primary_key": pk_c,
-                "slice_index": pa.array(bkt_idx.astype(np.int32), type=pa.int32()),
-                "timestamp": ts_c,
-                "deformation_type": pa.array(["window_snapshot"] * total),
-                "shape_snapshot": sc,
-                "pattern_ver": pa.array(np.full(total, 1, dtype=np.int32)),
-                "changed_property": pa.nulls(total, type=pa.string()),
-                "changed_line_id": pa.nulls(total, type=pa.string()),
-            }, schema=_TEMPORAL_SCHEMA)
-            mode = "append" if lance_p.exists() else "create"
-            _write_lance(tbl, str(lance_p), mode=mode)
-
-        def _build_traj_chunk(
-            traj_tables: list,
-            tensor: np.ndarray,
-            pks: list[str],
-            bkt_ts: list,
-            mu_a: np.ndarray | None,
-            sig_a: np.ndarray | None,
-        ) -> None:
-            nt, nb, dt = tensor.shape
-            if nt == 0 or nb < 2:
-                return
-            d2 = dt * 2
-            _s = np.maximum(sig_a, 1e-2) if sig_a is not None else None
-            d = (tensor - mu_a) / _s if mu_a is not None and _s is not None else tensor
-            tv = np.concatenate([d.mean(axis=1), d.std(axis=1)], axis=1).astype(np.float32)
-            disp = np.linalg.norm(d[:, -1, :] - d[:, 0, :], axis=1).astype(np.float32)
-            ts = pa.schema([
-                pa.field("primary_key", pa.string()),
-                pa.field("trajectory_vector", pa.list_(pa.float32(), d2)),
-                pa.field("displacement", pa.float32()),
-                pa.field("num_slices", pa.int32()),
-                pa.field("first_timestamp", pa.timestamp("us", tz="UTC")),
-                pa.field("last_timestamp", pa.timestamp("us", tz="UTC")),
-            ])
-            tvc = pa.FixedSizeListArray.from_arrays(
-                pa.array(tv.ravel(), type=pa.float32()), list_size=d2,
-            ).cast(pa.list_(pa.float32(), d2))
-            traj_tables.append(pa.table({
-                "primary_key": pa.array(pks, type=pa.string()),
-                "trajectory_vector": tvc,
-                "displacement": pa.array(disp, type=pa.float32()),
-                "num_slices": pa.array(np.full(nt, nb, dtype=np.int32)),
-                "first_timestamp": pa.array([bkt_ts[0]] * nt, type=pa.timestamp("us", tz="UTC")),
-                "last_timestamp": pa.array([bkt_ts[-1]] * nt, type=pa.timestamp("us", tz="UTC")),
-            }, schema=ts))
-
         # 1. Precondition: build() must have been called
         sphere_json_path = self.output_path / "_gds_meta" / "sphere.json"
         if not sphere_json_path.exists():
@@ -3440,36 +4196,12 @@ class GDSBuilder:
             raise ValueError(f"Event line '{event_line}' not registered")
         event_table = self._lines[event_line].table
 
-        # 4. Parse timestamps to epoch seconds
-        ts_col = event_table[time_col]
-        if pa.types.is_timestamp(ts_col.type):
-            unit = ts_col.type.unit
-            divisors = {"s": 1.0, "ms": 1e3, "us": 1e6, "ns": 1e9}
-            divisor = divisors.get(unit, 1e6)
-            epoch_arr = pc.divide(
-                pc.cast(pc.cast(ts_col, pa.int64()), pa.float64()), divisor,
-            )
-        elif pa.types.is_floating(ts_col.type) or pa.types.is_integer(ts_col.type):
-            epoch_arr = pc.cast(ts_col, pa.float64())
-        else:
-            from hypertopos.engine.chains import parse_timestamps_to_epoch
-            epoch_arr = pa.chunked_array([pa.array(
-                parse_timestamps_to_epoch(ts_col.to_pylist()),
-                type=pa.float64(),
-            )])
-
-        # 5. Compute bucket IDs
-        window_secs = _parse_time_window(time_window)
-        min_ts = pc.min(epoch_arr).as_py()
-        if min_ts is None:
-            return {}
-        diff = pc.subtract(epoch_arr, min_ts)
-        bucket_arr = pc.cast(
-            pc.floor(pc.divide(pc.cast(diff, pa.float64()), window_secs)),
-            pa.int64(),
+        # 4-5. Parse timestamps and compute bucket IDs
+        bucket_np, n_buckets, min_ts, window_secs = (
+            self._parse_event_buckets(event_table, time_col, time_window)
         )
-        bucket_np = bucket_arr.to_numpy(zero_copy_only=False).astype(np.int64)
-        n_buckets = int(bucket_np.max()) + 1
+        if n_buckets == 0:
+            return {}
 
         # 6. Determine which anchor patterns to process
         patterns_to_process: dict[str, _PatternReg] = {}
@@ -3491,269 +4223,25 @@ class GDSBuilder:
 
         from concurrent.futures import ThreadPoolExecutor
 
-        from hypertopos.storage.writer import _TEMPORAL_SCHEMA, GDSWriter
+        from hypertopos.storage.writer import GDSWriter
 
         writer = GDSWriter(str(self.output_path))
         result: dict[str, int] = {}
 
-        def _build_temporal_for_pattern(
-            pat_id: str, pat: _PatternReg,
-        ) -> tuple[str, int]:
-            pat_meta = sphere_data["patterns"].get(pat_id)
-            if pat_meta is None:
-                return pat_id, 0
-
-            relations_meta = pat_meta.get("relations", [])
-            prop_columns = pat_meta.get("prop_columns", [])
-
-            anchor_line_reg = self._lines[pat.entity_line]
-            anchor_keys = anchor_line_reg.table["primary_key"]
-            anchor_keys_list = anchor_keys.to_pylist()
-            n_anchor = len(anchor_keys_list)
-
-            lance_dir = self.output_path / "temporal" / pat_id
-            lance_dir.mkdir(parents=True, exist_ok=True)
-            lance_path = lance_dir / "data.lance"
-
-            D = len(relations_meta) + len(prop_columns)
-            non_empty_buckets = np.unique(bucket_np)
-            slices_written = len(non_empty_buckets)
-
-            # Adaptive chunking
-            mem_budget = self._detect_available_memory()
-            chunk_size = self._compute_chunk_size(
-                n_anchor, n_buckets, D, int(mem_budget * 0.5),
-            )
-
-            all_bkt_ts = [
-                datetime.fromtimestamp(min_ts + b * window_secs, tz=UTC)
-                for b in range(n_buckets)
-            ]
-            _mu_arr = (
-                np.array(pat_meta["mu"], dtype=np.float32)
-                if pat_meta.get("mu") else None
-            )
-            _sig_arr = (
-                np.array(pat_meta["sigma_diag"], dtype=np.float32)
-                if pat_meta.get("sigma_diag") else None
-            )
-
-            if chunk_size >= n_anchor:
-                # ── Single-pass (fits in RAM) ──
-                shape_tensor = self._precompute_shape_tensor(
-                    pat_id, event_table, bucket_np, n_buckets,
-                    anchor_keys, anchor_keys_list, n_anchor,
-                    relations_meta, prop_columns,
-                )
-                _tensor_to_lance(
-                    shape_tensor, anchor_keys_list, n_anchor,
-                    non_empty_buckets, lance_path, min_ts, window_secs, D,
-                )
-
-                # Centroids
-                if slices_written > 0:
-                    mu = np.array(pat_meta["mu"], dtype=np.float32)
-                    sigma = np.array(pat_meta["sigma_diag"], dtype=np.float32)
-                    sigma_safe = np.where(sigma < 1e-6, 1.0, sigma)
-                    theta_norm = float(np.linalg.norm(
-                        np.array(pat_meta["theta"], dtype=np.float32),
-                    ))
-                    centroids: list[dict] = []
-                    for b in range(n_buckets):
-                        ws = shape_tensor[:, b, :]
-                        am = np.any(ws != 0, axis=1)
-                        na = int(am.sum())
-                        if na == 0:
-                            continue
-                        ad = (ws[am] - mu) / sigma_safe
-                        c = ad.mean(axis=0).tolist()
-                        ar = 0.0
-                        if theta_norm > 0:
-                            nr = np.sqrt(np.einsum('ij,ij->i', ad, ad))
-                            ar = float((nr > theta_norm).sum() / len(nr))
-                        centroids.append({
-                            "window_start": datetime.fromtimestamp(
-                                min_ts + b * window_secs, tz=UTC),
-                            "window_end": datetime.fromtimestamp(
-                                min_ts + (b + 1) * window_secs, tz=UTC),
-                            "centroid": c, "entity_count": na,
-                            "anomaly_rate": ar,
-                        })
-                    if centroids:
-                        writer.write_temporal_centroids(pat_id, centroids)
-
-                # Rolling z
-                if slices_written >= 3:
-                    mz = self._compute_max_rolling_z(
-                        shape_tensor, n_anchor, n_buckets,
-                    )
-                    self._write_max_rolling_z(pat_id, anchor_keys_list, mz)
-
-                # Trajectory
-                if slices_written >= 2:
-                    am = np.any(
-                        shape_tensor.reshape(n_anchor, -1) != 0, axis=1,
-                    )
-                    if am.any():
-                        writer.write_trajectory_from_tensor(
-                            pat_id, shape_tensor[am],
-                            [anchor_keys_list[i] for i in np.flatnonzero(am)],
-                            bucket_timestamps=all_bkt_ts,
-                            mu=_mu_arr, sigma_diag=_sig_arr,
-                        )
-
-            else:
-                # ── Chunked path (adaptive memory) ──
-                logger.info(
-                    "Temporal %s: chunking %d entities into chunks of %d",
-                    pat_id, n_anchor, chunk_size,
-                )
-                mu = np.array(pat_meta["mu"], dtype=np.float32)
-                sigma = np.array(pat_meta["sigma_diag"], dtype=np.float32)
-                sigma_safe = np.where(sigma < 1e-6, 1.0, sigma)
-                theta_norm = float(np.linalg.norm(
-                    np.array(pat_meta["theta"], dtype=np.float32),
-                ))
-
-                c_n_active = np.zeros(n_buckets, dtype=np.int64)
-                c_sum_delta = np.zeros((n_buckets, D), dtype=np.float64)
-                c_n_anom = np.zeros(n_buckets, dtype=np.int64)
-                all_max_z = np.zeros(n_anchor, dtype=np.float32)
-                traj_tables: list[pa.Table] = []
-
-                # Pre-compute event aggregates ONCE for all entities
-                _pre_grouped = self._precompute_derived_grouped(
-                    pat_id, event_table, bucket_np, relations_meta,
-                )
-                _pre_graph = self._precompute_graph_features(
-                    pat_id, event_table, anchor_keys, bucket_np,
-                    n_buckets, relations_meta,
-                )
-
-                orig_table = self._lines[pat.entity_line].table
-                try:
-                    for cs in range(0, n_anchor, chunk_size):
-                        ce = min(cs + chunk_size, n_anchor)
-                        nc = ce - cs
-                        ckl = anchor_keys_list[cs:ce]
-                        cka = pa.array(ckl, type=pa.string())
-
-                        self._lines[pat.entity_line].table = (
-                            orig_table.slice(cs, nc)
-                        )
-
-                        # Slice pre-computed graph tensors for this chunk
-                        _chunk_graph: dict[int, np.ndarray] = {}
-                        for sk, full_t in _pre_graph.items():
-                            _chunk_graph[sk] = full_t[cs:ce]
-
-                        ct = self._precompute_shape_tensor(
-                            pat_id, event_table, bucket_np, n_buckets,
-                            cka, ckl, nc,
-                            relations_meta, prop_columns,
-                            pre_grouped=_pre_grouped,
-                            pre_graph=_chunk_graph,
-                        )
-
-                        _tensor_to_lance(
-                            ct, ckl, nc, non_empty_buckets,
-                            lance_path, min_ts, window_secs, D,
-                        )
-
-                        # Accumulate centroids
-                        for b in range(n_buckets):
-                            sh = ct[:, b, :]
-                            act = np.any(sh != 0, axis=1)
-                            if not act.any():
-                                continue
-                            ad = ((sh[act] - mu) / sigma_safe).astype(
-                                np.float64,
-                            )
-                            nr = np.sqrt(np.einsum('ij,ij->i', ad, ad))
-                            c_n_active[b] += int(act.sum())
-                            c_sum_delta[b] += ad.sum(axis=0)
-                            if theta_norm > 0:
-                                c_n_anom[b] += int(
-                                    (nr > theta_norm).sum(),
-                                )
-
-                        all_max_z[cs:ce] = self._compute_max_rolling_z(
-                            ct, nc, n_buckets,
-                        )
-
-                        if slices_written >= 2:
-                            am = np.any(
-                                ct.reshape(nc, -1) != 0, axis=1,
-                            )
-                            if am.any():
-                                _build_traj_chunk(
-                                    traj_tables, ct[am],
-                                    [ckl[i] for i in np.flatnonzero(am)],
-                                    all_bkt_ts, _mu_arr, _sig_arr,
-                                )
-
-                        del ct
-                finally:
-                    self._lines[pat.entity_line].table = orig_table
-
-                # Finalize centroids
-                if slices_written > 0:
-                    centroids = []
-                    for b in range(n_buckets):
-                        if c_n_active[b] == 0:
-                            continue
-                        cv = (c_sum_delta[b] / c_n_active[b]).tolist()
-                        ar = float(c_n_anom[b] / c_n_active[b])
-                        centroids.append({
-                            "window_start": datetime.fromtimestamp(
-                                min_ts + b * window_secs, tz=UTC),
-                            "window_end": datetime.fromtimestamp(
-                                min_ts + (b + 1) * window_secs, tz=UTC),
-                            "centroid": cv,
-                            "entity_count": int(c_n_active[b]),
-                            "anomaly_rate": ar,
-                        })
-                    if centroids:
-                        writer.write_temporal_centroids(pat_id, centroids)
-
-                if slices_written >= 3:
-                    self._write_max_rolling_z(
-                        pat_id, anchor_keys_list, all_max_z,
-                    )
-
-                if traj_tables:
-                    ct_traj = pa.concat_tables(traj_tables)
-                    tp = (
-                        self.output_path / "_gds_meta" / "trajectory"
-                        / f"{pat_id}.lance"
-                    )
-                    tp.parent.mkdir(parents=True, exist_ok=True)
-                    _write_lance(ct_traj, str(tp), mode="overwrite")
-                    nt = ct_traj.num_rows
-                    if nt >= 256:
-                        import lance as _ltr
-
-                        tds = _ltr.dataset(str(tp))
-                        np_ = min(64, max(16, int(nt ** 0.5)))
-                        with suppress(Exception):
-                            tds.create_index(
-                                "trajectory_vector",
-                                index_type="IVF_FLAT",
-                                num_partitions=np_,
-                            )
-
-            # Finalize — compact + BTREE index
-            if slices_written > 0:
-                writer.compact_temporal(pat_id)
-                writer.build_temporal_index(pat_id)
-
-            return pat_id, slices_written
-
         # 7. Process each anchor pattern — parallel when >1
+        def _run_one(pid: str, p: _PatternReg) -> tuple[str, int]:
+            pat_meta = sphere_data["patterns"].get(pid)
+            if pat_meta is None:
+                return pid, 0
+            return self._build_temporal_one(
+                pid, p, pat_meta, event_table,
+                bucket_np, n_buckets, min_ts, window_secs, writer,
+            )
+
         if len(patterns_to_process) > 1:
             with ThreadPoolExecutor(max_workers=len(patterns_to_process)) as pool:
                 futures = [
-                    pool.submit(_build_temporal_for_pattern, pid, p)
+                    pool.submit(_run_one, pid, p)
                     for pid, p in patterns_to_process.items()
                 ]
                 for fut in futures:
@@ -3761,7 +4249,7 @@ class GDSBuilder:
                     result[pid] = n_slices
         else:
             for pat_id, pat in patterns_to_process.items():
-                pid, n_slices = _build_temporal_for_pattern(pat_id, pat)
+                pid, n_slices = _run_one(pat_id, pat)
                 result[pid] = n_slices
 
         return result
@@ -4114,6 +4602,7 @@ class GDSBuilder:
         *,
         pre_grouped: dict[str, pa.Table] | None = None,
         pre_graph: dict[int, np.ndarray] | None = None,
+        anchor_table_override: pa.Table | None = None,
     ) -> np.ndarray:
         """Pre-compute shape tensor (n_anchor, n_buckets, D) in single-pass.
 
@@ -4133,6 +4622,11 @@ class GDSBuilder:
         D = n_rel + n_prop
 
         shape_tensor = np.zeros((n_anchor, n_buckets, D), dtype=np.float32)
+        _anchor_tbl = (
+            anchor_table_override
+            if anchor_table_override is not None
+            else self._lines[pat.entity_line].table
+        )
 
         # Build lookup maps: dim_index, derived specs, graph feature specs
         key_to_idx = {k: i for i, k in enumerate(anchor_keys_list)}
@@ -4186,7 +4680,7 @@ class GDSBuilder:
 
         # --- A. Static dims: fill once and broadcast across all buckets ---
         if static_dims:
-            anchor_table = self._lines[pat.entity_line].table
+            anchor_table = _anchor_tbl
             for j, rel_meta, rel in static_dims:
                 edge_max = rel_meta.get("edge_max")
                 fk_col_name = rel.fk_col
@@ -4215,7 +4709,7 @@ class GDSBuilder:
 
         # --- B. Property fill: static, broadcast across all buckets ---
         if n_prop > 0:
-            anchor_table = self._lines[pat.entity_line].table
+            anchor_table = _anchor_tbl
             for p_idx, prop in enumerate(prop_columns):
                 col_idx = n_rel + p_idx
                 if prop in anchor_table.schema.names:

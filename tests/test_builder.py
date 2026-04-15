@@ -977,6 +977,8 @@ def test_delta_rank_pct_consistent_after_two_builds(tmp_path):
             "delta_rank_pct": pa.array([100.0], type=pa.float32()),  # bad pre-fix value
             "is_anomaly": pa.array([False], type=pa.bool_()),
             "conformal_p": pa.array([0.5], type=pa.float32()),
+            "bregman_divergence": pa.array([0.0], type=pa.float32()),
+            "anomaly_confidence": pa.array([0.0], type=pa.float32()),
             "n_anomalous_dims": pa.array([0], type=pa.int32()),
             "entity_keys": pa.array([[]], type=pa.list_(pa.string())),
             "last_refresh_at": pa.array([now], type=pa.timestamp("us", tz="UTC")),

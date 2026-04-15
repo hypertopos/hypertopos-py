@@ -1241,3 +1241,176 @@ class TestFindCounterparties:
                 "bad_col",
                 "to_account",
             )
+
+
+# ---------- Pipeline parallelism ----------
+
+
+class TestPipelineBuild:
+    """build() with temporal_configs pipelines geometry → temporal per-pattern."""
+
+    def _make_events(self, n_days=3):
+        from datetime import datetime
+
+        rows = []
+        tx_id = 0
+        accounts = ["A", "B", "C"]
+        for day in range(1, n_days + 1):
+            for _ in range(10):
+                rows.append({
+                    "primary_key": f"TX-{tx_id}",
+                    "from_account": accounts[tx_id % 3],
+                    "to_account": accounts[(tx_id + 1) % 3],
+                    "amount": (tx_id + 1) * 10,
+                    "timestamp": datetime(2024, 1, day),
+                })
+                tx_id += 1
+        return pa.table({k: [r[k] for r in rows] for k in rows[0]})
+
+    def _make_builder(self, path, events):
+        accounts = pa.table({"primary_key": ["A", "B", "C"]})
+        builder = GDSBuilder("test", str(path))
+        builder.add_line(
+            "transactions", events,
+            key_col="primary_key", source_id="test", role="event",
+        )
+        builder.add_line(
+            "accounts", accounts,
+            key_col="primary_key", source_id="test", role="anchor",
+        )
+        builder.add_derived_dimension(
+            "accounts", "transactions", "from_account",
+            "count", None, "tx_count",
+        )
+        builder.add_pattern("acct_pattern", "anchor", "accounts", relations=[])
+        return builder
+
+    def test_pipeline_build_produces_identical_results(self, tmp_path):
+        """Pipeline build (temporal_configs) matches sequential build+build_temporal."""
+        import lance
+
+        events = self._make_events(n_days=5)
+
+        # Sequential: build() then build_temporal()
+        seq_path = tmp_path / "seq"
+        b_seq = self._make_builder(seq_path, events)
+        b_seq.build()
+        b_seq.build_temporal("timestamp", "1d")
+
+        # Pipeline: build(temporal_configs=...)
+        pipe_path = tmp_path / "pipe"
+        b_pipe = self._make_builder(pipe_path, events)
+        b_pipe.build(temporal_configs=[{
+            "time_col": "timestamp",
+            "time_window": "1d",
+        }])
+
+        # Compare geometry
+        for suffix in [
+            "geometry/acct_pattern/v=1/data.lance",
+        ]:
+            seq_ds = lance.dataset(str(seq_path / suffix))
+            pipe_ds = lance.dataset(str(pipe_path / suffix))
+            seq_tbl = seq_ds.to_table()
+            pipe_tbl = pipe_ds.to_table()
+
+            assert seq_tbl.num_rows == pipe_tbl.num_rows
+            seq_norms = seq_tbl["delta_norm"].to_numpy(zero_copy_only=False)
+            pipe_norms = pipe_tbl["delta_norm"].to_numpy(zero_copy_only=False)
+            np.testing.assert_allclose(seq_norms, pipe_norms, atol=1e-6)
+
+            seq_anom = seq_tbl["is_anomaly"].to_numpy(zero_copy_only=False)
+            pipe_anom = pipe_tbl["is_anomaly"].to_numpy(zero_copy_only=False)
+            np.testing.assert_array_equal(seq_anom, pipe_anom)
+
+        # Compare temporal
+        seq_temp = lance.dataset(
+            str(seq_path / "temporal/acct_pattern/data.lance"),
+        ).to_table()
+        pipe_temp = lance.dataset(
+            str(pipe_path / "temporal/acct_pattern/data.lance"),
+        ).to_table()
+
+        assert seq_temp.num_rows == pipe_temp.num_rows
+
+        # Compare sphere.json pattern stats
+        seq_sj = json.loads(
+            (seq_path / "_gds_meta/sphere.json").read_text(),
+        )
+        pipe_sj = json.loads(
+            (pipe_path / "_gds_meta/sphere.json").read_text(),
+        )
+        seq_pat = seq_sj["patterns"]["acct_pattern"]
+        pipe_pat = pipe_sj["patterns"]["acct_pattern"]
+        np.testing.assert_allclose(seq_pat["mu"], pipe_pat["mu"], atol=1e-6)
+        np.testing.assert_allclose(
+            seq_pat["sigma_diag"], pipe_pat["sigma_diag"], atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            seq_pat["theta"], pipe_pat["theta"], atol=1e-6,
+        )
+
+    def test_pipeline_build_without_temporal_configs(self, tmp_path):
+        """build() without temporal_configs works as before (no temporal data)."""
+        events = self._make_events(n_days=3)
+        builder = self._make_builder(tmp_path / "sphere", events)
+        builder.build()
+
+        # No temporal data created
+        temporal_dir = tmp_path / "sphere" / "temporal"
+        assert not temporal_dir.exists() or not list(temporal_dir.iterdir())
+
+    def test_pipeline_multi_pattern(self, tmp_path):
+        """Pipeline with 2 anchor patterns, temporal targeted to one only."""
+        from datetime import datetime
+
+        import lance
+
+        rows = []
+        tx_id = 0
+        for day in range(1, 6):
+            for _ in range(10):
+                rows.append({
+                    "primary_key": f"TX-{tx_id}",
+                    "from_account": ["A", "B", "C"][tx_id % 3],
+                    "category": ["X", "Y"][tx_id % 2],
+                    "amount": (tx_id + 1) * 10,
+                    "timestamp": datetime(2024, 1, day),
+                })
+                tx_id += 1
+        events = pa.table({k: [r[k] for r in rows] for k in rows[0]})
+        accounts = pa.table({"primary_key": ["A", "B", "C"]})
+        categories = pa.table({"primary_key": ["X", "Y"]})
+
+        path = tmp_path / "sphere"
+        builder = GDSBuilder("test", str(path))
+        builder.add_line("transactions", events, key_col="primary_key", source_id="test", role="event")
+        builder.add_line("accounts", accounts, key_col="primary_key", source_id="test", role="anchor")
+        builder.add_line("categories", categories, key_col="primary_key", source_id="test", role="anchor")
+        builder.add_derived_dimension("accounts", "transactions", "from_account", "count", None, "tx_count")
+        builder.add_derived_dimension("categories", "transactions", "category", "count", None, "cat_count")
+        builder.add_pattern("acct_pattern", "anchor", "accounts", relations=[])
+        builder.add_pattern("cat_pattern", "anchor", "categories", relations=[])
+
+        builder.build(temporal_configs=[{
+            "time_col": "timestamp",
+            "time_window": "1d",
+            "event_line": "transactions",
+            "anchor_pattern": "acct_pattern",
+        }])
+
+        # Geometry for both patterns
+        assert (path / "geometry/acct_pattern/v=1/data.lance").exists()
+        assert (path / "geometry/cat_pattern/v=1/data.lance").exists()
+
+        # Temporal only for acct_pattern (targeted by config)
+        assert (path / "temporal/acct_pattern/data.lance").exists()
+        assert not (path / "temporal/cat_pattern").exists()
+
+        # Verify temporal data
+        ds = lance.dataset(str(path / "temporal/acct_pattern/data.lance"))
+        assert ds.count_rows() == 15  # 3 accounts × 5 days
+
+        # Sphere.json has both patterns
+        sj = json.loads((path / "_gds_meta/sphere.json").read_text())
+        assert len(sj["patterns"]) == 2

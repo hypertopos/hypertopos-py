@@ -357,6 +357,7 @@ def _bfs_seed_batch(
     max_chains: int,
 ) -> list[Chain]:
     """Run DFS from a batch of seed nodes. Designed for multiprocessing."""
+    from hypertopos.engine.adjacency import temporal_bisect
     chains: list[Chain] = []
     visited_chains: set[frozenset] = set()
 
@@ -382,12 +383,10 @@ def _bfs_seed_batch(
                 continue
 
             extended = False
-            for to_key, ts, epk, cur, amt in adj.get(current, []):
-                if has_timestamps and last_ts is not None:
-                    if ts < last_ts:
-                        continue
-                    if (ts - last_ts) > window_secs:
-                        continue
+            neighbors = adj.get(current, [])
+            if has_timestamps and last_ts is not None and neighbors:
+                neighbors = temporal_bisect(neighbors, ts_from=last_ts, ts_to=last_ts + window_secs, ts_index=1)
+            for to_key, ts, epk, cur, amt in neighbors:
 
                 if epk in path_events_set:
                     continue

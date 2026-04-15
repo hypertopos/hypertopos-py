@@ -98,6 +98,7 @@ class Pattern:
     event_dimensions: list[EventDimDef] = field(default_factory=list)
     dim_percentiles: dict[str, dict[str, float]] | None = None
     timestamp_col: str | None = None
+    dimension_kinds: list[str] | None = None
 
     def delta_dim(self) -> int:
         return len(self.relations) + len(self.event_dimensions) + len(self.prop_columns)

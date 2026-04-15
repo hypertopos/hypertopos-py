@@ -63,6 +63,9 @@ class HyperSphere:
         # Inherit warm points cache from parent reader (PyArrow tables are
         # immutable and reference-counted — shallow copy is safe).
         session_reader._points_cache = dict(self._reader._points_cache)
+        session_reader._adjacency_cache = dict(
+            getattr(self._reader, "_adjacency_cache", {}),
+        )
 
         # Pin Lance dataset versions at session-open time (MVCC isolation).
         pinned: dict[str, int] = {}

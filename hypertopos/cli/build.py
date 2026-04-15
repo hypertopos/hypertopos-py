@@ -369,30 +369,33 @@ def _do_build(
     # 4c. Register aliases
     _add_aliases(builder, cfg.aliases)
 
-    # 5. Build
+    # 5. Build (with pipeline parallelism when temporal configs present)
     # Suppress edge table emission if --no-edges
     if no_edges:
         builder._no_edges = True
 
     t_phase = time.time()
-    if verbose:
+    tc_dicts: list[dict[str, str]] | None = None
+    if not no_temporal and cfg.temporal:
+        tc_dicts = [
+            {
+                "time_col": tc.timestamp_col,
+                "time_window": tc.window,
+                "event_line": tc.event_line,
+                "anchor_pattern": tc.pattern,
+            }
+            for tc in cfg.temporal
+        ]
+        if verbose:
+            print("  Building geometry + temporal (pipeline)...")
+    elif verbose:
         print("  Building geometry...")
-    builder.build()
-    if verbose:
-        print(f"  Geometry total: {time.time() - t_phase:.1f}s")
 
-    # 6. Temporal
-    if not no_temporal:
-        t_phase = time.time()
-        for tc in cfg.temporal:
-            if verbose:
-                print(
-                    f"  Building temporal for '{tc.pattern}' "
-                    f"({tc.window} windows)..."
-                )
-            _build_temporal(builder, tc)
-        if verbose and cfg.temporal:
-            print(f"  Temporal total: {time.time() - t_phase:.1f}s")
+    builder.build(temporal_configs=tc_dicts)
+    if verbose:
+        elapsed = time.time() - t_phase
+        label = "geometry + temporal" if tc_dicts else "geometry"
+        print(f"  {label.capitalize()} total: {elapsed:.1f}s")
 
     # 6b. Persist timestamp_col from temporal configs into sphere.json
     #     Written to both the anchor pattern (named in tc.pattern) and the

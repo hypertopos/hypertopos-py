@@ -437,6 +437,17 @@ def aggregate(
             f"'{event_pattern_id}'. "
             f"Valid relation lines: {_valid_lines}."
         )
+    # Ambiguous: multiple relations to the same line (e.g. pickup/dropoff zones)
+    _gbl_count = sum(1 for r in pattern.relations if r.line_id == group_by_line)
+    if _gbl_count > 1:
+        raise RuntimeError(
+            f"group_by_line='{group_by_line}' is ambiguous — pattern "
+            f"'{event_pattern_id}' has {_gbl_count} relations to "
+            f"'{group_by_line}'. Use group_by_property='<entity_line>:<column>' "
+            f"to group on a specific column of the event entity line instead, "
+            f"or use a non-ambiguous relation line: "
+            f"{sorted(set(r.line_id for r in pattern.relations) - {group_by_line})}."
+        )
 
     # Validate group_by_line_2
     if group_by_line_2 is not None:

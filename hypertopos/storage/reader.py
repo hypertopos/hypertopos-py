@@ -80,6 +80,17 @@ class GDSReader:
         # Cache of row IDs discovered by per-key BTREE equality scans.
         # Key: (line_id, version, primary_key) → Lance internal row ID.
         self._points_row_id_cache: dict[tuple, int] = {}
+        self._adjacency_cache: dict[str, Any] = {}
+
+    def get_adjacency(self, pattern_id: str) -> Any:
+        if not hasattr(self, "_adjacency_cache"):
+            self._adjacency_cache: dict[str, Any] = {}
+        if pattern_id not in self._adjacency_cache:
+            from hypertopos.engine.adjacency import AdjacencyIndex
+            self._adjacency_cache[pattern_id] = AdjacencyIndex.from_lance(
+                self, pattern_id,
+            )
+        return self._adjacency_cache[pattern_id]
 
     def read_sphere(self) -> Sphere:
         raw = json.loads((self._base / "_gds_meta" / "sphere.json").read_text())
@@ -236,6 +247,7 @@ class GDSReader:
             entity_line_id=raw.get("entity_line"),
             dim_percentiles=raw.get("dim_percentiles"),
             timestamp_col=raw.get("timestamp_col"),
+            dimension_kinds=raw.get("dimension_kinds"),
         )
 
     def _parse_alias(self, raw: dict[str, Any]) -> Alias:

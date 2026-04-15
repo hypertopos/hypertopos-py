@@ -56,6 +56,8 @@ class Polygon:
     delta_alias: np.ndarray | None = None
     is_anomaly_alias: bool | None = None
     delta_rank_pct: float | None = None
+    bregman_divergence: float | None = None
+    anomaly_confidence: float | None = None
 
     def is_event(self) -> bool:
         return self.pattern_type == "event"

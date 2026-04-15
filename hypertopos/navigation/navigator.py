@@ -736,6 +736,7 @@ class GDSNavigator:
         fdr_method: str = "bh",
         select: str = "top_norm",
         metric: str = "L2",
+        min_confidence: float = 0.0,
     ) -> tuple[list[Polygon], int, list[dict] | None, dict | None]:
         """Find the most anomalous polygons in a pattern.
 
@@ -795,23 +796,28 @@ class GDSNavigator:
                 threshold=float(threshold),
                 top_n=offset + top_n,
                 offset=0,
+                min_confidence=min_confidence,
             )
             total_found = resp["total_found"]
+            # Build norm lookup from full response first (handles duplicates)
+            _all_norm_lookup = dict(zip(resp["keys"], resp["delta_norms"]))
             sub_keys = list(dict.fromkeys(resp["keys"][offset:]))
-            sub_norms = resp["delta_norms"][offset:]
             if sub_keys:
                 light_cols = [
                     "primary_key", "scale", "delta", "delta_norm",
                     "delta_rank_pct", "is_anomaly",
                     "last_refresh_at", "updated_at",
+                    "bregman_divergence", "anomaly_confidence",
+                    "edges", "entity_keys",
                 ]
                 full_geo = self._storage.read_geometry(
                     pattern_id, version, point_keys=sub_keys,
                     columns=light_cols,
                 )
-                norm_lookup = dict(zip(sub_keys, sub_norms, strict=False))
+                norm_lookup = {k: _all_norm_lookup[k] for k in sub_keys if k in _all_norm_lookup}
                 results = self._engine.geometry_to_polygons(
                     full_geo, norm_lookup=norm_lookup, top_n=top_n,
+                    pattern=pattern,
                     pattern_id=pattern_id,
                     pattern_type=pattern.pattern_type,
                     pattern_ver=version,
@@ -835,7 +841,12 @@ class GDSNavigator:
         cols = list(self._LIGHT_COLUMNS)
         if missing_edge_to:
             cols.append("edges")
-        if metric == "Linf":
+        if min_confidence > 0.0:
+            cols.append("anomaly_confidence")
+        if metric == "bregman":
+            cols.append("bregman_divergence")
+        if metric in ("Linf", "bregman"):
+            # Linf/bregman: can't use pre-computed delta_norm filter, read all
             light = self._storage.read_geometry(
                 pattern_id, version, columns=cols,
             )
@@ -865,6 +876,8 @@ class GDSNavigator:
         delta_matrix = delta_matrix_from_arrow(light)
         if metric == "Linf":
             norms = np.max(np.abs(delta_matrix), axis=1).astype(np.float32)
+        elif metric == "bregman" and "bregman_divergence" in light.schema.names:
+            norms = light["bregman_divergence"].to_numpy(zero_copy_only=False).astype(np.float32)
         else:
             norms = np.sqrt(np.einsum('ij,ij->i', delta_matrix, delta_matrix)).astype(np.float32)
         valid = norms >= threshold
@@ -876,7 +889,24 @@ class GDSNavigator:
         valid_idx = np.where(valid)[0]
         valid_norms = norms[valid_idx]
         total_found = len(valid_norms)
+
+        # Capture unfiltered count BEFORE any confidence / property filtering
         total_anomalies_unfiltered = total_found
+
+        # min_confidence filter — secondary filter on anomaly_confidence column
+        if min_confidence > 0.0 and pattern.dimension_kinds is None:
+            logger.warning(
+                "min_confidence filter ignored — pattern '%s' lacks "
+                "dimension_kinds (rebuild sphere with Bregman calibration)",
+                pattern_id,
+            )
+            min_confidence = 0.0
+        if min_confidence > 0.0 and "anomaly_confidence" in light.schema.names:
+            conf_values = light["anomaly_confidence"].to_numpy(zero_copy_only=False).astype(np.float32)
+            conf_mask = conf_values[valid_idx] >= min_confidence
+            valid_idx = valid_idx[conf_mask]
+            valid_norms = norms[valid_idx]
+            total_found = len(valid_norms)
 
         # Property filters — narrow anomalous set by entity line properties
         _pre_loaded_pts = None
@@ -948,16 +978,23 @@ class GDSNavigator:
             # Build norm lookup for these keys
             key_to_norm = {str(light["primary_key"][int(i)].as_py()): float(norms[i]) for i in valid_idx}
         else:
-            n = min(offset + top_n, len(valid_norms))
-            if n == 0:
+            if len(valid_norms) == 0:
                 emerging = self._find_emerging(
                     pattern_id, version, pattern, include_emerging, offset, top_n,
                 )
                 meta = {"total_anomalies_unfiltered": total_anomalies_unfiltered} if property_filters else None
                 return [], total_found, emerging, meta
-            top_local = np.argpartition(valid_norms, -n)[-n:]
-            top_local = top_local[np.argsort(valid_norms[top_local])[::-1]]
-            top_idx = valid_idx[top_local]
+            # Full sort for deterministic pagination (population is pre-filtered
+            # to anomalies above threshold, typically 5-20% of total)
+            sorted_local = np.argsort(valid_norms)[::-1]
+            n = min(offset + top_n, len(sorted_local))
+            # Include all entities tied with the boundary norm to prevent
+            # pagination duplicates when tied entities shift positions
+            if n < len(sorted_local):
+                boundary_norm = valid_norms[sorted_local[n - 1]]
+                while n < len(sorted_local) and valid_norms[sorted_local[n]] == boundary_norm:
+                    n += 1
+            top_idx = valid_idx[sorted_local[:n]]
             top_keys = [str(light["primary_key"][int(i)].as_py()) for i in top_idx]
             key_to_norm = {str(light["primary_key"][int(i)].as_py()): float(norms[i]) for i in top_idx}
 
@@ -968,11 +1005,15 @@ class GDSNavigator:
             "primary_key", "scale", "delta", "delta_norm",
             "delta_rank_pct", "is_anomaly",
             "last_refresh_at", "updated_at",
+            "bregman_divergence", "anomaly_confidence",
+            "edges", "entity_keys",
         ]
         full = self._storage.read_geometry(
             pattern_id, version, filter=f"primary_key IN ({pk_in})",
             columns=_anomaly_light_cols,
         )
+        from hypertopos.engine.geometry import _reconstruct_edges_from_entity_keys
+
         results: list[Polygon] = []
         for i in range(full.num_rows):
             row = {col: full[col][i].as_py() for col in full.schema.names}
@@ -980,6 +1021,24 @@ class GDSNavigator:
             recomputed_norm = key_to_norm.get(
                 pk, float(np.linalg.norm(np.array(row["delta"], dtype=np.float32)))
             )
+            # Decode edges from struct column or reconstruct from entity_keys
+            if row.get("edges"):
+                edges = [
+                    Edge(
+                        line_id=e["line_id"],
+                        point_key=e["point_key"],
+                        status=e["status"],
+                        direction=e["direction"],
+                        is_jumpable=bool(e["point_key"]),
+                    )
+                    for e in row["edges"]
+                ]
+            elif row.get("entity_keys") and pattern.relations:
+                edges = _reconstruct_edges_from_entity_keys(
+                    row["entity_keys"], pattern.relations,
+                )
+            else:
+                edges = []
             results.append(Polygon(
                 primary_key=pk,
                 pattern_id=row.get("pattern_id", pattern_id),
@@ -989,10 +1048,18 @@ class GDSNavigator:
                 delta=np.array(row["delta"], dtype=np.float32),
                 delta_norm=recomputed_norm,
                 is_anomaly=bool(row["is_anomaly"]),
-                edges=[],
+                edges=edges,
                 last_refresh_at=row["last_refresh_at"],
                 updated_at=row["updated_at"],
                 delta_rank_pct=float(row["delta_rank_pct"]) if "delta_rank_pct" in row else None,
+                bregman_divergence=(
+                    float(row.get("bregman_divergence", 0.0))
+                    if "bregman_divergence" in row else None
+                ),
+                anomaly_confidence=(
+                    float(row.get("anomaly_confidence", 0.0))
+                    if "anomaly_confidence" in row else None
+                ),
             ))
         if rank_by_property is not None:
             # Preserve property-based order (Pass 2 may scramble it)
@@ -1007,7 +1074,8 @@ class GDSNavigator:
         for p in results:
             if p.primary_key not in seen or p.delta_norm > seen[p.primary_key].delta_norm:
                 seen[p.primary_key] = p
-        results = sorted(seen.values(), key=lambda p: p.delta_norm, reverse=True)
+        # Sort by (-delta_norm, primary_key) for deterministic pagination on tied norms
+        results = sorted(seen.values(), key=lambda p: (-p.delta_norm, p.primary_key))
         results = results[offset:offset + top_n]
         results = self._apply_fdr_select_polygons(
             results, fdr_alpha=fdr_alpha, select=select, top_n=top_n,
@@ -2376,7 +2444,7 @@ class GDSNavigator:
         *,
         timestamp_cutoff: float | None = None,
     ) -> dict[str, Any]:
-        """Fast counterparty lookup via edge table BTREE indexes.
+        """Fast counterparty lookup via adjacency index.
 
         Returns same structure as find_counterparties but with ``amount_sum``
         and ``amount_max`` per counterparty entry.  Anomaly enrichment uses
@@ -2385,29 +2453,22 @@ class GDSNavigator:
         ``timestamp_cutoff`` restricts the lookup to edges with
         ``timestamp <= timestamp_cutoff``.
         """
-        # Outgoing: from_key == primary_key → counterparties in to_key
-        fwd = self._storage.read_edges(
-            pattern_id, from_keys=[primary_key], timestamp_to=timestamp_cutoff,
-        )
-        # Incoming: to_key == primary_key → counterparties in from_key
-        rev = self._storage.read_edges(
-            pattern_id, to_keys=[primary_key], timestamp_to=timestamp_cutoff,
-        )
+        adj = self._storage.get_adjacency(pattern_id)
+        fwd_edges = adj.neighbors_out(primary_key, ts_to=timestamp_cutoff)
+        rev_edges = adj.neighbors_in(primary_key, ts_to=timestamp_cutoff)
 
-        def _group(edges: pa.Table, group_col: str) -> list[dict[str, Any]]:
-            if edges.num_rows == 0:
+        def _group(edges: list, top_n: int) -> list[dict[str, Any]]:
+            if not edges:
                 return []
-            grouped = edges.group_by(group_col).aggregate([
-                ("event_key", "count"),
-                ("amount", "sum"),
-                ("amount", "max"),
-            ])
-            keys = grouped[group_col].to_pylist()
-            counts = grouped["event_key_count"].to_pylist()
-            sums = grouped["amount_sum"].to_pylist()
-            maxes = grouped["amount_max"].to_pylist()
+            from collections import defaultdict
+            agg: dict[str, list[float]] = defaultdict(list)
+            for target, _ts, amount, _ek in edges:
+                agg[target].append(amount)
             pairs = sorted(
-                zip(keys, counts, sums, maxes, strict=False),
+                [
+                    (k, len(amounts), sum(amounts), max(amounts))
+                    for k, amounts in agg.items()
+                ],
                 key=lambda x: x[1],
                 reverse=True,
             )[:top_n]
@@ -2421,8 +2482,8 @@ class GDSNavigator:
                 for k, c, s, m in pairs
             ]
 
-        outgoing = _group(fwd, "to_key")
-        incoming = _group(rev, "from_key")
+        outgoing = _group(fwd_edges, top_n)
+        incoming = _group(rev_edges, top_n)
 
         # Anomaly enrichment via anchor pattern geometry
         scoring_pattern = (
@@ -2705,34 +2766,18 @@ class GDSNavigator:
                 f"Pattern '{pattern_id}' has no edge table. "
                 "entity_flow requires an edge table."
             )
-        fwd = self._storage.read_edges(
-            pattern_id, from_keys=[primary_key], timestamp_to=timestamp_cutoff,
-        )
-        rev = self._storage.read_edges(
-            pattern_id, to_keys=[primary_key], timestamp_to=timestamp_cutoff,
-        )
+        adj = self._storage.get_adjacency(pattern_id)
+        fwd_edges = adj.neighbors_out(primary_key, ts_to=timestamp_cutoff)
+        rev_edges = adj.neighbors_in(primary_key, ts_to=timestamp_cutoff)
 
-        # Sum outgoing amounts per counterparty
-        out_by_cp: dict[str, float] = {}
-        if fwd.num_rows > 0:
-            grouped = fwd.group_by("to_key").aggregate([("amount", "sum")])
-            for k, s in zip(
-                grouped["to_key"].to_pylist(),
-                grouped["amount_sum"].to_pylist(),
-                strict=False,
-            ):
-                out_by_cp[k] = float(s)
+        from collections import defaultdict
+        out_by_cp: dict[str, float] = defaultdict(float)
+        for target, _ts, amount, _ek in fwd_edges:
+            out_by_cp[target] += amount
 
-        # Sum incoming amounts per counterparty
-        in_by_cp: dict[str, float] = {}
-        if rev.num_rows > 0:
-            grouped = rev.group_by("from_key").aggregate([("amount", "sum")])
-            for k, s in zip(
-                grouped["from_key"].to_pylist(),
-                grouped["amount_sum"].to_pylist(),
-                strict=False,
-            ):
-                in_by_cp[k] = float(s)
+        in_by_cp: dict[str, float] = defaultdict(float)
+        for source, _ts, amount, _ek in rev_edges:
+            in_by_cp[source] += amount
 
         outgoing_total = sum(out_by_cp.values())
         incoming_total = sum(in_by_cp.values())
@@ -2788,18 +2833,11 @@ class GDSNavigator:
                 f"Pattern '{pattern_id}' has no edge table. "
                 "contagion_score requires an edge table."
             )
-        fwd = self._storage.read_edges(
-            pattern_id, from_keys=[primary_key], timestamp_to=timestamp_cutoff,
-        )
-        rev = self._storage.read_edges(
-            pattern_id, to_keys=[primary_key], timestamp_to=timestamp_cutoff,
-        )
+        adj = self._storage.get_adjacency(pattern_id)
+        fwd_edges = adj.neighbors_out(primary_key, ts_to=timestamp_cutoff)
+        rev_edges = adj.neighbors_in(primary_key, ts_to=timestamp_cutoff)
 
-        cp_keys: set[str] = set()
-        if fwd.num_rows > 0:
-            cp_keys.update(fwd["to_key"].to_pylist())
-        if rev.num_rows > 0:
-            cp_keys.update(rev["from_key"].to_pylist())
+        cp_keys: set[str] = {e[0] for e in fwd_edges} | {e[0] for e in rev_edges}
         cp_keys.discard(primary_key)
 
         total = len(cp_keys)
@@ -3355,29 +3393,33 @@ class GDSNavigator:
                 f"Pattern '{pattern_id}' has no edge table. "
                 "anomalous_edges requires an edge table."
             )
+        adj = self._storage.get_adjacency(pattern_id)
         # A→B edges
-        fwd = self._storage.read_edges(pattern_id, from_keys=[from_key], to_keys=[to_key])
+        fwd_edges = [
+            (from_key, tgt, ts, amt, ek)
+            for tgt, ts, amt, ek in adj.neighbors_out(from_key)
+            if tgt == to_key
+        ]
         # B→A edges
-        rev = self._storage.read_edges(pattern_id, from_keys=[to_key], to_keys=[from_key])
+        rev_edges = [
+            (to_key, tgt, ts, amt, ek)
+            for tgt, ts, amt, ek in adj.neighbors_out(to_key)
+            if tgt == from_key
+        ]
 
-        # Concat edge data
         all_edges: list[dict[str, Any]] = []
-        for tbl in (fwd, rev):
-            if tbl.num_rows == 0:
+        seen_event_keys: set[str] = set()
+        for f, t, ts, amt, ek in fwd_edges + rev_edges:
+            if ek in seen_event_keys:
                 continue
-            from_arr = tbl["from_key"].to_pylist()
-            to_arr = tbl["to_key"].to_pylist()
-            ek_arr = tbl["event_key"].to_pylist()
-            ts_arr = tbl["timestamp"].to_pylist()
-            amt_arr = tbl["amount"].to_pylist()
-            for f, t, ek, ts, amt in zip(from_arr, to_arr, ek_arr, ts_arr, amt_arr, strict=False):
-                all_edges.append({
-                    "event_key": ek,
-                    "from_key": f,
-                    "to_key": t,
-                    "amount": round(float(amt), 2),
-                    "timestamp": float(ts),
-                })
+            seen_event_keys.add(ek)
+            all_edges.append({
+                "event_key": ek,
+                "from_key": f,
+                "to_key": t,
+                "amount": round(float(amt), 2),
+                "timestamp": float(ts),
+            })
 
         if not all_edges:
             return {
@@ -4344,7 +4386,7 @@ class GDSNavigator:
 
         def _score(delta: np.ndarray) -> tuple[float, int]:
             s = float(np.sum((delta * sigma + pattern.mu) * pattern.edge_max))
-            return round(s, 3), int(round(s))
+            return round(max(0.0, s), 3), max(0, int(round(s)))
 
         history = []
         for sl in solid.slices:
@@ -4466,7 +4508,9 @@ class GDSNavigator:
         if sample_size is not None and sample_size < len(keys):
             keys = random.sample(keys, sample_size)
 
-        dim_names = [r.line_id for r in pattern.relations] + list(pattern.prop_columns)
+        dim_names = pattern.dim_labels or (
+            [r.line_id for r in pattern.relations] + list(pattern.prop_columns)
+        )
 
         # True streaming — consume batches without list() materialisation.
         # path_length requires all intermediate slice deltas, so a single Arrow
@@ -4848,7 +4892,9 @@ class GDSNavigator:
         delta_norms: list[float] = [float(v) for v in table["delta_norm"].to_pylist()]
 
         delta_matrix = delta_matrix_from_arrow(table)
-        dim_names = [r.line_id for r in pattern.relations] + list(pattern.prop_columns)
+        dim_names = pattern.dim_labels or (
+            [r.line_id for r in pattern.relations] + list(pattern.prop_columns)
+        )
 
         clusters = self._engine.find_clusters(
             delta_matrix=delta_matrix,
@@ -4893,13 +4939,10 @@ class GDSNavigator:
             return "continuous"
         try:
             tbl = self._storage.read_geometry(
-                pattern_id, version, columns=["delta"]
+                pattern_id, version, columns=["delta"], sample_size=200
             )
             if tbl is None or len(tbl) == 0:
                 return "continuous"
-            # Sample up to 200 rows
-            n_sample = min(200, len(tbl))
-            tbl = tbl.slice(0, n_sample)
             delta_col = tbl["delta"].combine_chunks()
             flat = delta_col.values.to_numpy(zero_copy_only=False)
             d = len(flat) // len(delta_col)
@@ -4963,6 +5006,11 @@ class GDSNavigator:
                 "calibration_health": calibration_health,
                 "geometry_mode": geometry_mode,
             }
+
+            # dimension_kinds summary — compact view of divergence families
+            if pattern.dimension_kinds:
+                from hypertopos.builder._bregman import format_kinds_summary
+                entry["dimension_kinds"] = format_kinds_summary(pattern.dimension_kinds)
 
             # inactive_ratio from geometry_stats cache (no geometry scan)
             if (
@@ -5236,7 +5284,7 @@ class GDSNavigator:
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns[pattern_id]
         n_rel = len(pattern.relations)
-        dim_names = (
+        dim_names = pattern.dim_labels or (
             [r.line_id for r in pattern.relations] + list(pattern.prop_columns)
         )
 
@@ -5365,7 +5413,9 @@ class GDSNavigator:
 
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns[pattern_id]
-        dim_names = [r.line_id for r in pattern.relations] + list(pattern.prop_columns)
+        dim_names = pattern.dim_labels or (
+            [r.line_id for r in pattern.relations] + list(pattern.prop_columns)
+        )
 
         def _read_window(ts_from: str, ts_to: str) -> pa.Table:
             import itertools as _itertools
@@ -5805,7 +5855,9 @@ class GDSNavigator:
                 f"pi12 requires anchor pattern — '{pattern_id}' has type 'event'."
             )
 
-        dim_names = [r.line_id for r in pattern.relations] + list(pattern.prop_columns)
+        dim_names = pattern.dim_labels or (
+            [r.line_id for r in pattern.relations] + list(pattern.prop_columns)
+        )
         n_rel = len(pattern.relations)
 
         import itertools
@@ -7002,12 +7054,21 @@ class GDSNavigator:
         For continuous mode, use find_counterparties instead.
         """
         version = self._resolve_version(pattern_id)
-        visited: set[str] = {primary_key}
-        entities: list[dict[str, Any]] = []
-        queue: deque[tuple[str, int]] = deque()
 
         sphere = self._storage.read_sphere()
         _pat = sphere.patterns[pattern_id]
+
+        if _pat.is_continuous:
+            raise GDSNavigationError(
+                f"find_neighborhood requires binary FK mode. "
+                f"Pattern '{pattern_id}' uses continuous edge encoding "
+                f"(edge_max={_pat.edge_max}). "
+                f"Use find_counterparties instead."
+            )
+
+        visited: set[str] = {primary_key}
+        entities: list[dict[str, Any]] = []
+        queue: deque[tuple[str, int]] = deque()
 
         # Seed BFS from center entity
         center_geo = self._storage.read_geometry(
@@ -7248,45 +7309,6 @@ class GDSNavigator:
         self._anchor_pattern_cache[event_pattern_id] = None
         return None
 
-    def _build_adjacency(
-        self,
-        pattern_id: str,
-        keys: set[str] | None = None,
-    ) -> dict[str, list[tuple[str, str, float, float]]]:
-        """Build adjacency dict from edge table via BTREE indexed lookups.
-
-        Only loads edges for requested keys (subgraph). Never loads full table.
-        Returns {key: [(neighbor, event_key, timestamp, amount), ...]}.
-        Deduplicated: only one entry per unique neighbor per key (keeps first/best).
-        Includes reverse edges for undirected traversal.
-        """
-        if not keys:
-            return defaultdict(list)
-        fwd = self._storage.read_edges(pattern_id, from_keys=list(keys))
-        rev = self._storage.read_edges(pattern_id, to_keys=list(keys))
-        # Collect all edges, then deduplicate per (key, neighbor)
-        raw: dict[str, dict[str, tuple[str, float, float]]] = defaultdict(dict)
-        for tbl in (fwd, rev):
-            from_arr = tbl["from_key"].to_pylist()
-            to_arr = tbl["to_key"].to_pylist()
-            ek_arr = tbl["event_key"].to_pylist()
-            ts_arr = tbl["timestamp"].to_pylist()
-            amt_arr = tbl["amount"].to_pylist()
-            for f, t, ek, ts, amt in zip(from_arr, to_arr, ek_arr, ts_arr, amt_arr):
-                if f == t:
-                    continue  # skip self-loops
-                # Forward: f → t
-                if t not in raw[f]:
-                    raw[f][t] = (ek, ts, amt)
-                # Reverse: t → f
-                if f not in raw[t]:
-                    raw[t][f] = (ek, ts, amt)
-        # Convert to adjacency list format
-        adj: dict[str, list[tuple[str, str, float, float]]] = defaultdict(list)
-        for key, neighbors in raw.items():
-            for nb, (ek, ts, amt) in neighbors.items():
-                adj[key].append((nb, ek, ts, amt))
-        return adj
 
     def _get_cached_delta(
         self,
@@ -7397,7 +7419,7 @@ class GDSNavigator:
         to_key: str,
         pattern_id: str,
         max_depth: int = 5,
-        beam_width: int = 10,
+        beam_width: int = 50,
         scoring: str = "geometric",
     ) -> dict[str, Any]:
         """Find paths between two entities scored by geometric coherence.
@@ -7423,22 +7445,45 @@ class GDSNavigator:
         # Resolve anchor pattern for geometry scoring (entities live in anchor,
         # not event patterns — event pattern_id is only for edge table reads).
         scoring_pattern = self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
+        # Auto-scale beam for deep searches: wider beam prevents pruning
+        # legitimate intermediaries on long paths
+        if max_depth > 5:
+            beam_width = max(beam_width, beam_width * max_depth // 5)
         # Iterative beam search with per-depth adjacency expansion
         frontier: list[tuple[list[str], float]] = [([from_key], 0.0)]
         arrived: list[tuple[list[str], float]] = []
         adj: dict[str, list[tuple[str, str, float, float]]] = defaultdict(list)
         expanded_keys: set[str] = set()
         max_amt_seen = 1.0  # track max amount for "amount" scoring normalization
+        adj_index = self._storage.get_adjacency(pattern_id)
 
         for _depth in range(max_depth):
             # Expand adjacency only for frontier tips not yet expanded
             tips = {path[-1] for path, _ in frontier} - expanded_keys
             if tips:
-                new_adj = self._build_adjacency(pattern_id, tips)
-                for k, v in new_adj.items():
-                    adj[k].extend(v)
+                for k in tips:
+                    # Undirected: include both out- and in-edges
+                    # Store as (neighbor, event_key, timestamp, amount) to match iteration below
+                    neighbors = [
+                        (tgt, ek, ts, amt)
+                        for tgt, ts, amt, ek in adj_index.neighbors_out(k)
+                        if tgt != k
+                    ] + [
+                        (src, ek, ts, amt)
+                        for src, ts, amt, ek in adj_index.neighbors_in(k)
+                        if src != k
+                    ]
+                    # Deduplicate by neighbor (keep first occurrence)
+                    seen_nb: set[str] = set()
+                    deduped = []
+                    for entry in neighbors:
+                        nb = entry[0]
+                        if nb not in seen_nb:
+                            seen_nb.add(nb)
+                            deduped.append(entry)
+                    adj[k].extend(deduped)
                     if scoring == "amount":
-                        for _, _, _, amt in v:
+                        for _, _, _, amt in deduped:
                             if amt > max_amt_seen:
                                 max_amt_seen = amt
                 expanded_keys |= tips
@@ -7540,28 +7585,18 @@ class GDSNavigator:
             )
         window_secs = time_window_hours * 3600.0
 
+        adj_index = self._storage.get_adjacency(pattern_id)
+
         def _load_temporal_adj(keys: list[str]) -> tuple[dict, dict]:
-            """Load temporal adjacency for specific keys only (BTREE indexed)."""
-            fwd_edges = self._storage.read_edges(pattern_id, from_keys=keys)
-            bwd_edges = self._storage.read_edges(pattern_id, to_keys=keys)
             fwd_adj: dict[str, list[tuple[str, float, float]]] = defaultdict(list)
             bwd_adj: dict[str, list[tuple[str, float, float]]] = defaultdict(list)
-            for tbl, adj, f_col, t_col in [
-                (fwd_edges, fwd_adj, "from_key", "to_key"),
-                (bwd_edges, bwd_adj, "to_key", "from_key"),
-            ]:
-                f_arr = tbl[f_col].to_pylist()
-                t_arr = tbl[t_col].to_pylist()
-                ts_arr = tbl["timestamp"].to_pylist()
-                amt_arr = tbl["amount"].to_pylist()
-                for f, t, ts, amt in zip(f_arr, t_arr, ts_arr, amt_arr):
-                    if f == t:
-                        continue  # skip self-loops
-                    adj[f].append((t, ts, amt))
-            for k in fwd_adj:
-                fwd_adj[k].sort(key=lambda x: x[1])
-            for k in bwd_adj:
-                bwd_adj[k].sort(key=lambda x: x[1])
+            for k in keys:
+                fwd_adj[k] = [
+                    (tgt, ts, amt) for tgt, ts, amt, _ek in adj_index.neighbors_out(k) if tgt != k
+                ]
+                bwd_adj[k] = [
+                    (src, ts, amt) for src, ts, amt, _ek in adj_index.neighbors_in(k) if src != k
+                ]
             return fwd_adj, bwd_adj
 
         fwd, bwd = _load_temporal_adj([primary_key])
@@ -7713,6 +7748,10 @@ class GDSNavigator:
             conformal_p=conformal_p,
             temporal_slices=temporal_slices,
             reputation=reputation,
+            dimension_kinds=pattern.dimension_kinds,
+            sigma=pattern.sigma_diag,
+            mu=pattern.mu,
+            dimension_weights=pattern.dimension_weights,
         )
         explanation["primary_key"] = primary_key
         explanation["pattern_id"] = pattern_id
@@ -9403,15 +9442,15 @@ class GDSNavigator:
         entity_keys = set(delta_lookup.keys())
 
         # Build adjacency for sampled entities
-        adj = self._build_adjacency(pattern_id, keys=entity_keys)
+        adj_index = self._storage.get_adjacency(pattern_id)
 
         # Score each entity
         scored: list[tuple[str, float, int]] = []
         for pk, actual_delta in delta_lookup.items():
-            neighbors = adj.get(pk, [])
+            neighbors = adj_index.neighbors_out(pk) + adj_index.neighbors_in(pk)
             # Collect neighbor deltas — only those present in our delta_lookup
             neighbor_deltas_list = []
-            for nb_key, _ek, _ts, _amt in neighbors:
+            for nb_key, _ts, _amt, _ek in neighbors:
                 nb_delta = delta_lookup.get(nb_key)
                 if nb_delta is not None:
                     neighbor_deltas_list.append(nb_delta)

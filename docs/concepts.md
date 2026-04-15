@@ -68,6 +68,53 @@ Two opt-in post-processing stages can be applied to any attract primitive that s
 
 Both stages compose: `fdr_alpha=0.05, select="diverse"` first filters to FDR-controlled discoveries, then picks the K most geometrically diverse among them.
 
+## Bregman Divergence
+
+Standard anomaly scoring in GDS uses `‖δ‖₂` — a single Euclidean distance that treats every dimension identically. This is fast and works well when dimensions are roughly Gaussian.
+
+**Bregman divergence** generalises the scoring: each dimension contributes an anomaly score computed from the generator function matched to its distribution family (`kind`). For a dimension with kind `gaussian`, the generator is squared loss (identical to L2). For `poisson`, it is the Kullback-Leibler divergence for counts. For `bernoulli`, it is binary cross-entropy.
+
+The per-dimension Bregman scores are summed to produce `bregman_divergence` — a single float stored alongside `delta_norm` in the geometry file. Dimensions with a poor match between their assumed family and actual data shape produce disproportionately large Bregman terms, making them visible in `explain_anomaly` output.
+
+**What this enables:**
+- Binary FK dimensions (bernoulli) no longer inflate the total score when an entity is merely "active" in that relation — the scoring accounts for the 0/1 nature of the edge
+- Count-based derived features (poisson) are scored against their expected arrival rate rather than a z-score
+- `explain_anomaly` returns per-dimension Bregman contributions with `kind` and `pct_of_total`, identifying which distribution mismatch is the primary driver
+
+`bregman_divergence` is stored in sphere format ≥ 2.3. Pre-2.3 spheres return `None` for this field.
+
+### Dimension Kinds
+
+Every dimension in a pattern carries a `kind` tag — the distribution family used for Bregman scoring. The builder auto-detects kinds at build time using the following rules:
+
+| Dimension source | Inferred kind |
+|-----------------|---------------|
+| Binary FK (`edge_max = null`) | `bernoulli` |
+| `count`, `count_distinct`, `count:window=*` | `poisson` |
+| `sum:col`, `avg:col`, `std:col`, `iet_*` | `gaussian` |
+| `max:col`, `min:col` | `gaussian` |
+| `precomputed_dimension` with `edge_max: 1` | `bernoulli` |
+| `precomputed_dimension`, otherwise | `gaussian` |
+| `graph_features` in/out-degree (`edge_max > 1`) | `poisson` |
+| `graph_features` reciprocity, overlap (`edge_max = 1`) | `bernoulli` |
+
+Override via `kind:` on individual dimension entries in `sphere.yaml`. The resulting kind list is stored in `Pattern.dimension_kinds` and surfaced in `sphere_overview` as `dimension_kinds`.
+
+## Anomaly Confidence
+
+Bootstrap confidence measures how stable an entity's anomaly classification is under random resampling of the calibration population.
+
+The builder draws `bootstrap_iterations` bootstrap samples from the population (default 200), recomputes mu/sigma/theta on each sample, and records whether the entity's delta_norm exceeds the resampled theta. `anomaly_confidence` is the fraction of samples in which the entity is classified as anomalous.
+
+**Interpretation:**
+- `1.0` — entity is anomalous under every bootstrap resample; classification is robust
+- `0.5–0.99` — entity sits near the boundary; classification may flip with slightly different calibration data
+- `< 0.5` — entity is nominally anomalous (delta_norm > theta) but unstable; treat with caution
+
+`anomaly_confidence` is skipped when the pattern uses `group_by_property` (bootstrap is per-group, cost grows multiplicatively), `use_mahalanobis` (full covariance bootstrap is expensive), or N > 50K entities. In those cases the field is `None`.
+
+Filter `find_anomalies` by minimum confidence using `min_confidence` — for example `min_confidence=0.8` returns only entities whose anomaly classification is stable across at least 80% of bootstrap samples.
+
 ## Three Scales
 
 ![Three Scales](images/three-scales.svg)
@@ -172,6 +219,9 @@ Chains (both build-time `chain_lines` and runtime `discover_chains`) are sequenc
 | **Delta norm** | L2 magnitude of the deviation -- basis for similarity, clustering, and anomaly scoring |
 | **Theta threshold** | Statistical boundary derived from the population distribution (used for anomaly classification) |
 | **Deformation log** | History of changes that produced the current solid |
+| **Bregman divergence** | Distribution-aware anomaly distance summed across per-dimension Bregman terms |
+| **Anomaly confidence** | Bootstrap stability score (0–1) for anomaly classification under population resampling |
+| **Dimension kind** | Distribution family tag per dimension (`gaussian`, `poisson`, `bernoulli`) driving Bregman scoring |
 
 Every dimension has a meaning tied to a relation or tracked property.
 

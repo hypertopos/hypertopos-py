@@ -103,7 +103,7 @@ with sphere.session("agent-1") as session:
 
 | Primitive | Method | What it does | Returns |
 |-----------|--------|--------------|---------|
-| π5 | `π5_attract_anomaly(pattern_id, radius, top_n, fdr_alpha, fdr_method, select)` | Find most anomalous polygons | `(list[Polygon], int, list, dict)` |
+| π5 | `π5_attract_anomaly(pattern_id, radius, top_n, fdr_alpha, fdr_method, select, min_confidence)` | Find most anomalous polygons | `(list[Polygon], int, list, dict)` |
 | π6 | `π6_attract_boundary(alias_id, pattern_id, direction, top_n, fdr_alpha, fdr_method, select)` | Find entities nearest to alias cutting plane | `list[(Polygon, float)]` |
 | π7 | `π7_attract_hub(pattern_id, top_n, line_id_filter, fdr_alpha, fdr_method, select)` | Find entities with highest connectivity | `list[(str, int, float)]` |
 | π7+ | `π7_attract_hub_and_stats(pattern_id, top_n, line_id_filter)` | Hub ranking + population hub score statistics in one scan | `(list, dict)` |
@@ -141,7 +141,7 @@ with sphere.session("agent-1") as session:
 
 | Method | Description |
 |--------|-------------|
-| `explain_anomaly(primary_key, pattern_id)` | Structured investigation: severity, witness set, repair set, conformal p-value, reputation |
+| `explain_anomaly(primary_key, pattern_id)` | Structured investigation: severity, witness set, repair set, conformal p-value, reputation, and Bregman contributions returned under `top_dimensions[]` (fields: `dim`, `kind`, `bregman`, `pct_of_total`) |
 | `explain_anomaly_chain(primary_key, pattern_id, max_hops)` | Trace anomaly propagation through geometric neighbors |
 | `find_similar_entities(primary_key, pattern_id, top_n, dim_mask, metric)` | ANN search for nearest entities in delta-space. `dim_mask`: list of dimension names to restrict distance. `metric`: `"L2"` or `"cosine"`. Returns `SimilarityResult` |
 | `contrast_populations(pattern_id, group_a, group_b)` | Dimension-by-dimension comparison of two entity groups (Cohen's d) |
@@ -213,9 +213,9 @@ builder = GDSBuilder(
 | `add_graph_features(anchor_line, event_line, from_col, to_col, features)` | Auto-compute graph structural features (in/out-degree, reciprocity) |
 | `add_chain_line(line_id, chains, features)` | Create anchor line from extracted chain dicts |
 | `add_alias(alias_id, base_pattern_id, cutting_plane_dimension, cutting_plane_threshold)` | Register an alias with a cutting plane for sub-population analysis |
-| `build()` | Validate, compute statistics, write all files. Returns output path |
+| `build(temporal_configs=None)` | Validate, compute statistics, write all files. Pass `temporal_configs` to run geometry→temporal pipeline per pattern. Returns output path |
 | `incremental_update(pattern_id, changed_entities, deleted_keys)` | Update geometry incrementally with drift tracking |
-| `build_temporal(time_col, time_window)` | Generate temporal snapshots from time-windowed event data. Call after `build()` |
+| `build_temporal(time_col, time_window)` | Generate temporal snapshots from time-windowed event data. Call after `build()` when not using pipeline mode |
 
 ### RelationSpec
 
@@ -304,6 +304,8 @@ Key methods: `current_version()`, `has_fts()`.
 | `is_anomaly` | `bool` | Whether delta_norm >= theta_norm |
 | `edges` | `list[Edge]` | All edges in this polygon |
 | `delta_rank_pct` | `float \| None` | Percentile rank within population (0-100) |
+| `bregman_divergence` | `float \| None` | Per-entity Bregman divergence score — distribution-aware anomaly distance computed per dimension using its `kind` tag. `None` on pre-2.3 spheres. |
+| `anomaly_confidence` | `float \| None` | Bootstrap stability score (0–1): fraction of bootstrap samples in which the entity is classified as anomalous. `None` when bootstrap was skipped (N > 50K, `group_by_property`, or `use_mahalanobis`). |
 
 Key methods: `is_event()`, `is_anchor()`, `alive_edges()`, `edges_for_line(line_id)`.
 
@@ -343,6 +345,7 @@ Key methods: `slice_at(timestamp)` -- binary search for the slice active at a gi
 | `version` | `int` | Pattern version |
 | `prop_columns` | `list[str]` | Boolean property columns tracked as dimensions |
 | `dimension_weights` | `np.ndarray \| None` | Per-dimension importance weights |
+| `dimension_kinds` | `list[str] \| None` | Per-dimension distribution family: `"gaussian"`, `"poisson"`, or `"bernoulli"`. Populated at build time; `None` on pre-2.3 spheres. |
 
 Key properties: `theta_norm`, `dim_labels`, `delta_dim()`, `is_continuous`, `max_hub_score`.
 

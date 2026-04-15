@@ -79,6 +79,16 @@ def _prepare_trips() -> pa.Table:
     )
     raw = raw.append_column("tip_pct", tip_pct)
 
+    # Filter out-of-range timestamps (TLC data contains rare bad dates 2008–2088)
+    _pickup_ts = raw["tpep_pickup_datetime"]
+    _ts_min = pa.scalar(1546300800000000, pa.int64())  # 2019-01-01 00:00 UTC in us
+    _ts_max = pa.scalar(1548979200000000, pa.int64())  # 2019-02-01 00:00 UTC in us
+    _pickup_int = pc.cast(_pickup_ts, pa.int64())
+    raw = raw.filter(pc.and_(
+        pc.greater_equal(_pickup_int, _ts_min),
+        pc.less(_pickup_int, _ts_max),
+    ))
+
     # Cast to timestamp without tz (Windows tzdata workaround)
     pickup_no_tz = raw["tpep_pickup_datetime"].cast(pa.timestamp("us"))
     # Pickup hour and day of week

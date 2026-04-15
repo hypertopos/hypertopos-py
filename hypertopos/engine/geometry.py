@@ -956,9 +956,17 @@ class GDSEngine:
                     float(row["delta_rank_pct"])
                     if "delta_rank_pct" in row else None
                 ),
+                bregman_divergence=(
+                    float(row.get("bregman_divergence", 0.0))
+                    if "bregman_divergence" in row else None
+                ),
+                anomaly_confidence=(
+                    float(row.get("anomaly_confidence", 0.0))
+                    if "anomaly_confidence" in row else None
+                ),
             ))
 
-        results.sort(key=lambda p: p.delta_norm, reverse=True)
+        results.sort(key=lambda p: (-p.delta_norm, p.primary_key))
         if top_n is not None:
             return results[:top_n]
         return results

@@ -109,6 +109,9 @@ Domain columns vary per line. The `primary_key` column is always present and alw
 | `delta` | fixed_size_list\<float32\> | Z-scored delta vector (deviation from mu) |
 | `delta_norm` | float32 | L2 norm of delta (distance from population center -- used for scoring, clustering, and similarity) |
 | `delta_rank_pct` | float32 | Percentile rank of delta_norm (0--100) |
+| `conformal_p` | float32 | Conformal p-value (null when not computed) |
+| `bregman_divergence` | float32 | Sum of per-dimension Bregman terms (distribution-aware anomaly distance). Null on pre-2.3 spheres. |
+| `anomaly_confidence` | float32 | Bootstrap stability score: fraction of bootstrap resamples in which entity is anomalous. Null when bootstrap was skipped. |
 | `edges` | list\<struct\> | Edge list: line_id, point_key, direction, status |
 
 The `delta` vector length equals the number of dimensions in the pattern. Geometry datasets carry an IVF-PQ ANN index on the `delta` column for trajectory similarity search.

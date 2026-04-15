@@ -7,6 +7,35 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-04-15
+
+### Added
+- Distribution-aware Bregman divergence with per-dimension kind tags (gaussian/poisson/bernoulli). Auto-detected from dimension type; YAML `kind:` override per dimension.
+- Per-dimension anomaly threshold (hyper-ellipsoid boundary) replacing uniform decomposition (hyper-sphere).
+- `anomaly_confidence` per entity via stratified bootstrap resampling. Configurable `bootstrap_iterations` (default 200, 0 to skip). Skipped for populations > 50K (use `conformal_p`), `group_by_property`, and `use_mahalanobis` patterns.
+- `bregman_divergence` stored alongside `delta_norm` in geometry.
+- `dimension_kinds` per pattern in sphere.json metadata.
+- `find_anomalies` returns edges on polygons (both fast path and in-process path).
+- `find_neighborhood` raises `GDSNavigationError` for continuous-mode patterns instead of silently returning empty results.
+- In-memory adjacency index for graph operations — lazy build on first graph call, cached on session reader.
+- Build pipeline per-pattern parallelism: geometry → temporal as concurrent pipeline (up to 4 threads).
+
+### Changed
+- `explain_anomaly` returns per-dimension Bregman contributions (additive, kind-labeled) instead of absolute z-score deltas when dimension_kinds available.
+- Sphere format bumped to 2.3. Old spheres must be rebuilt.
+- Chain extraction uses temporal bisect for neighbor filtering instead of linear timestamp scan.
+
+### Fixed
+- `find_anomalies` pagination: deterministic ordering on tied `delta_norm` values prevents entity duplication across page boundaries.
+- `hub_score_history` clamps negative `hub_score`/`alive_edges_est` to zero for early temporal slices.
+- `anomalous_edges` deduplicates by `event_key` for self-loops (`from_key == to_key`).
+- `find_clusters`, `find_drifting_entities`, `compare_time_windows`, `find_regime_changes` use `pattern.dim_labels` for dimension names, including event dimensions.
+- `find_geometric_path` default `beam_width` increased from 10 to 50; auto-scales for deep searches.
+- `aggregate` raises explicit error when `group_by_line` matches multiple relations on the same pattern.
+- `search_entities` JSON serialization handles datetime columns.
+- `sphere_overview` mode detection uses `sample_size=200` instead of full geometry table read.
+- Weighted Bregman norms for `metric="bregman"` in `find_anomalies`.
+
 ## [0.3.3] — 2026-04-13
 
 ### Added

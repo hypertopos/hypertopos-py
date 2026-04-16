@@ -307,3 +307,56 @@ def test_temporal_overlap_full_bidirectional():
     # A0: out={A1}, in={A1}, bidir={A1} → 1/(1+1-1)=1.0
     # A1: out={A0}, in={A0}, bidir={A0} → 1/(1+1-1)=1.0
     np.testing.assert_array_almost_equal(actual[:, 0, 0], [1.0, 1.0])
+
+
+# --- Graph algorithm features (static) ---
+
+def test_static_graph_algo_features():
+    """New graph algorithm features produce non-zero results."""
+    table = pa.table({
+        "from_key": pa.array(["A0", "A1", "A2", "A0", "A1"]),
+        "to_key": pa.array(["A1", "A2", "A0", "A2", "A0"]),
+    })
+    anchor_keys = pa.array(["A0", "A1", "A2"])
+    features = ["pagerank", "connected_component", "clustering_coefficient",
+                 "community", "betweenness"]
+
+    results = compute_graph_features(
+        table, anchor_keys, "from_key", "to_key", features,
+    )
+    assert set(results.keys()) == set(features)
+
+    # PageRank: all nodes should have positive scores
+    pr_vals, _ = results["pagerank"]
+    assert all(v > 0 for v in pr_vals)
+
+    # Connected components: triangle → all same component
+    cc_vals, _ = results["connected_component"]
+    assert cc_vals[0] == cc_vals[1] == cc_vals[2]
+
+    # Clustering coefficient: triangle → all 1.0
+    cl_vals, _ = results["clustering_coefficient"]
+    np.testing.assert_array_almost_equal(cl_vals, [1.0, 1.0, 1.0], decimal=1)
+
+    # Community: triangle → all same community
+    com_vals, _ = results["community"]
+    assert com_vals[0] == com_vals[1] == com_vals[2]
+
+    # Betweenness: triangle → all roughly equal (and small)
+    bt_vals, _ = results["betweenness"]
+    assert all(v >= 0 for v in bt_vals)
+
+
+def test_temporal_graph_algo_features_static_only():
+    """Graph algo features are static-only — temporal returns zeros."""
+    n_events, n_anchors, n_buckets = 200, 5, 3
+    table, buckets = _make_event_table(n_events, n_anchors, n_buckets)
+    anchor_keys = pa.array([f"A{i}" for i in range(n_anchors)])
+    features = ["pagerank", "betweenness"]
+
+    actual = compute_graph_features_temporal(
+        table, anchor_keys, "from_key", "to_key", features, buckets, n_buckets,
+    )
+    assert actual.shape == (n_anchors, n_buckets, len(features))
+    # Static-only features produce zeros in temporal mode (by design)
+    np.testing.assert_array_equal(actual, 0.0)

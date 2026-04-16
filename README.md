@@ -13,8 +13,8 @@
 hypertopos is not a database, and not a machine learning model. It is a layer that turns relational data into a coordinate system where every entity gets a position derived from its relationships and the population around it.
 
 ```
-typical:    data → storage → features → feature store → ML → serving → decision
-hypertopos: data → hypertopos (WIP) → ML
+typical:    data → features → feature store → ML → decision
+hypertopos: data → representation (hypertopos) → ML / decision
 ```
 
 ```bash
@@ -51,6 +51,7 @@ Each capability below emerges from treating entities as points in a shared, popu
 | Diverse anomaly selection | Facility location covers distinct anomaly regions | Top-N returns redundant extremes | `0.3.1` |
 | Distribution-aware scoring | Per-dim Bregman divergence (gaussian/poisson/bernoulli). Additive | PyOD/sklearn: uniform metric across all features | `0.4.0` |
 | Anomaly confidence | Bootstrap `anomaly_confidence: 0-1`. `min_confidence` filter | No equivalent — binary verdict, no stability signal | `0.4.0` |
+| Graph algorithm dimensions | PageRank, betweenness, community, clustering as geometry dims | Separate graph DB + manual joins | `0.4.1` |
 
 ### What changes in practice
 

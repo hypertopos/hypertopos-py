@@ -97,6 +97,8 @@ Every dimension in a pattern carries a `kind` tag — the distribution family us
 | `precomputed_dimension`, otherwise | `gaussian` |
 | `graph_features` in/out-degree (`edge_max > 1`) | `poisson` |
 | `graph_features` reciprocity, overlap (`edge_max = 1`) | `bernoulli` |
+| `graph_features` pagerank, betweenness, clustering_coefficient | auto |
+| `graph_features` community, connected_component | auto |
 
 Override via `kind:` on individual dimension entries in `sphere.yaml`. The resulting kind list is stored in `Pattern.dimension_kinds` and surfaced in `sphere_overview` as `dimension_kinds`.
 
@@ -186,7 +188,7 @@ An edge table is a flat Lance dataset that links anchor entities through an even
 **When it exists:** The builder emits an edge table automatically for event patterns with 2+ FK relations to the same anchor line (e.g. an event pattern with `from_entity` and `to_entity` both pointing to the same anchor line). It can also be configured explicitly in YAML.
 
 **What it enables:**
-- **Runtime graph traversal** -- `find_geometric_path` uses beam search over the edge table, scoring paths by geometric coherence of intermediate entities
+- **Runtime graph traversal** -- `find_geometric_path` uses bidirectional BFS over the edge table, scoring discovered paths by geometric coherence of intermediate entities
 - **Lazy chain discovery** -- `discover_chains` performs temporal BFS on edges without requiring build-time chain extraction
 - **Edge statistics** -- row counts, unique entity counts, timestamp and amount ranges
 - **Witness cohort discovery** -- `find_witness_cohort` ranks entities that share the target's witness signature by combining delta similarity, witness overlap, trajectory alignment, and a graded anomaly bonus, while excluding entities already connected via the edge table. **Investigative peer ranking, not edge forecasting** — surfaces existing peers rather than predicting future edges. Uniquely possible because population-relative geometry, witness sets, temporal solids, and the edge table all live in one storage layer

@@ -122,7 +122,7 @@ with sphere.session("agent-1") as session:
 
 | Method | Description |
 |--------|-------------|
-| `find_geometric_path(from_key, to_key, pattern_id, max_depth=5, beam_width=10, scoring="geometric")` | Beam search for paths between two entities via the edge table, scored by geometric coherence. Scoring modes: `"geometric"` (witness overlap + delta alignment + anomaly preservation), `"amount"` (geometric score modulated by log(transaction amount)), `"anomaly"` (prefer paths through anomalous entities), `"shortest"` (plain BFS, no geometric scoring). Returns best paths with per-hop scores |
+| `find_geometric_path(from_key, to_key, pattern_id, max_depth=5, beam_width=50, scoring="geometric")` | Bidirectional BFS for paths between two entities via the edge table, scored by geometric coherence. Scoring modes: `"geometric"` (witness overlap + delta alignment + anomaly preservation), `"amount"` (geometric score modulated by log(transaction amount)), `"anomaly"` (prefer paths through anomalous entities), `"shortest"` (plain BFS, no geometric scoring). Returns top `beam_width` paths by score |
 | `discover_chains(primary_key, pattern_id, time_window_hours=168, max_hops=10, min_hops=2, max_chains=100, direction="forward")` | Runtime temporal BFS on the edge table to discover entity chains from a starting point. Unlike `find_chains_for_entity()` which queries pre-computed chains, this performs live traversal -- works without build-time chain extraction |
 | `entity_flow(primary_key, pattern_id, top_n=20, *, timestamp_cutoff=None)` | Net flow analysis per counterparty via edge table. Two edge lookups (outgoing + incoming), sum amounts, compute per-counterparty net flow. `timestamp_cutoff` (Unix seconds) restricts to edges with `timestamp <= cutoff`. Returns outgoing/incoming totals, net_flow, flow_direction, counterparties sorted by abs(net_flow) |
 | `contagion_score(primary_key, pattern_id, *, timestamp_cutoff=None)` | Score how many of an entity's counterparties are anomalous via edge table + geometry check. `timestamp_cutoff` enables as-of contagion reconstruction. Returns score (0.0–1.0), total/anomalous counterparty counts |
@@ -210,7 +210,7 @@ builder = GDSBuilder(
 | `add_derived_dimension(anchor_line, event_line, anchor_fk, metric, metric_col, dimension_name)` | Dimension derived from event aggregation (count, sum, max, std, mean) |
 | `add_composite_line(anchor_line, event_line, anchor_fk, ...)` | Create composite anchor line from event-anchor join |
 | `add_precomputed_dimension(anchor_line, dimension_name, edge_max)` | Dimension from a column already on the entity table |
-| `add_graph_features(anchor_line, event_line, from_col, to_col, features)` | Auto-compute graph structural features (in/out-degree, reciprocity) |
+| `add_graph_features(anchor_line, event_line, from_col, to_col, features)` | Auto-compute graph structural features (degree, reciprocity, pagerank, betweenness, community, clustering, components) |
 | `add_chain_line(line_id, chains, features)` | Create anchor line from extracted chain dicts |
 | `add_alias(alias_id, base_pattern_id, cutting_plane_dimension, cutting_plane_threshold)` | Register an alias with a cutting plane for sub-population analysis |
 | `build(temporal_configs=None)` | Validate, compute statistics, write all files. Pass `temporal_configs` to run geometry→temporal pipeline per pattern. Returns output path |

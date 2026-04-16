@@ -7413,6 +7413,55 @@ class GDSNavigator:
 
         return geo_score
 
+    def _score_path(
+        self,
+        path_keys: list[str],
+        pattern_id: str,
+        scoring: str,
+        adj_index: Any = None,
+        max_amount: float = 1.0,
+    ) -> float:
+        total = 0.0
+        for i in range(len(path_keys) - 1):
+            amount = 0.0
+            if scoring == "amount" and adj_index is not None:
+                amount = self._lookup_edge_amount(
+                    adj_index, path_keys[i], path_keys[i + 1],
+                )
+            total += self._score_hop(
+                path_keys[i], path_keys[i + 1], pattern_id, scoring,
+                amount=amount, max_amount=max_amount,
+            )
+        return total
+
+    @staticmethod
+    def _lookup_edge_amount(adj_index: Any, from_key: str, to_key: str) -> float:
+        for tgt, _ts, amt, _ek in adj_index.neighbors_out(from_key):
+            if tgt == to_key:
+                return amt
+        for src, _ts, amt, _ek in adj_index.neighbors_in(from_key):
+            if src == to_key:
+                return amt
+        return 0.0
+
+    @staticmethod
+    def _reconstruct_bidir_path(
+        fwd_parent: dict[str, str | None],
+        bwd_parent: dict[str, str | None],
+        meeting: str,
+    ) -> list[str]:
+        fwd: list[str] = []
+        node: str | None = meeting
+        while node is not None:
+            fwd.append(node)
+            node = fwd_parent[node]
+        fwd.reverse()
+        node = bwd_parent[meeting]
+        while node is not None:
+            fwd.append(node)
+            node = bwd_parent[node]
+        return fwd
+
     def find_geometric_path(
         self,
         from_key: str,
@@ -7424,15 +7473,15 @@ class GDSNavigator:
     ) -> dict[str, Any]:
         """Find paths between two entities scored by geometric coherence.
 
-        Uses edge table for traversal, delta vectors for scoring.
-        Beam search: at each depth, keep top beam_width candidates.
+        Uses bidirectional BFS for reliable path finding, then scores
+        found paths by geometric coherence post-hoc.
 
         Args:
             from_key: Source entity primary key.
             to_key: Target entity primary key.
             pattern_id: Event pattern with edge table.
             max_depth: Maximum hops to search.
-            beam_width: Candidates kept per depth level.
+            beam_width: Maximum paths returned (top-K by score).
             scoring: "geometric" | "anomaly" | "shortest" | "amount".
 
         Returns dict with paths, each scored, plus summary.
@@ -7442,83 +7491,90 @@ class GDSNavigator:
                 f"Pattern '{pattern_id}' has no edge table. "
                 "Rebuild sphere with edge table support."
             )
-        # Resolve anchor pattern for geometry scoring (entities live in anchor,
-        # not event patterns — event pattern_id is only for edge table reads).
         scoring_pattern = self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
-        # Auto-scale beam for deep searches: wider beam prevents pruning
-        # legitimate intermediaries on long paths
-        if max_depth > 5:
-            beam_width = max(beam_width, beam_width * max_depth // 5)
-        # Iterative beam search with per-depth adjacency expansion
-        frontier: list[tuple[list[str], float]] = [([from_key], 0.0)]
-        arrived: list[tuple[list[str], float]] = []
-        adj: dict[str, list[tuple[str, str, float, float]]] = defaultdict(list)
-        expanded_keys: set[str] = set()
-        max_amt_seen = 1.0  # track max amount for "amount" scoring normalization
         adj_index = self._storage.get_adjacency(pattern_id)
 
-        for _depth in range(max_depth):
-            # Expand adjacency only for frontier tips not yet expanded
-            tips = {path[-1] for path, _ in frontier} - expanded_keys
-            if tips:
-                for k in tips:
-                    # Undirected: include both out- and in-edges
-                    # Store as (neighbor, event_key, timestamp, amount) to match iteration below
-                    neighbors = [
-                        (tgt, ek, ts, amt)
-                        for tgt, ts, amt, ek in adj_index.neighbors_out(k)
-                        if tgt != k
-                    ] + [
-                        (src, ek, ts, amt)
-                        for src, ts, amt, ek in adj_index.neighbors_in(k)
-                        if src != k
-                    ]
-                    # Deduplicate by neighbor (keep first occurrence)
-                    seen_nb: set[str] = set()
-                    deduped = []
-                    for entry in neighbors:
-                        nb = entry[0]
-                        if nb not in seen_nb:
-                            seen_nb.add(nb)
-                            deduped.append(entry)
-                    adj[k].extend(deduped)
-                    if scoring == "amount":
-                        for _, _, _, amt in deduped:
-                            if amt > max_amt_seen:
-                                max_amt_seen = amt
-                expanded_keys |= tips
-                # Prefetch deltas for newly discovered neighbors
-                if scoring != "shortest":
-                    neighbor_keys = {nb for tip in tips for nb, *_ in adj.get(tip, [])}
-                    self._prefetch_deltas(neighbor_keys | tips, scoring_pattern)
+        # Phase 1: Bidirectional BFS — expand from both ends
+        fwd_parent: dict[str, str | None] = {from_key: None}
+        bwd_parent: dict[str, str | None] = {to_key: None}
+        fwd_depth: dict[str, int] = {from_key: 0}
+        bwd_depth: dict[str, int] = {to_key: 0}
+        fwd_frontier: set[str] = {from_key}
+        bwd_frontier: set[str] = {to_key}
 
-            candidates: list[tuple[list[str], float]] = []
-            for path, score in frontier:
-                last = path[-1]
-                for neighbor, _ek, _ts, _amt in adj.get(last, []):
-                    if neighbor in set(path):  # no cycles
-                        continue
-                    hop_score = self._score_hop(
-                        last, neighbor, scoring_pattern, scoring,
-                        amount=_amt, max_amount=max_amt_seen,
-                    )
-                    new_path = path + [neighbor]
-                    new_score = score + hop_score
-                    if neighbor == to_key:
-                        arrived.append((new_path, new_score))
-                    else:
-                        candidates.append((new_path, new_score))
-            if arrived:
-                break
-            # Beam: keep top beam_width
-            candidates.sort(key=lambda x: x[1], reverse=True)
-            frontier = candidates[:beam_width]
-            if not frontier:
-                break
+        half = (max_depth + 1) // 2
+        for d in range(1, half + 1):
+            new_fwd: set[str] = set()
+            for node in fwd_frontier:
+                for tgt, _ts, _amt, _ek in adj_index.neighbors_out(node):
+                    if tgt != node and tgt not in fwd_parent:
+                        fwd_parent[tgt] = node
+                        fwd_depth[tgt] = d
+                        new_fwd.add(tgt)
+                for src, _ts, _amt, _ek in adj_index.neighbors_in(node):
+                    if src != node and src not in fwd_parent:
+                        fwd_parent[src] = node
+                        fwd_depth[src] = d
+                        new_fwd.add(src)
+            fwd_frontier = new_fwd
+
+            new_bwd: set[str] = set()
+            for node in bwd_frontier:
+                for tgt, _ts, _amt, _ek in adj_index.neighbors_out(node):
+                    if tgt != node and tgt not in bwd_parent:
+                        bwd_parent[tgt] = node
+                        bwd_depth[tgt] = d
+                        new_bwd.add(tgt)
+                for src, _ts, _amt, _ek in adj_index.neighbors_in(node):
+                    if src != node and src not in bwd_parent:
+                        bwd_parent[src] = node
+                        bwd_depth[src] = d
+                        new_bwd.add(src)
+            bwd_frontier = new_bwd
+
+        # Phase 2: Find valid meeting points (0 < total hops ≤ max_depth)
+        meetings = fwd_parent.keys() & bwd_parent.keys()
+        valid = sorted(
+            ((fwd_depth[m] + bwd_depth[m], m) for m in meetings
+             if 0 < fwd_depth[m] + bwd_depth[m] <= max_depth),
+        )
+        valid = valid[:1000]
+
+        # Phase 3: Reconstruct paths, reject cycles
+        raw_paths: list[list[str]] = []
+        for _, m in valid:
+            path = self._reconstruct_bidir_path(fwd_parent, bwd_parent, m)
+            if len(path) == len(set(path)):
+                raw_paths.append(path)
+
+        # Phase 4: Score paths
+        if raw_paths and scoring != "shortest":
+            all_keys: set[str] = set()
+            for path in raw_paths:
+                all_keys.update(path)
+            self._prefetch_deltas(all_keys, scoring_pattern)
+
+        max_amt = 1.0
+        if scoring == "amount":
+            for path in raw_paths:
+                for i in range(len(path) - 1):
+                    amt = self._lookup_edge_amount(adj_index, path[i], path[i + 1])
+                    if amt > max_amt:
+                        max_amt = amt
+
+        scored: list[tuple[list[str], float]] = []
+        for path in raw_paths:
+            score = self._score_path(path, scoring_pattern, scoring, adj_index, max_amt)
+            scored.append((path, score))
+        if scoring == "shortest":
+            scored.sort(key=lambda x: len(x[0]))  # prefer fewer hops
+        else:
+            scored.sort(key=lambda x: x[1], reverse=True)
+        scored = scored[:beam_width]
 
         # Format results
         paths = []
-        for path_keys, score in sorted(arrived, key=lambda x: x[1], reverse=True):
+        for path_keys, score in scored:
             paths.append({
                 "keys": path_keys,
                 "hops": len(path_keys) - 1,

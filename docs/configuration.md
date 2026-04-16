@@ -564,6 +564,8 @@ The builder assigns a `kind` tag to every dimension at build time. The tag drive
 | `precomputed_dimension`, otherwise | `gaussian` | Default continuous |
 | `graph_features` (`in_degree`, `out_degree`) | `poisson` | Degree counts (`edge_max > 1`) |
 | `graph_features` (`reciprocity`, `counterpart_overlap`) | `bernoulli` | Binary presence (`edge_max = 1`) |
+| `graph_features` (`pagerank`, `betweenness`, `clustering_coefficient`) | auto | Continuous scores (igraph C backend) |
+| `graph_features` (`community`, `connected_component`) | auto | Integer IDs (categorical) |
 | `geo_properties`, `metric_properties` | `gaussian` | Continuous measurements |
 
 **Override via `kind:`** on individual dimension entries (precomputed, derived). Override takes precedence over auto-detection. Event dimensions use auto-detection only.
@@ -649,7 +651,7 @@ patterns:
       event_line: transactions
       from_col: from_account
       to_col: to_account
-      features: [in_degree, out_degree, reciprocity, counterpart_overlap]
+      features: [in_degree, out_degree, reciprocity, counterpart_overlap, pagerank, betweenness, community, clustering_coefficient, connected_component]
 ```
 
 **Supported features:**
@@ -657,13 +659,18 @@ patterns:
 - `out_degree` — number of unique outgoing edges
 - `reciprocity` — fraction of counterparties with bidirectional flow
 - `counterpart_overlap` — Jaccard similarity of in/out counterparty sets
+- `pagerank` — network centrality (igraph C backend)
+- `betweenness` — bridge score between communities (edge-sampled on large graphs)
+- `community` — community ID via label propagation
+- `clustering_coefficient` — local triangle density
+- `connected_component` — isolated subgraph membership
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `event_line` | string | — | **Required.** Event line with from/to columns. |
 | `from_col` | string | — | **Required.** Source entity FK column. |
 | `to_col` | string | — | **Required.** Destination entity FK column. |
-| `features` | list | all four | Which features to compute. |
+| `features` | list | all nine | Which features to compute. Requires `pip install hypertopos[graph]` for pagerank/betweenness/community/clustering_coefficient/connected_component. |
 
 ---
 

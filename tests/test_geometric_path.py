@@ -622,6 +622,24 @@ class TestFindGeometricPath:
         )
         assert result["summary"]["paths_found"] >= 1
 
+    def test_long_path_7_hops(self, nav):
+        """A000→A001 is 7 hops in the +3 circular graph. Must be found."""
+        result = nav.find_geometric_path(
+            "A000", "A001", "tx_pattern", max_depth=8,
+        )
+        assert result["summary"]["paths_found"] >= 1
+        best = result["paths"][0]
+        assert best["keys"][0] == "A000"
+        assert best["keys"][-1] == "A001"
+        assert best["hops"] <= 8
+
+    def test_beam_width_caps_output(self, nav):
+        """beam_width should cap the number of returned paths."""
+        result = nav.find_geometric_path(
+            "A000", "A009", "tx_pattern", max_depth=8, beam_width=2,
+        )
+        assert len(result["paths"]) <= 2
+
     def test_no_edge_table_raises(self, nav):
         """Pattern without edge table should raise."""
         with pytest.raises(GDSNavigationError, match="no edge table"):

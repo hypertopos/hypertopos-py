@@ -22,7 +22,8 @@ Investigation depth, detection quality, edge-derived geometry, and advanced anal
 Bregman geometry, anomaly confidence, distribution-aware calibration, build pipeline, graph acceleration.
 
 - **0.4.0** — Distribution-aware Bregman divergence with per-dimension kind tags. Per-dimension anomaly threshold (hyper-ellipsoid). Theta calibration fix. Anomaly confidence via stratified bootstrap. Interpretive MCP output (`explain_anomaly` returns Bregman contributions). Sphere format 2.3. Per-pattern pipeline parallelism (geometry → temporal overlap, up to 4 threads). In-memory adjacency index — full graph in dict, O(1) neighbor lookups replacing Lance BTREE scans across all graph operations. Temporal bisect in chain extraction.
-- **0.4.x** — Native graph algorithms as dimensions — PageRank, community detection (label propagation), betweenness centrality, triangle count, connected components computed at build time via adjacency index. Continuous features as derived dimensions, categorical features as group_by_property.
+- **0.4.1** — Native graph algorithms as geometry dimensions (igraph C backend): PageRank, betweenness centrality (edge-sampled), community detection (label propagation), clustering coefficient, connected components. Stress test fixes: find_anomalies edges and pagination, hub_score_history clamp, detect_pattern type guard, aggregate ambiguity guard, dim_labels in find_clusters.
+- **0.4.2** — Intrinsic/extrinsic decomposition (entity-caused vs population-caused position changes). Entity influence scoring (hidden influencer detection). Cross-pattern temporal lead-lag discovery. Bidirectional BFS for find_geometric_path (guaranteed path finding). Storey adaptive pi0 estimation for FDR.
 
 ---
 

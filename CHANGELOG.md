@@ -7,6 +7,14 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-04-16
+
+### Added
+- Native graph algorithms as geometry dimensions: `pagerank`, `connected_component`, `clustering_coefficient`, `community` (label propagation), `betweenness` (sampled Brandes). Computed at build time on the adjacency index — no external dependencies. Add to `graph_features.features` list in sphere YAML.
+
+### Fixed
+- `find_geometric_path` rewritten from beam search to bidirectional BFS for reliable path discovery in sparse graphs.
+
 ## [0.4.0] — 2026-04-15
 
 ### Added

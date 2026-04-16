@@ -830,6 +830,38 @@ def compute_graph_features(
         vals = np.where(union_size > 0, bidir_vals / safe_union, 0.0)
         results["counterpart_overlap"] = (vals, 1)
 
+    # --- Graph algorithm features (computed on AdjacencyIndex) ---
+    _ALGO_FEATURES = {
+        "pagerank", "connected_component", "clustering_coefficient",
+        "community", "betweenness",
+    }
+    needed_algos = _ALGO_FEATURES & set(features)
+    if needed_algos:
+        from hypertopos.engine.graph_algorithms import compute_all_from_lists
+
+        f_list = edges["_f"].to_pylist()
+        t_list = edges["_t"].to_pylist()
+        algo_results = compute_all_from_lists(f_list, t_list, needed_algos)
+
+        _EDGE_MAX_OVERRIDES = {
+            "clustering_coefficient": 1,
+            "betweenness": 1,
+        }
+        for feat_name, scores in algo_results.items():
+            vals = np.zeros(n, dtype=np.float64)
+            for k, v in scores.items():
+                idx = key_to_idx.get(k)
+                if idx is not None:
+                    vals[idx] = float(v)
+            if feat_name in ("connected_component", "community"):
+                n_unique = len(set(scores.values())) if scores else 1
+                edge_max = max(n_unique - 1, 1)
+            elif feat_name in _EDGE_MAX_OVERRIDES:
+                edge_max = _EDGE_MAX_OVERRIDES[feat_name]
+            else:
+                edge_max = _resolve_edge_max(vals, "auto", 99.0)
+            results[feat_name] = (vals, edge_max)
+
     return results
 
 
@@ -862,6 +894,12 @@ def compute_graph_features_temporal(
     # Classify features
     FAST_FEATURES = {"in_degree", "out_degree"}
     NUMPY_FEATURES = {"reciprocity", "counterpart_overlap"}
+    # Graph algo features are static-only — skip in temporal (per-window
+    # PageRank/betweenness is meaningless and extremely expensive)
+    STATIC_ONLY_FEATURES = {
+        "pagerank", "connected_component", "clustering_coefficient",
+        "community", "betweenness",
+    }
     fast_indices = [i for i, f in enumerate(features) if f in FAST_FEATURES]
     need_recip = "reciprocity" in features
     need_overlap = "counterpart_overlap" in features
@@ -869,6 +907,7 @@ def compute_graph_features_temporal(
     unknown_indices = [
         i for i, f in enumerate(features)
         if f not in FAST_FEATURES and f not in NUMPY_FEATURES
+        and f not in STATIC_ONLY_FEATURES
     ]
 
     # --- Shared: null-filter and integer-encode once ---

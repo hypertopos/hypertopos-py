@@ -50,6 +50,41 @@ def test_neighbors_unknown_key_returns_empty():
     assert idx.neighbors_in("Z") == []
 
 
+def test_pair_counts_matches_defaultdict_baseline():
+    idx = AdjacencyIndex.from_edge_lists(
+        from_keys=["A", "A", "B", "A", "C", "C"],
+        to_keys=["B", "B", "C", "C", "A", "C"],
+        timestamps=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        amounts=[10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
+        event_keys=["e1", "e2", "e3", "e4", "e5", "e6"],
+    )
+    assert idx.pair_counts() == {
+        ("A", "B"): 2,
+        ("B", "C"): 1,
+        ("A", "C"): 1,
+        ("C", "A"): 1,
+        ("C", "C"): 1,
+    }
+
+
+def test_pair_counts_lazy_and_cached():
+    idx = AdjacencyIndex.from_edge_lists(
+        from_keys=["A", "A"], to_keys=["B", "C"],
+        timestamps=[1.0, 2.0], amounts=[10.0, 20.0],
+        event_keys=["e1", "e2"],
+    )
+    assert idx._pair_counts is None
+    first = idx.pair_counts()
+    assert idx._pair_counts is first
+    second = idx.pair_counts()
+    assert second is first
+
+
+def test_pair_counts_empty_adjacency():
+    idx = AdjacencyIndex(_out={}, _in={}, _nodes=set(), _edge_count=0)
+    assert idx.pair_counts() == {}
+
+
 def test_neighbors_out_temporal_filter():
     idx = AdjacencyIndex.from_edge_lists(
         from_keys=["A", "A", "A", "A"],

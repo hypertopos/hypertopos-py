@@ -29,6 +29,7 @@ _NAVIGATION_RECOVERABLE_ERRORS = (
 )
 
 if TYPE_CHECKING:
+    from hypertopos.engine.adjacency import AdjacencyIndex
     from hypertopos.engine.geometry import GDSEngine
     from hypertopos.model.manifest import Contract, Manifest
     from hypertopos.storage.reader import GDSReader
@@ -101,6 +102,27 @@ class SimilarityResult(list):
     def __init__(self, items: list[tuple[str, float]], *, degenerate_warning: str | None = None):
         super().__init__(items)
         self.degenerate_warning = degenerate_warning
+
+
+# ---------------------------------------------------------------------------
+# Root-cause trace — DAG node container
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class RootCauseNode:
+    """One node in a root-cause trace DAG returned by ``trace_root_cause``.
+
+    role: "root" | "structural_witness" | "edge_counterparty" | "hub" | "neighbor_contamination"
+    evidence: free-form per-role evidence dict (top_dimensions, delta_norm, contagion_score, ...)
+    children: downstream nodes (may be empty for leaves / bounded branches)
+    """
+
+    entity_key: str
+    role: str
+    severity: str
+    evidence: dict[str, Any]
+    children: list[RootCauseNode]
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +210,20 @@ class WitnessCohortResult:
     candidate_pool_size: int
     weights_used: dict[str, float]
     summary: dict[str, Any]
+
+
+@dataclasses.dataclass(frozen=True)
+class MotifSpec:
+    """Dispatcher entry for a named structural motif.
+
+    Enumerator signature: ``enumerate(nav, seed, pattern_id, time_window_hours,
+    **kwargs) -> list[dict]`` — returns a list of motif instances, each with
+    ``edges: list[tuple[str,str]]`` plus motif-specific fields.
+    """
+
+    enumerate: Any
+    default_window_hours: int
+    min_instances: int
 
 
 def _derive_edge_line_ids(edges_list: list[dict] | None) -> list[str]:
@@ -678,25 +714,49 @@ class GDSNavigator:
         fdr_alpha: float | None,
         select: str,
         top_n: int,
+        fdr_method: str = "bh",
+        p_value_method: str = "rank",
+        pattern_df: int | None = None,
     ) -> list[Polygon]:
         """Apply FDR filtering and diverse selection to a list of Polygons.
 
         Mutates Polygon objects in-place (sets q_value / representativeness)
         and returns the filtered/reordered list.
+
+        p_value_method: "rank" (default, uniform-by-construction) or "chi2"
+          (upper-tail χ²(df) on ||delta||²). Rank-based p-values carry no null
+          vs alternative signal for the Storey estimator; "chi2" is the option
+          that makes fdr_method="storey" actually shrink q-values. Requires
+          pattern_df to be supplied by the caller.
         """
+        if p_value_method not in ("rank", "chi2"):
+            raise ValueError(
+                f"p_value_method must be 'rank' or 'chi2', got {p_value_method!r}"
+            )
+        if p_value_method == "chi2" and pattern_df is None:
+            raise ValueError("p_value_method='chi2' requires pattern_df")
+
         # --- FDR filtering (opt-in) ---
         if fdr_alpha is not None and len(polygons) > 0:
             from hypertopos.engine.fdr import (
                 benjamini_hochberg,
                 empirical_p_values_from_rank,
+                parametric_p_values_chi2,
             )
-            rank_pct = np.array(
-                [p.delta_rank_pct if p.delta_rank_pct is not None else 0.0
-                 for p in polygons],
-                dtype=np.float64,
-            )
-            p_values = empirical_p_values_from_rank(rank_pct)
-            rejected, q_values = benjamini_hochberg(p_values, fdr_alpha)
+            if p_value_method == "rank":
+                rank_pct = np.array(
+                    [p.delta_rank_pct if p.delta_rank_pct is not None else 0.0
+                     for p in polygons],
+                    dtype=np.float64,
+                )
+                p_values = empirical_p_values_from_rank(rank_pct)
+            else:  # chi2
+                delta_norms = np.array(
+                    [float(p.delta_norm) for p in polygons],
+                    dtype=np.float64,
+                )
+                p_values = parametric_p_values_chi2(delta_norms, df=int(pattern_df))
+            rejected, q_values = benjamini_hochberg(p_values, fdr_alpha, method=fdr_method)
             for poly, q in zip(polygons, q_values):
                 poly.q_value = float(q)  # type: ignore[attr-defined]
             polygons = [p for p, keep in zip(polygons, rejected) if keep]
@@ -734,6 +794,7 @@ class GDSNavigator:
         property_filters: dict | None = None,
         fdr_alpha: float | None = None,
         fdr_method: str = "bh",
+        p_value_method: str = "rank",
         select: str = "top_norm",
         metric: str = "L2",
         min_confidence: float = 0.0,
@@ -746,9 +807,9 @@ class GDSNavigator:
         with ``total_anomalies_unfiltered`` when *property_filters* is set,
         or ``None`` otherwise.
         """
-        if fdr_method != "bh":
-            raise NotImplementedError(
-                f"Only fdr_method='bh' is supported, got {fdr_method!r}"
+        if fdr_method not in ("bh", "storey"):
+            raise ValueError(
+                f"fdr_method must be 'bh' or 'storey', got {fdr_method!r}"
             )
         if metric not in ("L2", "Linf"):
             raise ValueError(f"metric must be 'L2' or 'Linf', got '{metric}'")
@@ -826,6 +887,8 @@ class GDSNavigator:
                 results = []
             results = self._apply_fdr_select_polygons(
                 results, fdr_alpha=fdr_alpha, select=select, top_n=top_n,
+                fdr_method=fdr_method, p_value_method=p_value_method,
+                pattern_df=len(pattern.theta) if p_value_method == "chi2" else None,
             )
             emerging = self._find_emerging(
                 pattern_id, version, pattern, include_emerging, offset, top_n,
@@ -1079,6 +1142,8 @@ class GDSNavigator:
         results = results[offset:offset + top_n]
         results = self._apply_fdr_select_polygons(
             results, fdr_alpha=fdr_alpha, select=select, top_n=top_n,
+            fdr_method=fdr_method, p_value_method=p_value_method,
+            pattern_df=len(pattern.theta) if p_value_method == "chi2" else None,
         )
 
         emerging = self._find_emerging(
@@ -1732,6 +1797,7 @@ class GDSNavigator:
         top_n: int = 10,
         fdr_alpha: float | None = None,
         fdr_method: str = "bh",
+        p_value_method: str = "rank",
         select: str = "top_norm",
     ) -> list[tuple[Polygon, float]]:
         """Find entities closest to an alias segment boundary (cutting plane).
@@ -1739,9 +1805,9 @@ class GDSNavigator:
         Returns (polygon, signed_distance) pairs sorted by |signed_distance|.
         signed_distance >= 0 → inside segment, < 0 → outside segment.
         """
-        if fdr_method != "bh":
-            raise NotImplementedError(
-                f"Only fdr_method='bh' is supported, got {fdr_method!r}"
+        if fdr_method not in ("bh", "storey"):
+            raise ValueError(
+                f"fdr_method must be 'bh' or 'storey', got {fdr_method!r}"
             )
         sphere = self._storage.read_sphere()
         alias = sphere.aliases.get(alias_id)
@@ -1834,6 +1900,8 @@ class GDSNavigator:
             polygons = [p for p, _ in results]
             polygons = self._apply_fdr_select_polygons(
                 polygons, fdr_alpha=fdr_alpha, select=select, top_n=top_n,
+                fdr_method=fdr_method, p_value_method=p_value_method,
+                pattern_df=len(pattern.theta) if p_value_method == "chi2" else None,
             )
             kept_keys = {p.primary_key for p in polygons}
             dist_lookup = {p.primary_key: d for p, d in results}
@@ -3521,6 +3589,1110 @@ class GDSNavigator:
         self._edge_pattern_cache[anchor_pattern_id] = result
         return result
 
+    def _pair_count_for_pattern(
+        self, graph_pid: str, version: int,
+    ) -> dict[tuple[str, str], int]:
+        """Delegate to AdjacencyIndex.pair_counts() — shared with motif ranking."""
+        return self._storage.get_adjacency(graph_pid).pair_counts()
+
+    _EDGE_POTENTIAL_PAIR_CAP = 1000
+
+    def edge_potential(
+        self,
+        from_key: str,
+        to_key: str,
+        pattern_id: str,
+    ) -> dict[str, Any]:
+        """Geometric anomaly score for the edge (from_key → to_key).
+
+        Formula: ||δ_from − δ_to||₂ × (1 / min(pair_tx_count, 1000)).
+
+        High score = endpoints are structurally distant AND the pair is rare.
+        Empirically (AUROC 0.918 on AML HI-small is_laundering), the rarity
+        prior carries most of the signal — recurring high-volume pairs between
+        two "extreme" accounts are usually legitimate (e.g. corporate payroll),
+        while a single transaction between two geometrically divergent accounts
+        is the classic layering signature.
+
+        Raises GDSNavigationError when either endpoint is missing from the
+        anchor pattern's geometry.
+        """
+        sphere = self._storage.read_sphere()
+        if pattern_id not in sphere.patterns:
+            raise GDSNavigationError(
+                f"Pattern '{pattern_id}' not found in sphere."
+            )
+        pattern = sphere.patterns[pattern_id]
+        graph_pid: str | None = None
+        if pattern.pattern_type == "anchor":
+            graph_pid = self._resolve_edge_pattern_for_anchor(pattern_id)
+        elif pattern.pattern_type == "event" and self._storage.has_edge_table(pattern_id):
+            graph_pid = pattern_id
+        if graph_pid is None:
+            raise GDSNavigationError(
+                f"Pattern '{pattern_id}' has no graph companion; edge_potential "
+                f"requires an event pattern with an edge table."
+            )
+
+        version = self._resolve_version(pattern_id)
+        # Load endpoint delta vectors — fail loudly if either missing.
+        def _load_delta(key: str) -> np.ndarray:
+            geo = self._storage.read_geometry(
+                pattern_id, version, primary_key=key, columns=["primary_key", "delta"],
+            )
+            if geo.num_rows == 0:
+                raise GDSNavigationError(
+                    f"Entity '{key}' not found in pattern '{pattern_id}' geometry."
+                )
+            return np.asarray(geo["delta"][0].as_py(), dtype=np.float64)
+
+        d_from = _load_delta(from_key)
+        d_to = _load_delta(to_key)
+        distance = float(np.linalg.norm(d_from - d_to))
+
+        counts = self._pair_count_for_pattern(graph_pid, version)
+        if from_key == to_key:
+            # Self-loop: use the stored count once; do not double by adding the
+            # reverse direction (which is the same pair in this dict).
+            pair_tx_count = counts.get((from_key, to_key), 0)
+        else:
+            pair_tx_count = counts.get((from_key, to_key), 0) + counts.get((to_key, from_key), 0)
+        # Cap the weight denominator so a single 10 000-tx pair doesn't underflow
+        # to 0; raw count is still reported separately so the agent sees the cap.
+        effective_count = max(1, min(pair_tx_count, self._EDGE_POTENTIAL_PAIR_CAP))
+        score = round(distance * (1.0 / effective_count), 6)
+
+        # Pattern-local normalisation: compute rank_pct + is_high_potential
+        # against the full ranking. Uses attract_edge_potential's cache, so
+        # only the first call pays the full-population scoring cost.
+        score_rank_pct: float | None = None
+        is_high_potential: bool | None = None
+        try:
+            full_ranking = self.attract_edge_potential(
+                pattern_id, top_n=10**9, min_pair_count=1,
+            )
+            if full_ranking:
+                better = sum(1 for r in full_ranking if r["score"] > score)
+                n = len(full_ranking)
+                score_rank_pct = round(100.0 * (n - better) / n, 2)
+                p95_idx = max(0, int(n * 0.05) - 1)
+                p95_threshold = full_ranking[p95_idx]["score"] if p95_idx < n else full_ranking[0]["score"]
+                is_high_potential = bool(score >= p95_threshold)
+        except (*_NAVIGATION_RECOVERABLE_ERRORS, GDSError):
+            pass
+
+        return {
+            "from_key": from_key,
+            "to_key": to_key,
+            "pattern_id": pattern_id,
+            "score": score,
+            "delta_distance": round(distance, 4),
+            "pair_tx_count": pair_tx_count,
+            "effective_weight": round(1.0 / effective_count, 6),
+            "score_rank_pct": score_rank_pct,
+            "is_high_potential": is_high_potential,
+            "interpretation": (
+                f"Edge score {round(score, 4)} = distance {round(distance, 4)} "
+                f"× weight {round(1.0 / effective_count, 4)} "
+                f"(pair_tx_count={pair_tx_count})."
+            ),
+        }
+
+    def attract_edge_potential(
+        self,
+        pattern_id: str,
+        top_n: int = 10,
+        from_key: str | None = None,
+        to_key: str | None = None,
+        min_pair_count: int = 1,
+    ) -> list[dict[str, Any]]:
+        """Rank edges by geometric edge potential, highest first.
+
+        Scans the companion event pattern's edge table, vectorised by a single
+        batch geometry read of all endpoint entities, then ranks by
+        ``||δ_from − δ_to||₂ × (1 / min(pair_tx_count, 1000))``. Use ``from_key``
+        or ``to_key`` to scope the ranking to edges touching a specific entity —
+        useful for per-entity investigation within ``trace_root_cause``.
+
+        Each result also carries ``score_rank_pct`` (percentile within the
+        pattern, 0–100) and ``is_high_potential`` (True when score ≥ p95 of
+        the scored population). Results are cached per
+        ``(pattern_id, version, from_key, to_key, min_pair_count)`` at navigator
+        instance level — repeat calls with the same params return in O(1).
+
+        ``min_pair_count`` filters out pairs appearing fewer times than the
+        threshold (default 1 — keeps everything). Raise to 3+ on very large
+        edge tables where one-off pairs dominate.
+        """
+        sphere = self._storage.read_sphere()
+        if pattern_id not in sphere.patterns:
+            raise GDSNavigationError(f"Pattern '{pattern_id}' not found in sphere.")
+        pattern = sphere.patterns[pattern_id]
+        graph_pid: str | None = None
+        if pattern.pattern_type == "anchor":
+            graph_pid = self._resolve_edge_pattern_for_anchor(pattern_id)
+        elif pattern.pattern_type == "event" and self._storage.has_edge_table(pattern_id):
+            graph_pid = pattern_id
+        if graph_pid is None:
+            raise GDSNavigationError(
+                f"Pattern '{pattern_id}' has no graph companion; attract_edge_potential "
+                f"requires an event pattern with an edge table."
+            )
+
+        version = self._resolve_version(pattern_id)
+
+        # ---- Base ranking cache (the whole pattern, min_pair_count=1) ----
+        # Computed once per (pattern_id, version) — all filtered calls reuse it.
+        # Each entry carries `score_rank_pct_global` and `is_high_potential`
+        # (against pattern-wide p95). Filter queries add `score_rank_pct_in_filter`
+        # relative to their own subset without recomputing the O(pairs) scoring loop.
+        if not hasattr(self, "_attract_edge_base_cache"):
+            self._attract_edge_base_cache: dict[tuple[str, int], list[dict[str, Any]]] = {}
+        base_key = (pattern_id, version)
+        base_sorted = self._attract_edge_base_cache.get(base_key)
+
+        if base_sorted is None:
+            counts = self._pair_count_for_pattern(graph_pid, version)
+            if not counts:
+                self._attract_edge_base_cache[base_key] = []
+                base_sorted = []
+            else:
+                # Batch-load ALL endpoint delta vectors in one geometry read.
+                # We intentionally do NOT push endpoints into Lance as a
+                # point_keys filter here, even though on first glance that
+                # looks like free pruning. On endpoint-dense patterns (e.g.
+                # AML-shaped transaction graphs where every account appears
+                # in at least one edge) Lance BTREE predicate pushdown with
+                # hundreds of thousands of keys is ~1000-1500× slower than a
+                # full-population scan of a cached file. The full scan plus
+                # Python-side membership check is consistently fast across
+                # the endpoint-density regimes we see in practice.
+                all_keys = {k for pair in counts.keys() for k in pair}
+                geo = self._storage.read_geometry(
+                    pattern_id, version, columns=["primary_key", "delta"],
+                )
+                delta_by_key: dict[str, np.ndarray] = {}
+                for i in range(geo.num_rows):
+                    k = geo["primary_key"][i].as_py()
+                    if k in all_keys:
+                        delta_by_key[k] = np.asarray(geo["delta"][i].as_py(), dtype=np.float64)
+
+                scored: list[dict[str, Any]] = []
+                for (f, t), cnt in counts.items():
+                    if f not in delta_by_key or t not in delta_by_key:
+                        continue
+                    distance = float(np.linalg.norm(delta_by_key[f] - delta_by_key[t]))
+                    effective_count = max(1, min(cnt, self._EDGE_POTENTIAL_PAIR_CAP))
+                    score = distance * (1.0 / effective_count)
+                    scored.append({
+                        "from_key": f,
+                        "to_key": t,
+                        "score": round(score, 6),
+                        "delta_distance": round(distance, 4),
+                        "pair_tx_count": cnt,
+                    })
+                scored.sort(key=lambda r: -r["score"])
+
+                # Assign GLOBAL rank_pct + is_high_potential (pattern-wide p95).
+                n = len(scored)
+                if n > 0:
+                    p95_idx = max(0, int(n * 0.05) - 1)
+                    p95_threshold = scored[p95_idx]["score"] if p95_idx < n else scored[0]["score"]
+                    for i, r in enumerate(scored):
+                        r["score_rank_pct_global"] = round(100.0 * (n - i) / n, 2)
+                        r["is_high_potential"] = bool(r["score"] >= p95_threshold)
+                base_sorted = scored
+                self._attract_edge_base_cache[base_key] = base_sorted
+
+        # ---- Fast-path: unfiltered default call returns base directly ----
+        if from_key is None and to_key is None and min_pair_count == 1:
+            # Back-compat field: also surface `score_rank_pct` (alias of global).
+            for r in base_sorted:
+                r.setdefault("score_rank_pct", r.get("score_rank_pct_global"))
+            return base_sorted[:top_n]
+
+        # ---- Filter path: O(m) pass over base_sorted, no rescoring ----
+        filter_key = (pattern_id, version, from_key, to_key, min_pair_count)
+        if not hasattr(self, "_attract_edge_filter_cache"):
+            self._attract_edge_filter_cache: dict[tuple, list[dict[str, Any]]] = {}
+        filtered = self._attract_edge_filter_cache.get(filter_key)
+        if filtered is None:
+            filtered = []
+            for r in base_sorted:
+                if from_key is not None and r["from_key"] != from_key:
+                    continue
+                if to_key is not None and r["to_key"] != to_key:
+                    continue
+                if r["pair_tx_count"] < min_pair_count:
+                    continue
+                filtered.append(r)
+            # Reassign `score_rank_pct` (filter-local) and preserve global fields.
+            m = len(filtered)
+            for i, r in enumerate(filtered):
+                # Clone to avoid mutating base_sorted with filter-local pct.
+                cloned = dict(r)
+                cloned["score_rank_pct_in_filter"] = round(100.0 * (m - i) / m, 2) if m else 100.0
+                cloned["score_rank_pct"] = cloned.get("score_rank_pct_global")
+                filtered[i] = cloned
+            self._attract_edge_filter_cache[filter_key] = filtered
+
+        return filtered[:top_n]
+
+    # ------------------------------------------------------------------
+    # find_motif — structural motif scoring (0.5.0)
+    # ------------------------------------------------------------------
+
+    _MOTIF_SCORE_EPSILON = 1e-30
+
+    @property
+    def _motif_registry(self) -> dict[str, MotifSpec]:
+        """Dispatch table for named AML motifs.
+
+        Lazy-initialised so subclasses or monkey-patched test doubles can
+        swap enumerators without fighting a class-level attribute.
+        """
+        cached = getattr(self, "_motif_registry_cache", None)
+        if cached is not None:
+            return cached
+        registry: dict[str, MotifSpec] = {
+            "fan_out": MotifSpec(
+                enumerate=GDSNavigator._enumerate_fan_out,
+                default_window_hours=168,
+                min_instances=3,
+            ),
+            "cycle_2": MotifSpec(
+                enumerate=GDSNavigator._enumerate_cycle_2,
+                default_window_hours=24,
+                min_instances=1,
+            ),
+            "cycle_3": MotifSpec(
+                enumerate=GDSNavigator._enumerate_cycle_3,
+                default_window_hours=72,
+                min_instances=1,
+            ),
+            "structuring": MotifSpec(
+                enumerate=GDSNavigator._enumerate_structuring,
+                default_window_hours=1,
+                min_instances=1,
+            ),
+        }
+        self._motif_registry_cache = registry
+        return registry
+
+    def _score_motif_from_edges(
+        self, edges: list[tuple[str, str]], pattern_id: str,
+    ) -> dict[str, Any]:
+        """Score a motif as the product of edge_potential across its edges.
+
+        Reuses the edge_potential cache from the 0.5.0 edge-potential primitive.
+        A zero edge_potential (identical-delta endpoints) is semantically
+        distinct from underflow — it collapses the motif score to exactly 0.0
+        to surface "structurally a motif, geometrically indistinguishable
+        endpoints" cases. Non-zero products below 1e-30 are clamped to 1e-30
+        to keep sorting stable.
+        """
+        if not edges:
+            raise GDSNavigationError(
+                "_score_motif_from_edges requires a non-empty edges list.",
+            )
+        breakdown: list[dict[str, Any]] = []
+        product = 1.0
+        saw_zero = False
+        for (u, v) in edges:
+            ep = self.edge_potential(u, v, pattern_id)
+            score = float(ep["score"])
+            breakdown.append({
+                "edge": (u, v),
+                "edge_potential": score,
+                "delta_distance": ep.get("delta_distance"),
+                "pair_tx_count": ep.get("pair_tx_count"),
+                "effective_weight": ep.get("effective_weight"),
+            })
+            if score == 0.0:
+                saw_zero = True
+            product *= score
+        if not saw_zero and product < self._MOTIF_SCORE_EPSILON:
+            product = self._MOTIF_SCORE_EPSILON
+        return {"score": product, "breakdown": breakdown}
+
+    _MOTIF_RANKING_CACHE_MAX = 8
+
+    def score_motif(
+        self,
+        entity_key: str,
+        motif_type: str,
+        pattern_id: str,
+        time_window_hours: int | None = None,
+        amt1_min: float = 10000.0,
+        amt2_max: float = 10000.0,
+    ) -> dict[str, Any]:
+        """Score the best ``motif_type`` instance seeded at ``entity_key``.
+
+        When multiple motif instances are found around ``entity_key``, the one
+        with the highest product-of-edge_potential score wins. Returns a dict
+        with ``found`` flag, ``score``, ``breakdown`` (per-edge scores), and
+        motif-specific identifying fields (``counterparty`` for cycle_2,
+        ``ring`` for cycle_3, ``k`` for fan_out, ``path`` for structuring).
+        ``amt1_min`` and ``amt2_max`` gate the three hops of a ``structuring``
+        motif (hop1 ≥ amt1_min, hop2 and hop3 ≤ amt2_max); ignored for other
+        motif types.
+        """
+        if motif_type not in self._motif_registry:
+            valid = ", ".join(sorted(self._motif_registry.keys()))
+            raise GDSNavigationError(
+                f"Unknown motif_type '{motif_type}'. Valid: {valid}.",
+            )
+        if time_window_hours is not None and time_window_hours <= 0:
+            raise GDSNavigationError(
+                f"time_window_hours must be positive, got {time_window_hours}.",
+            )
+        if motif_type == "structuring":
+            if amt1_min <= 0 or amt2_max <= 0:
+                raise GDSNavigationError(
+                    "amt1_min and amt2_max must be positive for structuring motif.",
+                )
+        spec = self._motif_registry[motif_type]
+        window = time_window_hours if time_window_hours is not None else spec.default_window_hours
+
+        instances = spec.enumerate(
+            self, entity_key, pattern_id, window,
+            amt1_min=amt1_min, amt2_max=amt2_max,
+        )
+        if not instances:
+            return {
+                "motif_type": motif_type,
+                "seed": entity_key,
+                "pattern_id": pattern_id,
+                "found": False,
+                "score": 0.0,
+                "reason": f"no {motif_type} motif around entity in window {window}h",
+            }
+        best: dict[str, Any] | None = None
+        best_score = -1.0
+        for inst in instances:
+            scored = self._score_motif_from_edges(inst["edges"], pattern_id)
+            if scored["score"] > best_score:
+                best_score = scored["score"]
+                best = {**inst, **scored}
+        assert best is not None
+        best["pattern_id"] = pattern_id
+        best["found"] = True
+        best["time_window_hours"] = window
+        return best
+
+    def find_high_potential_motifs(
+        self,
+        pattern_id: str,
+        motif_type: str,
+        top_n: int = 10,
+        time_window_hours: int | None = None,
+        seeds: list[str] | None = None,
+        min_k: int | None = None,
+        amt1_min: float = 10000.0,
+        amt2_max: float = 10000.0,
+    ) -> list[dict[str, Any]]:
+        """Rank ``motif_type`` instances across the pattern by score, desc.
+
+        LRU-cached per ``(pattern_id, version, motif_type, time_window_hours,
+        amt1_min, amt2_max)``. Filters by ``seeds`` (post-cache) if provided.
+        For ``cycle_3`` results are deduplicated by canonical ring (sorted
+        tuple of primary keys) so each physical cycle appears once regardless
+        of which of 3 seeds surfaces it. For ``structuring`` results are
+        deduplicated by canonical path (tuple of 4 primary keys). Amount
+        thresholds ``amt1_min``/``amt2_max`` only affect ``structuring``;
+        other motif types ignore them.
+        """
+        if motif_type not in self._motif_registry:
+            valid = ", ".join(sorted(self._motif_registry.keys()))
+            raise GDSNavigationError(
+                f"Unknown motif_type '{motif_type}'. Valid: {valid}.",
+            )
+        if top_n <= 0:
+            raise GDSNavigationError(f"top_n must be positive, got {top_n}.")
+        if time_window_hours is not None and time_window_hours <= 0:
+            raise GDSNavigationError(
+                f"time_window_hours must be positive, got {time_window_hours}.",
+            )
+        if motif_type == "structuring":
+            if amt1_min <= 0 or amt2_max <= 0:
+                raise GDSNavigationError(
+                    "amt1_min and amt2_max must be positive for structuring motif.",
+                )
+        spec = self._motif_registry[motif_type]
+        window = time_window_hours if time_window_hours is not None else spec.default_window_hours
+        version = self._resolve_version(pattern_id)
+
+        cache_key = (pattern_id, version, motif_type, window, amt1_min, amt2_max)
+        if not hasattr(self, "_motif_ranking_cache"):
+            from collections import OrderedDict
+            self._motif_ranking_cache: OrderedDict[tuple, list[dict[str, Any]]] = OrderedDict()
+        cache = self._motif_ranking_cache
+        if cache_key in cache:
+            cache.move_to_end(cache_key)
+            ranked = cache[cache_key]
+        else:
+            # Discover all seeds from the pattern's geometry primary_key column.
+            geo = self._storage.read_geometry(
+                pattern_id, version, columns=["primary_key"],
+            )
+            all_seeds = geo["primary_key"].to_pylist() if geo.num_rows else []
+            ranked = self._rank_motifs(
+                all_seeds, pattern_id, motif_type, window, min_k,
+                amt1_min=amt1_min, amt2_max=amt2_max,
+            )
+            cache[cache_key] = ranked
+            while len(cache) > self._MOTIF_RANKING_CACHE_MAX:
+                cache.popitem(last=False)
+
+        if seeds is not None:
+            seed_set = set(seeds)
+            filtered = [r for r in ranked if r["seed"] in seed_set]
+        else:
+            filtered = ranked
+        return filtered[:top_n]
+
+    def _batch_read_deltas(
+        self, pattern_id: str, version: int, keys: set[str],
+    ) -> dict[str, np.ndarray]:
+        """Filtered geometry read → ``{primary_key: delta_vector}`` for ``keys``.
+
+        Uses Lance ``point_keys`` BTREE filter so only rows for the endpoints
+        actually participating in motif instances are materialised — cuts
+        geometry I/O from full-population (often 500k+ rows) down to the
+        endpoint subset (typically <20% of the population on AML-shaped
+        patterns where most accounts are isolated or low-degree).
+        """
+        if not keys:
+            return {}
+        geo = self._storage.read_geometry(
+            pattern_id, version,
+            point_keys=list(keys),
+            columns=["primary_key", "delta"],
+        )
+        pk_col = geo["primary_key"].to_pylist()
+        delta_col = geo["delta"]
+        result: dict[str, np.ndarray] = {}
+        for i, pk in enumerate(pk_col):
+            result[pk] = np.asarray(delta_col[i].as_py(), dtype=np.float64)
+        return result
+
+    def _lean_score_motif(
+        self,
+        edges: list[tuple[str, str]],
+        delta_map: dict[str, np.ndarray],
+        pair_counts: dict[tuple[str, str], int],
+    ) -> dict[str, Any] | None:
+        """Product of edge_potential scores using only the pre-fetched caches.
+
+        Returns ``None`` when any endpoint is missing from ``delta_map``
+        (skipped from the ranking).
+        """
+        breakdown: list[dict[str, Any]] = []
+        product = 1.0
+        saw_zero = False
+        for (u, v) in edges:
+            if u not in delta_map or v not in delta_map:
+                return None
+            distance = float(np.linalg.norm(delta_map[u] - delta_map[v]))
+            if u == v:
+                cnt = pair_counts.get((u, v), 0)
+            else:
+                cnt = pair_counts.get((u, v), 0) + pair_counts.get((v, u), 0)
+            effective = max(1, min(cnt, self._EDGE_POTENTIAL_PAIR_CAP))
+            edge_score = distance * (1.0 / effective)
+            breakdown.append({
+                "edge": (u, v),
+                "edge_potential": round(edge_score, 6),
+                "delta_distance": round(distance, 4),
+                "pair_tx_count": cnt,
+                "effective_weight": round(1.0 / effective, 6),
+            })
+            if edge_score == 0.0:
+                saw_zero = True
+            product *= edge_score
+        if not saw_zero and product < self._MOTIF_SCORE_EPSILON:
+            product = self._MOTIF_SCORE_EPSILON
+        return {"score": product, "breakdown": breakdown}
+
+    def _rank_motifs(
+        self,
+        all_seeds: list[str],
+        pattern_id: str,
+        motif_type: str,
+        window: int,
+        min_k: int | None,
+        amt1_min: float = 10000.0,
+        amt2_max: float = 10000.0,
+    ) -> list[dict[str, Any]]:
+        graph_pid = self._resolve_motif_graph_pid(pattern_id)
+        version = self._resolve_version(pattern_id)
+        adj = self._storage.get_adjacency(graph_pid)
+        if adj.edge_count() == 0:
+            return []
+        pair_counts = adj.pair_counts()
+        window_sec = float(window) * 3600.0
+        effective_min_k = min_k if (motif_type == "fan_out" and min_k is not None) else 3
+
+        active_seeds = self._active_seeds_for_motif(
+            adj, all_seeds, motif_type, effective_min_k,
+            amt1_min=amt1_min,
+        )
+
+        instances: list[dict[str, Any]] = []
+        seen_rings: set[tuple[str, ...]] = set()
+        for seed in active_seeds:
+            if motif_type == "fan_out":
+                found = self._enum_fan_out_via_adj(seed, adj, window_sec, effective_min_k)
+            elif motif_type == "cycle_2":
+                found = self._enum_cycle_2_via_adj(seed, adj, window_sec)
+            elif motif_type == "cycle_3":
+                found = self._enum_cycle_3_via_adj(seed, adj, window_sec)
+            elif motif_type == "structuring":
+                found = self._enum_structuring_via_adj(
+                    seed, adj, window_sec, amt1_min, amt2_max,
+                )
+            else:
+                found = []
+            for inst in found:
+                if motif_type == "cycle_3":
+                    ring = tuple(sorted(inst["ring"]))
+                    if ring in seen_rings:
+                        continue
+                    seen_rings.add(ring)
+                elif motif_type == "cycle_2":
+                    pair = tuple(sorted([inst["seed"], inst["counterparty"]]))
+                    if pair in seen_rings:
+                        continue
+                    seen_rings.add(pair)
+                elif motif_type == "structuring":
+                    canonical = tuple(inst["path"])
+                    if canonical in seen_rings:
+                        continue
+                    seen_rings.add(canonical)
+                instances.append(inst)
+
+        all_endpoint_keys: set[str] = set()
+        for inst in instances:
+            for (u, v) in inst["edges"]:
+                all_endpoint_keys.add(u)
+                all_endpoint_keys.add(v)
+        delta_map = self._batch_read_deltas(pattern_id, version, all_endpoint_keys)
+
+        scored: list[dict[str, Any]] = []
+        for inst in instances:
+            sc = self._lean_score_motif(inst["edges"], delta_map, pair_counts)
+            if sc is None:
+                continue
+            scored.append({**inst, **sc})
+        scored.sort(key=lambda r: -r["score"])
+        n = len(scored)
+        if n > 0:
+            p95_idx = max(0, int(n * 0.05) - 1)
+            p95_threshold = scored[p95_idx]["score"] if p95_idx < n else scored[0]["score"]
+            for i, r in enumerate(scored):
+                r["score_rank_pct"] = round(100.0 * (n - i) / n, 2)
+                r["is_high_potential"] = bool(r["score"] >= p95_threshold)
+        return scored
+
+    @staticmethod
+    def _active_seeds_for_motif(
+        adj: "AdjacencyIndex",
+        all_seeds: list[str],
+        motif_type: str,
+        effective_min_k: int,
+        amt1_min: float = 10000.0,
+    ) -> list[str]:
+        all_seeds_set = set(all_seeds)
+        if motif_type in {"cycle_2", "cycle_3"}:
+            return [
+                s for s in (set(adj._out.keys()) & set(adj._in.keys()))
+                if s in all_seeds_set
+            ]
+        if motif_type == "fan_out":
+            return [
+                s for s in all_seeds_set
+                if s in adj._out
+                and len({t for (t, *_r) in adj._out[s] if t != s}) >= effective_min_k
+            ]
+        if motif_type == "structuring":
+            return [
+                s for s in all_seeds_set
+                if s in adj._out
+                and any(
+                    amt is not None and amt >= amt1_min and t != s
+                    for (t, _ts, amt, _ek) in adj._out[s]
+                )
+            ]
+        return [s for s in all_seeds if s in adj._out]
+
+    @staticmethod
+    def _enum_fan_out_via_adj(
+        seed: str,
+        adj: "AdjacencyIndex",
+        window_sec: float,
+        min_k: int,
+    ) -> list[dict[str, Any]]:
+        edges = adj.neighbors_out(seed)
+        if not edges:
+            return []
+        max_ts = max(ts for (_, ts, *_r) in edges)
+        recent = [
+            (t, ts) for (t, ts, *_r) in edges
+            if t != seed and ts >= max_ts - window_sec
+        ]
+        unique = sorted({t for (t, _) in recent})
+        if len(unique) < min_k:
+            return []
+        return [{
+            "motif_type": "fan_out",
+            "seed": seed,
+            "k": len(unique),
+            "edges": [(seed, t) for t in unique],
+        }]
+
+    @staticmethod
+    def _enum_cycle_2_via_adj(
+        seed: str,
+        adj: "AdjacencyIndex",
+        window_sec: float,
+    ) -> list[dict[str, Any]]:
+        out_edges = adj.neighbors_out(seed)
+        in_edges = adj.neighbors_in(seed)
+        if not out_edges or not in_edges:
+            return []
+        out_by_cp: dict[str, list[float]] = defaultdict(list)
+        for (t, ts, *_r) in out_edges:
+            if t != seed:
+                out_by_cp[t].append(ts)
+        in_by_cp: dict[str, list[float]] = defaultdict(list)
+        for (f, ts, *_r) in in_edges:
+            if f != seed:
+                in_by_cp[f].append(ts)
+        results: list[dict[str, Any]] = []
+        for cp in set(out_by_cp) & set(in_by_cp):
+            closest = min(abs(a - b) for a in out_by_cp[cp] for b in in_by_cp[cp])
+            if closest > window_sec:
+                continue
+            results.append({
+                "motif_type": "cycle_2",
+                "seed": seed,
+                "counterparty": cp,
+                "edges": [(seed, cp), (cp, seed)],
+            })
+        return results
+
+    @staticmethod
+    def _enum_cycle_3_via_adj(
+        seed: str,
+        adj: "AdjacencyIndex",
+        window_sec: float,
+        max_triads: int = 50,
+    ) -> list[dict[str, Any]]:
+        out_from_seed = adj.neighbors_out(seed)
+        if not out_from_seed:
+            return []
+        seed_to_b: dict[str, list[float]] = defaultdict(list)
+        for (b, ts, *_r) in out_from_seed:
+            if b != seed:
+                seed_to_b[b].append(ts)
+        triads: list[dict[str, Any]] = []
+        for b, ts_ab_list in seed_to_b.items():
+            for (c, ts_bc, *_r) in adj.neighbors_out(b):
+                if c == seed or c == b:
+                    continue
+                closing = [ts for (x, ts, *_r) in adj.neighbors_out(c) if x == seed]
+                if not closing:
+                    continue
+                best: tuple[float, float, float] | None = None
+                for t_ab in ts_ab_list:
+                    if ts_bc <= t_ab:
+                        continue
+                    for t_ca in closing:
+                        if t_ca <= ts_bc:
+                            continue
+                        if t_ca - t_ab > window_sec:
+                            continue
+                        if best is None or (t_ca - t_ab) < (best[2] - best[0]):
+                            best = (t_ab, ts_bc, t_ca)
+                if best is None:
+                    continue
+                triads.append({
+                    "motif_type": "cycle_3",
+                    "seed": seed,
+                    "ring": [seed, b, c],
+                    "edges": [(seed, b), (b, c), (c, seed)],
+                    "timestamps": list(best),
+                })
+                if len(triads) >= max_triads:
+                    return triads
+        return triads
+
+    @staticmethod
+    def _enum_structuring_via_adj(
+        seed: str,
+        adj: "AdjacencyIndex",
+        window_sec: float,
+        amt1_min: float,
+        amt2_max: float,
+        max_instances: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Open 3-hop chain A→B→C→D with amount gating and strict temporal ordering.
+
+        hop1 (A→B) amount >= amt1_min, hop2 (B→C) and hop3 (C→D) amount <= amt2_max.
+        ts_ab < ts_bc < ts_cd, total span ts_cd - ts_ab <= window_sec. Self-visits
+        rejected (D, C ∉ visited path prefix).
+        """
+        out1 = adj.neighbors_out(seed)
+        # Guard NULL / non-positive amounts. EDGE_TABLE_SCHEMA declares amount
+        # as nullable pa.float64, and some producers emit signed amounts
+        # (refunds/reversals as negative). Structuring is a positive money
+        # flow by definition — treating NULL or ≤ 0 as if zero would falsely
+        # pass the "≤ amt2_max" small-hop predicate. Skip both at every hop.
+        large_first = [
+            (b, ts, amt)
+            for (b, ts, amt, _ek) in out1
+            if b != seed
+            and amt is not None and amt > 0
+            and amt >= amt1_min
+        ]
+        if not large_first:
+            return []
+
+        results: list[dict[str, Any]] = []
+        for (b, ts_ab, amt_ab) in large_first:
+            for (c, ts_bc, amt_bc, _ek_bc) in adj.neighbors_out(b):
+                if c == seed or c == b:
+                    continue
+                if ts_bc <= ts_ab or ts_bc - ts_ab > window_sec:
+                    continue
+                if amt_bc is None or amt_bc <= 0 or amt_bc > amt2_max:
+                    continue
+                for (d, ts_cd, amt_cd, _ek_cd) in adj.neighbors_out(c):
+                    if d == seed or d == b or d == c:
+                        continue
+                    if ts_cd <= ts_bc or ts_cd - ts_ab > window_sec:
+                        continue
+                    if amt_cd is None or amt_cd <= 0 or amt_cd > amt2_max:
+                        continue
+                    results.append({
+                        "motif_type": "structuring",
+                        "seed": seed,
+                        "path": [seed, b, c, d],
+                        "edges": [(seed, b), (b, c), (c, d)],
+                        "timestamps": [ts_ab, ts_bc, ts_cd],
+                        "amounts": [amt_ab, amt_bc, amt_cd],
+                    })
+                    if len(results) >= max_instances:
+                        return results
+        return results
+
+    def _resolve_motif_graph_pid(self, pattern_id: str) -> str:
+        """Return the graph companion pattern_id for motif enumeration."""
+        sphere = self._storage.read_sphere()
+        if pattern_id not in sphere.patterns:
+            raise GDSNavigationError(f"Pattern '{pattern_id}' not found in sphere.")
+        pattern = sphere.patterns[pattern_id]
+        if pattern.pattern_type == "anchor":
+            graph_pid = self._resolve_edge_pattern_for_anchor(pattern_id)
+            if graph_pid is None:
+                raise GDSNavigationError(
+                    f"Anchor pattern '{pattern_id}' has no event pattern companion "
+                    f"with an edge table; motif analysis requires one.",
+                )
+            return graph_pid
+        if pattern.pattern_type == "event" and self._storage.has_edge_table(pattern_id):
+            return pattern_id
+        raise GDSNavigationError(
+            f"Pattern '{pattern_id}' has no graph companion; motif analysis "
+            f"requires an event pattern with an edge table.",
+        )
+
+    def _enumerate_fan_out(
+        self,
+        seed: str,
+        pattern_id: str,
+        time_window_hours: int,
+        min_k: int = 3,
+        **_kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        """Hub → k distinct targets within a sliding time window.
+
+        Selects the window [max_ts - H, max_ts] where max_ts is the most
+        recent outgoing tx of the seed. Returns at most one motif (the
+        "recent burst" interpretation — matches AML flash-fan-out semantics).
+        """
+        graph_pid = self._resolve_motif_graph_pid(pattern_id)
+        edges = self._storage.read_edges(graph_pid, from_keys=[seed])
+        if edges.num_rows == 0:
+            return []
+        if time_window_hours is not None and "timestamp" in edges.schema.names:
+            ts = np.asarray(edges["timestamp"].to_pylist(), dtype=np.int64)
+            if ts.size:
+                max_ts = int(ts.max())
+                window_us = int(time_window_hours * 3600 * 1_000_000)
+                mask = ts >= (max_ts - window_us)
+                edges = edges.filter(pa.array(mask))
+        targets = [t for t in edges["to_key"].to_pylist() if t != seed]
+        unique = sorted(set(targets))
+        if len(unique) < min_k:
+            return []
+        return [{
+            "motif_type": "fan_out",
+            "seed": seed,
+            "k": len(unique),
+            "edges": [(seed, t) for t in unique],
+        }]
+
+    def _enumerate_cycle_2(
+        self,
+        seed: str,
+        pattern_id: str,
+        time_window_hours: int,
+        counterparty: str | None = None,
+        **_kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        """Bidirectional pair (A ↔ B) with both directions within ``time_window_hours``."""
+        graph_pid = self._resolve_motif_graph_pid(pattern_id)
+        out_edges = self._storage.read_edges(graph_pid, from_keys=[seed])
+        in_edges = self._storage.read_edges(graph_pid, to_keys=[seed])
+        if out_edges.num_rows == 0 or in_edges.num_rows == 0:
+            return []
+        window_us = int(time_window_hours * 3600 * 1_000_000)
+        out_by_target: dict[str, list[int]] = defaultdict(list)
+        for to_key, ts in zip(
+            out_edges["to_key"].to_pylist(),
+            out_edges["timestamp"].to_pylist() if "timestamp" in out_edges.schema.names else [0] * out_edges.num_rows,
+        ):
+            if to_key == seed:
+                continue
+            out_by_target[to_key].append(int(ts) if ts is not None else 0)
+        in_by_source: dict[str, list[int]] = defaultdict(list)
+        for from_key, ts in zip(
+            in_edges["from_key"].to_pylist(),
+            in_edges["timestamp"].to_pylist() if "timestamp" in in_edges.schema.names else [0] * in_edges.num_rows,
+        ):
+            if from_key == seed:
+                continue
+            in_by_source[from_key].append(int(ts) if ts is not None else 0)
+        results: list[dict[str, Any]] = []
+        candidates = set(out_by_target) & set(in_by_source)
+        if counterparty is not None:
+            candidates &= {counterparty}
+        for cp in sorted(candidates):
+            ts_out = out_by_target[cp]
+            ts_in = in_by_source[cp]
+            closest_span = min(
+                abs(a - b) for a in ts_out for b in ts_in
+            )
+            if closest_span > window_us:
+                continue
+            results.append({
+                "motif_type": "cycle_2",
+                "seed": seed,
+                "counterparty": cp,
+                "edges": [(seed, cp), (cp, seed)],
+            })
+        return results
+
+    def _enumerate_cycle_3(
+        self,
+        seed: str,
+        pattern_id: str,
+        time_window_hours: int,
+        max_triads: int = 50,
+        **_kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        """Directed triad A→B→C→A with strictly monotonic timestamps within window."""
+        graph_pid = self._resolve_motif_graph_pid(pattern_id)
+        out_from_seed = self._storage.read_edges(graph_pid, from_keys=[seed])
+        if out_from_seed.num_rows == 0:
+            return []
+        has_ts = "timestamp" in out_from_seed.schema.names
+        window_us = int(time_window_hours * 3600 * 1_000_000)
+
+        seed_to_b: dict[str, list[int]] = defaultdict(list)
+        for b, ts in zip(
+            out_from_seed["to_key"].to_pylist(),
+            out_from_seed["timestamp"].to_pylist() if has_ts else [0] * out_from_seed.num_rows,
+        ):
+            if b == seed:
+                continue
+            seed_to_b[b].append(int(ts) if ts is not None else 0)
+
+        b_keys = list(seed_to_b.keys())
+        if not b_keys:
+            return []
+        out_from_bs = self._storage.read_edges(graph_pid, from_keys=b_keys)
+        if out_from_bs.num_rows == 0:
+            return []
+        b_to_c: dict[tuple[str, str], list[int]] = defaultdict(list)
+        for from_b, to_c, ts in zip(
+            out_from_bs["from_key"].to_pylist(),
+            out_from_bs["to_key"].to_pylist(),
+            out_from_bs["timestamp"].to_pylist() if has_ts else [0] * out_from_bs.num_rows,
+        ):
+            if to_c == seed or to_c == from_b:
+                continue
+            b_to_c[(from_b, to_c)].append(int(ts) if ts is not None else 0)
+
+        c_candidates = {c for (_b, c) in b_to_c.keys()}
+        if not c_candidates:
+            return []
+        close_back = self._storage.read_edges(
+            graph_pid, from_keys=list(c_candidates), to_keys=[seed],
+        )
+        c_to_seed: dict[str, list[int]] = defaultdict(list)
+        for c, ts in zip(
+            close_back["from_key"].to_pylist(),
+            close_back["timestamp"].to_pylist() if has_ts else [0] * close_back.num_rows,
+        ):
+            c_to_seed[c].append(int(ts) if ts is not None else 0)
+
+        triads: list[dict[str, Any]] = []
+        for (b, c), ts_bc_list in b_to_c.items():
+            if c not in c_to_seed:
+                continue
+            ts_ab_list = seed_to_b[b]
+            ts_ca_list = c_to_seed[c]
+            # Look for (ts_ab < ts_bc < ts_ca) with ts_ca - ts_ab <= window.
+            best: tuple[int, int, int] | None = None
+            for t_ab in ts_ab_list:
+                for t_bc in ts_bc_list:
+                    if t_bc <= t_ab:
+                        continue
+                    for t_ca in ts_ca_list:
+                        if t_ca <= t_bc:
+                            continue
+                        if t_ca - t_ab > window_us:
+                            continue
+                        if best is None or (t_ca - t_ab) < (best[2] - best[0]):
+                            best = (t_ab, t_bc, t_ca)
+            if best is None:
+                continue
+            triads.append({
+                "motif_type": "cycle_3",
+                "seed": seed,
+                "ring": [seed, b, c],
+                "edges": [(seed, b), (b, c), (c, seed)],
+                "timestamps": list(best),
+            })
+            if len(triads) >= max_triads:
+                break
+        return triads
+
+    def _enumerate_structuring(
+        self,
+        seed: str,
+        pattern_id: str,
+        time_window_hours: int,
+        max_instances: int = 50,
+        amt1_min: float = 10000.0,
+        amt2_max: float = 10000.0,
+        **_kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        """Single-seed enumeration of structuring A→B→C→D via BTREE read_edges.
+
+        Mirrors the _enumerate_cycle_3 pattern (single-seed path used by
+        score_motif). For ranking across all seeds, use _enum_structuring_via_adj.
+        """
+        graph_pid = self._resolve_motif_graph_pid(pattern_id)
+        out_from_seed = self._storage.read_edges(graph_pid, from_keys=[seed])
+        if out_from_seed.num_rows == 0:
+            return []
+        has_ts = "timestamp" in out_from_seed.schema.names
+        has_amt = "amount" in out_from_seed.schema.names
+        if not has_amt:
+            raise GDSNavigationError(
+                "structuring motif requires edge table with an amount column.",
+            )
+        window_sec = float(time_window_hours) * 3600.0
+
+        ab_rows = list(zip(
+            out_from_seed["to_key"].to_pylist(),
+            out_from_seed["timestamp"].to_pylist() if has_ts else [0.0] * out_from_seed.num_rows,
+            out_from_seed["amount"].to_pylist(),
+        ))
+        large_first = [
+            (b, float(ts) if ts is not None else 0.0, float(amt))
+            for (b, ts, amt) in ab_rows
+            if b != seed
+            and amt is not None and float(amt) > 0
+            and float(amt) >= amt1_min
+        ]
+        if not large_first:
+            return []
+
+        b_keys = sorted({b for (b, _ts, _amt) in large_first})
+        out_from_bs = self._storage.read_edges(graph_pid, from_keys=b_keys)
+        if out_from_bs.num_rows == 0:
+            return []
+        bc_rows = list(zip(
+            out_from_bs["from_key"].to_pylist(),
+            out_from_bs["to_key"].to_pylist(),
+            out_from_bs["timestamp"].to_pylist() if has_ts else [0.0] * out_from_bs.num_rows,
+            out_from_bs["amount"].to_pylist(),
+        ))
+
+        c_candidates = {c for (_b, c, _ts, _amt) in bc_rows if c != seed}
+        if not c_candidates:
+            return []
+        out_from_cs = self._storage.read_edges(graph_pid, from_keys=list(c_candidates))
+        if out_from_cs.num_rows == 0:
+            return []
+        cd_rows = list(zip(
+            out_from_cs["from_key"].to_pylist(),
+            out_from_cs["to_key"].to_pylist(),
+            out_from_cs["timestamp"].to_pylist() if has_ts else [0.0] * out_from_cs.num_rows,
+            out_from_cs["amount"].to_pylist(),
+        ))
+
+        results: list[dict[str, Any]] = []
+        for (b, ts_ab, amt_ab) in large_first:
+            for (from_b, c, ts_bc_raw, amt_bc_raw) in bc_rows:
+                if from_b != b:
+                    continue
+                if c == seed or c == b:
+                    continue
+                # NULL / non-positive amount on a small-amount hop cannot
+                # pass the "≤ amt2_max" predicate (refunds and NULLs are not
+                # structuring). Skip rather than falsely matching.
+                if amt_bc_raw is None:
+                    continue
+                ts_bc = float(ts_bc_raw) if ts_bc_raw is not None else 0.0
+                amt_bc = float(amt_bc_raw)
+                if amt_bc <= 0:
+                    continue
+                if ts_bc <= ts_ab or ts_bc - ts_ab > window_sec:
+                    continue
+                if amt_bc > amt2_max:
+                    continue
+                for (from_c, d, ts_cd_raw, amt_cd_raw) in cd_rows:
+                    if from_c != c:
+                        continue
+                    if d == seed or d == b or d == c:
+                        continue
+                    if amt_cd_raw is None:
+                        continue
+                    ts_cd = float(ts_cd_raw) if ts_cd_raw is not None else 0.0
+                    amt_cd = float(amt_cd_raw)
+                    if amt_cd <= 0:
+                        continue
+                    if ts_cd <= ts_bc or ts_cd - ts_ab > window_sec:
+                        continue
+                    if amt_cd > amt2_max:
+                        continue
+                    results.append({
+                        "motif_type": "structuring",
+                        "seed": seed,
+                        "path": [seed, b, c, d],
+                        "edges": [(seed, b), (b, c), (c, d)],
+                        "timestamps": [ts_ab, ts_bc, ts_cd],
+                        "amounts": [amt_ab, amt_bc, amt_cd],
+                    })
+                    if len(results) >= max_instances:
+                        return results
+        return results
+
     def _existing_neighbors(
         self,
         primary_key: str,
@@ -4047,6 +5219,7 @@ class GDSNavigator:
         line_id_filter: str | None = None,
         fdr_alpha: float | None = None,
         fdr_method: str = "bh",
+        p_value_method: str = "rank",
         select: str = "top_norm",
     ) -> list[tuple[str, int, float]]:
         """π7 — Find entities with highest geometric connectivity (hub score).
@@ -4060,9 +5233,9 @@ class GDSNavigator:
 
         Use line_id_filter to rank by edges to a specific line only.
         """
-        if fdr_method != "bh":
-            raise NotImplementedError(
-                f"Only fdr_method='bh' is supported, got {fdr_method!r}"
+        if fdr_method not in ("bh", "storey"):
+            raise ValueError(
+                f"fdr_method must be 'bh' or 'storey', got {fdr_method!r}"
             )
         version = self._resolve_version(pattern_id)
         sphere = self._storage.read_sphere()
@@ -4155,7 +5328,7 @@ class GDSNavigator:
             p_values = np.array(
                 [(N - i) / N for i in range(N)], dtype=np.float64,
             )
-            rejected, q_values = benjamini_hochberg(p_values, fdr_alpha)
+            rejected, q_values = benjamini_hochberg(p_values, fdr_alpha, method=fdr_method)
             results = [
                 r for r, keep in zip(results, rejected) if keep
             ]
@@ -4267,6 +5440,7 @@ class GDSNavigator:
         line_id_filter: str | None = None,
         fdr_alpha: float | None = None,
         fdr_method: str = "bh",
+        p_value_method: str = "rank",
         select: str = "top_norm",
     ) -> tuple[list[tuple[str, int, float, float | None]], dict]:
         """π7 variant — returns (top_n_results, score_stats) in ONE geometry scan.
@@ -4277,9 +5451,9 @@ class GDSNavigator:
         hub_score_pct is the score as a percentage of max_hub_score (None in binary mode).
         stats dict includes max_hub_score for continuous patterns.
         """
-        if fdr_method != "bh":
-            raise NotImplementedError(
-                f"Only fdr_method='bh' is supported, got {fdr_method!r}"
+        if fdr_method not in ("bh", "storey"):
+            raise ValueError(
+                f"fdr_method must be 'bh' or 'storey', got {fdr_method!r}"
             )
         version = self._resolve_version(pattern_id)
         sphere = self._storage.read_sphere()
@@ -4339,7 +5513,7 @@ class GDSNavigator:
                 dtype=np.float64,
             )
             p_values = empirical_p_values_from_rank(rank_pcts)
-            rejected, q_values = benjamini_hochberg(p_values, fdr_alpha)
+            rejected, q_values = benjamini_hochberg(p_values, fdr_alpha, method=fdr_method)
             results = [
                 r for r, keep in zip(results, rejected) if keep
             ]
@@ -4444,13 +5618,23 @@ class GDSNavigator:
         rank_by_dimension: str | None = None,
         fdr_alpha: float | None = None,
         fdr_method: str = "bh",
+        p_value_method: str = "rank",
         select: str = "top_norm",
     ) -> list[dict]:
-        """π9 — Find entities with highest geometric drift (temporal velocity).
+        """π9 — Find entities with highest geometric drift (temporal velocity and direction).
 
         Scans anchor pattern population, reads all temporal history in one pass,
-        computes displacement (||delta_last - delta_first||) and path length
-        (Σ ||delta[i+1] - delta[i]||). Returns top_n ranked by displacement DESC.
+        computes displacement (||delta_last - delta_first||), path length
+        (Σ ||delta[i+1] - delta[i]||), and direction of drift relative to the
+        null centre. Returns top_n ranked by displacement DESC.
+
+        Two direction fields are attached per entity:
+          - gradient_alignment ∈ [-1, 1] — radially-inward component of the
+            drift vector. +1 means the entity is moving perfectly toward the
+            null centre (normalising), -1 means moving perfectly away
+            (deteriorating), 0 means tangential motion at constant radius.
+          - drift_direction ∈ {"normalizing", "deteriorating", "neutral"} —
+            label derived from gradient_alignment with soft cutoffs at ±0.3.
 
         Only works on anchor patterns — event patterns have no temporal history.
         Use filters={"timestamp_from": "2024-01-01", "timestamp_to": "2026-01-01"}
@@ -4466,9 +5650,9 @@ class GDSNavigator:
         dimension_diffs and dimension_diffs_current still include prop_columns as
         informational context so agents can see property acquisition separately.
         """
-        if fdr_method != "bh":
-            raise NotImplementedError(
-                f"Only fdr_method='bh' is supported, got {fdr_method!r}"
+        if fdr_method not in ("bh", "storey"):
+            raise ValueError(
+                f"fdr_method must be 'bh' or 'storey', got {fdr_method!r}"
             )
         import random
 
@@ -4616,6 +5800,25 @@ class GDSNavigator:
             path_length = float(np.sqrt(np.einsum('ij,ij->i', step_diffs, step_diffs)).sum())
             ratio = displacement / path_length if path_length > 0 else 0.0
 
+            # Gradient alignment: radially-inward component of the drift vector.
+            # +1 → drift aimed at null centre (normalising),
+            #  0 → tangential (constant radius),
+            # -1 → pure outward drift (deteriorating).
+            _first_norm = float(np.linalg.norm(delta_first[:n_rel]))
+            if displacement > 1e-9 and _first_norm > 1e-9:
+                _gradient_alignment = float(
+                    -np.dot(diff[:n_rel], delta_first[:n_rel])
+                    / (displacement * _first_norm)
+                )
+            else:
+                _gradient_alignment = 0.0
+            if _gradient_alignment > 0.3:
+                _drift_direction = "normalizing"
+            elif _gradient_alignment < -0.3:
+                _drift_direction = "deteriorating"
+            else:
+                _drift_direction = "neutral"
+
             _rel_deltas = all_deltas[:, :n_rel]
             delta_norms = np.sqrt(np.einsum('ij,ij->i', _rel_deltas, _rel_deltas))
             if n >= 3:
@@ -4645,6 +5848,8 @@ class GDSNavigator:
                 },
                 "path_length": round(path_length, 4),
                 "ratio": round(ratio, 4),
+                "gradient_alignment": round(_gradient_alignment, 4),
+                "drift_direction": _drift_direction,
                 "num_slices": n,
                 "first_timestamp": self._us_to_iso(t_ts_us[start]),
                 "last_timestamp": self._us_to_iso(t_ts_us[end - 1]),
@@ -4747,7 +5952,7 @@ class GDSNavigator:
                 dtype=np.float64,
             )
             p_values = empirical_p_values_from_rank(rank_pcts)
-            rejected, q_values = benjamini_hochberg(p_values, fdr_alpha)
+            rejected, q_values = benjamini_hochberg(p_values, fdr_alpha, method=fdr_method)
             for row, q in zip(results, q_values):
                 row["q_value"] = float(q)
             results = [row for row, keep in zip(results, rejected) if keep]
@@ -7829,6 +9034,559 @@ class GDSNavigator:
 
         return explanation
 
+    def trace_root_cause(
+        self,
+        primary_key: str,
+        pattern_id: str,
+        max_depth: int = 2,
+        max_branches: int = 3,
+        *,
+        hub_pop_limit: int = 50_000,
+        contagion_min_threshold: float = 0.10,
+        contagion_min_counterparties: int = 3,
+        max_total_nodes: int = 50,
+        edge_counterparty_top_n: int = 1,
+        branches_enabled: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Multi-hop root-cause DAG for an anomalous entity.
+
+        Composes ``explain_anomaly`` (root + top dimensions),
+        ``find_counterparties`` (edge-derived witness follow — sorted by
+        anomaly, not by transaction volume), ``contagion_score`` (neighbour
+        anomaly fraction with explicit anomalous counterparty keys), and
+        ``π7_attract_hub`` (hub concentration signal) into one bounded DAG.
+        Replaces the former linear ``explain_anomaly_chain``.
+
+        Severity uses one scale for every node:
+        ``"normal" < "low" < "moderate" < "high" < "critical" < "extreme"``.
+        Contagion grading: < ``contagion_min_threshold`` → no branch, then
+        ``low`` (>= threshold), ``moderate`` (>= 0.25), ``high`` (>= 0.50),
+        ``critical`` (>= 0.75).
+
+        Per-node candidates (contagion, edge-counterparty, hub) are collected,
+        scored by unified severity strength, then the top ``max_branches`` are
+        kept — the tree is not FIFO-ordered.  ``truncated`` is set only when at
+        least one candidate was dropped because of the cap.  A hard
+        ``max_total_nodes`` cap guards against recursion blowups.
+
+        Args:
+            primary_key: anomalous entity to trace.
+            pattern_id: pattern it lives in.
+            max_depth: hops away from the root to expand. 0 = root only.
+            max_branches: max children kept per node after priority sort.
+            hub_pop_limit: skip hub branch when the pattern has more than this
+                many entities (π7 is O(n), not worth it on 500k+ populations).
+            contagion_min_threshold: minimum contagion score for the branch to
+                be attached at all. Set to 0.0 to always attach when the entity
+                has counterparties; set above 0.5 to keep only high-signal.
+            max_total_nodes: hard cap on nodes expanded across the whole DAG.
+
+        Returns a wrapper dict:
+            {
+                "root": nested RootCauseNode dict,
+                "summary": str,
+                "hop_count": int,
+                "branches_explored": int,
+                "truncated": bool,
+            }
+        """
+        sphere = self._storage.read_sphere()
+        if pattern_id not in sphere.patterns:
+            raise GDSNavigationError(f"Pattern '{pattern_id}' not found in sphere.")
+        pattern = sphere.patterns[pattern_id]
+
+        # Resolve graph companion — the event pattern carrying the actual edge
+        # table for an anchor pattern. Continuous-mode anchors cannot answer
+        # counterparty / contagion queries directly; their graph lives in a
+        # paired event pattern. Fall back to the pattern itself when it is an
+        # event pattern with its own edges, or None when no graph is usable.
+        graph_pid: str | None = None
+        try:
+            if pattern.pattern_type == "anchor":
+                graph_pid = self._resolve_edge_pattern_for_anchor(pattern_id)
+            elif pattern.pattern_type == "event" and self._storage.has_edge_table(pattern_id):
+                graph_pid = pattern_id
+        except (*_NAVIGATION_RECOVERABLE_ERRORS, GDSError):
+            graph_pid = None
+        home_line = sphere.entity_line(pattern_id) if hasattr(sphere, "entity_line") else None
+
+        # Version-keyed hub cache — invalidates automatically across rebuilds.
+        try:
+            pattern_version = self._resolve_version(pattern_id)
+        except (*_NAVIGATION_RECOVERABLE_ERRORS, GDSError):
+            pattern_version = 0
+
+        # Unified severity scale used by every node in the DAG.
+        # The legacy "medium" label from explain_anomaly is mapped to "moderate"
+        # so the whole tree speaks one vocabulary.
+        _SEVERITY_STRENGTH = {
+            "normal": 0,
+            "low": 1,
+            "medium": 2,
+            "moderate": 2,
+            "high": 3,
+            "critical": 4,
+            "extreme": 5,
+        }
+
+        def _normalise_severity(sev: str) -> str:
+            return "moderate" if sev == "medium" else sev
+
+        # Session-scope (navigator-instance) caches keyed by (pattern_version, entity).
+        # Survive across multiple trace_root_cause calls within one session — critical
+        # for agent investigation flows that hit the same counterparty repeatedly.
+        # Hub cache already lives at self._trace_hub_cache with version keying.
+        # LRU cap — 2000 entries per cache, evict oldest on overflow. Protects
+        # against long agent sessions touching 10k+ entities.
+        _LRU_MAX = 2000
+        if not hasattr(self, "_trace_contagion_cache"):
+            self._trace_contagion_cache: dict[tuple[str, int, str], dict[str, Any] | None] = {}
+        if not hasattr(self, "_trace_cps_cache"):
+            self._trace_cps_cache: dict[tuple[str, int, str], list[dict[str, Any]]] = {}
+        if not hasattr(self, "_trace_cp_ledger"):
+            # Cross-call ledger: entity_key -> set of entity_keys that listed it
+            # as an anomalous counterparty in their trace. Exposes inter-call
+            # clique signals without requiring the agent to diff multiple trees.
+            self._trace_cp_ledger: dict[tuple[str, int, str], set[str]] = {}
+
+        def _lru_put(cache: dict, key: Any, value: Any) -> None:
+            if key in cache:
+                return  # already present
+            if len(cache) >= _LRU_MAX:
+                # Evict oldest — dict preserves insertion order in py3.7+.
+                cache.pop(next(iter(cache)))
+            cache[key] = value
+
+        _contagion_cache = self._trace_contagion_cache
+        _cps_cache = self._trace_cps_cache
+        _cp_ledger = self._trace_cp_ledger
+        # Cache key format: (graph_pid, version, entity_key) — version invalidates
+        # automatically on rebuild.
+
+        # Validate branches_enabled — typos like ["kubelek"] would silently
+        # disable all branches, which is a user-hostile failure mode.
+        _VALID_BRANCHES = {"edge_counterparty", "neighbor_contamination", "hub"}
+        if branches_enabled is not None:
+            invalid = set(branches_enabled) - _VALID_BRANCHES
+            if invalid:
+                raise GDSNavigationError(
+                    f"branches_enabled contains invalid values: {sorted(invalid)}. "
+                    f"Valid options: {sorted(_VALID_BRANCHES)}."
+                )
+        _enabled_branches = set(branches_enabled) if branches_enabled else _VALID_BRANCHES
+
+        def _grade_contagion(score: float) -> str | None:
+            if score < contagion_min_threshold:
+                return None
+            if score >= 0.75:
+                return "critical"
+            if score >= 0.50:
+                return "high"
+            if score >= 0.25:
+                return "moderate"
+            return "low"
+
+        visited: set[str] = set()
+        stats = {"hop_count": 0, "branches_explored": 0, "truncated": False}
+
+        def _node_to_dict(node: RootCauseNode) -> dict[str, Any]:
+            return {
+                "entity_key": node.entity_key,
+                "role": node.role,
+                "severity": node.severity,
+                "evidence": node.evidence,
+                "children": [_node_to_dict(c) for c in node.children],
+            }
+
+        def _expand(
+            entity_key: str,
+            depth_remaining: int,
+            role: str,
+            inherited_evidence: dict[str, Any] | None = None,
+        ) -> RootCauseNode:
+            if entity_key in visited:
+                return RootCauseNode(
+                    entity_key=entity_key,
+                    role=role,
+                    severity="normal",
+                    evidence={"cycle": True, **(inherited_evidence or {})},
+                    children=[],
+                )
+            visited.add(entity_key)
+            stats["hop_count"] += 1
+
+            try:
+                explanation = self.explain_anomaly(entity_key, pattern_id)
+            except (*_NAVIGATION_RECOVERABLE_ERRORS, GDSError):
+                return RootCauseNode(
+                    entity_key=entity_key,
+                    role=role,
+                    severity="normal",
+                    evidence={"explain_failed": True, **(inherited_evidence or {})},
+                    children=[],
+                )
+
+            severity = _normalise_severity(explanation.get("severity", "normal"))
+            top_dims = explanation.get("top_dimensions", [])[:max_branches]
+            evidence: dict[str, Any] = {
+                "top_dimensions": top_dims,
+                "delta_norm": explanation.get("delta_norm"),
+                "conformal_p": explanation.get("conformal_p"),
+            }
+            if inherited_evidence:
+                evidence.update(inherited_evidence)
+
+            if (
+                severity == "normal"
+                or not top_dims
+                or depth_remaining <= 0
+                or stats["hop_count"] >= max_total_nodes
+            ):
+                if stats["hop_count"] >= max_total_nodes:
+                    stats["truncated"] = True
+                return RootCauseNode(
+                    entity_key=entity_key,
+                    role=role,
+                    severity=severity,
+                    evidence=evidence,
+                    children=[],
+                )
+
+            # ---- Build candidate list (not yet filtered by max_branches) ----
+            # Each candidate is (strength: int, builder: Callable[[], RootCauseNode]).
+            # Callers that actually recurse (edge_counterparty) are deferred so
+            # recursion only runs for selected candidates — prevents wasted work.
+            candidates: list[tuple[int, Any]] = []
+
+            # --- Candidate: neighbor_contamination ---
+            contagion_data: dict[str, Any] | None = None
+            cps_data: list[dict[str, Any]] = []
+            if graph_pid is not None:
+                # contagion_score cache: one 27s scan per entity max per session.
+                cache_key = (graph_pid, pattern_version, entity_key)
+                if cache_key in _contagion_cache:
+                    contagion_data = _contagion_cache[cache_key]
+                else:
+                    try:
+                        contagion_data = self.contagion_score(entity_key, graph_pid)
+                    except (*_NAVIGATION_RECOVERABLE_ERRORS, GDSError):
+                        contagion_data = None
+                    _lru_put(_contagion_cache, cache_key, contagion_data)
+
+                # find_counterparties cache: same rationale.
+                # Note: find_counterparties returns {outgoing: [...], incoming: [...]}
+                # (not a flat "counterparties" list). Merge and dedupe self-edges.
+                if home_line is not None:
+                    if cache_key in _cps_cache:
+                        cps_data = _cps_cache[cache_key]
+                    else:
+                        try:
+                            cp_result = self.find_counterparties(
+                                entity_key,
+                                line_id=home_line,
+                                from_col="from_key",
+                                to_col="to_key",
+                                pattern_id=graph_pid,
+                                top_n=50,
+                            )
+                            if isinstance(cp_result, dict):
+                                raw_cps = (
+                                    list(cp_result.get("outgoing") or [])
+                                    + list(cp_result.get("incoming") or [])
+                                )
+                                seen_keys: set[str] = set()
+                                merged: list[dict[str, Any]] = []
+                                for c in raw_cps:
+                                    k = c.get("primary_key") or c.get("key")
+                                    if not k or k == entity_key or k in seen_keys:
+                                        continue
+                                    seen_keys.add(k)
+                                    merged.append(c)
+                                cps_data = merged
+                        except (*_NAVIGATION_RECOVERABLE_ERRORS, GDSError):
+                            cps_data = []
+                        _lru_put(_cps_cache, cache_key, cps_data)
+                    # find_counterparties fast path (edge-table BTREE lookup)
+                    # already enriches is_anomaly via _resolve_anchor_pattern_for_scoring
+                    # — the flag is already an account-level signal, not TX-level,
+                    # so no second-pass enrichment is needed.
+
+            if (
+                contagion_data is not None
+                and "neighbor_contamination" in _enabled_branches
+            ):
+                cscore = float(contagion_data.get("score", 0.0) or 0.0)
+                total_cp = int(contagion_data.get("total_counterparties") or 0)
+                c_severity = _grade_contagion(cscore)
+                # Small-N guard: a score of 1.0 from 1/1 counterparty is statistical
+                # noise, not a meaningful contamination signal. Require a minimum
+                # counterparty pool before attaching the branch.
+                if (
+                    total_cp >= contagion_min_counterparties
+                    and c_severity is not None
+                ):
+                    # Populate anomalous_cp_keys from the counterparty list —
+                    # saves the agent a follow-up call.
+                    anom_keys = [
+                        c.get("primary_key") or c.get("key")
+                        for c in cps_data
+                        if c.get("is_anomaly") and (c.get("primary_key") or c.get("key"))
+                    ]
+                    # Update session-scope ledger: record that `entity_key` listed
+                    # each anom_key as its anomalous counterparty. Read back when
+                    # building other branches to surface inter-call clique signals.
+                    for ak in anom_keys:
+                        ledger_key = (graph_pid, pattern_version, ak)
+                        _cp_ledger.setdefault(ledger_key, set()).add(entity_key)
+                    # Revisits-root list: the subset of anomalous counterparties
+                    # that equals the trace root — a self-documenting clique signal.
+                    revisits_root_keys = [k for k in anom_keys if k == primary_key]
+                    # Inter-call clique: any entity previously seen listing THIS
+                    # entity as their anomalous counterparty.
+                    prev_seen_key = (graph_pid, pattern_version, entity_key)
+                    seen_as_cp_of = sorted(_cp_ledger.get(prev_seen_key, set()) - {entity_key})
+                    cscore_rounded = round(cscore, 4)
+                    c_severity_final = c_severity
+                    anom_keys_sample = anom_keys[:10]
+                    contagion_anom_count = contagion_data.get("anomalous_counterparties")
+
+                    def _build_contagion(
+                        _key: str = entity_key,
+                        _sev: str = c_severity_final,
+                        _score: float = cscore_rounded,
+                        _total: int = total_cp,
+                        _anom_count: Any = contagion_anom_count,
+                        _keys: list[str] = anom_keys_sample,
+                        _revisits_keys: list[str] = revisits_root_keys,
+                        _seen_as_cp: list[str] = seen_as_cp_of,
+                    ) -> RootCauseNode:
+                        ev: dict[str, Any] = {
+                            "contagion_score": _score,
+                            "total_counterparties": _total,
+                            "anomalous_counterparties": _anom_count,
+                            "anomalous_cp_keys": _keys,
+                        }
+                        if _revisits_keys:
+                            ev["revisits_root"] = _revisits_keys
+                        if _seen_as_cp:
+                            ev["previously_seen_as_cp_of"] = _seen_as_cp
+                        return RootCauseNode(
+                            entity_key=_key,
+                            role="neighbor_contamination",
+                            severity=_sev,
+                            evidence=ev,
+                            children=[],
+                        )
+
+                    candidates.append((_SEVERITY_STRENGTH.get(c_severity_final, 0), _build_contagion))
+
+            # --- Candidate(s): edge_counterparty (sort-by-anomaly, not volume) ---
+            # Each anomalous counterparty up to edge_counterparty_top_n becomes a
+            # separate candidate. If more anomalous CPs exist than the cap, mark
+            # truncated — the extras ARE informative but we chose not to recurse
+            # on them to keep the tree bounded.
+            if (
+                depth_remaining > 1
+                and graph_pid is not None
+                and cps_data
+                and stats["hop_count"] < max_total_nodes
+                and "edge_counterparty" in _enabled_branches
+            ):
+                # Rank counterparties: anomalous first (by delta_rank_pct desc
+                # within each group). The critical fix over sorting purely by
+                # amount_sum, which repeatedly missed the actual anomalous
+                # neighbours on AML-style continuous patterns.
+                def _cp_sort_key(c: dict[str, Any]) -> tuple[int, float]:
+                    anom_flag = 1 if c.get("is_anomaly") else 0
+                    rank_pct = float(c.get("delta_rank_pct") or 0.0)
+                    return (-anom_flag, -rank_pct)
+
+                sorted_cps = sorted(cps_data, key=_cp_sort_key)
+                anomalous_cps = [c for c in sorted_cps if c.get("is_anomaly")]
+                if len(anomalous_cps) > edge_counterparty_top_n:
+                    stats["truncated"] = True
+                picked_cps = anomalous_cps[:edge_counterparty_top_n]
+                first_dim = top_dims[0] if top_dims else {}
+                via_dim = first_dim.get("label") or first_dim.get("dim")
+
+                for anom_cp in picked_cps:
+                    cp_key = anom_cp.get("primary_key") or anom_cp.get("key")
+                    if not cp_key:
+                        continue
+                    rank_pct = float(anom_cp.get("delta_rank_pct") or 0.0)
+                    if rank_pct >= 99.9:
+                        cp_sev_hint = "extreme"
+                    elif rank_pct >= 99.0:
+                        cp_sev_hint = "critical"
+                    elif rank_pct >= 95.0:
+                        cp_sev_hint = "high"
+                    else:
+                        cp_sev_hint = "moderate"
+                    edge_pot_evidence: dict[str, Any] | None = None
+                    try:
+                        edge_pot_evidence = self.edge_potential(
+                            entity_key, cp_key, pattern_id,
+                        )
+                    except (*_NAVIGATION_RECOVERABLE_ERRORS, GDSError):
+                        edge_pot_evidence = None
+                    inherited = {
+                        "via_dim": via_dim,
+                        "witness_counterparty_delta_rank_pct": rank_pct,
+                    }
+                    if edge_pot_evidence is not None:
+                        inherited["edge_potential"] = {
+                            "score": edge_pot_evidence.get("score"),
+                            "delta_distance": edge_pot_evidence.get("delta_distance"),
+                            "pair_tx_count": edge_pot_evidence.get("pair_tx_count"),
+                            "effective_weight": edge_pot_evidence.get("effective_weight"),
+                        }
+
+                    best_motif: dict[str, Any] | None = None
+                    for mt in ("cycle_2", "cycle_3", "fan_out"):
+                        try:
+                            scored = self.score_motif(
+                                entity_key, motif_type=mt, pattern_id=pattern_id,
+                            )
+                        except (*_NAVIGATION_RECOVERABLE_ERRORS, GDSError):
+                            continue
+                        if not scored.get("found"):
+                            continue
+                        if mt == "fan_out" and cp_key not in {
+                            e[1] for e in scored.get("edges", [])
+                        }:
+                            continue
+                        if mt in {"cycle_2", "cycle_3"} and cp_key not in scored.get(
+                            "ring", [scored.get("counterparty")],
+                        ):
+                            continue
+                        if best_motif is None or scored["score"] > best_motif["score"]:
+                            best_motif = {
+                                "motif_type": mt,
+                                "score": scored["score"],
+                                "time_window_hours": scored.get("time_window_hours"),
+                            }
+                            if mt == "cycle_3":
+                                best_motif["ring"] = scored.get("ring")
+                            elif mt == "cycle_2":
+                                best_motif["counterparty"] = scored.get("counterparty")
+                            elif mt == "fan_out":
+                                best_motif["k"] = scored.get("k")
+                    if best_motif is not None:
+                        inherited["motif_potential"] = best_motif
+
+                    def _build_edge_cp(
+                        _key: str = cp_key,
+                        _depth: int = depth_remaining - 1,
+                        _inh: dict[str, Any] = inherited,
+                    ) -> RootCauseNode:
+                        return _expand(
+                            _key,
+                            _depth,
+                            role="edge_counterparty",
+                            inherited_evidence=_inh,
+                        )
+
+                    candidates.append((_SEVERITY_STRENGTH.get(cp_sev_hint, 0), _build_edge_cp))
+
+            # --- Candidate: hub (gated by population size) ---
+            try:
+                pop_size = int(getattr(pattern, "population_size", 0) or 0)
+            except (TypeError, ValueError):
+                pop_size = 0
+            if pop_size <= hub_pop_limit and "hub" in _enabled_branches:
+                if not hasattr(self, "_trace_hub_cache"):
+                    self._trace_hub_cache: dict[tuple[str, int], set[str]] = {}
+                cache_key = (pattern_id, pattern_version)
+                hub_keys = self._trace_hub_cache.get(cache_key)
+                if hub_keys is None:
+                    try:
+                        hubs = self.π7_attract_hub(pattern_id, top_n=20)
+                        hub_keys = {h[0] for h in hubs}
+                    except (*_NAVIGATION_RECOVERABLE_ERRORS, GDSError):
+                        hub_keys = set()
+                    self._trace_hub_cache[cache_key] = hub_keys
+                if entity_key in hub_keys:
+                    hub_severity_final = severity  # inherit root anomaly severity
+                    hub_entity_final = entity_key
+
+                    def _build_hub(
+                        _sev: str = hub_severity_final,
+                        _entity: str = hub_entity_final,
+                    ) -> RootCauseNode:
+                        return RootCauseNode(
+                            entity_key=_entity,
+                            role="hub",
+                            severity=_sev,
+                            evidence={"is_top_hub": True, "hub_top_n": 20},
+                            children=[],
+                        )
+
+                    candidates.append((_SEVERITY_STRENGTH.get(hub_severity_final, 0), _build_hub))
+
+            # ---- Priority selection: sort desc by strength, take top-K ----
+            candidates.sort(key=lambda c: -c[0])
+            selected = candidates[:max_branches]
+            if len(candidates) > max_branches:
+                stats["truncated"] = True
+
+            children: list[RootCauseNode] = []
+            for _, builder in selected:
+                if stats["hop_count"] >= max_total_nodes:
+                    stats["truncated"] = True
+                    break
+                children.append(builder())
+                stats["branches_explored"] += 1
+
+            return RootCauseNode(
+                entity_key=entity_key,
+                role=role,
+                severity=severity,
+                evidence=evidence,
+                children=children,
+            )
+
+        root_node = _expand(primary_key, max_depth, role="root")
+
+        severity_root = root_node.severity
+        if severity_root == "normal":
+            summary = (
+                f"Entity {primary_key} is not anomalous in pattern {pattern_id} — "
+                f"no root cause to trace."
+            )
+        else:
+            top_witness = None
+            td = root_node.evidence.get("top_dimensions") or []
+            if td and isinstance(td[0], dict):
+                top_witness = td[0].get("label") or td[0].get("dim")
+
+            # Walk the whole tree to collect the set of branch roles actually
+            # emitted — saves the agent a traversal pass.
+            found_roles: list[str] = []
+            def _collect_roles(node: RootCauseNode) -> None:
+                for c in node.children:
+                    if c.role not in found_roles:
+                        found_roles.append(c.role)
+                    _collect_roles(c)
+            _collect_roles(root_node)
+            roles_str = ", ".join(found_roles) if found_roles else "none"
+
+            summary = (
+                f"Entity {primary_key} is {severity_root} in {pattern_id}"
+                + (f"; primary witness: {top_witness}" if top_witness else "")
+                + f"; branches found: {roles_str}"
+                + f"; {stats['branches_explored']} nodes"
+                + (" (truncated)" if stats["truncated"] else "")
+                + "."
+            )
+
+        return {
+            "root": _node_to_dict(root_node),
+            "summary": summary,
+            "hop_count": stats["hop_count"],
+            "branches_explored": stats["branches_explored"],
+            "truncated": stats["truncated"],
+        }
+
     # ------------------------------------------------------------------
     # line_profile — direct points-table column profiling
     # ------------------------------------------------------------------
@@ -8661,93 +10419,6 @@ class GDSNavigator:
 
         alerts.sort(key=lambda d: d["event_anomaly_rate"], reverse=True)
         return alerts[:top_n]
-
-    def explain_anomaly_chain(
-        self,
-        primary_key: str,
-        pattern_id: str,
-        max_hops: int = 3,
-    ) -> list[dict[str, Any]]:
-        """Trace an anomaly chain through geometric neighbors.
-
-        Starts from primary_key, calls explain_anomaly to get top witness
-        dimensions, then follows to the nearest anomalous neighbor via
-        find_similar_entities.  Repeats for max_hops, tracking visited
-        entities to avoid cycles.
-        """
-        sphere = self._storage.read_sphere()
-        if pattern_id not in sphere.patterns:
-            raise GDSNavigationError(
-                f"Pattern '{pattern_id}' not found in sphere."
-            )
-
-        # Quick check: is the starting entity anomalous?
-        version = self._resolve_version(pattern_id)
-        start_geo = self._storage.read_geometry(
-            pattern_id, version,
-            primary_key=primary_key,
-            columns=["is_anomaly"],
-        )
-        if start_geo.num_rows == 0:
-            return []
-        if not bool(start_geo["is_anomaly"][0].as_py()):
-            return [{
-                "hop": 0,
-                "entity_key": primary_key,
-                "severity": "normal",
-                "interpretation": f"Entity {primary_key} is not anomalous — no chain to trace.",
-            }]
-
-        chain: list[dict[str, Any]] = []
-        visited: set[str] = set()
-        current_key = primary_key
-
-        for hop in range(max_hops):
-            if current_key in visited:
-                break
-            visited.add(current_key)
-
-            try:
-                explanation = self.explain_anomaly(current_key, pattern_id)
-            except (GDSNavigationError, GDSEntityNotFoundError, KeyError):
-                break
-
-            severity = explanation.get("severity", "unknown")
-            top_dims = explanation.get("top_dimensions", [])
-            witness = top_dims[0]["label"] if top_dims else None
-
-            chain.append({
-                "hop": hop,
-                "entity_key": current_key,
-                "severity": severity,
-                "witness": witness,
-                "top_dimensions": top_dims[:3],
-                "interpretation": (
-                    f"Hop {hop}: {current_key} severity={severity}"
-                    + (f", top witness={witness}" if witness else "")
-                ),
-            })
-
-            # Find nearest anomalous neighbor
-            try:
-                neighbors = self.find_similar_entities(
-                    current_key, pattern_id, top_n=10,
-                    filter_expr="is_anomaly = true",
-                )
-            except (GDSNavigationError, GDSEntityNotFoundError, KeyError):
-                break
-
-            next_key = None
-            for nk, _ in neighbors:
-                if nk not in visited:
-                    next_key = nk
-                    break
-
-            if next_key is None:
-                break
-            current_key = next_key
-
-        return chain
 
     def detect_hub_anomaly_concentration(
         self,

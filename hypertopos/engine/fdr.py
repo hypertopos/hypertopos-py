@@ -4,17 +4,21 @@
 # See LICENSE.md in the repository root for full terms.
 """Multiple-testing correction primitives for the navigator layer.
 
-Pure NumPy. No state. No I/O. Closed-form per-batch operations on numeric arrays.
+Pure NumPy + scipy.special. No state. No I/O. Closed-form per-batch operations.
 """
 from __future__ import annotations
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.special import gammaincc
 
 __all__ = [
     "benjamini_hochberg",
     "empirical_p_values_from_rank",
+    "parametric_p_values_chi2",
     "q_values_from_p_values",
+    "storey_pi0",
+    "storey_q_values",
 ]
 
 
@@ -37,6 +41,28 @@ def empirical_p_values_from_rank(
     # clip into (eps, 1) — use a fixed floor (not 1/N) because
     # delta_rank_pct is computed against the FULL population, so
     # the input array may be a small top-N subset with very small p-values.
+    return np.clip(p, 1e-10, 1.0)
+
+
+def parametric_p_values_chi2(
+    delta_norms: NDArray[np.float64],
+    df: int,
+) -> NDArray[np.float64]:
+    """Upper-tail p-values under the χ²(df) null for ||delta||².
+
+    If delta_i ~ N(0, 1) iid across df dimensions (the population-relative
+    construction), then ||delta||² ~ χ²(df) and the upper-tail survival
+    function gives per-entity p-values that concentrate near 0 for genuine
+    alternatives — unlike the rank-based p-values, which are uniform by
+    construction and carry no null/alternative signal for the Storey estimator.
+
+    Returns: p-values in (0, 1], clipped to [1e-10, 1].
+    """
+    if df <= 0:
+        raise ValueError(f"df must be positive, got {df}")
+    chi2 = np.asarray(delta_norms, dtype=np.float64) ** 2
+    # gammaincc(df/2, x/2) == 1 - F_χ²(df, x) (upper-tail survival function)
+    p = gammaincc(df / 2.0, chi2 / 2.0)
     return np.clip(p, 1e-10, 1.0)
 
 
@@ -66,24 +92,58 @@ def q_values_from_p_values(
     return q_values
 
 
+def storey_pi0(
+    p_values: NDArray[np.float64],
+    lam: float = 0.5,
+) -> float:
+    if not 0.0 < lam < 1.0:
+        raise ValueError(f"lam must be in (0, 1), got {lam}")
+    p = np.asarray(p_values, dtype=np.float64)
+    n = p.shape[0]
+    if n == 0:
+        return 1.0
+    tail_count = float(np.sum(p > lam))
+    pi0 = tail_count / ((1.0 - lam) * n)
+    # Floor at 1/n — prevents collapse to 0 when tail count is 0 on small n,
+    # preserves q-value ranking. Matches the R qvalue package behaviour.
+    return float(min(max(pi0, 1.0 / n), 1.0))
+
+
+def storey_q_values(
+    p_values: NDArray[np.float64],
+    lam: float = 0.5,
+) -> NDArray[np.float64]:
+    p = np.asarray(p_values, dtype=np.float64)
+    n = p.shape[0]
+    if n == 0:
+        return np.empty(0, dtype=np.float64)
+    q_bh = q_values_from_p_values(p)
+    pi0 = storey_pi0(p, lam=lam)
+    return np.clip(pi0 * q_bh, 0.0, 1.0)
+
+
 def benjamini_hochberg(
     p_values: NDArray[np.float64],
     alpha: float,
+    method: str = "bh",
 ) -> tuple[NDArray[np.bool_], NDArray[np.float64]]:
-    """Apply BH procedure at level alpha.
+    """Apply BH-family FDR procedure at level alpha.
 
-    Returns:
-        rejected: 1-D bool array, True for entities passing BH cutoff
-        q_values: 1-D float array of per-entity q-values
+    method: "bh" (default) — Benjamini-Hochberg, assumes π₀ = 1.
+            "storey" — BH scaled by Storey π̂₀, recovers power when π₀ < 1.
 
-    Guarantees: E[FDR | rejected] <= alpha (under independence or PRDS)
+    Guarantees: E[FDR | rejected] <= alpha
+        - under independence or PRDS for method="bh"
+        - under independence for method="storey" (Storey 2002)
     """
     if not 0.0 < alpha < 1.0:
         raise ValueError(f"alpha must be in (0, 1), got {alpha}")
+    if method not in ("bh", "storey"):
+        raise ValueError(f"method must be 'bh' or 'storey', got {method!r}")
     p_values = np.asarray(p_values, dtype=np.float64)
     n = p_values.shape[0]
     if n == 0:
         return np.empty(0, dtype=np.bool_), np.empty(0, dtype=np.float64)
-    q_values = q_values_from_p_values(p_values)
+    q_values = q_values_from_p_values(p_values) if method == "bh" else storey_q_values(p_values)
     rejected = q_values <= alpha
     return rejected, q_values

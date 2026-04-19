@@ -28,6 +28,7 @@ class AdjacencyIndex:
     _in: dict[str, list[EdgeTuple]] = field(repr=False)
     _nodes: set[str] = field(repr=False)
     _edge_count: int = 0
+    _pair_counts: dict[tuple[str, str], int] | None = field(default=None, repr=False)
 
     @classmethod
     def from_edge_lists(
@@ -101,6 +102,17 @@ class AdjacencyIndex:
 
     def edge_count(self) -> int:
         return self._edge_count
+
+    def pair_counts(self) -> dict[tuple[str, str], int]:
+        if self._pair_counts is not None:
+            return self._pair_counts
+        counts: dict[tuple[str, str], int] = {}
+        for src, edges in self._out.items():
+            for (tgt, _ts, _amt, _ek) in edges:
+                key = (src, tgt)
+                counts[key] = counts.get(key, 0) + 1
+        self._pair_counts = counts
+        return counts
 
     @staticmethod
     def _temporal_slice(edges: list[EdgeTuple], ts_from: float | None, ts_to: float | None) -> list[EdgeTuple]:

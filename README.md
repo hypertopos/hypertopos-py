@@ -8,7 +8,7 @@
 [![PyArrow](https://img.shields.io/badge/format-PyArrow-red.svg)](https://arrow.apache.org/docs/python/)
 [![Lance](https://img.shields.io/badge/storage-Lance-blueviolet.svg)](https://github.com/lance-format/lance)
 [![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io)
-[![Version](https://img.shields.io/badge/version-0.4.0-%235500FF.svg)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.5.0-%235500FF.svg)](pyproject.toml)
 
 hypertopos is not a database, and not a machine learning model. It is a layer that turns relational data into a coordinate system where every entity gets a position derived from its relationships and the population around it.
 
@@ -52,6 +52,11 @@ Each capability below emerges from treating entities as points in a shared, popu
 | Distribution-aware scoring | Per-dim Bregman divergence (gaussian/poisson/bernoulli). Additive | PyOD/sklearn: uniform metric across all features | `0.4.0` |
 | Anomaly confidence | Bootstrap `anomaly_confidence: 0-1`. `min_confidence` filter | No equivalent — binary verdict, no stability signal | `0.4.0` |
 | Graph algorithm dimensions | PageRank, betweenness, community, clustering as geometry dims | Separate graph DB + manual joins | `0.4.1` |
+| Adaptive false-discovery-rate | Storey π₀ estimator + χ² parametric p-values recover BH power loss | BH without adaptive π₀ overcorrects on null-heavy populations | `0.5.0` |
+| Drift direction | `gradient_alignment` + `drift_direction ∈ {normalizing, deteriorating, neutral}` | Drift magnitude only — no toward/away-from-centre signal | `0.5.0` |
+| One-call root cause | `trace_root_cause` returns bounded evidence DAG — witness, edge-counterparty, contamination, hub | Manual chain of `explain_anomaly → find_counterparties → contagion_score → π7 hub` | `0.5.0` |
+| Geometric edge potential | `\|\|delta_from − delta_to\|\| × (1/pair_tx_count)` — per-edge layering signature | Node-level `delta_norm` misses one-off transactions between divergent accounts | `0.5.0` |
+| Structural motif scoring | Product of `edge_potential` across closed-vocab motifs (fan_out, cycle_2, cycle_3, structuring) | Graph DB motif matching has no geometric rarity score | `0.5.0` |
 
 ### What changes in practice
 
@@ -67,6 +72,10 @@ The same problems look different when graph, time, and statistics are unified:
 | Understand propagation | PageRank, manual path tracing, cross-table joins | `propagate_influence(source)` — Cohen's d between connected vs control group |
 | Trust an anomaly verdict | Re-run with different thresholds, manual sensitivity analysis | `find_anomalies(min_confidence=0.8)` — only entities stable under population perturbation |
 | Understand why anomalous | SHAP on black-box model, approximate feature importance | `explain_anomaly` — per-dimension Bregman contribution with distribution kind, sums to 100% |
+| Root-cause an anomaly | Manual chain: explain → counterparties → contagion → hub check, 4+ tool calls | `trace_root_cause(entity)` — single call returns bounded DAG of evidence |
+| Detect relationship layering | Custom rule engine or manual rare-pair SQL queries | `edge_potential(A, B)` — per-edge score combining endpoint distance and pair rarity |
+| Match AML typology patterns | Graph DB subgraph queries + separate risk scoring | `find_motif(type="structuring", …)` — structural pattern + geometric rarity product |
+| Direction of behavioural drift | Drift magnitude alone — no toward/away-from-centre signal | `attract_drift` returns `drift_direction ∈ {normalizing, deteriorating, neutral}` |
 
 ## Benchmarks
 

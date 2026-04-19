@@ -5,15 +5,29 @@ All notable changes to hypertopos will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] — 2026-04-19
+
+### Added
+- Storey adaptive π₀ FDR: `benjamini_hochberg(..., method="storey")` and `fdr_method="storey"` on `π5_attract_anomaly`, `π6_attract_boundary`, `π7_attract_hub`, `π9_attract_drift`. The LSL π̂₀ estimator scales BH q-values, recovering discoveries vanilla BH leaves on the table when the population carries a meaningful null mass. Default `fdr_method` remains `"bh"`. Power recovery is regime-dependent — spheres with an over-compressed delta_norm distribution or an extreme super-anomaly tail see zero uplift because BH already separates every entity from the null.
+- Parametric chi-squared p-values: `parametric_p_values_chi2(delta_norms, df)` computes upper-tail χ²(df) survival — the mathematically correct p-value under the `N(0, 1)` null. Navigator gains `p_value_method` parameter (`"rank"` default, `"chi2"` opt-in). `"chi2"` is what lets `fdr_method="storey"` actually shrink q-values; rank-based p-values are uniform by construction and defeat the Storey estimator.
+- Drift direction: `π9_attract_drift` (and MCP `find_drifting_entities`) returns `gradient_alignment ∈ [-1, 1]` and `drift_direction ∈ {"normalizing", "deteriorating", "neutral"}` for every entity — the radially-inward component of the drift vector, distinguishing entities moving toward the population centre from ones moving away without extra tool calls.
+- Multi-hop root-cause tracing: new `GDSNavigator.trace_root_cause(primary_key, pattern_id, max_depth=2, max_branches=3, …)` returns a bounded DAG of evidence around an anomalous entity — root witness dimensions, edge-counterparty branch (sorted by anomaly not transaction volume), neighbour-contamination branch with `anomalous_cp_keys` evidence, and hub membership branch. All nodes share one severity scale, candidate branches are priority-ordered by severity strength, and `truncated=true` flags when a real candidate was dropped. One call replaces the manual `explain_anomaly → find_counterparties → contagion_score → π7 hub` chain.
+- Geometric edge potential: new `GDSNavigator.edge_potential(from_key, to_key, pattern_id)` and `attract_edge_potential(pattern_id, top_n, …)` primitives score transaction edges (not just node footprints) as `||δ_from − δ_to|| × (1/pair_tx_count)` — catches one-off transactions between geometrically divergent accounts, a classic AML layering signature that entity-level `delta_norm` misses. Pair-count histogram is sourced from the shared `AdjacencyIndex.pair_counts()` cache used by eight graph primitives, so the rarity prior is O(1) after any graph primitive has warmed adjacency in the session. Auto-enriches the `edge_counterparty` branch of `trace_root_cause`.
+- Structural motif scoring: new `GDSNavigator.score_motif(entity_key, motif_type, pattern_id, time_window_hours=None, amt1_min=10000.0, amt2_max=10000.0)` and `find_high_potential_motifs(pattern_id, motif_type, top_n, …)` compose edge_potential across motif edges via product. Closed vocabulary of 4 atoms: `fan_out` (hub → k targets), `cycle_2` (A↔B round-trip), `cycle_3` (directed A→B→C→A triad with strict temporal ordering), and `structuring` (open A→B→C→D chain with amount-gated hops — hop1 ≥ `amt1_min`, hops 2-3 ≤ `amt2_max`, flash window). Amount thresholds default to the USD reporting threshold and are configurable per jurisdiction. Smart per-motif default time windows (168h / 24h / 72h / 1h). Motif ranking and edge_potential both enumerate off the shared `AdjacencyIndex` cache — adjacency build cost is paid once per pattern per session and reused by eight graph primitives. LRU cache caps 8 ranking entries per navigator instance with `structuring` thresholds part of the cache key. Covers structural atoms of 25 documented AML typologies.
+
+### Removed
+- `GDSNavigator.explain_anomaly_chain` — superseded by `trace_root_cause`. Previous linear same-similar walk is recoverable via `find_similar_entities(..., filter_expr="is_anomaly = true")`; the DAG tracer solves the intended root-cause use case.
 
 ## [0.4.1] — 2026-04-16
 
 ### Added
-- Native graph algorithms as geometry dimensions: `pagerank`, `connected_component`, `clustering_coefficient`, `community` (label propagation), `betweenness` (sampled Brandes). Computed at build time on the adjacency index — no external dependencies. Add to `graph_features.features` list in sphere YAML.
+- Native graph algorithms as build-time geometry dimensions: `pagerank` (importance), `betweenness` (brokerage, edge-sampled Brandes), `community` (label-propagation membership), `clustering_coefficient` (local triangle density), `connected_component` (disconnected subgraph id). Computed via igraph C backend on the in-memory adjacency index introduced in 0.4.0 — no external services, no Python graph library beyond igraph bindings. Add to `graph_features.features` in sphere YAML and the metrics flow through `explain_anomaly`, `find_anomalies`, and every delta-based primitive like any other dimension.
+
+### Changed
+- `find_geometric_path` switched from beam search to bidirectional BFS. Guarantees a path is found when one exists within `max_depth` — beam search could miss valid paths in sparse or loosely connected graphs. `beam_width` now caps the number of top-scored paths returned after discovery, not search width.
 
 ### Fixed
-- `find_geometric_path` rewritten from beam search to bidirectional BFS for reliable path discovery in sparse graphs.
+- `hypertopos.__version__` reports the installed package version (was frozen at `0.3.0`).
 
 ## [0.4.0] — 2026-04-15
 

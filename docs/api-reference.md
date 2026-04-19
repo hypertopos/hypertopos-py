@@ -103,9 +103,9 @@ with sphere.session("agent-1") as session:
 
 | Primitive | Method | What it does | Returns |
 |-----------|--------|--------------|---------|
-| π5 | `π5_attract_anomaly(pattern_id, radius, top_n, fdr_alpha, fdr_method, select, min_confidence)` | Find most anomalous polygons | `(list[Polygon], int, list, dict)` |
-| π6 | `π6_attract_boundary(alias_id, pattern_id, direction, top_n, fdr_alpha, fdr_method, select)` | Find entities nearest to alias cutting plane | `list[(Polygon, float)]` |
-| π7 | `π7_attract_hub(pattern_id, top_n, line_id_filter, fdr_alpha, fdr_method, select)` | Find entities with highest connectivity | `list[(str, int, float)]` |
+| π5 | `π5_attract_anomaly(pattern_id, radius, top_n, fdr_alpha, fdr_method, p_value_method, select, min_confidence)` | Find most anomalous polygons | `(list[Polygon], int, list, dict)` |
+| π6 | `π6_attract_boundary(alias_id, pattern_id, direction, top_n, fdr_alpha, fdr_method, p_value_method, select)` | Find entities nearest to alias cutting plane | `list[(Polygon, float)]` |
+| π7 | `π7_attract_hub(pattern_id, top_n, line_id_filter, fdr_alpha, fdr_method, p_value_method, select)` | Find entities with highest connectivity | `list[(str, int, float)]` |
 | π7+ | `π7_attract_hub_and_stats(pattern_id, top_n, line_id_filter)` | Hub ranking + population hub score statistics in one scan | `(list, dict)` |
 | π8 | `π8_attract_cluster(pattern_id, n_clusters, top_n, sample_size)` | Discover geometric archetypes via k-means++ | `list[dict]` |
 
@@ -113,7 +113,7 @@ with sphere.session("agent-1") as session:
 
 | Primitive | Method | What it does | Returns |
 |-----------|--------|--------------|---------|
-| π9 | `π9_attract_drift(pattern_id, top_n, sample_size, fdr_alpha, fdr_method, select)` | Find entities with highest temporal drift | `list[dict]` |
+| π9 | `π9_attract_drift(pattern_id, top_n, sample_size, fdr_alpha, fdr_method, p_value_method, select)` | Find entities with highest temporal drift | `list[dict]` |
 | π10 | `π10_attract_trajectory(primary_key, pattern_id, top_n)` | Find entities with similar temporal trajectory | `list[dict]` |
 | π11 | `π11_attract_population_compare(pattern_id, window_a_from, window_a_to, window_b_from, window_b_to)` | Compare population geometry between two time windows | `dict` |
 | π12 | `π12_attract_regime_change(pattern_id, timestamp_from, timestamp_to)` | Detect population geometry regime shifts | `list[dict]` |
@@ -132,6 +132,10 @@ with sphere.session("agent-1") as session:
 | `propagate_influence(seed_keys, pattern_id, max_depth=3, decay=0.7, min_threshold=0.001, max_affected=10_000, *, timestamp_cutoff=None)` | BFS influence propagation from seed entities with geometric decay and tx_count weighting. At each hop: influence = parent_score * decay * geometric_coherence * tx_weight. `timestamp_cutoff` restricts BFS expansion to edges with `timestamp <= cutoff`. Returns affected_entities with tx_count per neighbor |
 | `cluster_bridges(pattern_id, n_clusters=5, top_n_bridges=10)` | Find entities bridging geometric clusters via edge table. Runs π8 clustering then identifies cross-cluster edges and bridge entities |
 | `anomalous_edges(from_key, to_key, pattern_id, top_n=10)` | Find edges between two entities enriched with event-level geometry (delta_norm, is_anomaly). Unlike path tools which score entities (anchor), this scores individual transactions (event geometry) |
+| `edge_potential(from_key, to_key, pattern_id)` | Per-edge geometric anomaly score (distance × 1/pair_count). Complements `delta_norm`. Returns `{score, delta_distance, pair_tx_count, effective_weight, interpretation}` |
+| `attract_edge_potential(pattern_id, top_n, from_key, to_key, min_pair_count)` | Rank all edges by `edge_potential` DESC. Scope to an entity with from/to. |
+| `score_motif(entity_key, motif_type, pattern_id, time_window_hours=None, amt1_min=10000.0, amt2_max=10000.0)` | Score best structural motif seeded at entity. `motif_type` ∈ {`fan_out`, `cycle_2`, `cycle_3`, `structuring`}. Composes `edge_potential` via product across motif edges. Defaults: fan_out=168h, cycle_2=24h, cycle_3=72h, structuring=1h. `amt1_min`/`amt2_max` gate the three hops of a `structuring` motif (hop1 ≥ amt1_min, hops 2 & 3 ≤ amt2_max); ignored for other motif types. |
+| `find_high_potential_motifs(pattern_id, motif_type, top_n, time_window_hours, seeds, min_k, amt1_min, amt2_max)` | Rank motifs of a given type across the pattern. LRU-cached per (pattern, motif_type, window, amt1_min, amt2_max), cap 8. `cycle_3` deduplicated by canonical ring, `structuring` deduplicated by canonical path. |
 | `find_witness_cohort(primary_key, pattern_id, top_n=10, *, config=None, edge_pattern_id=None)` | Rank entities that share the target's witness signature. Investigative peer ranking — NOT edge forecasting. Combines four signals: `exp(-distance/theta)` delta similarity, witness Jaccard overlap, trajectory cosine alignment (optional), and graded anomaly bonus from `delta_rank_pct`. Excludes entities already connected via BTREE edge lookup — this is the function's main contribution over plain ANN. Configure via `WitnessCohortConfig(weights=WitnessCohortWeights(...), candidate_pool, min_witness_overlap, min_score, use_trajectory, bidirectional_check, timestamp_cutoff)`. Returns `WitnessCohortResult` with ranked `CohortMember` items, per-component scores, exclusion counts, and reproducibility metadata |
 | `find_novel_entities(pattern_id, top_n=10, sample_size=5000)` | Rank entities by geometric deviation from neighbor-expected position using edge table adjacency. High `novelty_score` = entity doesn't behave like its neighborhood. Requires a pattern with an edge table. Returns list of dicts with `primary_key`, `novelty_score`, and per-dimension decomposition |
 
@@ -142,7 +146,7 @@ with sphere.session("agent-1") as session:
 | Method | Description |
 |--------|-------------|
 | `explain_anomaly(primary_key, pattern_id)` | Structured investigation: severity, witness set, repair set, conformal p-value, reputation, and Bregman contributions returned under `top_dimensions[]` (fields: `dim`, `kind`, `bregman`, `pct_of_total`) |
-| `explain_anomaly_chain(primary_key, pattern_id, max_hops)` | Trace anomaly propagation through geometric neighbors |
+| `trace_root_cause(primary_key, pattern_id, max_depth, max_branches)` | Multi-hop root-cause DAG: composes `explain_anomaly` + `find_counterparties` + `contagion_score` + `π7_attract_hub` into one bounded tree. Returns `{root, summary, hop_count, branches_explored, truncated}`. Replaces `explain_anomaly_chain` |
 | `find_similar_entities(primary_key, pattern_id, top_n, dim_mask, metric)` | ANN search for nearest entities in delta-space. `dim_mask`: list of dimension names to restrict distance. `metric`: `"L2"` or `"cosine"`. Returns `SimilarityResult` |
 | `contrast_populations(pattern_id, group_a, group_b)` | Dimension-by-dimension comparison of two entity groups (Cohen's d) |
 | `composite_risk(primary_key, line_id)` | Fisher's method combination of conformal p-values across patterns |

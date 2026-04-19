@@ -330,11 +330,18 @@ class TestPi5FdrSelect:
                 "test_pattern", top_n=5, select="quantum",
             )
 
-    def test_pi5_fdr_method_storey_raises(self, nav_pi5):
-        """fdr_method='storey' raises NotImplementedError."""
-        with pytest.raises(NotImplementedError, match="Only fdr_method='bh'"):
+    def test_pi5_fdr_method_storey_runs(self, nav_pi5):
+        """fdr_method='storey' returns results without raising."""
+        polys, total, _, _ = nav_pi5.π5_attract_anomaly(
+            "test_pattern", top_n=5, fdr_alpha=0.1, fdr_method="storey",
+        )
+        assert total >= 0
+        assert isinstance(polys, list)
+
+    def test_pi5_fdr_method_invalid_raises(self, nav_pi5):
+        with pytest.raises(ValueError, match="fdr_method must be"):
             nav_pi5.π5_attract_anomaly(
-                "test_pattern", top_n=5, fdr_method="storey",
+                "test_pattern", top_n=5, fdr_method="bogus",
             )
 
 
@@ -392,11 +399,18 @@ class TestPi6FdrSelect:
                 "test_alias", "test_pattern", top_n=5, select="quantum",
             )
 
-    def test_pi6_fdr_method_storey_raises(self, nav_pi6):
-        """fdr_method='storey' raises NotImplementedError."""
-        with pytest.raises(NotImplementedError, match="Only fdr_method='bh'"):
+    def test_pi6_fdr_method_storey_runs(self, nav_pi6):
+        """fdr_method='storey' returns results without raising."""
+        result = nav_pi6.π6_attract_boundary(
+            "test_alias", "test_pattern", top_n=5, fdr_alpha=0.1,
+            fdr_method="storey",
+        )
+        assert result is not None
+
+    def test_pi6_fdr_method_invalid_raises(self, nav_pi6):
+        with pytest.raises(ValueError, match="fdr_method must be"):
             nav_pi6.π6_attract_boundary(
-                "test_alias", "test_pattern", top_n=5, fdr_method="storey",
+                "test_alias", "test_pattern", top_n=5, fdr_method="bogus",
             )
 
 
@@ -448,11 +462,17 @@ class TestPi7FdrSelect:
                 "test_pattern", top_n=5, select="quantum",
             )
 
-    def test_pi7_fdr_method_storey_raises(self, nav_pi7):
-        """fdr_method='storey' raises NotImplementedError."""
-        with pytest.raises(NotImplementedError, match="Only fdr_method='bh'"):
+    def test_pi7_fdr_method_storey_runs(self, nav_pi7):
+        """fdr_method='storey' returns results without raising."""
+        result = nav_pi7.π7_attract_hub(
+            "test_pattern", top_n=5, fdr_alpha=0.1, fdr_method="storey",
+        )
+        assert result is not None
+
+    def test_pi7_fdr_method_invalid_raises(self, nav_pi7):
+        with pytest.raises(ValueError, match="fdr_method must be"):
             nav_pi7.π7_attract_hub(
-                "test_pattern", top_n=5, fdr_method="storey",
+                "test_pattern", top_n=5, fdr_method="bogus",
             )
 
 
@@ -505,11 +525,17 @@ class TestPi9FdrSelect:
                 "test_pattern", top_n=5, select="quantum",
             )
 
-    def test_pi9_fdr_method_storey_raises(self, nav_pi9):
-        """fdr_method='storey' raises NotImplementedError."""
-        with pytest.raises(NotImplementedError, match="Only fdr_method='bh'"):
+    def test_pi9_fdr_method_storey_runs(self, nav_pi9):
+        """fdr_method='storey' returns results without raising."""
+        result = nav_pi9.π9_attract_drift(
+            "test_pattern", top_n=5, fdr_alpha=0.1, fdr_method="storey",
+        )
+        assert result is not None
+
+    def test_pi9_fdr_method_invalid_raises(self, nav_pi9):
+        with pytest.raises(ValueError, match="fdr_method must be"):
             nav_pi9.π9_attract_drift(
-                "test_pattern", top_n=5, fdr_method="storey",
+                "test_pattern", top_n=5, fdr_method="bogus",
             )
 
 
@@ -519,22 +545,30 @@ class TestPi9FdrSelect:
 
 
 class TestFdrMethodValidation:
-    def test_fdr_method_storey_raises_pi5(self, nav_pi5):
-        with pytest.raises(NotImplementedError):
-            nav_pi5.π5_attract_anomaly(
-                "test_pattern", fdr_method="storey",
-            )
+    def test_fdr_method_invalid_raises_pi5(self, nav_pi5):
+        with pytest.raises(ValueError, match="fdr_method must be"):
+            nav_pi5.π5_attract_anomaly("test_pattern", fdr_method="bogus")
 
-    def test_fdr_method_storey_raises_pi6(self, nav_pi6):
-        with pytest.raises(NotImplementedError):
+    def test_fdr_method_invalid_raises_pi6(self, nav_pi6):
+        with pytest.raises(ValueError, match="fdr_method must be"):
             nav_pi6.π6_attract_boundary(
-                "test_alias", "test_pattern", fdr_method="storey",
+                "test_alias", "test_pattern", fdr_method="bogus",
             )
 
-    def test_fdr_method_storey_raises_pi7(self, nav_pi7):
-        with pytest.raises(NotImplementedError):
-            nav_pi7.π7_attract_hub("test_pattern", fdr_method="storey")
+    def test_fdr_method_invalid_raises_pi7(self, nav_pi7):
+        with pytest.raises(ValueError, match="fdr_method must be"):
+            nav_pi7.π7_attract_hub("test_pattern", fdr_method="bogus")
 
-    def test_fdr_method_storey_raises_pi9(self, nav_pi9):
-        with pytest.raises(NotImplementedError):
-            nav_pi9.π9_attract_drift("test_pattern", fdr_method="storey")
+    def test_fdr_method_invalid_raises_pi9(self, nav_pi9):
+        with pytest.raises(ValueError, match="fdr_method must be"):
+            nav_pi9.π9_attract_drift("test_pattern", fdr_method="bogus")
+
+    def test_storey_returns_at_least_as_many_as_bh_pi5(self, nav_pi5):
+        """Storey scales q-values by pi0 <= 1, so discoveries >= BH at same alpha."""
+        polys_bh, _, _, _ = nav_pi5.π5_attract_anomaly(
+            "test_pattern", top_n=100, fdr_alpha=0.1, fdr_method="bh",
+        )
+        polys_st, _, _, _ = nav_pi5.π5_attract_anomaly(
+            "test_pattern", top_n=100, fdr_alpha=0.1, fdr_method="storey",
+        )
+        assert len(polys_st) >= len(polys_bh)

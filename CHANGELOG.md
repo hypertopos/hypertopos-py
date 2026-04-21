@@ -5,6 +5,24 @@ All notable changes to hypertopos will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.5.1] — 2026-04-21
+
+### Added
+- Two new closed-vocabulary motifs extending the 0.5.0 structural catalog:
+  - `fan_in` — k distinct sources → one sink within a sliding time window, mirror of `fan_out`. Seed = sink. Surfaces concentrator/sink accounts (T13) and destination-side parallel layering (T12) as a single-call atomic query, so the agent no longer has to invert the graph by hand.
+  - `chain_k` — open directed chain A→B→…→Z of length `k` (3 ≤ k ≤ 8, k-1 edges), no cycle closure, no node revisit, strict monotone timestamps, total span ≤ window. Covers multi-stage layering typologies (T5 Long-Cycle Multi-Stage, T18 Multi-Jurisdiction Latency) that `cycle_3` and `structuring` could not express — `cycle_3` requires closure back to the seed and `structuring` is amount-gated with a 1h window; `chain_k` is the open-chain, amount-free variant that matches layering-over-days semantics. Each `chain_k` instance carries a `frontier_truncated: bool` flag — truthy when `_CHAIN_K_MAX_FRONTIER = 1000` was hit while expanding partial paths on at least one hop, signalling that the returned chains are real but the ranking may miss longer chains (recommended agent response: retry with a tighter `time_window_hours` or a lower `k`). Surfaces on both `score_motif` and `find_high_potential_motifs` result dicts.
+- `score_motif` and `find_high_potential_motifs` gain a `k` parameter (default 4, validated 3–8 for `chain_k`, ignored for other types). `k` participates in the ranking cache key so different chain lengths are cached separately. `score_motif` additionally gains a `min_k: int | None = None` override on the single-seed path — when provided (must be ≥ 1), it plumbs through to the `fan_out` / `fan_in` enumerators, so callers can check e.g. "is this sink fed by ≥ 10 distinct sources?" without falling back on `find_high_potential_motifs` and triggering a pattern-wide cold cache. When None (default), enumerators fall back to their built-in `min_k = 3`, preserving the original behaviour exactly. Ignored for motif types that don't accept it (`cycle_2`, `cycle_3`, `structuring`, `chain_k`).
+- `find_high_potential_motifs`'s `min_k` parameter now applies to `fan_in` in addition to `fan_out` (default 3).
+- Numeric stability for the motif catalog: every motif scorer returns `log_score` (sum of `log(edge_potential)` over non-zero edges, `-inf` when any edge is zero) and `score_clamped: bool` alongside `score`. The raw `score` is clamped at `_MOTIF_SCORE_MAX = 1e300` when the edge-potential product would overflow (mirror of the existing `_MOTIF_SCORE_EPSILON = 1e-30` underflow clamp), and the ranking sort key in `_rank_motifs` switched from `-score` to `-log_score` so large-`k` motifs rank correctly regardless of clamp. Observed on AML HI-small: `fan_out` / `fan_in` hubs with k in the low thousands produced `score = +inf` that survived JSON serialisation, tied `score_rank_pct` to `100.0` across every affected result, and destroyed ordering at the top of the ranking.
+
+### Fixed
+- `passive_scan` chain and composite sources report entity-specific `related_count` instead of the total pattern population count.
+- `detect_trajectory_anomaly` navigator method accepts `sample_size` to cap entity streaming on large patterns.
+- Builder writes `null` (not `0.0`) for `anomaly_confidence` when bootstrap is skipped, preventing agents from misinterpreting zero as a computed confidence score.
+- Single-seed motif enumerators for `fan_out`, `cycle_2`, and `cycle_3` computed their time-window threshold in microseconds against float-seconds timestamps (`EDGE_TABLE_SCHEMA` declares `timestamp: float64` = epoch seconds, as produced by `builder._to_epoch_seconds`). The µs-scaled threshold could never be exceeded by seconds-scale deltas, silently disabling the window filter in production — `score_motif(entity, motif_type, pattern_id, time_window_hours=H)` returned results as if no window was set. Flipped all three enumerators to seconds arithmetic, matching `_enumerate_structuring`, every `_enum_*_via_adj` adjacency path, and the new `_enumerate_fan_in` / `_enumerate_chain_k`. **Observable behaviour change on `score_motif`** for these three motif types: users who relied on the broken "all-time" behaviour may see fewer results on narrow windows. `find_high_potential_motifs` is unaffected (its adjacency ranking path was already correct). Test helper `_hour_us` retired in favour of `_hour_sec` so fixture semantics align with the production edge table; five tight-window parity regression guards (one per migrated enumerator plus the two shipping with the new motifs) prevent future unit reversion.
+
 ## [0.5.0] — 2026-04-19
 
 ### Added

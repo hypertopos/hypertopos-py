@@ -17,9 +17,12 @@ Any item may slip to 0.7.0 if scope pressure requires. The multi-epoch retention
 
 ---
 
-## Plan: 0.5.0
+## 0.5.0
 
-Theme: **detection-quality and investigation-workflow push.** Shipped: Storey adaptive π₀ FDR + chi² p-values, drift direction, multi-hop root-cause tracing (`trace_root_cause` DAG), geometric edge potential, find_motif with four motif types (fan_out / cycle_2 / cycle_3 / structuring) including the 0.5.0 AdjacencyIndex reuse refactor. The "architecture-emergent analytics" side of the original plan was re-scoped to 0.6.0 because the prerequisite infrastructure (multi-epoch calibration retention in the builder) was larger than the advertised features — scope stayed on detection quality and agent workflow instead.
+Detection-quality and investigation-workflow push.
+
+- **0.5.0** — Storey adaptive π₀ FDR + chi² p-values (power recovery in moderate-super-anomaly regimes without chasing the Storey estimator off a rank-based null). Drift direction on `π9_attract_drift` — `gradient_alignment` and `drift_direction ∈ {normalizing, deteriorating, neutral}` on every entity. Multi-hop root-cause tracing (`trace_root_cause` DAG) replacing `explain_anomaly_chain`. Geometric edge potential — per-edge anomaly score via `||δ_from − δ_to|| × (1/pair_tx_count)` sourced from the shared `AdjacencyIndex.pair_counts()` cache. Structural motif scoring — `score_motif` and `find_high_potential_motifs` over four closed-vocabulary atoms (`fan_out`, `cycle_2`, `cycle_3`, `structuring`) composing `edge_potential` via product, with 0.5.0 AdjacencyIndex-reuse refactor consolidating motif ranking / edge_potential / eight graph primitives onto one shared adjacency build per session. The "architecture-emergent analytics" side of the original plan was re-scoped to 0.6.0 because the prerequisite infrastructure (multi-epoch calibration retention in the builder) was larger than the advertised features.
+- **0.5.1** — Two new closed-vocabulary motifs extending the 0.5.0 catalog: `fan_in` (mirror of `fan_out`, sink-centric, covers T12 destination-side parallel layering and T13 concentrator/sink) and `chain_k` (open directed chain of parametric length 3 ≤ k ≤ 8, no cycle closure, no node revisit, covers T5 multi-stage layering and T18 multi-jurisdiction latency). Reuses the 0.5.0 `MotifSpec` / `_score_motif_from_edges` / AdjacencyIndex machinery without touching the format. `score_motif` and `find_high_potential_motifs` grow a `k` parameter (default 4, validated 3–8 for `chain_k`, ignored otherwise); `min_k` now applies to `fan_in` in addition to `fan_out`. `split_recombine` and `bipartite_burst` remain under consideration for 0.5.2.
 
 ---
 

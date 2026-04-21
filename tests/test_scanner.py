@@ -702,3 +702,164 @@ class TestGraphContagionSource:
         for hit in result.hits:
             assert "graph" not in hit.sources
         sess.__exit__(None, None, None)
+
+
+def _make_chain_pattern_fixture(tmp_path, n=50, seed=42):
+    """Build sphere with accounts + chain_pattern (with explicit geometry pattern).
+
+    Uses 20 chains of 3 keys each from a 50-account pool so most accounts
+    appear in only 1-2 chains — making entity-specific related_count clearly
+    smaller than total (20).
+    """
+    rng = np.random.default_rng(seed)
+
+    accounts = [{"account_id": f"A{i:04d}", "entity_type": "Individual"} for i in range(n)]
+    txs = []
+    for i in range(n * 5):
+        src = f"A{rng.integers(0, n):04d}"
+        dst = f"A{rng.integers(0, n):04d}"
+        if src == dst:
+            continue
+        txs.append(
+            {
+                "tx_id": f"T{i:06d}",
+                "from_account": src,
+                "to_account": dst,
+                "amount": float(rng.uniform(100, 10000)),
+            }
+        )
+
+    b = GDSBuilder("chain_rc_test", str(tmp_path / "gds"))
+    b.add_line("accounts", accounts, key_col="account_id", source_id="accounts", entity_type="account")
+    b.add_line("transactions", txs, key_col="tx_id", source_id="transactions", role="event")
+    b.add_derived_dimension("accounts", "transactions", "from_account", "count", None, "tx_out")
+    b.add_derived_dimension("accounts", "transactions", "to_account", "count", None, "tx_in")
+    b.add_pattern("account_pattern", "anchor", "accounts", relations=[])
+
+    chains = []
+    for ci in range(20):
+        keys = [f"A{rng.integers(0, n):04d}" for _ in range(3)]
+        c = Chain(
+            chain_id=f"ch_{ci:03d}",
+            keys=keys,
+            event_keys=[f"T{ci:03d}_{j}" for j in range(2)],
+            hop_count=2,
+            is_cyclic=(keys[0] == keys[-1]),
+            time_span_hours=10.0,
+            categories=["USD", "USD"],
+            amounts=[100.0, 90.0],
+            amount_decay=0.9,
+        )
+        chains.append(c.to_dict())
+    b.add_chain_line("tx_chains", chains, features=["hop_count", "is_cyclic"])
+    # Explicit chain pattern so geometry is built with a resolvable version
+    b.add_pattern("chain_pattern", "anchor", "tx_chains", relations=[])
+
+    b.build()
+
+    hs = HyperSphere.open(str(tmp_path / "gds"))
+    sess = hs.session("test")
+    scanner = PassiveScanner(
+        reader=sess._reader,
+        sphere=sess._reader.read_sphere(),
+        manifest=sess._manifest,
+    )
+    return scanner, sess
+
+
+class TestRelatedCountEntitySpecific:
+    """related_count must be the number of chains/composites containing this
+    specific entity, not the total geometry row count in the pattern."""
+
+    def test_chain_related_count_is_entity_specific(self, tmp_path):
+        """related_count for chain source must be < total chain count for most entities.
+
+        Uses filter_expr="" to scan all chains (not just anomalous) so we always
+        get hits regardless of anomaly flags in the small test fixture.
+        """
+        scanner, sess = _make_chain_pattern_fixture(tmp_path)
+        # filter_expr="" means read ALL chains (anomalous or not)
+        scanner.add_source("chains", "chain_pattern", key_type="chain", filter_expr="")
+
+        manifest = sess._manifest
+        version = manifest.pattern_version("chain_pattern")
+        total_chains = sess._reader.count_geometry_rows("chain_pattern", version)
+
+        result = scanner.scan("accounts", threshold=1)
+
+        # At least one hit must exist for the assertion to be meaningful
+        assert result.total_flagged > 0, (
+            f"No hits from chain source — total_chains={total_chains}, "
+            "check that chain_pattern geometry exists"
+        )
+
+        for hit in result.hits:
+            if "chains" not in hit.sources:
+                continue
+            src_hit = hit.sources["chains"]
+            # related_count must be entity-specific (how many chains contain THIS entity)
+            # With 20 chains and 50 accounts, most accounts appear in far fewer than 20 chains
+            assert src_hit.related_count <= total_chains, (
+                f"related_count {src_hit.related_count} exceeds total chain count {total_chains}"
+            )
+            # related_count must be >= anomalous_count (entity can't have more anomalous
+            # chains than total chains it belongs to)
+            assert src_hit.related_count >= src_hit.anomalous_count, (
+                f"related_count {src_hit.related_count} < anomalous_count {src_hit.anomalous_count}"
+            )
+
+        # Verify entity-specificity: with 20 chains / 50 accounts, most accounts
+        # appear in only 1-2 chains, so related_count should be < 20 for most hits
+        chain_hits = [
+            hit.sources["chains"]
+            for hit in result.hits
+            if "chains" in hit.sources
+        ]
+        if chain_hits and total_chains > 1:
+            assert any(h.related_count < total_chains for h in chain_hits), (
+                f"All chain hits have related_count == {total_chains} (total), "
+                "which means related_count is not entity-specific"
+            )
+
+        sess.__exit__(None, None, None)
+
+    def test_composite_related_count_is_entity_specific(self, tmp_path):
+        """related_count for composite source must reflect per-entity composite count."""
+        scanner, sess = _make_scanner_fixture(tmp_path, n=50, seed=42)
+        scanner.add_source("pairs", "pair_pattern", key_type="composite")
+
+        manifest = sess._manifest
+        version = manifest.pattern_version("pair_pattern")
+        total_composites = sess._reader.count_geometry_rows("pair_pattern", version)
+
+        result = scanner.scan("accounts", threshold=1)
+
+        if result.total_flagged == 0:
+            sess.__exit__(None, None, None)
+            return  # no hits to check
+
+        for hit in result.hits:
+            if "pairs" not in hit.sources:
+                continue
+            src_hit = hit.sources["pairs"]
+            assert src_hit.related_count <= total_composites, (
+                f"related_count {src_hit.related_count} exceeds total composite count {total_composites}"
+            )
+            assert src_hit.related_count >= src_hit.anomalous_count, (
+                f"related_count {src_hit.related_count} < anomalous_count {src_hit.anomalous_count}"
+            )
+
+        # Verify entity-specificity: with n=50 accounts and ~250 pairs (n*5 txs),
+        # most accounts appear in far fewer pairs than the total
+        pair_hits = [
+            hit.sources["pairs"]
+            for hit in result.hits
+            if "pairs" in hit.sources
+        ]
+        if pair_hits and total_composites > 1:
+            assert any(h.related_count < total_composites for h in pair_hits), (
+                f"All composite hits have related_count == {total_composites} (total), "
+                "which means related_count is not entity-specific"
+            )
+
+        sess.__exit__(None, None, None)

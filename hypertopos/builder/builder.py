@@ -1622,7 +1622,7 @@ class GDSBuilder:
             "anomaly_confidence": (
                 pa.array(anomaly_confidence_arr[start:end], type=pa.float32())
                 if anomaly_confidence_arr is not None
-                else pa.array(np.zeros(cn, dtype=np.float32), type=pa.float32())
+                else pa.array([None] * cn, type=pa.float32())
             ),
             "n_anomalous_dims": (
                 pa.array(n_anom_dims[start:end], type=pa.int32())
@@ -3086,7 +3086,7 @@ class GDSBuilder:
                     ),
                     type=pa.float32(),
                 ),
-                "anomaly_confidence": pa.array(np.zeros(n_new, dtype=np.float32), type=pa.float32()),
+                "anomaly_confidence": pa.array([None] * n_new, type=pa.float32()),
                 "n_anomalous_dims": pa.array(n_anom_dims, type=pa.int32()),
                 "entity_keys": pa.array(entity_key_lists, type=pa.list_(pa.string())),
                 "last_refresh_at": pa.array([now] * n_new, type=ts_type),

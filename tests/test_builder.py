@@ -1832,3 +1832,42 @@ def test_builder_dim_percentiles_skips_string_columns(tmp_path):
     assert "name" not in dp
     if dp:
         assert "score" in dp
+
+
+def test_geometry_writes_null_confidence_when_bootstrap_skipped(tmp_path):
+    """When bootstrap is not run, anomaly_confidence column must be all-null (not 0.0)."""
+    import lance
+    import pyarrow as pa
+    from hypertopos.builder.builder import GDSBuilder, RelationSpec
+
+    builder = GDSBuilder("s", str(tmp_path / "gds"))
+    customers = pa.table(
+        {
+            "customer_id": ["C-1", "C-2", "C-3"],
+            "segment_id": ["S-A", "S-B", "S-A"],
+        }
+    )
+    segments = pa.table({"segment_id": ["S-A", "S-B"]})
+    builder.add_line("customers", customers, key_col="customer_id", source_id="test")
+    builder.add_line("segments", segments, key_col="segment_id", source_id="test")
+    builder.add_pattern(
+        "customer_pattern",
+        pattern_type="anchor",
+        entity_line="customers",
+        relations=[
+            RelationSpec(line_id="customers", fk_col=None, direction="self"),
+            RelationSpec(line_id="segments", fk_col="segment_id", direction="in"),
+        ],
+    )
+    # Build without bootstrap — bootstrap_iterations defaults to 0 or is not set
+    builder.build()
+
+    geo_path = tmp_path / "gds" / "geometry" / "customer_pattern" / "v=1" / "data.lance"
+    geo_table = lance.dataset(str(geo_path)).to_table(columns=["anomaly_confidence"])
+
+    # All values must be null (None), not 0.0
+    confidence_col = geo_table["anomaly_confidence"]
+    for i in range(len(confidence_col)):
+        assert confidence_col[i].as_py() is None, (
+            f"Row {i}: expected null anomaly_confidence, got {confidence_col[i].as_py()}"
+        )

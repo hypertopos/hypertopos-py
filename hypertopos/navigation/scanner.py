@@ -461,15 +461,28 @@ class PassiveScanner:
                 if part:
                     entity_hits[part].append(norm_f)
 
-        total = self._reader.count_geometry_rows(
-            source.pattern_id, version,
-        )
+        # Build per-entity total composite count by reading all PKs (no filter).
+        # This gives entity-specific related_count rather than total pattern population.
+        entity_total_count: dict[str, int] = defaultdict(int)
+        try:
+            all_geo = self._reader.read_geometry(
+                source.pattern_id, version,
+                columns=["primary_key"],
+            )
+            for all_pk in all_geo["primary_key"].to_pylist():
+                if not all_pk:
+                    continue
+                for part in all_pk.split(sep):
+                    if part:
+                        entity_total_count[part] += 1
+        except Exception:
+            pass
 
         result: dict[str, ScanSourceHit] = {}
         for ek, norms in entity_hits.items():
             result[ek] = ScanSourceHit(
                 anomalous_count=len(norms),
-                related_count=total,
+                related_count=entity_total_count.get(ek, len(norms)),
                 max_delta_norm=max(norms),
             )
         return result
@@ -522,6 +535,14 @@ class PassiveScanner:
             filter=filt,
         )
 
+        # Build per-entity total chain count from chain_to_entities (covers ALL chains,
+        # since chain_to_entities was populated from the full points table before filtering
+        # to anomalous geometry rows below).
+        entity_total_count: dict[str, int] = defaultdict(int)
+        for _chain_pk, entity_keys in chain_to_entities.items():
+            for ek in entity_keys:
+                entity_total_count[ek] += 1
+
         entity_hits: dict[str, list[float]] = defaultdict(list)
         for chain_pk, norm in zip(
             geo["primary_key"].to_pylist(),
@@ -531,15 +552,11 @@ class PassiveScanner:
             for ek in chain_to_entities.get(chain_pk, []):
                 entity_hits[ek].append(norm_f)
 
-        total = self._reader.count_geometry_rows(
-            source.pattern_id, version,
-        )
-
         result: dict[str, ScanSourceHit] = {}
         for ek, norms in entity_hits.items():
             result[ek] = ScanSourceHit(
                 anomalous_count=len(norms),
-                related_count=total,
+                related_count=entity_total_count.get(ek, len(norms)),
                 max_delta_norm=max(norms),
             )
         return result

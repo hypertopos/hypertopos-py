@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 from collections import defaultdict, deque
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal
@@ -16,6 +17,14 @@ import pyarrow.compute as pc
 
 from hypertopos.model.objects import Edge, Point, Polygon, Solid
 from hypertopos.utils.arrow import delta_matrix_from_arrow
+
+# Numeric stability bounds for motif-score products.
+# ``_MOTIF_SCORE_EPSILON`` clamps non-zero underflow (product < 1e-30) UP
+# so sorting stays stable; ``_MOTIF_SCORE_MAX`` clamps overflow (product
+# > 1e300 or +inf) DOWN so JSON serialisation stays finite. The
+# ``log_score`` companion field remains informative past both clamps.
+_MOTIF_SCORE_EPSILON = 1e-30
+_MOTIF_SCORE_MAX = 1e300
 
 logger = logging.getLogger(__name__)
 
@@ -3842,6 +3851,10 @@ class GDSNavigator:
     # find_motif — structural motif scoring (0.5.0)
     # ------------------------------------------------------------------
 
+    # _MOTIF_SCORE_EPSILON mirrored as class attribute for legacy
+    # `self._MOTIF_SCORE_EPSILON` subclass overrides — the actual scorers
+    # reference the module-level constant. _MOTIF_SCORE_MAX is module-level
+    # only (no historical subclass override to preserve).
     _MOTIF_SCORE_EPSILON = 1e-30
 
     @property
@@ -3875,6 +3888,16 @@ class GDSNavigator:
                 default_window_hours=1,
                 min_instances=1,
             ),
+            "fan_in": MotifSpec(
+                enumerate=GDSNavigator._enumerate_fan_in,
+                default_window_hours=168,
+                min_instances=3,
+            ),
+            "chain_k": MotifSpec(
+                enumerate=GDSNavigator._enumerate_chain_k,
+                default_window_hours=168,
+                min_instances=1,
+            ),
         }
         self._motif_registry_cache = registry
         return registry
@@ -3889,7 +3912,11 @@ class GDSNavigator:
         distinct from underflow — it collapses the motif score to exactly 0.0
         to surface "structurally a motif, geometrically indistinguishable
         endpoints" cases. Non-zero products below 1e-30 are clamped to 1e-30
-        to keep sorting stable.
+        to keep sorting stable; products above 1e300 (or +inf) are clamped
+        DOWN to 1e300 and the ``score_clamped`` flag is set. ``log_score``
+        = sum of log(ep) across non-zero edges (or ``-inf`` when any edge is
+        zero) stays informative past both clamps and is what the ranking
+        sort actually keys on.
         """
         if not edges:
             raise GDSNavigationError(
@@ -3897,6 +3924,7 @@ class GDSNavigator:
             )
         breakdown: list[dict[str, Any]] = []
         product = 1.0
+        log_score = 0.0
         saw_zero = False
         for (u, v) in edges:
             ep = self.edge_potential(u, v, pattern_id)
@@ -3910,10 +3938,29 @@ class GDSNavigator:
             })
             if score == 0.0:
                 saw_zero = True
+            else:
+                log_score += math.log(score)
             product *= score
-        if not saw_zero and product < self._MOTIF_SCORE_EPSILON:
-            product = self._MOTIF_SCORE_EPSILON
-        return {"score": product, "breakdown": breakdown}
+        score_clamped = False
+        if saw_zero:
+            # Zero dominates — preserve semantic 0.0 and -inf log_score.
+            log_score_out: float = -math.inf
+            product_out: float = 0.0
+        else:
+            if product < _MOTIF_SCORE_EPSILON:
+                product_out = _MOTIF_SCORE_EPSILON
+            elif math.isinf(product) or product > _MOTIF_SCORE_MAX:
+                product_out = _MOTIF_SCORE_MAX
+                score_clamped = True
+            else:
+                product_out = product
+            log_score_out = log_score
+        return {
+            "score": product_out,
+            "log_score": log_score_out,
+            "score_clamped": score_clamped,
+            "breakdown": breakdown,
+        }
 
     _MOTIF_RANKING_CACHE_MAX = 8
 
@@ -3925,6 +3972,8 @@ class GDSNavigator:
         time_window_hours: int | None = None,
         amt1_min: float = 10000.0,
         amt2_max: float = 10000.0,
+        min_k: int | None = None,
+        k: int = 4,
     ) -> dict[str, Any]:
         """Score the best ``motif_type`` instance seeded at ``entity_key``.
 
@@ -3932,10 +3981,13 @@ class GDSNavigator:
         with the highest product-of-edge_potential score wins. Returns a dict
         with ``found`` flag, ``score``, ``breakdown`` (per-edge scores), and
         motif-specific identifying fields (``counterparty`` for cycle_2,
-        ``ring`` for cycle_3, ``k`` for fan_out, ``path`` for structuring).
-        ``amt1_min`` and ``amt2_max`` gate the three hops of a ``structuring``
-        motif (hop1 ≥ amt1_min, hop2 and hop3 ≤ amt2_max); ignored for other
-        motif types.
+        ``ring`` for cycle_3, ``k`` for fan_out / fan_in / chain_k,
+        ``path`` for structuring / chain_k). ``amt1_min`` and ``amt2_max``
+        gate the three hops of a ``structuring`` motif; ``k`` sets the chain
+        length for ``chain_k`` (3 ≤ k ≤ 8, default 4); ignored for other
+        motif types. ``min_k`` overrides the distinct-neighbour threshold
+        for ``fan_out`` / ``fan_in`` (default 3 when ``None``); ignored for
+        other motif types.
         """
         if motif_type not in self._motif_registry:
             valid = ", ".join(sorted(self._motif_registry.keys()))
@@ -3946,17 +3998,30 @@ class GDSNavigator:
             raise GDSNavigationError(
                 f"time_window_hours must be positive, got {time_window_hours}.",
             )
+        if min_k is not None and min_k < 1:
+            raise GDSNavigationError(
+                f"min_k must be ≥ 1 when provided, got {min_k}.",
+            )
         if motif_type == "structuring":
             if amt1_min <= 0 or amt2_max <= 0:
                 raise GDSNavigationError(
                     "amt1_min and amt2_max must be positive for structuring motif.",
                 )
+        if motif_type == "chain_k":
+            if k < 3 or k > 8:
+                raise GDSNavigationError(
+                    f"chain_k requires 3 ≤ k ≤ 8, got k={k}.",
+                )
         spec = self._motif_registry[motif_type]
         window = time_window_hours if time_window_hours is not None else spec.default_window_hours
 
+        enum_kwargs: dict[str, Any] = {
+            "amt1_min": amt1_min, "amt2_max": amt2_max, "k": k,
+        }
+        if min_k is not None:
+            enum_kwargs["min_k"] = min_k
         instances = spec.enumerate(
-            self, entity_key, pattern_id, window,
-            amt1_min=amt1_min, amt2_max=amt2_max,
+            self, entity_key, pattern_id, window, **enum_kwargs,
         )
         if not instances:
             return {
@@ -3990,6 +4055,7 @@ class GDSNavigator:
         min_k: int | None = None,
         amt1_min: float = 10000.0,
         amt2_max: float = 10000.0,
+        k: int = 4,
     ) -> list[dict[str, Any]]:
         """Rank ``motif_type`` instances across the pattern by score, desc.
 
@@ -4018,11 +4084,16 @@ class GDSNavigator:
                 raise GDSNavigationError(
                     "amt1_min and amt2_max must be positive for structuring motif.",
                 )
+        if motif_type == "chain_k":
+            if k < 3 or k > 8:
+                raise GDSNavigationError(
+                    f"chain_k requires 3 ≤ k ≤ 8, got k={k}.",
+                )
         spec = self._motif_registry[motif_type]
         window = time_window_hours if time_window_hours is not None else spec.default_window_hours
         version = self._resolve_version(pattern_id)
 
-        cache_key = (pattern_id, version, motif_type, window, amt1_min, amt2_max)
+        cache_key = (pattern_id, version, motif_type, window, amt1_min, amt2_max, k)
         if not hasattr(self, "_motif_ranking_cache"):
             from collections import OrderedDict
             self._motif_ranking_cache: OrderedDict[tuple, list[dict[str, Any]]] = OrderedDict()
@@ -4038,7 +4109,7 @@ class GDSNavigator:
             all_seeds = geo["primary_key"].to_pylist() if geo.num_rows else []
             ranked = self._rank_motifs(
                 all_seeds, pattern_id, motif_type, window, min_k,
-                amt1_min=amt1_min, amt2_max=amt2_max,
+                amt1_min=amt1_min, amt2_max=amt2_max, k=k,
             )
             cache[cache_key] = ranked
             while len(cache) > self._MOTIF_RANKING_CACHE_MAX:
@@ -4089,6 +4160,7 @@ class GDSNavigator:
         """
         breakdown: list[dict[str, Any]] = []
         product = 1.0
+        log_score = 0.0
         saw_zero = False
         for (u, v) in edges:
             if u not in delta_map or v not in delta_map:
@@ -4109,10 +4181,28 @@ class GDSNavigator:
             })
             if edge_score == 0.0:
                 saw_zero = True
+            else:
+                log_score += math.log(edge_score)
             product *= edge_score
-        if not saw_zero and product < self._MOTIF_SCORE_EPSILON:
-            product = self._MOTIF_SCORE_EPSILON
-        return {"score": product, "breakdown": breakdown}
+        score_clamped = False
+        if saw_zero:
+            product_out: float = 0.0
+            log_score_out: float = -math.inf
+        else:
+            if product < _MOTIF_SCORE_EPSILON:
+                product_out = _MOTIF_SCORE_EPSILON
+            elif math.isinf(product) or product > _MOTIF_SCORE_MAX:
+                product_out = _MOTIF_SCORE_MAX
+                score_clamped = True
+            else:
+                product_out = product
+            log_score_out = log_score
+        return {
+            "score": product_out,
+            "log_score": log_score_out,
+            "score_clamped": score_clamped,
+            "breakdown": breakdown,
+        }
 
     def _rank_motifs(
         self,
@@ -4123,6 +4213,7 @@ class GDSNavigator:
         min_k: int | None,
         amt1_min: float = 10000.0,
         amt2_max: float = 10000.0,
+        k: int = 4,
     ) -> list[dict[str, Any]]:
         graph_pid = self._resolve_motif_graph_pid(pattern_id)
         version = self._resolve_version(pattern_id)
@@ -4131,7 +4222,9 @@ class GDSNavigator:
             return []
         pair_counts = adj.pair_counts()
         window_sec = float(window) * 3600.0
-        effective_min_k = min_k if (motif_type == "fan_out" and min_k is not None) else 3
+        effective_min_k = (
+            min_k if (motif_type in {"fan_out", "fan_in"} and min_k is not None) else 3
+        )
 
         active_seeds = self._active_seeds_for_motif(
             adj, all_seeds, motif_type, effective_min_k,
@@ -4143,6 +4236,10 @@ class GDSNavigator:
         for seed in active_seeds:
             if motif_type == "fan_out":
                 found = self._enum_fan_out_via_adj(seed, adj, window_sec, effective_min_k)
+            elif motif_type == "fan_in":
+                found = self._enum_fan_in_via_adj(
+                    seed, adj, window_sec, effective_min_k,
+                )
             elif motif_type == "cycle_2":
                 found = self._enum_cycle_2_via_adj(seed, adj, window_sec)
             elif motif_type == "cycle_3":
@@ -4151,6 +4248,8 @@ class GDSNavigator:
                 found = self._enum_structuring_via_adj(
                     seed, adj, window_sec, amt1_min, amt2_max,
                 )
+            elif motif_type == "chain_k":
+                found = self._enum_chain_k_via_adj(seed, adj, window_sec, k)
             else:
                 found = []
             for inst in found:
@@ -4164,7 +4263,7 @@ class GDSNavigator:
                     if pair in seen_rings:
                         continue
                     seen_rings.add(pair)
-                elif motif_type == "structuring":
+                elif motif_type in {"structuring", "chain_k"}:
                     canonical = tuple(inst["path"])
                     if canonical in seen_rings:
                         continue
@@ -4184,7 +4283,13 @@ class GDSNavigator:
             if sc is None:
                 continue
             scored.append({**inst, **sc})
-        scored.sort(key=lambda r: -r["score"])
+        # Sort by log_score DESC rather than raw score — stays correct past
+        # the overflow clamp (_MOTIF_SCORE_MAX). log_score is monotonic with
+        # product over the finite positive range, so order below the clamp
+        # is unchanged; above the clamp log_score breaks ties that the
+        # clamped raw score can't distinguish. -inf log_score (zero product)
+        # naturally sorts last under DESC.
+        scored.sort(key=lambda r: -r["log_score"])
         n = len(scored)
         if n > 0:
             p95_idx = max(0, int(n * 0.05) - 1)
@@ -4214,6 +4319,12 @@ class GDSNavigator:
                 if s in adj._out
                 and len({t for (t, *_r) in adj._out[s] if t != s}) >= effective_min_k
             ]
+        if motif_type == "fan_in":
+            return [
+                s for s in all_seeds_set
+                if s in adj._in
+                and len({f for (f, *_r) in adj._in[s] if f != s}) >= effective_min_k
+            ]
         if motif_type == "structuring":
             return [
                 s for s in all_seeds_set
@@ -4222,6 +4333,12 @@ class GDSNavigator:
                     amt is not None and amt >= amt1_min and t != s
                     for (t, _ts, amt, _ek) in adj._out[s]
                 )
+            ]
+        if motif_type == "chain_k":
+            return [
+                s for s in all_seeds_set
+                if s in adj._out
+                and any(t != s for (t, *_r) in adj._out[s])
             ]
         return [s for s in all_seeds if s in adj._out]
 
@@ -4248,6 +4365,32 @@ class GDSNavigator:
             "seed": seed,
             "k": len(unique),
             "edges": [(seed, t) for t in unique],
+        }]
+
+    @staticmethod
+    def _enum_fan_in_via_adj(
+        seed: str,
+        adj: "AdjacencyIndex",
+        window_sec: float,
+        min_k: int,
+    ) -> list[dict[str, Any]]:
+        """Mirror of _enum_fan_out_via_adj: seed = sink, collect distinct sources."""
+        edges = adj.neighbors_in(seed)
+        if not edges:
+            return []
+        max_ts = max(ts for (_, ts, *_r) in edges)
+        recent = [
+            (f, ts) for (f, ts, *_r) in edges
+            if f != seed and ts >= max_ts - window_sec
+        ]
+        unique = sorted({f for (f, _) in recent})
+        if len(unique) < min_k:
+            return []
+        return [{
+            "motif_type": "fan_in",
+            "seed": seed,
+            "k": len(unique),
+            "edges": [(f, seed) for f in unique],
         }]
 
     @staticmethod
@@ -4386,6 +4529,72 @@ class GDSNavigator:
                         return results
         return results
 
+    @staticmethod
+    def _enum_chain_k_via_adj(
+        seed: str,
+        adj: "AdjacencyIndex",
+        window_sec: float,
+        k: int,
+        max_frontier: int = 1000,
+        max_results: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Adjacency-based DFS for open chain of length k from seed.
+
+        Constraints: no node revisit (also blocks cycle closure), strict
+        monotone timestamps, total span ≤ window_sec. Frontier capped per
+        level at max_frontier; final results capped at max_results.
+        """
+        if k < 3 or k > 8:
+            return []
+        # Partial path: (path_tuple, edges_list, ts_first, ts_last)
+        _Partial = tuple[tuple[str, ...], list[tuple[str, str]], float | None, float | None]
+        frontier: list[_Partial] = [((seed,), [], None, None)]
+        truncated = False
+        for _hop in range(k - 1):
+            next_frontier: list[_Partial] = []
+            for (path, edge_list, ts_first, ts_last) in frontier:
+                tail = path[-1]
+                for (nxt, ts_new, _amt, _ek) in adj.neighbors_out(tail):
+                    if nxt in path:
+                        continue
+                    if ts_last is not None and ts_new <= ts_last:
+                        continue
+                    new_first = ts_first if ts_first is not None else ts_new
+                    if ts_new - new_first > window_sec:
+                        continue
+                    next_frontier.append((
+                        path + (nxt,),
+                        edge_list + [(tail, nxt)],
+                        new_first,
+                        ts_new,
+                    ))
+                    if len(next_frontier) >= max_frontier:
+                        truncated = True
+                        break
+                if len(next_frontier) >= max_frontier:
+                    truncated = True
+                    break
+            frontier = next_frontier
+            if not frontier:
+                return []
+        results: list[dict[str, Any]] = []
+        seen: set[tuple[str, ...]] = set()
+        for (path, edge_list, _ts_first, _ts_last) in frontier:
+            if path in seen:
+                continue
+            seen.add(path)
+            results.append({
+                "motif_type": "chain_k",
+                "seed": seed,
+                "k": k,
+                "path": list(path),
+                "edges": edge_list,
+                "frontier_truncated": truncated,
+            })
+            if len(results) >= max_results:
+                break
+        return results
+
     def _resolve_motif_graph_pid(self, pattern_id: str) -> str:
         """Return the graph companion pattern_id for motif enumeration."""
         sphere = self._storage.read_sphere()
@@ -4426,11 +4635,11 @@ class GDSNavigator:
         if edges.num_rows == 0:
             return []
         if time_window_hours is not None and "timestamp" in edges.schema.names:
-            ts = np.asarray(edges["timestamp"].to_pylist(), dtype=np.int64)
+            ts = np.asarray(edges["timestamp"].to_pylist(), dtype=np.float64)
             if ts.size:
-                max_ts = int(ts.max())
-                window_us = int(time_window_hours * 3600 * 1_000_000)
-                mask = ts >= (max_ts - window_us)
+                max_ts = float(ts.max())
+                window_sec = float(time_window_hours) * 3600.0
+                mask = ts >= (max_ts - window_sec)
                 edges = edges.filter(pa.array(mask))
         targets = [t for t in edges["to_key"].to_pylist() if t != seed]
         unique = sorted(set(targets))
@@ -4451,29 +4660,35 @@ class GDSNavigator:
         counterparty: str | None = None,
         **_kwargs: Any,
     ) -> list[dict[str, Any]]:
-        """Bidirectional pair (A ↔ B) with both directions within ``time_window_hours``."""
+        """Bidirectional pair (A ↔ B) with both directions within ``time_window_hours``.
+
+        Uses seconds arithmetic matching EDGE_TABLE_SCHEMA (timestamp: float64
+        epoch seconds) and the adjacency ranking path.
+        """
         graph_pid = self._resolve_motif_graph_pid(pattern_id)
         out_edges = self._storage.read_edges(graph_pid, from_keys=[seed])
         in_edges = self._storage.read_edges(graph_pid, to_keys=[seed])
         if out_edges.num_rows == 0 or in_edges.num_rows == 0:
             return []
-        window_us = int(time_window_hours * 3600 * 1_000_000)
-        out_by_target: dict[str, list[int]] = defaultdict(list)
+        window_sec = float(time_window_hours) * 3600.0
+        out_by_target: dict[str, list[float]] = defaultdict(list)
         for to_key, ts in zip(
             out_edges["to_key"].to_pylist(),
-            out_edges["timestamp"].to_pylist() if "timestamp" in out_edges.schema.names else [0] * out_edges.num_rows,
+            out_edges["timestamp"].to_pylist() if "timestamp" in out_edges.schema.names else [0.0] * out_edges.num_rows,
+            strict=False,
         ):
             if to_key == seed:
                 continue
-            out_by_target[to_key].append(int(ts) if ts is not None else 0)
-        in_by_source: dict[str, list[int]] = defaultdict(list)
+            out_by_target[to_key].append(float(ts) if ts is not None else 0.0)
+        in_by_source: dict[str, list[float]] = defaultdict(list)
         for from_key, ts in zip(
             in_edges["from_key"].to_pylist(),
-            in_edges["timestamp"].to_pylist() if "timestamp" in in_edges.schema.names else [0] * in_edges.num_rows,
+            in_edges["timestamp"].to_pylist() if "timestamp" in in_edges.schema.names else [0.0] * in_edges.num_rows,
+            strict=False,
         ):
             if from_key == seed:
                 continue
-            in_by_source[from_key].append(int(ts) if ts is not None else 0)
+            in_by_source[from_key].append(float(ts) if ts is not None else 0.0)
         results: list[dict[str, Any]] = []
         candidates = set(out_by_target) & set(in_by_source)
         if counterparty is not None:
@@ -4484,7 +4699,7 @@ class GDSNavigator:
             closest_span = min(
                 abs(a - b) for a in ts_out for b in ts_in
             )
-            if closest_span > window_us:
+            if closest_span > window_sec:
                 continue
             results.append({
                 "motif_type": "cycle_2",
@@ -4502,22 +4717,27 @@ class GDSNavigator:
         max_triads: int = 50,
         **_kwargs: Any,
     ) -> list[dict[str, Any]]:
-        """Directed triad A→B→C→A with strictly monotonic timestamps within window."""
+        """Directed triad A→B→C→A with strictly monotonic timestamps within window.
+
+        Uses seconds arithmetic matching EDGE_TABLE_SCHEMA (timestamp: float64
+        epoch seconds) and the adjacency ranking path.
+        """
         graph_pid = self._resolve_motif_graph_pid(pattern_id)
         out_from_seed = self._storage.read_edges(graph_pid, from_keys=[seed])
         if out_from_seed.num_rows == 0:
             return []
         has_ts = "timestamp" in out_from_seed.schema.names
-        window_us = int(time_window_hours * 3600 * 1_000_000)
+        window_sec = float(time_window_hours) * 3600.0
 
-        seed_to_b: dict[str, list[int]] = defaultdict(list)
+        seed_to_b: dict[str, list[float]] = defaultdict(list)
         for b, ts in zip(
             out_from_seed["to_key"].to_pylist(),
-            out_from_seed["timestamp"].to_pylist() if has_ts else [0] * out_from_seed.num_rows,
+            out_from_seed["timestamp"].to_pylist() if has_ts else [0.0] * out_from_seed.num_rows,
+            strict=False,
         ):
             if b == seed:
                 continue
-            seed_to_b[b].append(int(ts) if ts is not None else 0)
+            seed_to_b[b].append(float(ts) if ts is not None else 0.0)
 
         b_keys = list(seed_to_b.keys())
         if not b_keys:
@@ -4525,15 +4745,16 @@ class GDSNavigator:
         out_from_bs = self._storage.read_edges(graph_pid, from_keys=b_keys)
         if out_from_bs.num_rows == 0:
             return []
-        b_to_c: dict[tuple[str, str], list[int]] = defaultdict(list)
+        b_to_c: dict[tuple[str, str], list[float]] = defaultdict(list)
         for from_b, to_c, ts in zip(
             out_from_bs["from_key"].to_pylist(),
             out_from_bs["to_key"].to_pylist(),
-            out_from_bs["timestamp"].to_pylist() if has_ts else [0] * out_from_bs.num_rows,
+            out_from_bs["timestamp"].to_pylist() if has_ts else [0.0] * out_from_bs.num_rows,
+            strict=False,
         ):
             if to_c == seed or to_c == from_b:
                 continue
-            b_to_c[(from_b, to_c)].append(int(ts) if ts is not None else 0)
+            b_to_c[(from_b, to_c)].append(float(ts) if ts is not None else 0.0)
 
         c_candidates = {c for (_b, c) in b_to_c.keys()}
         if not c_candidates:
@@ -4541,12 +4762,13 @@ class GDSNavigator:
         close_back = self._storage.read_edges(
             graph_pid, from_keys=list(c_candidates), to_keys=[seed],
         )
-        c_to_seed: dict[str, list[int]] = defaultdict(list)
+        c_to_seed: dict[str, list[float]] = defaultdict(list)
         for c, ts in zip(
             close_back["from_key"].to_pylist(),
-            close_back["timestamp"].to_pylist() if has_ts else [0] * close_back.num_rows,
+            close_back["timestamp"].to_pylist() if has_ts else [0.0] * close_back.num_rows,
+            strict=False,
         ):
-            c_to_seed[c].append(int(ts) if ts is not None else 0)
+            c_to_seed[c].append(float(ts) if ts is not None else 0.0)
 
         triads: list[dict[str, Any]] = []
         for (b, c), ts_bc_list in b_to_c.items():
@@ -4554,8 +4776,7 @@ class GDSNavigator:
                 continue
             ts_ab_list = seed_to_b[b]
             ts_ca_list = c_to_seed[c]
-            # Look for (ts_ab < ts_bc < ts_ca) with ts_ca - ts_ab <= window.
-            best: tuple[int, int, int] | None = None
+            best: tuple[float, float, float] | None = None
             for t_ab in ts_ab_list:
                 for t_bc in ts_bc_list:
                     if t_bc <= t_ab:
@@ -4563,7 +4784,7 @@ class GDSNavigator:
                     for t_ca in ts_ca_list:
                         if t_ca <= t_bc:
                             continue
-                        if t_ca - t_ab > window_us:
+                        if t_ca - t_ab > window_sec:
                             continue
                         if best is None or (t_ca - t_ab) < (best[2] - best[0]):
                             best = (t_ab, t_bc, t_ca)
@@ -4778,6 +4999,132 @@ class GDSNavigator:
             keys[i]: np.asarray(vectors[i], dtype=np.float64)
             for i in range(tbl.num_rows)
         }
+
+    def _enumerate_fan_in(
+        self,
+        seed: str,
+        pattern_id: str,
+        time_window_hours: int,
+        min_k: int = 3,
+        **_kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        """k distinct sources → sink within a sliding time window.
+
+        Mirror of _enumerate_fan_out. Seconds arithmetic matching
+        EDGE_TABLE_SCHEMA (timestamp: float64 epoch seconds) and the
+        adjacency ranking path.
+        """
+        graph_pid = self._resolve_motif_graph_pid(pattern_id)
+        edges = self._storage.read_edges(graph_pid, to_keys=[seed])
+        if edges.num_rows == 0:
+            return []
+        if time_window_hours is not None and "timestamp" in edges.schema.names:
+            ts = np.asarray(edges["timestamp"].to_pylist(), dtype=np.float64)
+            if ts.size:
+                max_ts = float(ts.max())
+                window_sec = float(time_window_hours) * 3600.0
+                mask = ts >= (max_ts - window_sec)
+                edges = edges.filter(pa.array(mask))
+        sources = [s for s in edges["from_key"].to_pylist() if s != seed]
+        unique = sorted(set(sources))
+        if len(unique) < min_k:
+            return []
+        return [{
+            "motif_type": "fan_in",
+            "seed": seed,
+            "k": len(unique),
+            "edges": [(s, seed) for s in unique],
+        }]
+
+    _CHAIN_K_MAX_FRONTIER = 1000
+    _CHAIN_K_MAX_RESULTS = 50
+
+    def _enumerate_chain_k(
+        self,
+        seed: str,
+        pattern_id: str,
+        time_window_hours: int,
+        k: int = 4,
+        **_kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        """Open directed chain A → B → ... of length k, no cycle closure.
+
+        Uses seconds arithmetic throughout (matching EDGE_TABLE_SCHEMA
+        `timestamp: float64` = epoch seconds and the adjacency ranking
+        path `_enum_chain_k_via_adj`). Single-seed and ranking paths
+        therefore enforce the same window; no divergence. Monotone ts,
+        no node revisit (blocks seed closure), total span ≤ window_sec.
+        """
+        if k < 3 or k > 8:
+            raise GDSNavigationError(
+                f"chain_k requires 3 ≤ k ≤ 8, got k={k}.",
+            )
+        graph_pid = self._resolve_motif_graph_pid(pattern_id)
+        window_sec = float(time_window_hours) * 3600.0
+
+        _Partial = tuple[tuple[str, ...], list[tuple[str, str]], float | None, float | None]
+        frontier: list[_Partial] = [((seed,), [], None, None)]
+        truncated = False
+
+        for _hop in range(k - 1):
+            current_tails = sorted({path[-1] for (path, _e, _f, _l) in frontier})
+            if not current_tails:
+                return []
+            edges = self._storage.read_edges(graph_pid, from_keys=current_tails)
+            if edges.num_rows == 0:
+                return []
+            has_ts = "timestamp" in edges.schema.names
+            from_keys_arr = edges["from_key"].to_pylist()
+            to_keys_arr = edges["to_key"].to_pylist()
+            ts_arr = edges["timestamp"].to_pylist() if has_ts else [0.0] * edges.num_rows
+            out_by_src: dict[str, list[tuple[str, float]]] = defaultdict(list)
+            for fk, tk, ts in zip(from_keys_arr, to_keys_arr, ts_arr, strict=False):
+                out_by_src[fk].append((tk, float(ts) if ts is not None else 0.0))
+            next_frontier: list[_Partial] = []
+            for (path, edge_list, ts_first, ts_last) in frontier:
+                tail = path[-1]
+                for (nxt, ts_new) in out_by_src.get(tail, []):
+                    if nxt in path:
+                        continue
+                    if ts_last is not None and ts_new <= ts_last:
+                        continue
+                    new_first = ts_first if ts_first is not None else ts_new
+                    if ts_new - new_first > window_sec:
+                        continue
+                    next_frontier.append((
+                        path + (nxt,),
+                        edge_list + [(tail, nxt)],
+                        new_first,
+                        ts_new,
+                    ))
+                    if len(next_frontier) >= self._CHAIN_K_MAX_FRONTIER:
+                        truncated = True
+                        break
+                if len(next_frontier) >= self._CHAIN_K_MAX_FRONTIER:
+                    truncated = True
+                    break
+            frontier = next_frontier
+            if not frontier:
+                return []
+
+        # frontier now holds paths of length k. Emit as motif instances.
+        results: list[dict[str, Any]] = []
+        seen_paths: set[tuple[str, ...]] = set()
+        for (path, edge_list, _ts_first, _ts_last) in frontier:
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            results.append({
+                "motif_type": "chain_k",
+                "seed": seed,
+                "k": k,
+                "path": list(path),
+                "edges": edge_list,
+                "frontier_truncated": truncated,
+            })
+            if len(results) >= self._CHAIN_K_MAX_RESULTS:
+                break
+        return results
 
     def find_witness_cohort(
         self,
@@ -9971,6 +10318,7 @@ class GDSNavigator:
         pattern_id: str,
         displacement_ranks: list[int] | None = None,
         top_n_per_range: int = 5,
+        sample_size: int | None = None,
     ) -> list[dict]:
         """Find entities with unusual temporal trajectory shapes.
 
@@ -10015,6 +10363,8 @@ class GDSNavigator:
                 timestamps = pc.cast(table["timestamp"], pa.int64()).to_pylist()
                 for pk, snap, ts in zip(pks, snapshots, timestamps, strict=True):
                     entity_slices[pk].append((ts, snap))
+                if sample_size is not None and len(entity_slices) >= sample_size:
+                    break
         except StopIteration:
             return []
 

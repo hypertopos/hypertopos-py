@@ -7,6 +7,23 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.2] — 2026-04-28
+
+### Added
+- Two new closed-vocabulary motifs extending the 0.5.1 catalog:
+  - `split_recombine` — diamond scatter-gather: source S → k distinct intermediaries M = {m₁,…,mₖ} → single sink D, with stacked-bipartite temporal order (all split-hops precede all recombine-hops within the window). Seed picks whether to enumerate forward from the source (`direction="forward"`) or backward from the sink (`direction="backward"`). Default window 24h, `min_k` default 3. Covers AML scatter-gather smurfing, parallel layering, and concentrator/sink atoms (forward from source vs backward from sink) without amount gating — for amount-gated chains use `structuring`. Canonical definition follows Starnini et al. 2021 and the IBM AMLSim stacked-bipartite spec.
+  - `bipartite_burst` — complete K_{k,m} bipartite subgraph within a tight time window: k distinct sources each send to every one of m distinct sinks. Greedy single-core enumeration (not maximal): enumerate seed-as-source first, fall back to seed-as-sink. Parameters `min_k` (sources, default 3), `min_m` (sinks, default 3), default window 24h. Covers coordinated-burst and parallel-collusion atoms; complements `fan_out` + `fan_in` by requiring completeness on both sides rather than single-anchor density.
+- `score_motif` and `find_high_potential_motifs` accept `direction` (`split_recombine`) and `min_m` (`bipartite_burst`) parameters. `min_k` override now applies to `split_recombine` and `bipartite_burst` in addition to `fan_out` / `fan_in`. Registry size grows from 6 to 8.
+
+### Changed
+- chain_k motif enumerator now uses per-k adaptive frontier cap (k=3,4: 1000; k=5: 500; k=6: 250; k=7: 125; k=8: 100) instead of a static 1000-cap. Bounds worst-case FHPM cold latency at higher k while preserving the generous cap for k=3,4 where measurements show no fragility. Public API unchanged (k=3..8 still accepted); `frontier_truncated=true` may surface more often at higher k as a result.
+- Single-seed motif enumeration (fan_out, fan_in, cycle_2, cycle_3, structuring, chain_k) now delegates to the in-memory adjacency-path enumerator instead of issuing per-call Lance read_edges scans. Single source of truth per motif type — single-seed dispatch follows the same hot path as find_high_potential_motifs ranking.
+- `_score_motif_from_edges` batches endpoint delta reads into a single filtered Lance scan and reuses the warm AdjacencyIndex pair_counts cache, mirroring the fast-path used by find_high_potential_motifs. Cuts found=true scoring tail latency from O(num_edges × per-endpoint Lance read) to O(1) batched scan. trace_root_cause's motif_potential auto-attach branch benefits transitively.
+- bipartite_burst K-set intersection now starts from the smallest neighbour-set (size-ascending sink/source ordering) instead of alphabetic order, bounding the running intersection by the smallest set. Result identical (set intersection is commutative); protects against worst-case dense graphs where one sink dominates.
+- `_enumerate_structuring` no longer raises `GDSNavigationError` when the underlying edge table lacks an amount column. The post-refactor adjacency path always carries amounts (defaulting to 1.0 when unspecified), so the predicate `amt >= amt1_min` returns an empty result cleanly. Now consistent with how the other 7 motifs handle no-match.
+- cycle_3 motif enumerator now pre-filters intermediary candidates via 2-step adjacency traversal before the inner pair loop, skipping intermediaries that have no return-edge to the seed within the time window. Result equivalence preserved (semantic no-op on the candidate space).
+- bipartite_burst K_{k,m} dispatcher now pre-checks seed in/out degree before invoking the per-side enumerator. Correctness-preserving; skips fruitless fail-fast work for seeds that don't qualify on either side.
+
 ## [0.5.1] — 2026-04-21
 
 ### Added

@@ -3898,6 +3898,16 @@ class GDSNavigator:
                 default_window_hours=168,
                 min_instances=1,
             ),
+            "split_recombine": MotifSpec(
+                enumerate=GDSNavigator._enumerate_split_recombine,
+                default_window_hours=168,
+                min_instances=1,
+            ),
+            "bipartite_burst": MotifSpec(
+                enumerate=GDSNavigator._enumerate_bipartite_burst,
+                default_window_hours=24,
+                min_instances=1,
+            ),
         }
         self._motif_registry_cache = registry
         return registry
@@ -3907,7 +3917,11 @@ class GDSNavigator:
     ) -> dict[str, Any]:
         """Score a motif as the product of edge_potential across its edges.
 
-        Reuses the edge_potential cache from the 0.5.0 edge-potential primitive.
+        Batched implementation: pre-fetches all unique endpoint deltas in a
+        single filtered Lance scan, then reuses the warm AdjacencyIndex
+        pair_counts cache. Cuts geometry I/O from O(num_edges) per-endpoint
+        Lance reads to O(1) batched scan over the endpoint subset.
+
         A zero edge_potential (identical-delta endpoints) is semantically
         distinct from underflow — it collapses the motif score to exactly 0.0
         to surface "structurally a motif, geometrically indistinguishable
@@ -3922,45 +3936,27 @@ class GDSNavigator:
             raise GDSNavigationError(
                 "_score_motif_from_edges requires a non-empty edges list.",
             )
-        breakdown: list[dict[str, Any]] = []
-        product = 1.0
-        log_score = 0.0
-        saw_zero = False
+        endpoint_keys: set[str] = set()
         for (u, v) in edges:
-            ep = self.edge_potential(u, v, pattern_id)
-            score = float(ep["score"])
-            breakdown.append({
-                "edge": (u, v),
-                "edge_potential": score,
-                "delta_distance": ep.get("delta_distance"),
-                "pair_tx_count": ep.get("pair_tx_count"),
-                "effective_weight": ep.get("effective_weight"),
-            })
-            if score == 0.0:
-                saw_zero = True
-            else:
-                log_score += math.log(score)
-            product *= score
-        score_clamped = False
-        if saw_zero:
-            # Zero dominates — preserve semantic 0.0 and -inf log_score.
-            log_score_out: float = -math.inf
-            product_out: float = 0.0
-        else:
-            if product < _MOTIF_SCORE_EPSILON:
-                product_out = _MOTIF_SCORE_EPSILON
-            elif math.isinf(product) or product > _MOTIF_SCORE_MAX:
-                product_out = _MOTIF_SCORE_MAX
-                score_clamped = True
-            else:
-                product_out = product
-            log_score_out = log_score
-        return {
-            "score": product_out,
-            "log_score": log_score_out,
-            "score_clamped": score_clamped,
-            "breakdown": breakdown,
-        }
+            endpoint_keys.add(u)
+            endpoint_keys.add(v)
+        version = self._resolve_version(pattern_id)
+        delta_map = self._batch_read_deltas(pattern_id, version, endpoint_keys)
+        graph_pid = self._resolve_motif_graph_pid(pattern_id)
+        adj = self._storage.get_adjacency(graph_pid)
+        pair_counts = adj.pair_counts()
+        result = self._lean_score_motif(edges, delta_map, pair_counts)
+        if result is None:
+            # _lean_score_motif returned None — at least one endpoint is absent from the batched delta read.
+            missing = next(
+                (u, v) for (u, v) in edges
+                if u not in delta_map or v not in delta_map
+            )
+            raise GDSNavigationError(
+                f"Entity {missing[0]!r} or {missing[1]!r} not found in "
+                f"pattern {pattern_id!r} geometry.",
+            )
+        return result
 
     _MOTIF_RANKING_CACHE_MAX = 8
 
@@ -3974,6 +3970,8 @@ class GDSNavigator:
         amt2_max: float = 10000.0,
         min_k: int | None = None,
         k: int = 4,
+        direction: str = "forward",
+        min_m: int = 3,
     ) -> dict[str, Any]:
         """Score the best ``motif_type`` instance seeded at ``entity_key``.
 
@@ -3981,12 +3979,19 @@ class GDSNavigator:
         with the highest product-of-edge_potential score wins. Returns a dict
         with ``found`` flag, ``score``, ``breakdown`` (per-edge scores), and
         motif-specific identifying fields (``counterparty`` for cycle_2,
-        ``ring`` for cycle_3, ``k`` for fan_out / fan_in / chain_k,
-        ``path`` for structuring / chain_k). ``amt1_min`` and ``amt2_max``
-        gate the three hops of a ``structuring`` motif; ``k`` sets the chain
-        length for ``chain_k`` (3 ≤ k ≤ 8, default 4); ignored for other
-        motif types. ``min_k`` overrides the distinct-neighbour threshold
-        for ``fan_out`` / ``fan_in`` (default 3 when ``None``); ignored for
+        ``ring`` for cycle_3, ``k`` for fan_out / fan_in / chain_k /
+        split_recombine / bipartite_burst, ``path`` for structuring /
+        chain_k, ``source`` / ``sink`` / ``intermediaries`` for
+        split_recombine, ``sources`` / ``sinks`` / ``m`` for bipartite_burst).
+        ``amt1_min`` and ``amt2_max`` gate the three hops of a
+        ``structuring`` motif; ``k`` sets the chain length for ``chain_k``
+        (3 ≤ k ≤ 8, default 4); ignored for other motif types. ``min_k``
+        overrides the distinct-neighbour threshold for ``fan_out`` /
+        ``fan_in`` / ``split_recombine`` / ``bipartite_burst`` (default 3
+        when ``None``). ``direction`` ("forward" or "backward") chooses
+        which side of a ``split_recombine`` diamond ``entity_key`` plays;
+        ignored for other motif types. ``min_m`` sets the second cardinality
+        of a ``bipartite_burst`` K_{k,m} subgraph (default 3); ignored for
         other motif types.
         """
         if motif_type not in self._motif_registry:
@@ -4012,11 +4017,27 @@ class GDSNavigator:
                 raise GDSNavigationError(
                     f"chain_k requires 3 ≤ k ≤ 8, got k={k}.",
                 )
+        if motif_type == "split_recombine":
+            if direction not in ("forward", "backward"):
+                raise GDSNavigationError(
+                    f"split_recombine direction must be 'forward' or 'backward', got {direction!r}.",
+                )
+            if min_k is not None and min_k < 2:
+                raise GDSNavigationError(
+                    f"split_recombine min_k must be >= 2, got {min_k}.",
+                )
+        if motif_type == "bipartite_burst":
+            effective_mk = min_k if min_k is not None else 3
+            if effective_mk < 2 or min_m < 2:
+                raise GDSNavigationError(
+                    f"bipartite_burst requires min_k >= 2 and min_m >= 2, got min_k={effective_mk}, min_m={min_m}.",
+                )
         spec = self._motif_registry[motif_type]
         window = time_window_hours if time_window_hours is not None else spec.default_window_hours
 
         enum_kwargs: dict[str, Any] = {
             "amt1_min": amt1_min, "amt2_max": amt2_max, "k": k,
+            "direction": direction, "min_m": min_m,
         }
         if min_k is not None:
             enum_kwargs["min_k"] = min_k
@@ -4030,6 +4051,7 @@ class GDSNavigator:
                 "pattern_id": pattern_id,
                 "found": False,
                 "score": 0.0,
+                "time_window_hours": window,
                 "reason": f"no {motif_type} motif around entity in window {window}h",
             }
         best: dict[str, Any] | None = None
@@ -4056,17 +4078,23 @@ class GDSNavigator:
         amt1_min: float = 10000.0,
         amt2_max: float = 10000.0,
         k: int = 4,
+        direction: str = "forward",
+        min_m: int = 3,
     ) -> list[dict[str, Any]]:
         """Rank ``motif_type`` instances across the pattern by score, desc.
 
         LRU-cached per ``(pattern_id, version, motif_type, time_window_hours,
-        amt1_min, amt2_max)``. Filters by ``seeds`` (post-cache) if provided.
-        For ``cycle_3`` results are deduplicated by canonical ring (sorted
-        tuple of primary keys) so each physical cycle appears once regardless
-        of which of 3 seeds surfaces it. For ``structuring`` results are
-        deduplicated by canonical path (tuple of 4 primary keys). Amount
-        thresholds ``amt1_min``/``amt2_max`` only affect ``structuring``;
-        other motif types ignore them.
+        amt1_min, amt2_max, k, direction, min_m)``. Filters by ``seeds``
+        (post-cache) if provided. For ``cycle_3`` results are deduplicated
+        by canonical ring (sorted tuple of primary keys) so each physical
+        cycle appears once regardless of which of 3 seeds surfaces it. For
+        ``structuring`` results are deduplicated by canonical path (tuple
+        of 4 primary keys). For ``split_recombine`` results are
+        deduplicated by ``(direction, source, sink, sorted intermediaries)``.
+        For ``bipartite_burst`` results are deduplicated by
+        ``(frozenset sources, frozenset sinks)``. Amount thresholds
+        ``amt1_min`` / ``amt2_max`` only affect ``structuring``; other
+        motif types ignore them.
         """
         if motif_type not in self._motif_registry:
             valid = ", ".join(sorted(self._motif_registry.keys()))
@@ -4089,11 +4117,29 @@ class GDSNavigator:
                 raise GDSNavigationError(
                     f"chain_k requires 3 ≤ k ≤ 8, got k={k}.",
                 )
+        if motif_type == "split_recombine":
+            if direction not in ("forward", "backward"):
+                raise GDSNavigationError(
+                    f"split_recombine direction must be 'forward' or 'backward', got {direction!r}.",
+                )
+            if min_k is not None and min_k < 2:
+                raise GDSNavigationError(
+                    f"split_recombine min_k must be >= 2, got {min_k}.",
+                )
+        if motif_type == "bipartite_burst":
+            effective_mk = min_k if min_k is not None else 3
+            if effective_mk < 2 or min_m < 2:
+                raise GDSNavigationError(
+                    f"bipartite_burst requires min_k >= 2 and min_m >= 2, got min_k={effective_mk}, min_m={min_m}.",
+                )
         spec = self._motif_registry[motif_type]
         window = time_window_hours if time_window_hours is not None else spec.default_window_hours
         version = self._resolve_version(pattern_id)
 
-        cache_key = (pattern_id, version, motif_type, window, amt1_min, amt2_max, k)
+        cache_key = (
+            pattern_id, version, motif_type, window,
+            amt1_min, amt2_max, k, direction, min_m,
+        )
         if not hasattr(self, "_motif_ranking_cache"):
             from collections import OrderedDict
             self._motif_ranking_cache: OrderedDict[tuple, list[dict[str, Any]]] = OrderedDict()
@@ -4110,6 +4156,7 @@ class GDSNavigator:
             ranked = self._rank_motifs(
                 all_seeds, pattern_id, motif_type, window, min_k,
                 amt1_min=amt1_min, amt2_max=amt2_max, k=k,
+                direction=direction, min_m=min_m,
             )
             cache[cache_key] = ranked
             while len(cache) > self._MOTIF_RANKING_CACHE_MAX:
@@ -4214,6 +4261,8 @@ class GDSNavigator:
         amt1_min: float = 10000.0,
         amt2_max: float = 10000.0,
         k: int = 4,
+        direction: str = "forward",
+        min_m: int = 3,
     ) -> list[dict[str, Any]]:
         graph_pid = self._resolve_motif_graph_pid(pattern_id)
         version = self._resolve_version(pattern_id)
@@ -4223,16 +4272,21 @@ class GDSNavigator:
         pair_counts = adj.pair_counts()
         window_sec = float(window) * 3600.0
         effective_min_k = (
-            min_k if (motif_type in {"fan_out", "fan_in"} and min_k is not None) else 3
+            min_k if (
+                motif_type in {"fan_out", "fan_in", "split_recombine", "bipartite_burst"}
+                and min_k is not None
+            ) else 3
         )
+        effective_min_m = min_m if min_m is not None else 3
 
         active_seeds = self._active_seeds_for_motif(
             adj, all_seeds, motif_type, effective_min_k,
             amt1_min=amt1_min,
+            direction=direction, min_m=effective_min_m,
         )
 
         instances: list[dict[str, Any]] = []
-        seen_rings: set[tuple[str, ...]] = set()
+        seen_rings: set = set()
         for seed in active_seeds:
             if motif_type == "fan_out":
                 found = self._enum_fan_out_via_adj(seed, adj, window_sec, effective_min_k)
@@ -4249,7 +4303,19 @@ class GDSNavigator:
                     seed, adj, window_sec, amt1_min, amt2_max,
                 )
             elif motif_type == "chain_k":
-                found = self._enum_chain_k_via_adj(seed, adj, window_sec, k)
+                _chain_k_frontier = self._CHAIN_K_MAX_FRONTIER_PER_K.get(k, self._CHAIN_K_MAX_FRONTIER)
+                found = self._enum_chain_k_via_adj(
+                    seed, adj, window_sec, k,
+                    _chain_k_frontier, self._CHAIN_K_MAX_RESULTS,
+                )
+            elif motif_type == "split_recombine":
+                found = self._enum_split_recombine_via_adj(
+                    seed, adj, window_sec, effective_min_k, direction,
+                )
+            elif motif_type == "bipartite_burst":
+                found = self._enum_bipartite_burst_via_adj(
+                    seed, adj, window_sec, effective_min_k, effective_min_m,
+                )
             else:
                 found = []
             for inst in found:
@@ -4268,6 +4334,22 @@ class GDSNavigator:
                     if canonical in seen_rings:
                         continue
                     seen_rings.add(canonical)
+                elif motif_type == "split_recombine":
+                    canonical_sr = (
+                        inst["direction"], inst["source"], inst["sink"],
+                        tuple(sorted(inst["intermediaries"])),
+                    )
+                    if canonical_sr in seen_rings:
+                        continue
+                    seen_rings.add(canonical_sr)
+                elif motif_type == "bipartite_burst":
+                    canonical_bb = (
+                        frozenset(inst["sources"]),
+                        frozenset(inst["sinks"]),
+                    )
+                    if canonical_bb in seen_rings:
+                        continue
+                    seen_rings.add(canonical_bb)
                 instances.append(inst)
 
         all_endpoint_keys: set[str] = set()
@@ -4306,6 +4388,8 @@ class GDSNavigator:
         motif_type: str,
         effective_min_k: int,
         amt1_min: float = 10000.0,
+        direction: str = "forward",
+        min_m: int = 3,
     ) -> list[str]:
         all_seeds_set = set(all_seeds)
         if motif_type in {"cycle_2", "cycle_3"}:
@@ -4324,6 +4408,29 @@ class GDSNavigator:
                 s for s in all_seeds_set
                 if s in adj._in
                 and len({f for (f, *_r) in adj._in[s] if f != s}) >= effective_min_k
+            ]
+        if motif_type == "split_recombine":
+            if direction == "forward":
+                return [
+                    s for s in all_seeds_set
+                    if s in adj._out
+                    and len({t for (t, *_r) in adj._out[s] if t != s}) >= effective_min_k
+                ]
+            return [
+                s for s in all_seeds_set
+                if s in adj._in
+                and len({f for (f, *_r) in adj._in[s] if f != s}) >= effective_min_k
+            ]
+        if motif_type == "bipartite_burst":
+            return [
+                s for s in all_seeds_set
+                if (
+                    s in adj._out
+                    and len({t for (t, *_r) in adj._out[s] if t != s}) >= min_m
+                ) or (
+                    s in adj._in
+                    and len({f for (f, *_r) in adj._in[s] if f != s}) >= effective_min_k
+                )
             ]
         if motif_type == "structuring":
             return [
@@ -4394,6 +4501,242 @@ class GDSNavigator:
         }]
 
     @staticmethod
+    def _enum_split_recombine_via_adj(
+        seed: str,
+        adj: "AdjacencyIndex",
+        window_sec: float,
+        min_k: int,
+        direction: str = "forward",
+    ) -> list[dict[str, Any]]:
+        """Adjacency-path diamond enumerator; mirrors _enumerate_split_recombine."""
+        if direction not in ("forward", "backward"):
+            return []
+        if direction == "forward":
+            out_edges = adj.neighbors_out(seed)
+            if not out_edges:
+                return []
+            max_ts = max(ts for (_n, ts, *_r) in out_edges)
+            latest_split_in: dict[str, float] = {}
+            for (m, ts, *_r) in out_edges:
+                if m == seed or ts < max_ts - window_sec:
+                    continue
+                if ts > latest_split_in.get(m, float("-inf")):
+                    latest_split_in[m] = ts
+            if len(latest_split_in) < min_k:
+                return []
+            sink_to_inter: dict[str, set[str]] = {}
+            for m, s_in_ts in latest_split_in.items():
+                for (d, t, *_r) in adj.neighbors_out(m):
+                    if d == seed or d == m:
+                        continue
+                    if t <= s_in_ts or t - s_in_ts > window_sec:
+                        continue
+                    sink_to_inter.setdefault(d, set()).add(m)
+            best_sink: str | None = None
+            best_inter: set[str] = set()
+            for d, inter in sorted(sink_to_inter.items()):
+                if len(inter) >= min_k and len(inter) > len(best_inter):
+                    best_sink, best_inter = d, inter
+            if best_sink is None:
+                return []
+            inter_sorted = sorted(best_inter)
+            edges = [(seed, m) for m in inter_sorted] + [
+                (m, best_sink) for m in inter_sorted
+            ]
+            return [{
+                "motif_type": "split_recombine",
+                "direction": "forward",
+                "seed": seed,
+                "source": seed,
+                "sink": best_sink,
+                "k": len(inter_sorted),
+                "intermediaries": inter_sorted,
+                "edges": edges,
+            }]
+
+        # direction == "backward"
+        in_edges = adj.neighbors_in(seed)
+        if not in_edges:
+            return []
+        max_ts = max(ts for (_n, ts, *_r) in in_edges)
+        earliest_recomb_out: dict[str, float] = {}
+        for (m, ts, *_r) in in_edges:
+            if m == seed or ts < max_ts - window_sec:
+                continue
+            if ts < earliest_recomb_out.get(m, float("inf")):
+                earliest_recomb_out[m] = ts
+        if len(earliest_recomb_out) < min_k:
+            return []
+        source_to_inter: dict[str, set[str]] = {}
+        for m, r_out_ts in earliest_recomb_out.items():
+            for (s, t, *_r) in adj.neighbors_in(m):
+                if s == seed or s == m:
+                    continue
+                if t >= r_out_ts or r_out_ts - t > window_sec:
+                    continue
+                source_to_inter.setdefault(s, set()).add(m)
+        best_source: str | None = None
+        best_inter = set()
+        for s, inter in sorted(source_to_inter.items()):
+            if len(inter) >= min_k and len(inter) > len(best_inter):
+                best_source, best_inter = s, inter
+        if best_source is None:
+            return []
+        inter_sorted = sorted(best_inter)
+        edges = [(best_source, m) for m in inter_sorted] + [
+            (m, seed) for m in inter_sorted
+        ]
+        return [{
+            "motif_type": "split_recombine",
+            "direction": "backward",
+            "seed": seed,
+            "source": best_source,
+            "sink": seed,
+            "k": len(inter_sorted),
+            "intermediaries": inter_sorted,
+            "edges": edges,
+        }]
+
+    @staticmethod
+    def _enum_bipartite_burst_via_adj(
+        seed: str,
+        adj: "AdjacencyIndex",
+        window_sec: float,
+        min_k: int,
+        min_m: int,
+    ) -> list[dict[str, Any]]:
+        """Adjacency K_{k,m} enumerator with fused source/sink dispatcher.
+
+        Branch B optimisation: fetches out_edges / in_edges once, pre-checks
+        distinct degree before invoking the heavyweight inner logic.  Seeds that
+        only qualify on one side skip the other side entirely, eliminating the
+        fruitless `_try_source` fallback that dominated Phase 1 cProfile output.
+
+        Nested helpers (_try_source_inner / _try_sink_inner) receive pre-fetched
+        edge lists so no second adj lookup is needed.  Inner logic is unchanged
+        from the original _try_source / _try_sink — small-set-first intersection
+        ordering is preserved.
+        """
+
+        def _try_source_inner(
+            seed_: str,
+            out_edges_: list,
+        ) -> dict[str, Any] | None:
+            max_ts = max(ts for (_n, ts, *_r) in out_edges_)
+            sinks = sorted({
+                d for (d, ts, *_r) in out_edges_
+                if d != seed_ and ts >= max_ts - window_sec
+            })
+            if len(sinks) < min_m:
+                return None
+            sources_per_sink: dict[str, set[str]] = {}
+            for d in sinks:
+                for (f, ts, *_r) in adj.neighbors_in(d):
+                    if f == d or ts < max_ts - window_sec:
+                        continue
+                    sources_per_sink.setdefault(d, set()).add(f)
+            sinks = [d for d in sinks if d in sources_per_sink]
+            if len(sinks) < min_m:
+                return None
+            sinks_by_size = sorted(sinks, key=lambda d: len(sources_per_sink[d]))
+            common = set(sources_per_sink[sinks_by_size[0]])
+            for d in sinks_by_size[1:]:
+                common &= sources_per_sink[d]
+                if len(common) < min_k:
+                    break
+            if seed_ not in common:
+                return None
+            if len(common) < min_k:
+                return None
+            sources_sorted = sorted(common)
+            sources_set = set(sources_sorted)
+            sinks_final = [
+                d for d in sorted(sinks)
+                if sources_set <= sources_per_sink[d]
+            ]
+            if len(sinks_final) < min_m:
+                return None
+            edges = [(s, d) for s in sources_sorted for d in sinks_final]
+            return {
+                "motif_type": "bipartite_burst",
+                "seed": seed_,
+                "k": len(sources_sorted),
+                "m": len(sinks_final),
+                "sources": sources_sorted,
+                "sinks": sinks_final,
+                "edges": edges,
+            }
+
+        def _try_sink_inner(
+            seed_: str,
+            in_edges_: list,
+        ) -> dict[str, Any] | None:
+            max_ts = max(ts for (_n, ts, *_r) in in_edges_)
+            sources = sorted({
+                f for (f, ts, *_r) in in_edges_
+                if f != seed_ and ts >= max_ts - window_sec
+            })
+            if len(sources) < min_k:
+                return None
+            sinks_per_source: dict[str, set[str]] = {}
+            for s in sources:
+                for (d, ts, *_r) in adj.neighbors_out(s):
+                    if d == s or ts < max_ts - window_sec:
+                        continue
+                    sinks_per_source.setdefault(s, set()).add(d)
+            sources = [s for s in sources if s in sinks_per_source]
+            if len(sources) < min_k:
+                return None
+            sources_by_size = sorted(sources, key=lambda s: len(sinks_per_source[s]))
+            common = set(sinks_per_source[sources_by_size[0]])
+            for s in sources_by_size[1:]:
+                common &= sinks_per_source[s]
+                if len(common) < min_m:
+                    break
+            if seed_ not in common:
+                return None
+            if len(common) < min_m:
+                return None
+            sinks_sorted = sorted(common)
+            sinks_set = set(sinks_sorted)
+            sources_final = [
+                s for s in sorted(sources)
+                if sinks_set <= sinks_per_source[s]
+            ]
+            if len(sources_final) < min_k:
+                return None
+            edges = [(s, d) for s in sources_final for d in sinks_sorted]
+            return {
+                "motif_type": "bipartite_burst",
+                "seed": seed_,
+                "k": len(sources_final),
+                "m": len(sinks_sorted),
+                "sources": sources_final,
+                "sinks": sinks_sorted,
+                "edges": edges,
+            }
+
+        out_edges = adj.neighbors_out(seed)
+        in_edges = adj.neighbors_in(seed)
+        if not out_edges and not in_edges:
+            return []
+
+        distinct_out = len({t for (t, *_r) in out_edges if t != seed})
+        distinct_in = len({f for (f, *_r) in in_edges if f != seed})
+
+        candidates: list = []
+        if distinct_out >= min_m:
+            candidates.append(lambda: _try_source_inner(seed, out_edges))
+        if distinct_in >= min_k:
+            candidates.append(lambda: _try_sink_inner(seed, in_edges))
+
+        for fn in candidates:
+            hit = fn()
+            if hit is not None:
+                return [hit]
+        return []
+
+    @staticmethod
     def _enum_cycle_2_via_adj(
         seed: str,
         adj: "AdjacencyIndex",
@@ -4438,6 +4781,15 @@ class GDSNavigator:
         for (b, ts, *_r) in out_from_seed:
             if b != seed:
                 seed_to_b[b].append(ts)
+        # Pre-filter: keep only b-nodes that have at least one out-neighbor already
+        # pointing back to seed.  Computed once outside the loop — O(|in(seed)|) build,
+        # then O(|out(b)|) per b vs O(|out(b)| × |in(seed)|) inside.
+        seed_in_set = {f for (f, *_r) in adj.neighbors_in(seed) if f != seed}
+        seed_to_b = {
+            b: ts_list
+            for b, ts_list in seed_to_b.items()
+            if any(c in seed_in_set for (c, *_r) in adj.neighbors_out(b))
+        }
         triads: list[dict[str, Any]] = []
         for b, ts_ab_list in seed_to_b.items():
             for (c, ts_bc, *_r) in adj.neighbors_out(b):
@@ -4626,31 +4978,18 @@ class GDSNavigator:
     ) -> list[dict[str, Any]]:
         """Hub → k distinct targets within a sliding time window.
 
-        Selects the window [max_ts - H, max_ts] where max_ts is the most
-        recent outgoing tx of the seed. Returns at most one motif (the
-        "recent burst" interpretation — matches AML flash-fan-out semantics).
+        Delegates to the in-memory adjacency enumerator. Single-seed cost on
+        a high-out-degree hub is dominated by ``adj.neighbors_out`` dict
+        lookups instead of a Lance ``read_edges`` scan.
         """
+        if min_k < 2:
+            raise GDSNavigationError(
+                f"fan_out min_k must be >= 2, got {min_k}.",
+            )
         graph_pid = self._resolve_motif_graph_pid(pattern_id)
-        edges = self._storage.read_edges(graph_pid, from_keys=[seed])
-        if edges.num_rows == 0:
-            return []
-        if time_window_hours is not None and "timestamp" in edges.schema.names:
-            ts = np.asarray(edges["timestamp"].to_pylist(), dtype=np.float64)
-            if ts.size:
-                max_ts = float(ts.max())
-                window_sec = float(time_window_hours) * 3600.0
-                mask = ts >= (max_ts - window_sec)
-                edges = edges.filter(pa.array(mask))
-        targets = [t for t in edges["to_key"].to_pylist() if t != seed]
-        unique = sorted(set(targets))
-        if len(unique) < min_k:
-            return []
-        return [{
-            "motif_type": "fan_out",
-            "seed": seed,
-            "k": len(unique),
-            "edges": [(seed, t) for t in unique],
-        }]
+        adj = self._storage.get_adjacency(graph_pid)
+        window_sec = float(time_window_hours) * 3600.0
+        return self._enum_fan_out_via_adj(seed, adj, window_sec, min_k)
 
     def _enumerate_cycle_2(
         self,
@@ -4662,51 +5001,15 @@ class GDSNavigator:
     ) -> list[dict[str, Any]]:
         """Bidirectional pair (A ↔ B) with both directions within ``time_window_hours``.
 
-        Uses seconds arithmetic matching EDGE_TABLE_SCHEMA (timestamp: float64
-        epoch seconds) and the adjacency ranking path.
+        Delegates to the in-memory adjacency enumerator. ``counterparty`` filter
+        applied post-delegate to preserve the public signature.
         """
         graph_pid = self._resolve_motif_graph_pid(pattern_id)
-        out_edges = self._storage.read_edges(graph_pid, from_keys=[seed])
-        in_edges = self._storage.read_edges(graph_pid, to_keys=[seed])
-        if out_edges.num_rows == 0 or in_edges.num_rows == 0:
-            return []
+        adj = self._storage.get_adjacency(graph_pid)
         window_sec = float(time_window_hours) * 3600.0
-        out_by_target: dict[str, list[float]] = defaultdict(list)
-        for to_key, ts in zip(
-            out_edges["to_key"].to_pylist(),
-            out_edges["timestamp"].to_pylist() if "timestamp" in out_edges.schema.names else [0.0] * out_edges.num_rows,
-            strict=False,
-        ):
-            if to_key == seed:
-                continue
-            out_by_target[to_key].append(float(ts) if ts is not None else 0.0)
-        in_by_source: dict[str, list[float]] = defaultdict(list)
-        for from_key, ts in zip(
-            in_edges["from_key"].to_pylist(),
-            in_edges["timestamp"].to_pylist() if "timestamp" in in_edges.schema.names else [0.0] * in_edges.num_rows,
-            strict=False,
-        ):
-            if from_key == seed:
-                continue
-            in_by_source[from_key].append(float(ts) if ts is not None else 0.0)
-        results: list[dict[str, Any]] = []
-        candidates = set(out_by_target) & set(in_by_source)
+        results = self._enum_cycle_2_via_adj(seed, adj, window_sec)
         if counterparty is not None:
-            candidates &= {counterparty}
-        for cp in sorted(candidates):
-            ts_out = out_by_target[cp]
-            ts_in = in_by_source[cp]
-            closest_span = min(
-                abs(a - b) for a in ts_out for b in ts_in
-            )
-            if closest_span > window_sec:
-                continue
-            results.append({
-                "motif_type": "cycle_2",
-                "seed": seed,
-                "counterparty": cp,
-                "edges": [(seed, cp), (cp, seed)],
-            })
+            results = [r for r in results if r.get("counterparty") == counterparty]
         return results
 
     def _enumerate_cycle_3(
@@ -4719,87 +5022,12 @@ class GDSNavigator:
     ) -> list[dict[str, Any]]:
         """Directed triad A→B→C→A with strictly monotonic timestamps within window.
 
-        Uses seconds arithmetic matching EDGE_TABLE_SCHEMA (timestamp: float64
-        epoch seconds) and the adjacency ranking path.
+        Delegates to the in-memory adjacency enumerator.
         """
         graph_pid = self._resolve_motif_graph_pid(pattern_id)
-        out_from_seed = self._storage.read_edges(graph_pid, from_keys=[seed])
-        if out_from_seed.num_rows == 0:
-            return []
-        has_ts = "timestamp" in out_from_seed.schema.names
+        adj = self._storage.get_adjacency(graph_pid)
         window_sec = float(time_window_hours) * 3600.0
-
-        seed_to_b: dict[str, list[float]] = defaultdict(list)
-        for b, ts in zip(
-            out_from_seed["to_key"].to_pylist(),
-            out_from_seed["timestamp"].to_pylist() if has_ts else [0.0] * out_from_seed.num_rows,
-            strict=False,
-        ):
-            if b == seed:
-                continue
-            seed_to_b[b].append(float(ts) if ts is not None else 0.0)
-
-        b_keys = list(seed_to_b.keys())
-        if not b_keys:
-            return []
-        out_from_bs = self._storage.read_edges(graph_pid, from_keys=b_keys)
-        if out_from_bs.num_rows == 0:
-            return []
-        b_to_c: dict[tuple[str, str], list[float]] = defaultdict(list)
-        for from_b, to_c, ts in zip(
-            out_from_bs["from_key"].to_pylist(),
-            out_from_bs["to_key"].to_pylist(),
-            out_from_bs["timestamp"].to_pylist() if has_ts else [0.0] * out_from_bs.num_rows,
-            strict=False,
-        ):
-            if to_c == seed or to_c == from_b:
-                continue
-            b_to_c[(from_b, to_c)].append(float(ts) if ts is not None else 0.0)
-
-        c_candidates = {c for (_b, c) in b_to_c.keys()}
-        if not c_candidates:
-            return []
-        close_back = self._storage.read_edges(
-            graph_pid, from_keys=list(c_candidates), to_keys=[seed],
-        )
-        c_to_seed: dict[str, list[float]] = defaultdict(list)
-        for c, ts in zip(
-            close_back["from_key"].to_pylist(),
-            close_back["timestamp"].to_pylist() if has_ts else [0.0] * close_back.num_rows,
-            strict=False,
-        ):
-            c_to_seed[c].append(float(ts) if ts is not None else 0.0)
-
-        triads: list[dict[str, Any]] = []
-        for (b, c), ts_bc_list in b_to_c.items():
-            if c not in c_to_seed:
-                continue
-            ts_ab_list = seed_to_b[b]
-            ts_ca_list = c_to_seed[c]
-            best: tuple[float, float, float] | None = None
-            for t_ab in ts_ab_list:
-                for t_bc in ts_bc_list:
-                    if t_bc <= t_ab:
-                        continue
-                    for t_ca in ts_ca_list:
-                        if t_ca <= t_bc:
-                            continue
-                        if t_ca - t_ab > window_sec:
-                            continue
-                        if best is None or (t_ca - t_ab) < (best[2] - best[0]):
-                            best = (t_ab, t_bc, t_ca)
-            if best is None:
-                continue
-            triads.append({
-                "motif_type": "cycle_3",
-                "seed": seed,
-                "ring": [seed, b, c],
-                "edges": [(seed, b), (b, c), (c, seed)],
-                "timestamps": list(best),
-            })
-            if len(triads) >= max_triads:
-                break
-        return triads
+        return self._enum_cycle_3_via_adj(seed, adj, window_sec, max_triads)
 
     def _enumerate_structuring(
         self,
@@ -4811,108 +5039,16 @@ class GDSNavigator:
         amt2_max: float = 10000.0,
         **_kwargs: Any,
     ) -> list[dict[str, Any]]:
-        """Single-seed enumeration of structuring A→B→C→D via BTREE read_edges.
+        """Single-seed enumeration of structuring A→B→C→D.
 
-        Mirrors the _enumerate_cycle_3 pattern (single-seed path used by
-        score_motif). For ranking across all seeds, use _enum_structuring_via_adj.
+        Delegates to the in-memory adjacency enumerator.
         """
         graph_pid = self._resolve_motif_graph_pid(pattern_id)
-        out_from_seed = self._storage.read_edges(graph_pid, from_keys=[seed])
-        if out_from_seed.num_rows == 0:
-            return []
-        has_ts = "timestamp" in out_from_seed.schema.names
-        has_amt = "amount" in out_from_seed.schema.names
-        if not has_amt:
-            raise GDSNavigationError(
-                "structuring motif requires edge table with an amount column.",
-            )
+        adj = self._storage.get_adjacency(graph_pid)
         window_sec = float(time_window_hours) * 3600.0
-
-        ab_rows = list(zip(
-            out_from_seed["to_key"].to_pylist(),
-            out_from_seed["timestamp"].to_pylist() if has_ts else [0.0] * out_from_seed.num_rows,
-            out_from_seed["amount"].to_pylist(),
-        ))
-        large_first = [
-            (b, float(ts) if ts is not None else 0.0, float(amt))
-            for (b, ts, amt) in ab_rows
-            if b != seed
-            and amt is not None and float(amt) > 0
-            and float(amt) >= amt1_min
-        ]
-        if not large_first:
-            return []
-
-        b_keys = sorted({b for (b, _ts, _amt) in large_first})
-        out_from_bs = self._storage.read_edges(graph_pid, from_keys=b_keys)
-        if out_from_bs.num_rows == 0:
-            return []
-        bc_rows = list(zip(
-            out_from_bs["from_key"].to_pylist(),
-            out_from_bs["to_key"].to_pylist(),
-            out_from_bs["timestamp"].to_pylist() if has_ts else [0.0] * out_from_bs.num_rows,
-            out_from_bs["amount"].to_pylist(),
-        ))
-
-        c_candidates = {c for (_b, c, _ts, _amt) in bc_rows if c != seed}
-        if not c_candidates:
-            return []
-        out_from_cs = self._storage.read_edges(graph_pid, from_keys=list(c_candidates))
-        if out_from_cs.num_rows == 0:
-            return []
-        cd_rows = list(zip(
-            out_from_cs["from_key"].to_pylist(),
-            out_from_cs["to_key"].to_pylist(),
-            out_from_cs["timestamp"].to_pylist() if has_ts else [0.0] * out_from_cs.num_rows,
-            out_from_cs["amount"].to_pylist(),
-        ))
-
-        results: list[dict[str, Any]] = []
-        for (b, ts_ab, amt_ab) in large_first:
-            for (from_b, c, ts_bc_raw, amt_bc_raw) in bc_rows:
-                if from_b != b:
-                    continue
-                if c == seed or c == b:
-                    continue
-                # NULL / non-positive amount on a small-amount hop cannot
-                # pass the "≤ amt2_max" predicate (refunds and NULLs are not
-                # structuring). Skip rather than falsely matching.
-                if amt_bc_raw is None:
-                    continue
-                ts_bc = float(ts_bc_raw) if ts_bc_raw is not None else 0.0
-                amt_bc = float(amt_bc_raw)
-                if amt_bc <= 0:
-                    continue
-                if ts_bc <= ts_ab or ts_bc - ts_ab > window_sec:
-                    continue
-                if amt_bc > amt2_max:
-                    continue
-                for (from_c, d, ts_cd_raw, amt_cd_raw) in cd_rows:
-                    if from_c != c:
-                        continue
-                    if d == seed or d == b or d == c:
-                        continue
-                    if amt_cd_raw is None:
-                        continue
-                    ts_cd = float(ts_cd_raw) if ts_cd_raw is not None else 0.0
-                    amt_cd = float(amt_cd_raw)
-                    if amt_cd <= 0:
-                        continue
-                    if ts_cd <= ts_bc or ts_cd - ts_ab > window_sec:
-                        continue
-                    if amt_cd > amt2_max:
-                        continue
-                    results.append({
-                        "motif_type": "structuring",
-                        "seed": seed,
-                        "path": [seed, b, c, d],
-                        "edges": [(seed, b), (b, c), (c, d)],
-                        "timestamps": [ts_ab, ts_bc, ts_cd],
-                        "amounts": [amt_ab, amt_bc, amt_cd],
-                    })
-                    if len(results) >= max_instances:
-                        return results
-        return results
+        return self._enum_structuring_via_adj(
+            seed, adj, window_sec, amt1_min, amt2_max, max_instances,
+        )
 
     def _existing_neighbors(
         self,
@@ -5010,33 +5146,23 @@ class GDSNavigator:
     ) -> list[dict[str, Any]]:
         """k distinct sources → sink within a sliding time window.
 
-        Mirror of _enumerate_fan_out. Seconds arithmetic matching
-        EDGE_TABLE_SCHEMA (timestamp: float64 epoch seconds) and the
-        adjacency ranking path.
+        Delegates to the in-memory adjacency enumerator.
         """
+        if min_k < 2:
+            raise GDSNavigationError(
+                f"fan_in min_k must be >= 2, got {min_k}.",
+            )
         graph_pid = self._resolve_motif_graph_pid(pattern_id)
-        edges = self._storage.read_edges(graph_pid, to_keys=[seed])
-        if edges.num_rows == 0:
-            return []
-        if time_window_hours is not None and "timestamp" in edges.schema.names:
-            ts = np.asarray(edges["timestamp"].to_pylist(), dtype=np.float64)
-            if ts.size:
-                max_ts = float(ts.max())
-                window_sec = float(time_window_hours) * 3600.0
-                mask = ts >= (max_ts - window_sec)
-                edges = edges.filter(pa.array(mask))
-        sources = [s for s in edges["from_key"].to_pylist() if s != seed]
-        unique = sorted(set(sources))
-        if len(unique) < min_k:
-            return []
-        return [{
-            "motif_type": "fan_in",
-            "seed": seed,
-            "k": len(unique),
-            "edges": [(s, seed) for s in unique],
-        }]
+        adj = self._storage.get_adjacency(graph_pid)
+        window_sec = float(time_window_hours) * 3600.0
+        return self._enum_fan_in_via_adj(seed, adj, window_sec, min_k)
 
-    _CHAIN_K_MAX_FRONTIER = 1000
+    # Per-k adaptive frontier cap. k=3,4 use generous cap; k>=5 tighten
+    # progressively to bound worst-case latency on hub seeds without losing
+    # recall on small-k investigations. Tuned against AML HI-Small FHPM
+    # k-sweep measurements (benchmark/ibm-aml/profiling/2026-04-27-115-*).
+    _CHAIN_K_MAX_FRONTIER_PER_K = {3: 1000, 4: 1000, 5: 500, 6: 250, 7: 125, 8: 100}
+    _CHAIN_K_MAX_FRONTIER = 1000  # legacy fallback for k outside the table
     _CHAIN_K_MAX_RESULTS = 50
 
     def _enumerate_chain_k(
@@ -5049,82 +5175,78 @@ class GDSNavigator:
     ) -> list[dict[str, Any]]:
         """Open directed chain A → B → ... of length k, no cycle closure.
 
-        Uses seconds arithmetic throughout (matching EDGE_TABLE_SCHEMA
-        `timestamp: float64` = epoch seconds and the adjacency ranking
-        path `_enum_chain_k_via_adj`). Single-seed and ranking paths
-        therefore enforce the same window; no divergence. Monotone ts,
-        no node revisit (blocks seed closure), total span ≤ window_sec.
+        Delegates to the in-memory adjacency enumerator.
         """
         if k < 3 or k > 8:
             raise GDSNavigationError(
                 f"chain_k requires 3 ≤ k ≤ 8, got k={k}.",
             )
         graph_pid = self._resolve_motif_graph_pid(pattern_id)
+        adj = self._storage.get_adjacency(graph_pid)
         window_sec = float(time_window_hours) * 3600.0
+        max_frontier = self._CHAIN_K_MAX_FRONTIER_PER_K.get(k, self._CHAIN_K_MAX_FRONTIER)
+        return self._enum_chain_k_via_adj(
+            seed, adj, window_sec, k,
+            max_frontier, self._CHAIN_K_MAX_RESULTS,
+        )
 
-        _Partial = tuple[tuple[str, ...], list[tuple[str, str]], float | None, float | None]
-        frontier: list[_Partial] = [((seed,), [], None, None)]
-        truncated = False
+    def _enumerate_split_recombine(
+        self,
+        seed: str,
+        pattern_id: str,
+        time_window_hours: int,
+        min_k: int = 3,
+        direction: str = "forward",
+        **_kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        """Diamond topology: source → k intermediaries → single sink, stacked-bipartite.
 
-        for _hop in range(k - 1):
-            current_tails = sorted({path[-1] for (path, _e, _f, _l) in frontier})
-            if not current_tails:
-                return []
-            edges = self._storage.read_edges(graph_pid, from_keys=current_tails)
-            if edges.num_rows == 0:
-                return []
-            has_ts = "timestamp" in edges.schema.names
-            from_keys_arr = edges["from_key"].to_pylist()
-            to_keys_arr = edges["to_key"].to_pylist()
-            ts_arr = edges["timestamp"].to_pylist() if has_ts else [0.0] * edges.num_rows
-            out_by_src: dict[str, list[tuple[str, float]]] = defaultdict(list)
-            for fk, tk, ts in zip(from_keys_arr, to_keys_arr, ts_arr, strict=False):
-                out_by_src[fk].append((tk, float(ts) if ts is not None else 0.0))
-            next_frontier: list[_Partial] = []
-            for (path, edge_list, ts_first, ts_last) in frontier:
-                tail = path[-1]
-                for (nxt, ts_new) in out_by_src.get(tail, []):
-                    if nxt in path:
-                        continue
-                    if ts_last is not None and ts_new <= ts_last:
-                        continue
-                    new_first = ts_first if ts_first is not None else ts_new
-                    if ts_new - new_first > window_sec:
-                        continue
-                    next_frontier.append((
-                        path + (nxt,),
-                        edge_list + [(tail, nxt)],
-                        new_first,
-                        ts_new,
-                    ))
-                    if len(next_frontier) >= self._CHAIN_K_MAX_FRONTIER:
-                        truncated = True
-                        break
-                if len(next_frontier) >= self._CHAIN_K_MAX_FRONTIER:
-                    truncated = True
-                    break
-            frontier = next_frontier
-            if not frontier:
-                return []
+        Delegates to the in-memory adjacency-path enumerator. Single-seed cost
+        on a high-out-degree hub is dominated by ``adj.neighbors_out`` lookups
+        (O(degree) dict iterations) instead of a Lance batched scan over every
+        intermediary's out-edges, which collapses tail latency on hub seeds.
+        """
+        if direction not in ("forward", "backward"):
+            raise GDSNavigationError(
+                f"split_recombine direction must be 'forward' or 'backward', got {direction!r}.",
+            )
+        if min_k < 2:
+            raise GDSNavigationError(
+                f"split_recombine min_k must be >= 2, got {min_k}.",
+            )
+        graph_pid = self._resolve_motif_graph_pid(pattern_id)
+        adj = self._storage.get_adjacency(graph_pid)
+        window_sec = float(time_window_hours) * 3600.0
+        return self._enum_split_recombine_via_adj(
+            seed, adj, window_sec, min_k, direction,
+        )
 
-        # frontier now holds paths of length k. Emit as motif instances.
-        results: list[dict[str, Any]] = []
-        seen_paths: set[tuple[str, ...]] = set()
-        for (path, edge_list, _ts_first, _ts_last) in frontier:
-            if path in seen_paths:
-                continue
-            seen_paths.add(path)
-            results.append({
-                "motif_type": "chain_k",
-                "seed": seed,
-                "k": k,
-                "path": list(path),
-                "edges": edge_list,
-                "frontier_truncated": truncated,
-            })
-            if len(results) >= self._CHAIN_K_MAX_RESULTS:
-                break
-        return results
+    def _enumerate_bipartite_burst(
+        self,
+        seed: str,
+        pattern_id: str,
+        time_window_hours: int,
+        min_k: int = 3,
+        min_m: int = 3,
+        **_kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        """Complete K_{k,m} bipartite subgraph in a tight time window.
+
+        Delegates to the in-memory adjacency-path enumerator. Single-seed cost
+        is dominated by ``adj.neighbors_in`` / ``adj.neighbors_out`` lookups
+        instead of Lance batched scans over every candidate source's out-edges,
+        which collapses tail latency on hub seeds with high in/out degree.
+        """
+        if min_k < 2 or min_m < 2:
+            raise GDSNavigationError(
+                f"bipartite_burst requires min_k >= 2 and min_m >= 2, got min_k={min_k}, min_m={min_m}.",
+            )
+        graph_pid = self._resolve_motif_graph_pid(pattern_id)
+        adj = self._storage.get_adjacency(graph_pid)
+        window_sec = float(time_window_hours) * 3600.0
+        return self._enum_bipartite_burst_via_adj(
+            seed, adj, window_sec, min_k, min_m,
+        )
 
     def find_witness_cohort(
         self,

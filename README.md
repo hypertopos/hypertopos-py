@@ -8,7 +8,7 @@
 [![PyArrow](https://img.shields.io/badge/format-PyArrow-red.svg)](https://arrow.apache.org/docs/python/)
 [![Lance](https://img.shields.io/badge/storage-Lance-blueviolet.svg)](https://github.com/lance-format/lance)
 [![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io)
-[![Version](https://img.shields.io/badge/version-0.5.1-%235500FF.svg)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.5.2-%235500FF.svg)](pyproject.toml)
 
 hypertopos is not a database, and not a machine learning model. It is a layer that turns relational data into a coordinate system where every entity gets a position derived from its relationships and the population around it.
 
@@ -58,6 +58,7 @@ Each capability below emerges from treating entities as points in a shared, popu
 | Geometric edge potential | `\|\|delta_from − delta_to\|\| × (1/pair_tx_count)` — per-edge layering signature | Node-level `delta_norm` misses one-off transactions between divergent accounts | `0.5.0` |
 | Structural motif scoring | Product of `edge_potential` across closed-vocab motifs (fan_out, cycle_2, cycle_3, structuring) | Graph DB motif matching has no geometric rarity score | `0.5.0` |
 | Extended motif catalog | `fan_in` (sink-centric concentrator) and `chain_k` (open directed chain, 3 ≤ k ≤ 8) extend the motif vocabulary; window-filter correctness fix on fan_out/cycle_2/cycle_3 | Prior motifs silently ignored declared `time_window_hours` in production | `0.5.1` |
+| Bipartite motif catalog | `split_recombine` (diamond scatter-gather S → k intermediaries → D, forward/backward seed anchoring) and `bipartite_burst` (complete K_{k,m} bipartite subgraph in tight window) cover scatter-gather smurfing, parallel layering, and coordinated-burst atoms | Closed-vocabulary atomic queries — no manual graph inversion or per-side enumeration glue | `0.5.2` |
 
 ### What changes in practice
 

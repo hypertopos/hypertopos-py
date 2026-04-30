@@ -16,6 +16,12 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from hypertopos.model.objects import Edge, Point, Polygon, Solid
+from hypertopos.model.sphere import (
+    CalibrationDriftReport,
+    CalibrationFit,
+    DimensionDrift,
+    IntrinsicExtrinsicReport,
+)
 from hypertopos.utils.arrow import delta_matrix_from_arrow
 
 # Numeric stability bounds for motif-score products.
@@ -410,6 +416,73 @@ def _classify_trajectory(delta_norms: list[float]) -> str:
     if np.sum(diffs > 0) > 0.7 * len(diffs):
         return "linear_drift"
     return "other"
+
+
+_SIGMA_SAFE_FLOOR = 1e-12
+
+
+def _compute_calibration_drift(
+    fit_from: CalibrationFit,
+    fit_to: CalibrationFit,
+    top_n: int,
+    verbose: bool,
+) -> CalibrationDriftReport:
+    """Pure math: compute drift between two CalibrationFit instances.
+
+    Caller is responsible for verifying schema_hash agreement before calling.
+    """
+    mu_a = fit_from.mu.astype(np.float64)
+    mu_b = fit_to.mu.astype(np.float64)
+    sigma_a = fit_from.sigma_diag.astype(np.float64)
+    sigma_b = fit_to.sigma_diag.astype(np.float64)
+    theta_a = fit_from.theta.astype(np.float64)
+    theta_b = fit_to.theta.astype(np.float64)
+
+    D = mu_a.shape[0]
+
+    mu_delta = mu_b - mu_a
+    sigma_safe = np.where(sigma_a > _SIGMA_SAFE_FLOOR, sigma_a, 1.0)
+    mu_delta_normalized = mu_delta / sigma_safe
+
+    sigma_delta = sigma_b - sigma_a
+    theta_delta = theta_b - theta_a
+
+    overall_drift_rms = float(np.linalg.norm(mu_delta_normalized) / np.sqrt(D))
+
+    kinds_a = fit_from.dimension_kinds
+    per_dim: list[DimensionDrift] = []
+    for i in range(D):
+        per_dim.append(
+            DimensionDrift(
+                dim_index=i,
+                dim_kind=kinds_a[i] if kinds_a is not None else None,
+                mu_from=float(mu_a[i]),
+                mu_to=float(mu_b[i]),
+                mu_delta=float(mu_delta[i]),
+                mu_delta_normalized=float(mu_delta_normalized[i]),
+                sigma_from=float(sigma_a[i]),
+                sigma_to=float(sigma_b[i]),
+                sigma_delta=float(sigma_delta[i]),
+                theta_from=float(theta_a[i]),
+                theta_to=float(theta_b[i]),
+                theta_delta=float(theta_delta[i]),
+            )
+        )
+
+    ranked = sorted(per_dim, key=lambda d: abs(d.mu_delta_normalized), reverse=True)
+    top_drifted = ranked[: min(top_n, D)]
+
+    return CalibrationDriftReport(
+        pattern_id=fit_from.pattern_id,
+        v_from=fit_from.calibration_epoch,
+        v_to=fit_to.calibration_epoch,
+        schema_hash=fit_from.schema_hash,
+        population_size_from=fit_from.population_size,
+        population_size_to=fit_to.population_size,
+        overall_drift_rms=overall_drift_rms,
+        top_drifted=top_drifted,
+        per_dimension=per_dim if verbose else None,
+    )
 
 
 class GDSNavigator:
@@ -1123,14 +1196,17 @@ class GDSNavigator:
                 edges=edges,
                 last_refresh_at=row["last_refresh_at"],
                 updated_at=row["updated_at"],
-                delta_rank_pct=float(row["delta_rank_pct"]) if "delta_rank_pct" in row else None,
+                delta_rank_pct=(
+                    None if row.get("delta_rank_pct") is None
+                    else float(row["delta_rank_pct"])
+                ),
                 bregman_divergence=(
-                    float(row.get("bregman_divergence", 0.0))
-                    if "bregman_divergence" in row else None
+                    None if row.get("bregman_divergence") is None
+                    else float(row["bregman_divergence"])
                 ),
                 anomaly_confidence=(
-                    float(row.get("anomaly_confidence", 0.0))
-                    if "anomaly_confidence" in row else None
+                    None if row.get("anomaly_confidence") is None
+                    else float(row["anomaly_confidence"])
                 ),
             ))
         if rank_by_property is not None:
@@ -1490,9 +1566,11 @@ class GDSNavigator:
         groups: dict[str, list[tuple[str, float]]] = defaultdict(list)
         pks = pts_tbl["primary_key"].to_pylist()
         gvs = pts_tbl[group_by].to_pylist()
+        seen_pks: set[str] = set()
         for pk, gv in zip(pks, gvs):
-            if pk not in pk_to_norm:
+            if pk not in pk_to_norm or pk in seen_pks:
                 continue
+            seen_pks.add(pk)
             gk = str(gv) if gv is not None else "(null)"
             groups[gk].append((pk, pk_to_norm[pk]))
 
@@ -1781,7 +1859,10 @@ class GDSNavigator:
                 edges=edges,
                 last_refresh_at=row["last_refresh_at"],
                 updated_at=row["updated_at"],
-                delta_rank_pct=float(row["delta_rank_pct"]) if "delta_rank_pct" in row else None,
+                delta_rank_pct=(
+                    None if row.get("delta_rank_pct") is None
+                    else float(row["delta_rank_pct"])
+                ),
             ))
 
         # Apply random sampling if requested (post-construction, pre-return)
@@ -1899,7 +1980,10 @@ class GDSNavigator:
                 edges=edges,
                 last_refresh_at=row["last_refresh_at"],
                 updated_at=row["updated_at"],
-                delta_rank_pct=float(row["delta_rank_pct"]) if "delta_rank_pct" in row else None,
+                delta_rank_pct=(
+                    None if row.get("delta_rank_pct") is None
+                    else float(row["delta_rank_pct"])
+                ),
             )
             results.append((polygon, signed_dist))
         results.sort(key=lambda x: abs(x[1]))
@@ -3604,6 +3688,28 @@ class GDSNavigator:
         """Delegate to AdjacencyIndex.pair_counts() — shared with motif ranking."""
         return self._storage.get_adjacency(graph_pid).pair_counts()
 
+    def _pair_count_direct(
+        self, graph_pid: str,
+    ) -> dict[tuple[str, str], int]:
+        """Compute pair counts from edge table via PyArrow groupby.
+
+        Reads only from_key/to_key (2 columns), bypassing AdjacencyIndex.
+        10–20× faster than get_adjacency().pair_counts() on large edge tables
+        because it skips the 5-column full-table to_pylist() in AdjacencyIndex.
+        """
+        tbl = self._storage.read_edges(graph_pid, columns=["from_key", "to_key"])
+        if tbl.num_rows == 0:
+            return {}
+        agg = tbl.group_by(["from_key", "to_key"]).aggregate(
+            [("from_key", "count")]
+        )
+        return {
+            (agg["from_key"][i].as_py(), agg["to_key"][i].as_py()): int(
+                agg["from_key_count"][i].as_py()
+            )
+            for i in range(agg.num_rows)
+        }
+
     _EDGE_POTENTIAL_PAIR_CAP = 1000
 
     def edge_potential(
@@ -3761,57 +3867,103 @@ class GDSNavigator:
         base_sorted = self._attract_edge_base_cache.get(base_key)
 
         if base_sorted is None:
-            counts = self._pair_count_for_pattern(graph_pid, version)
-            if not counts:
-                self._attract_edge_base_cache[base_key] = []
-                base_sorted = []
-            else:
-                # Batch-load ALL endpoint delta vectors in one geometry read.
-                # We intentionally do NOT push endpoints into Lance as a
-                # point_keys filter here, even though on first glance that
-                # looks like free pruning. On endpoint-dense patterns (e.g.
-                # AML-shaped transaction graphs where every account appears
-                # in at least one edge) Lance BTREE predicate pushdown with
-                # hundreds of thousands of keys is ~1000-1500× slower than a
-                # full-population scan of a cached file. The full scan plus
-                # Python-side membership check is consistently fast across
-                # the endpoint-density regimes we see in practice.
-                all_keys = {k for pair in counts.keys() for k in pair}
-                geo = self._storage.read_geometry(
-                    pattern_id, version, columns=["primary_key", "delta"],
-                )
-                delta_by_key: dict[str, np.ndarray] = {}
-                for i in range(geo.num_rows):
-                    k = geo["primary_key"][i].as_py()
-                    if k in all_keys:
-                        delta_by_key[k] = np.asarray(geo["delta"][i].as_py(), dtype=np.float64)
+            # For event patterns: bail BEFORE the 7.5 M-edge groupby when the
+            # cached edge_stats reveal that the unique-endpoint upper bound is
+            # < 1 % of the geometry rowcount.  In that regime the endpoints
+            # belong to a different entity type (e.g. zone IDs in a trip-edge
+            # pattern whose geometry holds trips) and no key will ever match
+            # the geometry primary keys.  Reading the build-time JSON cache
+            # is O(1); falling through pays for a 2-column scan of the full
+            # edge table.  Skip the live-scan branch of edge_table_stats —
+            # if the cache is absent, defer to the late-stage guard below.
+            if pattern.pattern_type == "event":
+                edge_stats = self._storage.edge_stats_cached(graph_pid)
+                if (
+                    edge_stats is not None
+                    and "unique_from" in edge_stats
+                    and "unique_to" in edge_stats
+                ):
+                    n_endpoints_upper = (
+                        int(edge_stats["unique_from"]) + int(edge_stats["unique_to"])
+                    )
+                    # Use pattern.population_size (already loaded from sphere.json)
+                    # as the geometry-row denominator — avoids opening the Lance
+                    # dataset cold just to count rows.  population_size is
+                    # geometry rowcount at calibration time and matches the
+                    # current dataset within the freshness window we accept here.
+                    geo_count = int(pattern.population_size or 0)
+                    if (
+                        geo_count > 0
+                        and n_endpoints_upper / geo_count < 0.01
+                    ):
+                        self._attract_edge_base_cache[base_key] = []
+                        base_sorted = []
 
-                scored: list[dict[str, Any]] = []
-                for (f, t), cnt in counts.items():
-                    if f not in delta_by_key or t not in delta_by_key:
-                        continue
-                    distance = float(np.linalg.norm(delta_by_key[f] - delta_by_key[t]))
-                    effective_count = max(1, min(cnt, self._EDGE_POTENTIAL_PAIR_CAP))
-                    score = distance * (1.0 / effective_count)
-                    scored.append({
-                        "from_key": f,
-                        "to_key": t,
-                        "score": round(score, 6),
-                        "delta_distance": round(distance, 4),
-                        "pair_tx_count": cnt,
-                    })
-                scored.sort(key=lambda r: -r["score"])
+            if base_sorted is None:
+                # Use direct PyArrow groupby (reads only 2 columns) instead of
+                # AdjacencyIndex.from_lance() which reads 5 columns and calls
+                # to_pylist() on the full edge table — 10–20× slower on large
+                # event patterns (e.g. 7.5 M trip edges = 132 s vs ~5 s).
+                counts = self._pair_count_direct(graph_pid)
+                if not counts:
+                    self._attract_edge_base_cache[base_key] = []
+                    base_sorted = []
+                else:
+                    # Batch-load ALL endpoint delta vectors in one geometry read.
+                    # We intentionally do NOT push endpoints into Lance as a
+                    # point_keys filter here, even though on first glance that
+                    # looks like free pruning. On endpoint-dense patterns (e.g.
+                    # AML-shaped transaction graphs where every account appears
+                    # in at least one edge) Lance BTREE predicate pushdown with
+                    # hundreds of thousands of keys is ~1000-1500× slower than a
+                    # full-population scan of a cached file. The full scan plus
+                    # Python-side membership check is consistently fast across
+                    # the endpoint-density regimes we see in practice.
+                    all_keys = {k for pair in counts.keys() for k in pair}
+                    # Late-stage ratio guard — fires on spheres without the
+                    # build-time edge_stats cache (older builds).  Same predicate
+                    # as the early bail above; here we already paid for the
+                    # groupby, so we skip only the geometry scan.
+                    geo_row_count = self._storage.count_geometry_rows(pattern_id, version)
+                    if geo_row_count > 0 and len(all_keys) / geo_row_count < 0.01:
+                        self._attract_edge_base_cache[base_key] = []
+                        base_sorted = []
+                    else:
+                        geo = self._storage.read_geometry(
+                            pattern_id, version, columns=["primary_key", "delta"],
+                        )
+                        delta_by_key: dict[str, np.ndarray] = {}
+                        for i in range(geo.num_rows):
+                            k = geo["primary_key"][i].as_py()
+                            if k in all_keys:
+                                delta_by_key[k] = np.asarray(geo["delta"][i].as_py(), dtype=np.float64)
 
-                # Assign GLOBAL rank_pct + is_high_potential (pattern-wide p95).
-                n = len(scored)
-                if n > 0:
-                    p95_idx = max(0, int(n * 0.05) - 1)
-                    p95_threshold = scored[p95_idx]["score"] if p95_idx < n else scored[0]["score"]
-                    for i, r in enumerate(scored):
-                        r["score_rank_pct_global"] = round(100.0 * (n - i) / n, 2)
-                        r["is_high_potential"] = bool(r["score"] >= p95_threshold)
-                base_sorted = scored
-                self._attract_edge_base_cache[base_key] = base_sorted
+                        scored: list[dict[str, Any]] = []
+                        for (f, t), cnt in counts.items():
+                            if f not in delta_by_key or t not in delta_by_key:
+                                continue
+                            distance = float(np.linalg.norm(delta_by_key[f] - delta_by_key[t]))
+                            effective_count = max(1, min(cnt, self._EDGE_POTENTIAL_PAIR_CAP))
+                            score = distance * (1.0 / effective_count)
+                            scored.append({
+                                "from_key": f,
+                                "to_key": t,
+                                "score": round(score, 6),
+                                "delta_distance": round(distance, 4),
+                                "pair_tx_count": cnt,
+                            })
+                        scored.sort(key=lambda r: -r["score"])
+
+                        # Assign GLOBAL rank_pct + is_high_potential (pattern-wide p95).
+                        n = len(scored)
+                        if n > 0:
+                            p95_idx = max(0, int(n * 0.05) - 1)
+                            p95_threshold = scored[p95_idx]["score"] if p95_idx < n else scored[0]["score"]
+                            for i, r in enumerate(scored):
+                                r["score_rank_pct_global"] = round(100.0 * (n - i) / n, 2)
+                                r["is_high_potential"] = bool(r["score"] >= p95_threshold)
+                        base_sorted = scored
+                        self._attract_edge_base_cache[base_key] = base_sorted
 
         # ---- Fast-path: unfiltered default call returns base directly ----
         if from_key is None and to_key is None and min_pair_count == 1:
@@ -6239,7 +6391,33 @@ class GDSNavigator:
         n_rel = len(pattern.relations)
 
         from hypertopos.engine.geometry import GDSEngine as _GE
+        from hypertopos.engine.geometry import _decomposition_scalars
         _compute_rep = _GE.compute_reputation
+
+        # M3 decomposition pre-flight: load oldest+latest calibration epochs once
+        # so the inline inner-loop computation just needs already-loaded shapes.
+        # Failure here (single epoch, schema mismatch, missing fit, or storage
+        # backend without multi-epoch retention) → 3 None additive fields per
+        # entry, batch response stays intact.
+        _decomp_fit_v1: CalibrationFit | None = None
+        _decomp_fit_v2: CalibrationFit | None = None
+        if hasattr(self._storage, "list_calibration_versions") and hasattr(
+            self._storage, "read_calibration_fit"
+        ):
+            try:
+                _decomp_versions = self._storage.list_calibration_versions(pattern_id)
+                if len(_decomp_versions) >= 2:
+                    _f1 = self._storage.read_calibration_fit(
+                        pattern_id, version=_decomp_versions[0],
+                    )
+                    _f2 = self._storage.read_calibration_fit(
+                        pattern_id, version=_decomp_versions[-1],
+                    )
+                    if _f1.schema_hash == _f2.schema_hash:
+                        _decomp_fit_v1 = _f1
+                        _decomp_fit_v2 = _f2
+            except (GDSError, KeyError, OSError, ValueError):
+                pass
 
         results: list[dict] = []
 
@@ -6301,6 +6479,19 @@ class GDSNavigator:
 
             rep = _compute_rep(delta_norms, _theta_norm)
 
+            if _decomp_fit_v1 is not None and _decomp_fit_v2 is not None:
+                _intr, _extr, _frac = _decomposition_scalars(
+                    all_shapes[0], all_shapes[-1],
+                    _decomp_fit_v1, _decomp_fit_v2,
+                )
+                _intrinsic_displacement = round(_intr, 4)
+                _extrinsic_displacement = round(_extr, 4)
+                _intrinsic_fraction: float | None = round(_frac, 4)
+            else:
+                _intrinsic_displacement = None
+                _extrinsic_displacement = None
+                _intrinsic_fraction = None
+
             results.append({
                 "primary_key": bk,
                 "displacement": round(displacement, 4),
@@ -6332,6 +6523,9 @@ class GDSNavigator:
                     for i, name in enumerate(dim_names[:n_rel])
                     if i < len(diff)
                 },
+                "intrinsic_displacement": _intrinsic_displacement,
+                "extrinsic_displacement": _extrinsic_displacement,
+                "intrinsic_fraction": _intrinsic_fraction,
             })
 
         if rank_dim_index is not None:
@@ -10369,14 +10563,10 @@ class GDSNavigator:
         if geo.num_rows == 0:
             return []
 
-        anomaly_map: dict[str, bool] = {}
-        anomalous_keys: list[str] = []
-        for i in range(geo.num_rows):
-            pk = geo["primary_key"][i].as_py()
-            is_anom = bool(geo["is_anomaly"][i].as_py())
-            anomaly_map[pk] = is_anom
-            if is_anom:
-                anomalous_keys.append(pk)
+        pks_list = geo["primary_key"].to_pylist()
+        is_anom_list = geo["is_anomaly"].to_pylist()
+        anomaly_map: dict[str, bool] = {pk: bool(ia) for pk, ia in zip(pks_list, is_anom_list)}
+        anomalous_keys: list[str] = [pk for pk, ia in zip(pks_list, is_anom_list) if ia]
 
         if not anomalous_keys:
             return []
@@ -10415,10 +10605,11 @@ class GDSNavigator:
                     point_keys=unknown,
                     columns=["primary_key", "is_anomaly"],
                 )
-                for i in range(unk_geo.num_rows):
-                    anomaly_map[unk_geo["primary_key"][i].as_py()] = bool(
-                        unk_geo["is_anomaly"][i].as_py()
-                    )
+                for unk_pk, unk_ia in zip(
+                    unk_geo["primary_key"].to_pylist(),
+                    unk_geo["is_anomaly"].to_pylist(),
+                ):
+                    anomaly_map[unk_pk] = bool(unk_ia)
 
             anomalous_count = sum(1 for nk in nkeys if anomaly_map.get(nk, False))
             rate = anomalous_count / len(nkeys)
@@ -10440,16 +10631,18 @@ class GDSNavigator:
         pattern_id: str,
         displacement_ranks: list[int] | None = None,
         top_n_per_range: int = 5,
-        sample_size: int | None = None,
+        sample_size: int = 10_000,
     ) -> list[dict]:
         """Find entities with unusual temporal trajectory shapes.
 
-        Performs a full temporal scan — classifies every entity's trajectory
-        shape (arch, v_shape, spike_recovery, linear_drift, flat) and returns
-        only non-trivial shapes.  More thorough than drift-ranking sampling
-        because arch/V-shape trajectories have near-zero displacement and are
-        invisible to drift ranking.
+        Classifies every entity's trajectory shape (arch, v_shape,
+        spike_recovery, linear_drift, flat) and returns only non-trivial
+        shapes. Arch/V-shape trajectories have near-zero displacement and
+        are invisible to drift ranking — hence the dedicated scan.
 
+        sample_size: max number of distinct entities streamed before stopping.
+            Defaults to 10,000. Pass None to scan the full population
+            (may be slow on large spheres).
         displacement_ranks: deprecated, ignored (kept for API compatibility).
         top_n_per_range: max results returned (repurposed as top_n).
 
@@ -10607,15 +10800,6 @@ class GDSNavigator:
         if population_rate < 1e-6:
             return []
 
-        # Detect regime changes (optional context)
-        changepoint_date: str | None = None
-        try:
-            regimes = self.π12_attract_regime_change(pattern_id)
-            if regimes and isinstance(regimes[0], dict) and "timestamp" in regimes[0]:
-                changepoint_date = regimes[0]["timestamp"]
-        except (ValueError, GDSNavigationError):
-            pass
-
         # Find string columns on entity line
         line = sphere.lines.get(entity_line_id)
         if line is None or not line.columns:
@@ -10636,56 +10820,63 @@ class GDSNavigator:
             columns=["primary_key"] + string_columns,
         )
 
-        # Build set of anomalous entity keys from geometry
-        anomalous_keys = set(
-            geo.filter(geo["is_anomaly"]).column("primary_key").to_pylist()
+        # Vectorized is_anomaly mask aligned with pts — single pc.is_in pass
+        anomalous_pk_arr = (
+            geo.filter(geo["is_anomaly"]).column("primary_key").combine_chunks()
         )
+        pts_pk_arr = pts["primary_key"].combine_chunks()
+        is_anom_mask = pc.is_in(pts_pk_arr, value_set=anomalous_pk_arr)
 
         output: list[dict] = []
-
-        # Build segment maps via single-pass groupby (not N×filter)
-        pk_list = pts["primary_key"].to_pylist()
 
         for col_name in string_columns:
             if col_name not in pts.column_names:
                 continue
 
-            col_vals = pts[col_name].to_pylist()
-            segment_keys_map: dict[str, set[str]] = {}
-            for pk, val in zip(pk_list, col_vals, strict=True):
-                if val is not None:
-                    segment_keys_map.setdefault(val, set()).add(pk)
+            col_arr = pts[col_name]
 
-            if len(segment_keys_map) > max_cardinality:
+            # Early cardinality check — skip high-cardinality cols without Python loop
+            n_unique = pc.count_distinct(col_arr.drop_null()).as_py()
+            if n_unique > max_cardinality:
                 continue
 
-            for val, segment_keys in segment_keys_map.items():
-                entity_count = len(segment_keys)
+            # Vectorized groupby: total and anomaly count per segment value
+            not_null_mask = pc.is_valid(col_arr)
+            grp_tbl = pa.table({
+                "seg": col_arr.filter(not_null_mask),
+                "is_anomaly": is_anom_mask.filter(not_null_mask),
+                "_pk": pts_pk_arr.filter(not_null_mask),
+            })
+            agg = grp_tbl.group_by("seg").aggregate([
+                ("_pk", "count"),
+                ("is_anomaly", "sum"),
+            ])
+
+            for i in range(agg.num_rows):
+                val = agg["seg"][i].as_py()
+                entity_count = int(agg["_pk_count"][i].as_py() or 0)
+                anomalous_count = int(agg["is_anomaly_sum"][i].as_py() or 0)
                 if entity_count == 0:
                     continue
 
-                anomalous_count = len(segment_keys & anomalous_keys)
                 anomaly_rate = anomalous_count / entity_count
-
                 shift_ratio = anomaly_rate / population_rate if population_rate > 0 else 0.0
                 if shift_ratio < min_shift_ratio:
                     continue
 
-                interpretation = (
-                    f"Segment {col_name}='{val}' has anomaly rate "
-                    f"{anomaly_rate:.1%} vs population {population_rate:.1%} "
-                    f"({shift_ratio:.1f}x overrepresented)."
-                )
                 output.append({
                     "segment_property": col_name,
-                    "segment_value": val,
+                    "segment_value": str(val),
                     "anomaly_rate": round(anomaly_rate, 4),
                     "population_rate": round(population_rate, 4),
                     "shift_ratio": round(shift_ratio, 2),
                     "entity_count": entity_count,
                     "anomalous_count": anomalous_count,
-                    "changepoint_date": changepoint_date,
-                    "interpretation": interpretation,
+                    "interpretation": (
+                        f"Segment {col_name}='{val}' has anomaly rate "
+                        f"{anomaly_rate:.1%} vs population {population_rate:.1%} "
+                        f"({shift_ratio:.1f}x overrepresented)."
+                    ),
                 })
 
         output.sort(key=lambda d: d["shift_ratio"], reverse=True)
@@ -11670,3 +11861,1424 @@ class GDSNavigator:
             }
             for pk, score, n_nb in scored[:top_n]
         ]
+
+    def compare_calibrations(
+        self,
+        pattern_id: str,
+        v_from: int | None = None,
+        v_to: int | None = None,
+        top_n: int = 10,
+        verbose: bool = False,
+    ) -> CalibrationDriftReport:
+        """Per-dimension μ/σ/θ drift between two calibration epochs of the same pattern.
+
+        Auto-resolve:
+          - v_from=None and v_to=None → (versions[-2], versions[-1])
+          - v_from=N and v_to=None → (N, latest)
+
+        Raises ValueError on v_from == v_to, schema_hash mismatch, or single-epoch
+        auto-resolve. CalibrationNotFoundError bubbles up from missing versions.
+        """
+        reader = self._storage
+        versions = reader.list_calibration_versions(pattern_id)
+
+        if v_from is None and v_to is None:
+            if len(versions) < 2:
+                raise ValueError(
+                    f"compare_calibrations requires at least 2 epochs on disk for "
+                    f"pattern={pattern_id!r}; found {len(versions)}"
+                )
+            v_from = versions[-2]
+            v_to = versions[-1]
+        elif v_to is None:
+            if not versions:
+                raise ValueError(
+                    f"compare_calibrations: no epochs on disk for pattern={pattern_id!r}"
+                )
+            v_to = versions[-1]
+        elif v_from is None:
+            raise ValueError(
+                "compare_calibrations: v_from cannot be None when v_to is explicit"
+            )
+
+        if v_from == v_to:
+            raise ValueError(
+                f"compare_calibrations: v_from and v_to must differ (both={v_from})"
+            )
+
+        fit_from = reader.read_calibration_fit(pattern_id, version=v_from)
+        fit_to = reader.read_calibration_fit(pattern_id, version=v_to)
+
+        if fit_from.schema_hash != fit_to.schema_hash:
+            raise ValueError(
+                f"compare_calibrations: schema_hash mismatch between v={v_from} "
+                f"({fit_from.schema_hash[:12]}...) and v={v_to} "
+                f"({fit_to.schema_hash[:12]}...) — mu vectors are not "
+                f"dimensionally comparable across schema changes"
+            )
+
+        return _compute_calibration_drift(fit_from, fit_to, top_n=top_n, verbose=verbose)
+
+    def decompose_drift(
+        self,
+        entity_key: str,
+        pattern_id: str,
+        v_from: int | None = None,
+        v_to: int | None = None,
+        timestamp_from: datetime | None = None,
+        timestamp_to: datetime | None = None,
+        top_n: int = 10,
+        verbose: bool = False,
+    ) -> IntrinsicExtrinsicReport:
+        """Decompose an entity's drift between two temporal slices into intrinsic
+        (entity-driven, σ_v1-normalised shape change) and extrinsic (residual,
+        population-recalibration-driven) components.
+
+        Auto-resolve:
+          - v_from=None and v_to=None → (versions[0] is oldest retained; v_to=versions[-1])
+          - v_from=N and v_to=None → (N, latest)
+          - timestamp_from=None → first slice in window
+          - timestamp_to=None → last slice in window
+
+        Raises ValueError on:
+          - <2 retained calibration epochs (auto-resolve)
+          - v_from == v_to
+          - schema_hash mismatch between v_from and v_to
+          - <2 temporal slices in the window
+          - event pattern (M3 requires anchor — temporal data is anchor-only)
+
+        CalibrationNotFoundError bubbles up from the underlying reader if a
+        requested version was GC'd by M1 retention policy.
+        """
+        from hypertopos.engine.geometry import (
+            _compute_intrinsic_extrinsic_decomposition,
+        )
+
+        reader = self._storage
+        sphere = reader.read_sphere()
+        pattern = sphere.patterns[pattern_id]
+
+        if pattern.pattern_type == "event":
+            raise ValueError(
+                f"decompose_drift: pattern_type 'event' has no temporal history; "
+                f"M3 requires anchor pattern (got pattern_id={pattern_id!r})"
+            )
+
+        versions = reader.list_calibration_versions(pattern_id)
+
+        if v_from is None and v_to is None:
+            if len(versions) < 2:
+                raise ValueError(
+                    f"decompose_drift requires at least 2 epochs on disk for "
+                    f"pattern={pattern_id!r}; found {len(versions)}"
+                )
+            v_from = versions[0]
+            v_to = versions[-1]
+        elif v_to is None:
+            if not versions:
+                raise ValueError(
+                    f"decompose_drift: no epochs on disk for pattern={pattern_id!r}"
+                )
+            v_to = versions[-1]
+        elif v_from is None:
+            raise ValueError(
+                "decompose_drift: v_from cannot be None when v_to is explicit"
+            )
+
+        if v_from == v_to:
+            raise ValueError(
+                f"decompose_drift: v_from and v_to must differ (both={v_from})"
+            )
+
+        fit_v1 = reader.read_calibration_fit(pattern_id, version=v_from)
+        fit_v2 = reader.read_calibration_fit(pattern_id, version=v_to)
+
+        if fit_v1.schema_hash != fit_v2.schema_hash:
+            raise ValueError(
+                f"decompose_drift: schema_hash mismatch between v={v_from} "
+                f"({fit_v1.schema_hash[:12]}...) and v={v_to} "
+                f"({fit_v2.schema_hash[:12]}...) — mu vectors are not "
+                f"dimensionally comparable across schema changes"
+            )
+
+        table = reader.read_temporal(
+            pattern_id, entity_key, agent_id=self._manifest.agent_id,
+        )
+        if table.num_rows == 0:
+            raise ValueError(
+                f"decompose_drift: no temporal slices for entity={entity_key!r} "
+                f"in pattern={pattern_id!r}"
+            )
+
+        timestamps = table["timestamp"].to_pylist()
+        shapes = table["shape_snapshot"].to_pylist()
+        rows = sorted(zip(timestamps, shapes), key=lambda r: r[0])
+
+        if timestamp_from is not None:
+            rows = [r for r in rows if r[0] >= timestamp_from]
+        if timestamp_to is not None:
+            rows = [r for r in rows if r[0] <= timestamp_to]
+
+        if len(rows) < 2:
+            raise ValueError(
+                f"decompose_drift requires at least 2 temporal slices for "
+                f"entity={entity_key!r} pattern={pattern_id!r} in window "
+                f"({timestamp_from!r}..{timestamp_to!r}); found {len(rows)}"
+            )
+
+        ts_a, shape_a_list = rows[0]
+        ts_b, shape_b_list = rows[-1]
+        shape_a = np.asarray(shape_a_list, dtype=np.float32)
+        shape_b = np.asarray(shape_b_list, dtype=np.float32)
+
+        return _compute_intrinsic_extrinsic_decomposition(
+            shape_a=shape_a, shape_b=shape_b,
+            fit_v1=fit_v1, fit_v2=fit_v2,
+            entity_key=entity_key, pattern_id=pattern_id,
+            timestamp_from=ts_a, timestamp_to=ts_b,
+            dim_labels=pattern.dim_labels,
+            top_n=top_n, verbose=verbose,
+        )
+
+    def find_calibration_influencers(
+        self,
+        pattern_id: str,
+        top_n: int = 10,
+        classify: str = "hidden",
+        high_threshold_pct: float = 90.0,
+        sample_size: int | None = None,
+        verbose: bool = False,
+    ):
+        """M4: find entities with high influence on coordinate system calibration.
+
+        See `docs/plans/2026-04-28-m4-hidden-influencer-design.md`.
+        """
+        from hypertopos.engine.geometry import (
+            _classify_influence,
+            _compute_leave_one_out_impact,
+            _count_cascading_flips,
+        )
+        from hypertopos.model.sphere import (
+            DimensionContribution,
+            InfluenceEntry,
+            InfluenceReport,
+        )
+        from hypertopos.utils.arrow import delta_matrix_from_arrow
+
+        valid_classify = {"hidden", "distorter", "standard_anomaly", "normal", "all"}
+        if classify not in valid_classify:
+            raise ValueError(
+                f"find_calibration_influencers: classify must be one of "
+                f"{sorted(valid_classify)}; got {classify!r}"
+            )
+        if not 0.0 < high_threshold_pct < 100.0:
+            raise ValueError(
+                f"find_calibration_influencers: high_threshold_pct must be "
+                f"in (0, 100); got {high_threshold_pct}"
+            )
+        if top_n < 1 or top_n > 50:
+            raise ValueError(
+                f"find_calibration_influencers: top_n must be in [1, 50]; "
+                f"got {top_n}"
+            )
+
+        sphere = self._storage.read_sphere()
+        pattern = sphere.patterns[pattern_id]
+        if pattern.pattern_type == "event":
+            raise ValueError(
+                f"find_calibration_influencers: pattern_type 'event' has no "
+                f"population statistics; M4 requires anchor pattern "
+                f"(got pattern_id={pattern_id!r})"
+            )
+
+        version = self._manifest.pattern_versions[pattern_id]
+        geo_table = self._storage.read_geometry(
+            pattern_id, version,
+            columns=["primary_key", "delta"],
+            sample_size=sample_size,
+        )
+        if geo_table.num_rows == 0:
+            raise ValueError(
+                f"find_calibration_influencers: pattern={pattern_id!r} has no entities"
+            )
+        if geo_table.num_rows < 2:
+            raise ValueError(
+                f"find_calibration_influencers: leave-one-out requires N >= 2 "
+                f"entities; pattern={pattern_id!r} has N={geo_table.num_rows}"
+            )
+
+        deltas = delta_matrix_from_arrow(geo_table).astype(np.float64)
+        pk_col = geo_table["primary_key"].to_pylist()
+
+        sigma_diag = np.asarray(pattern.sigma_diag, dtype=np.float64)
+        mu = np.asarray(pattern.mu, dtype=np.float64)
+        sigma_floor = np.maximum(sigma_diag, 1e-2)
+        shapes = deltas * sigma_floor + mu
+        N, D = shapes.shape
+
+        mu_full = shapes.mean(axis=0)
+        sigma_full = shapes.std(axis=0, ddof=0)
+        delta_norm = np.linalg.norm(deltas, axis=1)
+        theta_norm = float(pattern.theta_norm)
+
+        mu_imp, sigma_imp, total_imp, contrib = _compute_leave_one_out_impact(
+            shapes, mu_full, sigma_full,
+        )
+        classes = _classify_influence(
+            total_imp, delta_norm, theta_norm, high_threshold_pct=high_threshold_pct,
+        )
+        impact_threshold = float(np.percentile(total_imp, high_threshold_pct))
+
+        cell_counts = {
+            "hidden": classes.count("hidden"),
+            "distorter": classes.count("distorter"),
+            "standard_anomaly": classes.count("standard_anomaly"),
+            "normal": classes.count("normal"),
+        }
+
+        if classify == "all":
+            candidates = list(range(N))
+        else:
+            candidates = [i for i, c in enumerate(classes) if c == classify]
+        candidates.sort(key=lambda i: total_imp[i], reverse=True)
+        top_candidates = candidates[:top_n]
+
+        sum_s = shapes.sum(axis=0)
+        sum_s_sq = (shapes ** 2).sum(axis=0)
+        sigma_full_safe = np.maximum(sigma_full, 1e-12)
+        if verbose:
+            is_anom_full = delta_norm >= theta_norm
+
+        kinds_v = pattern.dimension_kinds
+        dim_labels_v = pattern.dim_labels
+
+        entries: list[InfluenceEntry] = []
+        for i in top_candidates:
+            contrib_i = contrib[i]
+            ranked_dim_idx = np.argsort(-np.abs(contrib_i))[: min(5, D)]
+            mu_without_i = (sum_s - shapes[i]) / (N - 1)
+            var_without_i = (sum_s_sq - shapes[i] ** 2) / (N - 1) - mu_without_i ** 2
+            var_without_i = np.maximum(var_without_i, 0.0)
+            sigma_without_i = np.sqrt(var_without_i)
+            mu_shift_i = (mu_full - mu_without_i) / sigma_full_safe
+            sigma_shift_i = (sigma_full - sigma_without_i) / sigma_full_safe
+
+            top_contribs = [
+                DimensionContribution(
+                    dim_index=int(d),
+                    dim_kind=(
+                        kinds_v[d]
+                        if kinds_v is not None and d < len(kinds_v) else None
+                    ),
+                    dim_label=(
+                        dim_labels_v[d]
+                        if dim_labels_v is not None and d < len(dim_labels_v) else None
+                    ),
+                    mu_shift=float(mu_shift_i[d]),
+                    sigma_shift=float(sigma_shift_i[d]),
+                    contribution=float(contrib_i[d]),
+                )
+                for d in ranked_dim_idx
+            ]
+
+            cascading: int | None = None
+            if verbose:
+                cascading = _count_cascading_flips(
+                    shape_E=shapes[i],
+                    sum_s=sum_s,
+                    sum_s_sq=sum_s_sq,
+                    shapes=shapes,
+                    is_anomaly_full=is_anom_full,
+                    e_idx=i,
+                    theta_norm=theta_norm,
+                )
+
+            entries.append(InfluenceEntry(
+                entity_key=pk_col[i],
+                mu_impact=float(mu_imp[i]),
+                sigma_impact=float(sigma_imp[i]),
+                total_impact=float(total_imp[i]),
+                delta_norm=float(delta_norm[i]),
+                classification=classes[i],
+                top_dim_contributions=top_contribs,
+                cascading_flip_count=cascading,
+            ))
+
+        return InfluenceReport(
+            pattern_id=pattern_id,
+            pattern_version=version,
+            population_size=N,
+            high_threshold_pct=high_threshold_pct,
+            total_impact_threshold=impact_threshold,
+            theta_norm=theta_norm,
+            classify_filter=classify,
+            cell_counts=cell_counts,
+            entries=entries,
+        )
+
+    def find_group_influence(
+        self,
+        pattern_id: str,
+        groups: list[list[str]],
+    ):
+        """Caller-supplied per-group leave-set-out impact +
+        reinforcing/canceling factor."""
+        from hypertopos.engine.geometry import (
+            _compute_leave_one_out_impact,
+            _compute_leave_set_out_impact,
+        )
+        from hypertopos.model.sphere import (
+            DimensionContribution,
+            GroupInfluenceReport,
+        )
+        from hypertopos.utils.arrow import delta_matrix_from_arrow
+
+        if len(groups) == 0:
+            raise ValueError(
+                "find_group_influence: groups list must be non-empty"
+            )
+
+        sphere = self._storage.read_sphere()
+        pattern = sphere.patterns[pattern_id]
+        if pattern.pattern_type == "event":
+            raise ValueError(
+                f"find_group_influence: pattern_type 'event' has no "
+                f"population statistics; M4 requires anchor pattern "
+                f"(got pattern_id={pattern_id!r})"
+            )
+
+        version = self._manifest.pattern_versions[pattern_id]
+        geo_table = self._storage.read_geometry(pattern_id, version)
+        N = geo_table.num_rows
+        if N < 3:
+            raise ValueError(
+                f"find_group_influence: pattern={pattern_id!r} has N={N}; "
+                f"need at least 3 entities total to leave a non-trivial "
+                f"population after removing a group of 2"
+            )
+
+        deltas = delta_matrix_from_arrow(geo_table).astype(np.float64)
+        pk_col = geo_table["primary_key"].to_pylist()
+        pk_to_idx = {pk: i for i, pk in enumerate(pk_col)}
+        sigma_diag = np.asarray(pattern.sigma_diag, dtype=np.float64)
+        mu = np.asarray(pattern.mu, dtype=np.float64)
+        sigma_floor = np.maximum(sigma_diag, 1e-2)
+        shapes = deltas * sigma_floor + mu
+
+        mu_full = shapes.mean(axis=0)
+        sigma_full = shapes.std(axis=0, ddof=0)
+
+        _, _, total_imp_per_entity, _ = _compute_leave_one_out_impact(
+            shapes, mu_full, sigma_full,
+        )
+
+        sigma_full_safe = np.maximum(sigma_full, 1e-12)
+        kinds_v = pattern.dimension_kinds
+        dim_labels_v = pattern.dim_labels
+
+        reports: list[GroupInfluenceReport] = []
+        for g_idx, group in enumerate(groups):
+            k = len(group)
+            if k < 2:
+                raise ValueError(
+                    f"find_group_influence: group at index {g_idx} has {k} "
+                    f"member(s); single-entity groups duplicate "
+                    f"find_calibration_influencers — use that primitive instead"
+                )
+            if len(set(group)) != k:
+                raise ValueError(
+                    f"find_group_influence: group at index {g_idx} contains "
+                    f"duplicate entity (group={group})"
+                )
+            if k >= N:
+                raise ValueError(
+                    f"find_group_influence: group at index {g_idx} has {k} "
+                    f"members but population N={N}; cannot leave empty population"
+                )
+            members_idx_list = []
+            for key in group:
+                if key not in pk_to_idx:
+                    raise ValueError(
+                        f"find_group_influence: entity {key!r} in group "
+                        f"{g_idx} not found in pattern={pattern_id!r}"
+                    )
+                members_idx_list.append(pk_to_idx[key])
+            members_idx = np.asarray(members_idx_list, dtype=np.int64)
+
+            mu_imp_set, sigma_imp_set, total_imp_set, contributions = (
+                _compute_leave_set_out_impact(
+                    shapes=shapes,
+                    members_idx=members_idx,
+                    mu_full=mu_full,
+                    sigma_full=sigma_full,
+                )
+            )
+
+            sum_individual = float(total_imp_per_entity[members_idx].sum())
+            if sum_individual <= 0.0:
+                raise ValueError(
+                    f"find_group_influence: group at index {g_idx} sum of "
+                    f"individual impacts is 0.0; reinforcing_factor undefined. "
+                    f"Group is at population centroid — use a non-degenerate group."
+                )
+            reinforcing = total_imp_set / sum_individual
+
+            D = shapes.shape[1]
+            ranked_dim_idx = np.argsort(-np.abs(contributions))[: min(5, D)]
+            set_shapes = shapes[members_idx]
+            set_sum = set_shapes.sum(axis=0)
+            set_sum_sq = (set_shapes ** 2).sum(axis=0)
+            mu_without_set = (shapes.sum(axis=0) - set_sum) / (N - k)
+            var_without_set = (
+                ((shapes ** 2).sum(axis=0) - set_sum_sq) / (N - k)
+                - mu_without_set ** 2
+            )
+            var_without_set = np.maximum(var_without_set, 0.0)
+            sigma_without_set = np.sqrt(var_without_set)
+            mu_shift = (mu_full - mu_without_set) / sigma_full_safe
+            sigma_shift = (sigma_full - sigma_without_set) / sigma_full_safe
+
+            top_contribs = [
+                DimensionContribution(
+                    dim_index=int(d),
+                    dim_kind=(
+                        kinds_v[d]
+                        if kinds_v is not None and d < len(kinds_v) else None
+                    ),
+                    dim_label=(
+                        dim_labels_v[d]
+                        if dim_labels_v is not None and d < len(dim_labels_v) else None
+                    ),
+                    mu_shift=float(mu_shift[d]),
+                    sigma_shift=float(sigma_shift[d]),
+                    contribution=float(contributions[d]),
+                )
+                for d in ranked_dim_idx
+            ]
+
+            reports.append(GroupInfluenceReport(
+                pattern_id=pattern_id,
+                pattern_version=version,
+                group_index=g_idx,
+                member_count=k,
+                members=list(group),
+                mu_impact_set=mu_imp_set,
+                sigma_impact_set=sigma_imp_set,
+                total_impact_set=total_imp_set,
+                sum_individual_impacts=sum_individual,
+                reinforcing_factor=reinforcing,
+                top_dim_contributions=top_contribs,
+            ))
+
+        return reports
+
+    def find_lead_lag(
+        self,
+        pattern_a: str,
+        pattern_b: str,
+        *,
+        timestamp_from: str | None = None,
+        timestamp_to: str | None = None,
+        cohort: str = "fixed",
+        min_epochs: int = 8,
+        max_lag: int | None = None,
+        fdr_alpha: float = 0.05,
+        fdr_method: str = "storey",
+        verbose: bool = False,
+        entity_key: str | None = None,
+    ):
+        """M5: cross-pattern temporal lead-lag in population-relative coordinates.
+
+        Both patterns must be ``pattern_type='anchor'``. Time alignment uses
+        the intersection of pattern timestamp sets; raises if intersection
+        size is below ``min_epochs``. Cohort defaults to ``'fixed'`` —
+        entities present at every common epoch in both patterns — for
+        clean panel-style centroid signals.
+
+        Returns a :class:`LeadLagReport` with three nested answer levels:
+          1. Population scalar lead-lag (``lag``, ``correlation``,
+             ``is_significant`` — Bonferroni-adjusted peak threshold).
+          2. Per-dim D_A x D_B matrix (``top_dim_pairs`` and full
+             ``per_dim_pairs`` when ``verbose=True``).
+          3. Per-entity drill-down via ``entity_key`` (population centroid
+             replaced by that entity's delta trajectory).
+        """
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        from hypertopos.engine.geometry import _compute_lead_lag_report
+
+        # ── 1. Validation ─────────────────────────────────────────────
+        if cohort not in ("fixed", "all"):
+            raise ValueError(
+                f"find_lead_lag: cohort must be 'fixed' or 'all'; got {cohort!r}"
+            )
+        if fdr_method not in ("bh", "storey"):
+            raise ValueError(
+                f"find_lead_lag: fdr_method must be 'bh' or 'storey'; got {fdr_method!r}"
+            )
+        if pattern_a == pattern_b:
+            raise ValueError(
+                f"find_lead_lag: pattern_a and pattern_b must differ (both={pattern_a!r})"
+            )
+        if min_epochs < 4:
+            raise ValueError(
+                f"find_lead_lag: min_epochs must be >= 4; got {min_epochs}"
+            )
+        if not 0.0 < fdr_alpha < 1.0:
+            raise ValueError(
+                f"find_lead_lag: fdr_alpha must be in (0, 1); got {fdr_alpha}"
+            )
+
+        sphere = self._storage.read_sphere()
+        if pattern_a not in sphere.patterns:
+            raise KeyError(f"pattern not found: {pattern_a!r}")
+        if pattern_b not in sphere.patterns:
+            raise KeyError(f"pattern not found: {pattern_b!r}")
+        pat_a = sphere.patterns[pattern_a]
+        pat_b = sphere.patterns[pattern_b]
+        if pat_a.pattern_type != "anchor":
+            raise ValueError(
+                f"find_lead_lag requires anchor patterns; got pattern_type="
+                f"{pat_a.pattern_type!r} for {pattern_a!r}"
+            )
+        if pat_b.pattern_type != "anchor":
+            raise ValueError(
+                f"find_lead_lag requires anchor patterns; got pattern_type="
+                f"{pat_b.pattern_type!r} for {pattern_b!r}"
+            )
+
+        # ── 2. Preflight cohort-size budget via geometry count ────────
+        # Geometry has one row per entity for anchor patterns (Lance
+        # count_rows is metadata-only, no scan). Lets us reject huge
+        # disjoint-line cross-pattern queries WITHOUT reading temporal.
+        D_a_pre = len(pat_a.mu)
+        D_b_pre = len(pat_b.mu)
+        _budget_bytes = 1_000_000_000  # 1 GB total across both tensors
+        if entity_key is None:
+            try:
+                ver_a = self._manifest.pattern_versions[pattern_a]
+                ver_b = self._manifest.pattern_versions[pattern_b]
+                n_ent_a = self._storage.count_geometry_rows(pattern_a, ver_a)
+                n_ent_b = self._storage.count_geometry_rows(pattern_b, ver_b)
+                # cohort='all' upper bound = union; cohort='fixed' ≤ min.
+                cohort_upper = (
+                    n_ent_a + n_ent_b if cohort == "all"
+                    else min(n_ent_a, n_ent_b)
+                )
+                # Use min_epochs as a conservative N (real N may be larger;
+                # if it isn't, the call would fail elsewhere on min_epochs).
+                bound_bytes = 4 * min_epochs * cohort_upper * (D_a_pre + D_b_pre)
+                if bound_bytes > _budget_bytes:
+                    raise ValueError(
+                        f"find_lead_lag: cohort upper bound would build at "
+                        f"least {bound_bytes / 1e9:.2f} GB of shape tensors "
+                        f"(pattern_a entities={n_ent_a}, pattern_b entities="
+                        f"{n_ent_b}, D_a={D_a_pre}, D_b={D_b_pre}, "
+                        f"min_epochs={min_epochs}); budget is "
+                        f"{_budget_bytes / 1e9:.1f} GB. Patterns are likely "
+                        f"over disjoint entity_lines — cross-pattern lead-lag "
+                        f"requires shared entity space. Try cohort='fixed' "
+                        f"(panel-clean intersection), rebuild the sphere with "
+                        f"both patterns over the same entity_line, or pass "
+                        f"entity_key=<id> for per-entity drill-down."
+                    )
+            except (KeyError, OSError, FileNotFoundError):
+                # Geometry not available — fall through to temporal scan.
+                pass
+
+        # ── 3. Phase 1 scan — meta only ([primary_key, timestamp]) ────
+        # Skip the heavy shape_snapshot list column on this pass so we
+        # can decide cohort + budget guard before reading gigabytes.
+        keys_filter = [entity_key] if entity_key is not None else None
+
+        def _read_meta_table(pid: str) -> pa.Table:
+            batches = list(self._storage.read_temporal_batched(
+                pid,
+                timestamp_from=timestamp_from,
+                timestamp_to=timestamp_to,
+                keys=keys_filter,
+                columns=["primary_key", "timestamp"],
+            ))
+            if not batches:
+                return pa.table({})
+            return pa.Table.from_batches(batches)
+
+        ta_meta = _read_meta_table(pattern_a)
+        tb_meta = _read_meta_table(pattern_b)
+        if ta_meta.num_rows == 0:
+            raise ValueError(
+                f"find_lead_lag: no temporal slices for pattern={pattern_a!r}"
+                + (f" entity={entity_key!r}" if entity_key else "")
+            )
+        if tb_meta.num_rows == 0:
+            raise ValueError(
+                f"find_lead_lag: no temporal slices for pattern={pattern_b!r}"
+                + (f" entity={entity_key!r}" if entity_key else "")
+            )
+
+        # ── 3. Time alignment via timestamp intersection ──────────────
+        ts_a_unique = pc.unique(ta_meta["timestamp"]).to_pylist()
+        ts_b_unique = pc.unique(tb_meta["timestamp"]).to_pylist()
+        T_a = sorted(set(ts_a_unique))
+        T_b = sorted(set(ts_b_unique))
+        T_common = sorted(set(T_a) & set(T_b))
+        N = len(T_common)
+        if N < min_epochs:
+            raise ValueError(
+                f"find_lead_lag: intersection of pattern timestamps has only "
+                f"N={N} epochs; need >= {min_epochs}. If patterns use different "
+                "event_line/window, lead-lag is not well-defined; rebuild with "
+                f"shared temporal config. (T_a count={len(T_a)}, T_b count={len(T_b)})"
+            )
+
+        max_lag_resolved = max(1, (N - 1) // 4) if max_lag is None else int(max_lag)
+        if (N - 1) - 2 * max_lag_resolved < 2:
+            raise ValueError(
+                f"find_lead_lag: trimmed window L={(N - 1) - 2 * max_lag_resolved} < 2; "
+                f"max_lag={max_lag_resolved} too large for N={N}"
+            )
+
+        # Restrict meta tables to T_common
+        T_common_arr = pa.array(T_common, type=ta_meta["timestamp"].type)
+        ta_meta = ta_meta.filter(
+            pc.is_in(ta_meta["timestamp"], value_set=T_common_arr),
+        )
+        tb_meta = tb_meta.filter(
+            pc.is_in(tb_meta["timestamp"], value_set=T_common_arr),
+        )
+
+        # ── 4. Cohort selection (uses meta table only) ────────────────
+        cohort_dropped: int | None = None
+        if entity_key is not None:
+            ts_a_for_e = sorted(set(ta_meta["timestamp"].to_pylist()))
+            ts_b_for_e = sorted(set(tb_meta["timestamp"].to_pylist()))
+            common_for_e = sorted(set(ts_a_for_e) & set(ts_b_for_e))
+            if len(common_for_e) < min_epochs:
+                raise ValueError(
+                    f"find_lead_lag: entity={entity_key!r} present in only "
+                    f"{len(common_for_e)} common epochs; need >= {min_epochs}"
+                )
+            T_common = common_for_e
+            N = len(T_common)
+            if (N - 1) - 2 * max_lag_resolved < 2:
+                raise ValueError(
+                    f"find_lead_lag: entity={entity_key!r} N={N} too small for "
+                    f"max_lag={max_lag_resolved}"
+                )
+            T_common_arr = pa.array(T_common, type=ta_meta["timestamp"].type)
+            cohort_E = [entity_key]
+            cohort_dropped = None
+        elif cohort == "fixed":
+            # Vectorised cohort intersection via Arrow group-by COUNT.
+            # An entity present at every t ∈ T_common in pattern A has exactly
+            # |T_common| (pk, t) rows after the T_common filter (and at least
+            # one if rows are duplicated, which builder writes never produce).
+            n_common = len(T_common)
+            counts_a = ta_meta.group_by("primary_key").aggregate(
+                [("timestamp", "count")]
+            )
+            counts_b = tb_meta.group_by("primary_key").aggregate(
+                [("timestamp", "count")]
+            )
+            full_in_a = set(
+                counts_a.filter(
+                    pc.equal(counts_a["timestamp_count"], n_common)
+                )["primary_key"].to_pylist()
+            )
+            full_in_b = set(
+                counts_b.filter(
+                    pc.equal(counts_b["timestamp_count"], n_common)
+                )["primary_key"].to_pylist()
+            )
+            cohort_E_set = full_in_a & full_in_b
+            if not cohort_E_set:
+                raise ValueError(
+                    "find_lead_lag: cohort='fixed' produced empty cohort "
+                    "(no entities present at every epoch in both patterns). "
+                    "If both patterns track different entity populations "
+                    "(e.g. accounts vs account_pairs), cross-pattern lead-lag "
+                    "is not applicable — there are no shared entities. "
+                    "Otherwise try cohort='all', entity_key=<id> for per-entity "
+                    "drill-down, or shorten the time window."
+                )
+            cohort_E = sorted(cohort_E_set)
+            cohort_dropped = (
+                (counts_a.num_rows + counts_b.num_rows) // 2 - len(cohort_E)
+            )
+        else:
+            cohort_E = sorted(
+                set(ta_meta["primary_key"].to_pylist())
+                | set(tb_meta["primary_key"].to_pylist())
+            )
+            cohort_dropped = None
+
+        # ── 5. Memory budget guard before full read ───────────────────
+        D_a = len(pat_a.mu)
+        D_b = len(pat_b.mu)
+
+        # Refuse to allocate giant tensors. Hits cohort='all' between
+        # patterns over disjoint entity_lines (e.g. AML accounts vs
+        # account_pairs vs tx_chains), where the union covers every
+        # entity in the sphere and the (N, |cohort|, D) tensors blow
+        # gigabytes before any compute starts.
+        _budget_bytes = 1_000_000_000  # 1 GB total across both tensors
+        _tensor_bytes = 4 * N * len(cohort_E) * (D_a + D_b)
+        if _tensor_bytes > _budget_bytes:
+            raise ValueError(
+                f"find_lead_lag: cohort would build "
+                f"{_tensor_bytes / 1e9:.2f} GB of shape tensors "
+                f"(cohort={len(cohort_E)}, N={N}, D_a={D_a}, D_b={D_b}); "
+                f"budget is {_budget_bytes / 1e9:.1f} GB. Patterns are "
+                f"likely over disjoint entity_lines — cross-pattern "
+                f"lead-lag requires shared entity space. Try cohort='fixed' "
+                f"(panel-clean intersection) or rebuild the sphere with "
+                f"both patterns over the same entity_line. For per-entity "
+                f"drill-down, pass entity_key=<id>."
+            )
+
+        # ── 6. Phase 2 scan — full read, filter in memory ────────────
+        # Cohort + budget already validated; key pushdown for thousands
+        # of IN-list entries is slower in Lance than a single full scan
+        # followed by an Arrow is_in mask. For entity_key mode (1 key)
+        # we DO push down — that's the fast point lookup path.
+        cohort_pa_arr = pa.array(cohort_E)
+        push_keys = (
+            [entity_key] if entity_key is not None
+            else (cohort_E if len(cohort_E) <= 64 else None)
+        )
+
+        def _read_full_table(pid: str, keys: list[str] | None) -> pa.Table:
+            batches = list(self._storage.read_temporal_batched(
+                pid,
+                timestamp_from=timestamp_from,
+                timestamp_to=timestamp_to,
+                keys=keys,
+            ))
+            if not batches:
+                return pa.table({})
+            return pa.Table.from_batches(batches)
+
+        ta_filt = _read_full_table(pattern_a, push_keys)
+        tb_filt = _read_full_table(pattern_b, push_keys)
+        if push_keys is None:
+            if ta_filt.num_rows > 0:
+                ta_filt = ta_filt.filter(
+                    pc.is_in(ta_filt["primary_key"], value_set=cohort_pa_arr),
+                )
+            if tb_filt.num_rows > 0:
+                tb_filt = tb_filt.filter(
+                    pc.is_in(tb_filt["primary_key"], value_set=cohort_pa_arr),
+                )
+        if ta_filt.num_rows > 0:
+            ta_filt = ta_filt.filter(
+                pc.is_in(ta_filt["timestamp"], value_set=T_common_arr),
+            )
+        if tb_filt.num_rows > 0:
+            tb_filt = tb_filt.filter(
+                pc.is_in(tb_filt["timestamp"], value_set=T_common_arr),
+            )
+
+        T_common_pa_arr = T_common_arr
+
+        def _build_shape_tensor(table: pa.Table, D: int) -> np.ndarray:
+            """Vectorised shape tensor build via Arrow index_in + list_flatten.
+
+            Returns (N, |cohort|, D) float32 with NaN where (pk, t) cell has
+            no row in the temporal table (entity missing at that epoch under
+            cohort='all').
+            """
+            tens = np.full((N, len(cohort_E), D), np.nan, dtype=np.float32)
+            if table.num_rows == 0:
+                return tens
+            # Vectorised index lookup — index_in returns null when not in value_set;
+            # we filter those out with a single Arrow mask.
+            pk_idx_pa = pc.index_in(table["primary_key"], value_set=cohort_pa_arr)
+            ts_idx_pa = pc.index_in(table["timestamp"], value_set=T_common_pa_arr)
+            keep_mask = pc.and_(pc.is_valid(pk_idx_pa), pc.is_valid(ts_idx_pa))
+            if not pc.any(keep_mask).as_py():
+                return tens
+            kept_table = table.filter(keep_mask)
+            kept_pk_idx = pc.index_in(
+                kept_table["primary_key"], value_set=cohort_pa_arr,
+            ).to_numpy(zero_copy_only=False).astype(np.int64)
+            kept_ts_idx = pc.index_in(
+                kept_table["timestamp"], value_set=T_common_pa_arr,
+            ).to_numpy(zero_copy_only=False).astype(np.int64)
+            # Flatten shape_snapshot list column → contiguous float32 (n_kept, D_actual).
+            shape_chunked = kept_table["shape_snapshot"]
+            shape_arr = (
+                shape_chunked.combine_chunks()
+                if hasattr(shape_chunked, "combine_chunks") else shape_chunked
+            )
+            flat_vals = shape_arr.values.to_numpy(zero_copy_only=False).astype(np.float32)
+            n_kept = kept_table.num_rows
+            if n_kept == 0:
+                return tens
+            D_actual = flat_vals.shape[0] // n_kept
+            shape_matrix = flat_vals.reshape(n_kept, D_actual)
+            d_use = min(D, D_actual)
+            # Vectorised scatter into the (T, |cohort|, D) tensor
+            tens[kept_ts_idx, kept_pk_idx, :d_use] = shape_matrix[:, :d_use]
+            return tens
+
+        shapes_a = _build_shape_tensor(ta_filt, D_a)
+        shapes_b = _build_shape_tensor(tb_filt, D_b)
+
+        # Replace NaN cells with the present-entity per-(t, dim) mean so that
+        # the population mean at epoch t equals the mean of present entities
+        # at that epoch (works for both 'all' and 'fixed' modes, with 'fixed'
+        # being NaN-free by construction except for rare missing rows).
+        def _impute_to_present_mean(tens: np.ndarray) -> np.ndarray:
+            mask = ~np.isnan(tens)
+            sums = np.where(mask, tens, np.float32(0.0)).sum(
+                axis=1, dtype=np.float32,
+            )
+            counts = mask.sum(axis=1).astype(np.float32)
+            counts_safe = np.where(counts > 0, counts, np.float32(1.0))
+            mean_per_td = (sums / counts_safe).astype(np.float32, copy=False)
+            return np.where(
+                mask, tens, mean_per_td[:, None, :],
+            ).astype(np.float32, copy=False)
+
+        _has_missing = (
+            cohort == "all"
+            or np.isnan(shapes_a).any()
+            or np.isnan(shapes_b).any()
+        )
+        if entity_key is None and _has_missing:
+            shapes_a = _impute_to_present_mean(shapes_a)
+            shapes_b = _impute_to_present_mean(shapes_b)
+        elif entity_key is not None:
+            # Per-entity mode: NaN rows mean entity is missing at that epoch.
+            # Fill with the entity's nearest-neighbour value — for single-entity
+            # cohort interpolating to "present-mean" reduces to copying.
+            mask_a = ~np.isnan(shapes_a).any(axis=(1, 2))
+            mask_b = ~np.isnan(shapes_b).any(axis=(1, 2))
+            if not (mask_a.all() and mask_b.all()):
+                # Drop missing epochs entirely — re-validate length
+                keep = np.where(mask_a & mask_b)[0]
+                if keep.shape[0] < N:
+                    if (keep.shape[0] - 1) - 2 * max_lag_resolved < 2:
+                        raise ValueError(
+                            f"find_lead_lag: entity={entity_key!r} after dropping "
+                            f"missing epochs has N={keep.shape[0]} too small for "
+                            f"max_lag={max_lag_resolved}"
+                        )
+                    shapes_a = shapes_a[keep]
+                    shapes_b = shapes_b[keep]
+                    T_common = [T_common[i] for i in keep]
+                    N = len(T_common)
+
+        # ── 6. Resolve schema_hash for traceability (best-effort) ─────
+        def _safe_schema_hash(pid: str) -> str:
+            try:
+                versions = self._storage.list_calibration_versions(pid)
+                if versions:
+                    fit = self._storage.read_calibration_fit(pid, version=versions[-1])
+                    return fit.schema_hash
+            except Exception:
+                pass
+            return ""
+
+        schema_hash_a = _safe_schema_hash(pattern_a)
+        schema_hash_b = _safe_schema_hash(pattern_b)
+
+        # ── 7. Build LeadLagReport via engine orchestrator ────────────
+        n_dropped_a = len(T_a) - N
+        n_dropped_b = len(T_b) - N
+        return _compute_lead_lag_report(
+            pattern_a=pattern_a,
+            pattern_b=pattern_b,
+            entity_key=entity_key,
+            shapes_a=shapes_a,
+            shapes_b=shapes_b,
+            mu_a=np.asarray(pat_a.mu, dtype=np.float32),
+            sigma_a=np.asarray(pat_a.sigma_diag, dtype=np.float32),
+            mu_b=np.asarray(pat_b.mu, dtype=np.float32),
+            sigma_b=np.asarray(pat_b.sigma_diag, dtype=np.float32),
+            dim_labels_a=pat_a.dim_labels,
+            dim_labels_b=pat_b.dim_labels,
+            timestamps=T_common,
+            n_dropped_a=n_dropped_a,
+            n_dropped_b=n_dropped_b,
+            cohort_size=len(cohort_E),
+            cohort_dropped=cohort_dropped,
+            schema_hash_a=schema_hash_a,
+            schema_hash_b=schema_hash_b,
+            max_lag=max_lag_resolved,
+            fdr_alpha=fdr_alpha,
+            fdr_method=fdr_method,
+            verbose=verbose,
+        )
+
+    def _attach_influence_fields_to_anomaly_entries(
+        self,
+        entries: list[dict],
+        pattern_id: str,
+    ) -> list[dict]:
+        """M4 additive: attach total_impact + classification per π5 entry.
+
+        Resolves to None per-entry when pattern is event-type, N<2, or storage
+        backend lacks shape reconstruction prerequisites."""
+        from hypertopos.engine.geometry import (
+            _classify_influence,
+            _compute_leave_one_out_impact,
+        )
+        from hypertopos.utils.arrow import delta_matrix_from_arrow
+
+        sphere = self._storage.read_sphere()
+        pattern = sphere.patterns[pattern_id]
+        if pattern.pattern_type == "event":
+            for e in entries:
+                e["total_impact"] = None
+                e["classification"] = None
+            return entries
+
+        version = self._manifest.pattern_versions[pattern_id]
+        try:
+            geo_table = self._storage.read_geometry(pattern_id, version)
+        except (KeyError, OSError, ValueError):
+            for e in entries:
+                e["total_impact"] = None
+                e["classification"] = None
+            return entries
+
+        N = geo_table.num_rows
+        if N < 2:
+            for e in entries:
+                e["total_impact"] = None
+                e["classification"] = None
+            return entries
+
+        deltas = delta_matrix_from_arrow(geo_table).astype(np.float64)
+        pk_col = geo_table["primary_key"].to_pylist()
+        pk_to_idx = {pk: i for i, pk in enumerate(pk_col)}
+        sigma_diag = np.asarray(pattern.sigma_diag, dtype=np.float64)
+        mu = np.asarray(pattern.mu, dtype=np.float64)
+        sigma_floor = np.maximum(sigma_diag, 1e-2)
+        shapes = deltas * sigma_floor + mu
+        mu_full = shapes.mean(axis=0)
+        sigma_full = shapes.std(axis=0, ddof=0)
+        delta_norm = np.linalg.norm(deltas, axis=1)
+        theta_norm = float(pattern.theta_norm)
+
+        try:
+            _, _, total_imp, _ = _compute_leave_one_out_impact(
+                shapes, mu_full, sigma_full,
+            )
+            classes = _classify_influence(
+                total_imp, delta_norm, theta_norm, high_threshold_pct=90.0,
+            )
+        except (ValueError, FloatingPointError):
+            for e in entries:
+                e["total_impact"] = None
+                e["classification"] = None
+            return entries
+
+        for e in entries:
+            ekey = e.get("primary_key")
+            if ekey is None or ekey not in pk_to_idx:
+                e["total_impact"] = None
+                e["classification"] = None
+                continue
+            i = pk_to_idx[ekey]
+            e["total_impact"] = float(round(total_imp[i], 4))
+            e["classification"] = classes[i]
+        return entries
+
+    def find_density_gaps(
+        self,
+        pattern_id: str,
+        *,
+        top_n: int = 10,
+        dim_pairs: list[tuple[str, str]] | None = None,
+        bins: int = 10,
+        alpha: float = 0.05,
+        r_min: float = 0.1,
+        r_max: float = 0.7,
+        sample_size: int = 100_000,
+    ) -> dict[str, Any]:
+        """Joint density gap detection via PIT + independence null + BH chi^2.
+
+        For each selected dim pair build a uniform-marginal 2D
+        histogram (probability integral transform normalises every dim
+        kind) and flag bins whose observed count is significantly below
+        the uniform-independence expectation. Each flagged bin maps
+        back to a named raw-feature range with a BH-corrected q-value.
+
+        sample_size: max entities to read (random sample when sphere is
+            larger). Defaults to 100,000. Pass None to read all.
+        """
+        from hypertopos.engine.density_gaps import (
+            ECDFEntry,
+            compute_density_gaps_for_pair,
+            is_usable_for_gap,
+            select_pairs_by_corr,
+        )
+
+        if not (0.0 < alpha < 1.0):
+            raise GDSNavigationError(
+                f"alpha must be in (0, 1); got {alpha}",
+            )
+        if not (4 <= bins <= 50):
+            raise GDSNavigationError(
+                f"bins must be in [4, 50]; got {bins}",
+            )
+        if not (0.0 <= r_min < r_max <= 1.0):
+            raise GDSNavigationError(
+                f"r_min/r_max must satisfy 0 <= r_min < r_max <= 1; "
+                f"got r_min={r_min}, r_max={r_max}",
+            )
+        if top_n < 1:
+            raise GDSNavigationError(
+                f"top_n must be >= 1; got {top_n}",
+            )
+
+        sphere = self._storage.read_sphere()
+        if pattern_id not in sphere.patterns:
+            raise GDSNavigationError(
+                f"pattern not found: {pattern_id!r}",
+            )
+        pattern = sphere.patterns[pattern_id]
+        version = self._manifest.pattern_versions.get(pattern_id, 1)
+        geo = self._storage.read_geometry(
+            pattern_id, version,
+            columns=["delta"],
+            sample_size=sample_size if sample_size is not None else None,
+        )
+        n = geo.num_rows
+        if n < 100:
+            raise GDSNavigationError(
+                f"pattern too small for density gap detection "
+                f"(need >= 100, got {n})",
+            )
+
+        flat = geo["delta"].combine_chunks().values.to_numpy(zero_copy_only=False)
+        d = flat.shape[0] // n
+        x_matrix = flat.reshape(n, d).astype(np.float32)
+        dim_labels = list(
+            pattern.dim_labels or [f"dim_{i}" for i in range(d)],
+        )
+
+        excluded: list[dict[str, str]] = []
+        usable_idx: list[int] = []
+        for i in range(d):
+            ok, reason = is_usable_for_gap(x_matrix[:, i])
+            if ok:
+                usable_idx.append(i)
+            else:
+                excluded.append({"dim": dim_labels[i], "reason": reason})
+
+        if len(usable_idx) < 2:
+            return {
+                "pattern_id": pattern_id,
+                "n_entities": n,
+                "gaps": [],
+                "excluded_dims": excluded,
+                "n_pairs_tested": 0,
+                "reason": "fewer than 2 usable dims",
+            }
+
+        ecdf_cache: dict[int, ECDFEntry] = {
+            i: ECDFEntry.from_values(x_matrix[:, i]) for i in usable_idx
+        }
+        u_matrix = np.column_stack(
+            [ecdf_cache[i].transform(x_matrix[:, i]) for i in usable_idx],
+        )
+
+        if dim_pairs is not None:
+            label_to_local = {
+                dim_labels[i]: idx for idx, i in enumerate(usable_idx)
+            }
+            unknown = [
+                name for pair in dim_pairs for name in pair
+                if name not in label_to_local
+            ]
+            if unknown:
+                raise GDSNavigationError(
+                    f"unknown dim names in dim_pairs: "
+                    f"{sorted(set(unknown))}",
+                )
+            pair_local: list[tuple[int, int, float]] = []
+            for (a, b) in dim_pairs:
+                la, lb = label_to_local[a], label_to_local[b]
+                r = float(abs(np.corrcoef(
+                    u_matrix[:, la], u_matrix[:, lb],
+                )[0, 1]))
+                pair_local.append((la, lb, r))
+        else:
+            corr = np.corrcoef(u_matrix.T)
+            pair_local = select_pairs_by_corr(
+                corr, r_min=r_min, r_max=r_max, top_k=20,
+            )
+
+        if not pair_local:
+            return {
+                "pattern_id": pattern_id,
+                "n_entities": n,
+                "gaps": [],
+                "excluded_dims": excluded,
+                "n_pairs_tested": 0,
+                "reason": "no pairs in correlation window",
+            }
+
+        all_cells: list[dict[str, Any]] = []
+        for (i_local, j_local, r) in pair_local:
+            i_global = usable_idx[i_local]
+            j_global = usable_idx[j_local]
+            cells = compute_density_gaps_for_pair(
+                u_matrix[:, i_local], u_matrix[:, j_local],
+                n=n, bins=bins, alpha=alpha,
+            )
+            for c in cells:
+                if not c["is_gap"]:
+                    continue
+                delta_lo_i, delta_hi_i = ecdf_cache[i_global].inverse(
+                    np.array(c["u_range_i"]),
+                )
+                delta_lo_j, delta_hi_j = ecdf_cache[j_global].inverse(
+                    np.array(c["u_range_j"]),
+                )
+                ratio = (
+                    float(c["expected"] / max(c["observed"], 1e-9))
+                    if c["observed"] > 0 else float("inf")
+                )
+                all_cells.append({
+                    "dim_i": dim_labels[i_global],
+                    "dim_j": dim_labels[j_global],
+                    "u_range_i": list(c["u_range_i"]),
+                    "u_range_j": list(c["u_range_j"]),
+                    "delta_range_i": [float(delta_lo_i), float(delta_hi_i)],
+                    "delta_range_j": [float(delta_lo_j), float(delta_hi_j)],
+                    "observed": c["observed"],
+                    "expected": c["expected"],
+                    "ratio": ratio,
+                    "p_value": c["p_value"],
+                    "q_value": c["q_value"],
+                    "is_gap": True,
+                    "correlation": float(r),
+                })
+
+        all_cells.sort(key=lambda c: -c["ratio"])
+        return {
+            "pattern_id": pattern_id,
+            "n_entities": n,
+            "gaps": all_cells[:top_n],
+            "excluded_dims": excluded,
+            "n_pairs_tested": len(pair_local),
+        }
+
+    def _build_scoped_adjacency_for_motif(
+        self,
+        pattern_id: str,
+        hops: list[Any],
+        seed_keys: list[str],
+    ) -> Any:
+        """Build a partial AdjacencyIndex covering only the BFS frontier
+        reachable from ``seed_keys`` within ``len(hops)`` levels.
+
+        Uses Lance BTREE-pushdown reads (``from_keys=`` / ``to_keys=`` IN
+        filters) to fetch only the edges actually visited.  On a 5 M-tx
+        edge table seeded by one anchor entity, this typically reads tens
+        to low hundreds of rows instead of the full table.
+        """
+        import pyarrow as pa
+        from hypertopos.engine.adjacency import AdjacencyIndex
+
+        needs_forward = any(
+            getattr(h, "direction", "forward") in ("forward", "any") for h in hops
+        )
+        needs_reverse = any(
+            getattr(h, "direction", "forward") in ("reverse", "any") for h in hops
+        )
+        if not (needs_forward or needs_reverse):
+            needs_forward = True
+
+        visited: set[str] = set(seed_keys)
+        frontier: set[str] = set(seed_keys)
+        edge_tables: list[pa.Table] = []
+
+        for _ in range(len(hops)):
+            if not frontier:
+                break
+            new_keys: set[str] = set()
+            if needs_forward:
+                t = self._storage.read_edges(
+                    pattern_id, from_keys=list(frontier),
+                )
+                if t.num_rows > 0:
+                    edge_tables.append(t)
+                    new_keys.update(t["to_key"].to_pylist())
+            if needs_reverse:
+                t = self._storage.read_edges(
+                    pattern_id, to_keys=list(frontier),
+                )
+                if t.num_rows > 0:
+                    edge_tables.append(t)
+                    new_keys.update(t["from_key"].to_pylist())
+            next_frontier = new_keys - visited
+            visited |= new_keys
+            frontier = next_frontier
+
+        if not edge_tables:
+            return AdjacencyIndex(_out={}, _in={}, _nodes=set(), _edge_count=0)
+
+        combined = pa.concat_tables(edge_tables)
+        # Forward + reverse reads of overlapping subgraphs surface the same
+        # transaction twice; dedup on event_key before handing to from_edge_lists.
+        if combined.num_rows > 0 and "event_key" in combined.column_names:
+            seen: set[str] = set()
+            keep: list[int] = []
+            eks = combined["event_key"].to_pylist()
+            for i, ek in enumerate(eks):
+                if ek not in seen:
+                    seen.add(ek)
+                    keep.append(i)
+            if len(keep) < combined.num_rows:
+                combined = combined.take(keep)
+
+        return AdjacencyIndex.from_edge_lists(
+            combined["from_key"].to_pylist(),
+            combined["to_key"].to_pylist(),
+            combined["timestamp"].to_pylist(),
+            combined["amount"].to_pylist(),
+            combined["event_key"].to_pylist(),
+        )
+
+    def find_motif_by_hops(
+        self,
+        pattern_id: str,
+        hops: list[Any],
+        *,
+        seed_keys: list[str] | None = None,
+        max_results: int = 100,
+        score: bool = False,
+    ) -> dict[str, Any]:
+        """Match motifs declaratively via per-hop ``HopPredicate``s.
+
+        Power-user escape hatch from the closed-vocab ``find_motif`` registry.
+        Caller passes a list of ``HopPredicate``s describing per-hop
+        amount / temporal / direction / edge-dim constraints; the navigator
+        walks the edge table looking for matching chains.
+
+        Bounded MVP — supports ``amount_min`` / ``amount_max`` /
+        ``time_delta_max_hours`` / ``direction`` (``forward`` / ``reverse``
+        / ``any``) / ``edge_dim_predicates``. ``amount_ratio_to_prev`` and
+        ``require_anomalous_entity`` ship in a follow-up release.
+        """
+        from hypertopos.engine.hop_predicate import enumerate_motifs_by_hops
+
+        if not hops:
+            raise GDSNavigationError("hops must be non-empty")
+        if not 1 <= len(hops) <= 6:
+            raise GDSNavigationError(
+                f"hop count must be 1..6; got {len(hops)}",
+            )
+        if max_results < 1:
+            raise GDSNavigationError(
+                f"max_results must be >= 1; got {max_results}",
+            )
+
+        sphere = self._storage.read_sphere()
+        if pattern_id not in sphere.patterns:
+            raise GDSNavigationError(
+                f"pattern not found: {pattern_id!r}",
+            )
+        pattern = sphere.patterns[pattern_id]
+        if pattern.pattern_type != "event":
+            raise GDSNavigationError(
+                f"find_motif_by_hops requires an event pattern; "
+                f"got pattern_type={pattern.pattern_type!r} for "
+                f"{pattern_id!r}",
+            )
+
+        # When seed_keys are provided, build a scoped AdjacencyIndex via
+        # Lance BTREE-pushdown reads expanding the BFS frontier hop-by-hop.
+        # On large edge tables (multi-million rows) this avoids the cold-cache
+        # full-table to_pylist() rebuild that AdjacencyIndex.from_lance pays
+        # on the first global call — for a 2-hop seeded query on AML HI-small
+        # (5 M tx, ~22 outgoing edges per seed) the scoped build reads ~70
+        # edges vs. 5 M.  The unseeded path keeps the cached global index.
+        if seed_keys:
+            adj = self._build_scoped_adjacency_for_motif(
+                pattern_id, hops, seed_keys,
+            )
+        else:
+            # AdjacencyIndex is built once per pattern at storage level
+            # (cached inside GDSReader._adjacency_cache).  Subsequent calls
+            # reuse it; cold first call on a multi-million-edge table can
+            # take tens of seconds — that is the price of full enumeration.
+            adj = self._storage.get_adjacency(pattern_id)
+        if adj is None or not adj._out:
+            return {
+                "pattern_id": pattern_id,
+                "n_results": 0,
+                "motifs": [],
+                "reason": "pattern has no edge table",
+            }
+
+        # edge_features sidecar — only loaded when at least one hop
+        # references edge_dim_predicates.
+        needs_features = any(
+            bool(getattr(h, "edge_dim_predicates", {})) for h in hops
+        )
+        edge_features = (
+            self._storage.read_edge_features(pattern_id)
+            if needs_features else None
+        )
+        if needs_features and (edge_features is None or edge_features.num_rows == 0):
+            raise GDSNavigationError(
+                f"edge_dim_predicates require an edge_features sidecar; "
+                f"pattern {pattern_id!r} has none — declare "
+                f"edge_dimensions: in YAML and rebuild the sphere",
+            )
+
+        try:
+            instances = enumerate_motifs_by_hops(
+                adj._out,
+                adj._in,
+                hops=hops,
+                seed_keys=seed_keys,
+                max_results=max_results,
+                edge_features=edge_features,
+            )
+        except ValueError as exc:
+            raise GDSNavigationError(str(exc)) from exc
+
+        # Scoring uses _score_motif_from_edges which requires anchor-pattern
+        # geometry (entity-level polygons). Event patterns store
+        # per-transaction polygons keyed by event_key, so motif edges
+        # (account, account) do not map back to event-pattern geometry.
+        # Score is silently skipped when pattern_type == "event"; future
+        # work wires up the anchor-companion lookup for event-
+        # pattern scoring.
+        if score and instances and pattern.pattern_type != "event":
+            scored: list[dict[str, Any]] = []
+            for inst in instances:
+                edge_pairs = [
+                    (inst["nodes"][i], inst["nodes"][i + 1])
+                    for i in range(len(inst["edges"]))
+                ]
+                try:
+                    breakdown = self._score_motif_from_edges(
+                        edges=edge_pairs, pattern_id=pattern_id,
+                    )
+                    inst_with_score = dict(inst)
+                    inst_with_score["score"] = breakdown.get("score", 0.0)
+                    inst_with_score["score_breakdown"] = breakdown.get(
+                        "breakdown", [],
+                    )
+                    scored.append(inst_with_score)
+                except GDSNavigationError:
+                    # Anchor companion not addressable — keep instance unscored.
+                    scored.append(dict(inst))
+            scored.sort(key=lambda m: -m.get("score", 0.0))
+            instances = scored
+
+        return {
+            "pattern_id": pattern_id,
+            "n_results": len(instances),
+            "motifs": instances,
+        }
+

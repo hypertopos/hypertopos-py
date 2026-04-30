@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from unittest.mock import MagicMock
 
+import pyarrow as pa
 import pytest
 
 from hypertopos.engine.adjacency import AdjacencyIndex
@@ -15,10 +16,17 @@ from hypertopos.navigation.navigator import (
     GDSNavigator,
     RootCauseNode,
 )
+from hypertopos.storage._schemas import EDGE_TABLE_SCHEMA
 
 
 def _empty_adjacency() -> AdjacencyIndex:
     return AdjacencyIndex(_out={}, _in={}, _nodes=set(), _edge_count=0)
+
+
+def _empty_edges_table() -> pa.Table:
+    return pa.table(
+        {f.name: pa.array([], type=f.type) for f in EDGE_TABLE_SCHEMA},
+    )
 
 
 class TestRootCauseNode:
@@ -73,6 +81,8 @@ def _make_nav_with_mocks(*, entity_line: str | None = "accounts") -> GDSNavigato
     sphere.entity_line = MagicMock(return_value=entity_line)
     storage.read_sphere = MagicMock(return_value=sphere)
     storage.get_adjacency = MagicMock(return_value=_empty_adjacency())
+    storage.read_edges = MagicMock(return_value=_empty_edges_table())
+    storage.count_geometry_rows = MagicMock(return_value=0)
     engine = MagicMock()
     manifest = MagicMock()
     contract = MagicMock()
@@ -239,6 +249,8 @@ class TestTraceRootCauseRecursion:
         sphere.entity_line = MagicMock(return_value="main_line")
         storage.read_sphere = MagicMock(return_value=sphere)
         storage.get_adjacency = MagicMock(return_value=_empty_adjacency())
+        storage.read_edges = MagicMock(return_value=_empty_edges_table())
+        storage.count_geometry_rows = MagicMock(return_value=0)
         return GDSNavigator(MagicMock(), storage, MagicMock(), MagicMock())
 
     def _stub_graph_companion(self, monkeypatch, graph_pid: str = "graph_pid"):
@@ -472,6 +484,8 @@ class TestTraceRootCauseQualityFixes:
         sphere.entity_line = MagicMock(return_value="accounts")
         storage.read_sphere = MagicMock(return_value=sphere)
         storage.get_adjacency = MagicMock(return_value=_empty_adjacency())
+        storage.read_edges = MagicMock(return_value=_empty_edges_table())
+        storage.count_geometry_rows = MagicMock(return_value=0)
         return GDSNavigator(MagicMock(), storage, MagicMock(), MagicMock())
 
     def _stub_companion(self, monkeypatch, pid: str = "graph_pid"):

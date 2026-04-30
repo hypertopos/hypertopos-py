@@ -203,6 +203,43 @@ The edge table is intentionally separate from geometry. Geometry stores delta ve
 
 Skippable during build with `--no-edges` for faster iteration.
 
+## Density gaps via independence null
+
+`find_density_gaps(pattern_id, …)` answers the inverse of anomaly
+detection: which combinations of dim values **should** be populated
+under an independence null but are not? Each pattern dim is mapped to
+a uniform `[0, 1]` marginal via its empirical CDF (probability integral
+transform), so the test is dim-kind agnostic — Gaussian, Poisson,
+heavy-tail and non-parametric dims all reduce to the same uniform
+representation. Pairs with Pearson `|r|` in `[r_min, r_max]` (default
+`[0.1, 0.7]`) are tested against the uniform-independence expectation
+on a `bins × bins` joint histogram via per-cell chi² residual; only
+under-populated cells are kept and Benjamini-Hochberg correction is
+applied across the test set to control FDR. Each flagged cell maps
+back to a named delta-space range (z-score units — geometry deltas, not
+raw property values) — the agent receives statements like *"no entities
+with `_d_tx_count ∈ [-0.6, -0.4]` AND `_d_amount_std ∈ [0.5, 0.8]`;
+independence predicts ~52, observed 0"*. Mapping back to raw property
+ranges (e.g. tx_count=50..200) is a follow-up that requires joining
+through the points table. Bernoulli, degenerate
+and `< 30`-finite-value dims are auto-excluded and reported in
+`excluded_dims`. Anchor patterns only — event-pattern delta vectors
+typically have low pair counts and don't yield robust chi² statistics.
+
+## Edge-derived dimensions
+
+Event patterns can declare an `edge_dimensions:` block in YAML to add up to five build-time per-edge signals to their polygon geometry:
+
+| Dim | Type | Signal |
+|---|---|---|
+| `pair_edge_count` | poisson | edges per `(from_key, to_key)` directed pair across the full sphere span — flags concentration / pair-locking |
+| `position_in_chain` | poisson | depth in the longest reverse-temporal chain ending at this edge; values below `min_position` zero out — flags entities deep into structuring chains |
+| `time_since_pair_last_edge` | gaussian | seconds since the previous edge in the same pair; first edge in a pair gets a sentinel = sphere span |
+| `pair_amount_zscore` (LOW_VAR pairs only) | gaussian | signed z-score of amount within `(from_key, to_key)` pairs whose CV(amount) < `cv_threshold`; HIGH_VAR pairs and pairs below `min_count` write 0.0 — direction-agnostic outlier signal on locked-amount pairs |
+| `find_motif_structuring` | bernoulli | 1.0 if the edge participates in any A→B→C→D structuring motif within `time_window_hours` with hop1 ≥ `amt1_min` and hops 2/3 ≤ `amt2_max` |
+
+These dims are computed at edge-table emission time, written to the `_gds_meta/edge_features/{pid}/data.lance` sidecar keyed by `event_key`, AND merged into the event polygon `shape_snapshot` (one extra dim per declared entry). Downstream primitives (`find_anomalies`, `find_similar_entities`, `find_clusters`) automatically include them in `delta` / `delta_norm` / classification — no new query API. Reject `min_position < 3` at YAML parse time. Anchor patterns reject the block — the per-edge → per-entity aggregation that would let anchor patterns use these dims is a deferred follow-up.
+
 ## Chain Interpretation
 
 Chains (both build-time `chain_lines` and runtime `discover_chains`) are sequences of entities linked by temporally ordered edges. They represent **structural paths** — the existence of a route through the graph within a time window — not causally linked flows.
@@ -315,6 +352,91 @@ A typical GDS exploration might look like this:
 5. use navigation primitives to move from one finding to the next
 
 That pattern is the core of the system: broad structure first, focused investigation second.
+
+## Calibration epoch vs schema version vs schema hash
+
+Three orthogonal axes describe a pattern's state:
+
+| Axis | Field | Increments on |
+|---|---|---|
+| Schema (coarse) | `pattern.version` | Intended: schema change. Currently dormant — builder always writes `1`. |
+| Schema (fine) | `pattern.schema_hash` | Schema change (relations / event_dimensions / prop_columns / dimension_kinds / dim order). |
+| Calibration epoch | `pattern.calibration_epoch` | Re-fit on the same schema — every full builder run. |
+
+A `CalibrationFit` (one historical epoch) is identified by `(pattern_id, calibration_epoch)`
+and is self-described by `schema_hash`. Schema drift wipes prior epochs because mu/sigma
+vectors from a different schema have different dimensionality.
+
+## Coordinate system influence
+
+Standard anomaly detection asks "how far is this entity from population normalcy?".
+The inverse question — and a meta-anomaly category not surfacing in any single-entity
+metric — is "how much does this entity SHAPE what 'normal' means?". hypertopos
+answers via the influence × anomaly classification matrix:
+
+- **Hidden influencer** (high impact + low anomaly): an entity invisible to anomaly
+  scans but whose presence defines the coordinate origin and scale. Removing it
+  shifts μ/σ enough that other entities flip classification. Common operational
+  triggers: data quality issues (duplicated records), adversarial population
+  manipulation (coordinated AML attacks injecting "average-looking" accounts to
+  shift coordinates and mask fraud).
+- **Calibration distorter** (high impact + high anomaly): an extreme outlier that
+  simultaneously moves the coordinate origin AND triggers anomaly detection. The
+  flag indicates the entity should likely be reviewed for exclusion from population
+  statistics rather than just flagged as anomalous.
+- **Standard anomaly** (low impact + high anomaly): a regular outlier whose removal
+  would not recalibrate the coordinate system noticeably.
+- **Normal** (low impact + low anomaly): the bulk of the population.
+
+Math: exact leave-one-out via rolling Σs/Σs². Per entity E,
+`mu_impact = ‖(μ_full - μ_without_E) / σ_full‖` measures the centroid shift;
+`sigma_impact` measures the variance shift; `total_impact = sqrt(mu_impact² + sigma_impact²)`.
+Classification gates use a percentile cutoff for "high impact" (default 90th) and the
+existing `θ_norm` for "high anomaly".
+
+Distinct from **influence functions** (Cook 1977; Koh & Liang 2017) which measure
+impact on a trained model's parameters or predictions: this measures impact on the
+COORDINATE SYSTEM itself — the entity's removal changes the geometric positions of
+ALL OTHER entities. The hidden influencer cell (high impact + low anomaly) cannot
+exist in model-based influence analysis.
+
+## Cross-pattern lead-lag in population-relative coordinates
+
+When the same entity participates in multiple anchor patterns over the same
+entity line, each pattern produces a parallel temporal trajectory in an
+independently-calibrated population-relative coordinate space. Comparing the
+centroid drift of one pattern's population to another's at varying lag reveals
+the temporal ordering of population-level shifts: when the
+`account_behavior_pattern` centroid begins to move before the
+`account_stress_pattern` centroid, behavior is the leading indicator and
+stress is the lagging consequence.
+
+The signal is computed as the magnitude of the population centroid step
+between consecutive epochs — a scalar per pattern per epoch. Pearson
+cross-correlation at lags `[-max_lag, +max_lag]` produces the lead-lag
+profile. The peak lag is the headline answer; volatility (mean per-entity
+step magnitude) cross-correlation is reported alongside as confirmation,
+and an `agreement` label flags whether the two channels concur.
+
+Three architectural decisions make this primitive emergent rather than
+borrowed from classical signal processing:
+
+1. **Population-relative.** Each pattern's trajectory lives in its own
+   `(μ, σ)`-normalised coordinate space, so cross-pattern correlation
+   compares dimensionless drift signatures rather than raw measurements.
+2. **Time-grid intersection.** Patterns sharing the same `event_line` and
+   `window` land on a deterministic bucket grid (`bucket_id = floor((event_ts
+   - min_ts) / window)`); intersection over the per-pattern timestamp sets
+   gives the natural alignment without resampling.
+3. **Per-dim D_A × D_B matrix.** Each `(dim_a, dim_b)` pair yields its own
+   cross-correlation; BH or Storey FDR over Bonferroni-over-lag-adjusted
+   p-values surfaces the specific named-dimension pairs that lead, with
+   `top_dim_pairs` ranked by ascending q-value.
+
+This is distinct from Granger causality (regression on lagged levels) and
+from time-series cross-correlation in unitful coordinates: both lack the
+population-relative coordinate space and the named, interpretable
+dimensions that hypertopos provides.
 
 ## What This Document Is Not
 

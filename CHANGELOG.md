@@ -7,6 +7,234 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-04-30
+
+### Theme
+
+**Architecture-emergent analytics, properly enabled.** Calibration is
+now versioned (multi-epoch retention, sphere format 2.4) and four
+patent-aligned analytics ride on that versioning:
+`compare_calibrations`, intrinsic / extrinsic drift decomposition,
+hidden-influencer matrix, cross-pattern temporal lead-lag. Companion
+features round out the release: edge-derived build-time dimensions,
+joint density gap detection, and a declarative `HopPredicate` motif
+API as power-user escape hatch from the closed-vocab `find_motif`
+registry.
+
+### Added
+- `GDSNavigator.find_motif_by_hops(pattern_id, hops, *, seed_keys, max_results, score)`
+  — declarative motif API. Caller passes a list of `HopPredicate`s
+  describing per-hop constraints (`amount_min` / `amount_max` /
+  `time_delta_max_hours` / `direction` (`"forward"` / `"reverse"` /
+  `"any"`) / `edge_dim_predicates` referencing the per-edge sidecar from
+  the edge_dimensions YAML block) and the navigator walks the edge table
+  for matching chains of length 1..6. Power-user escape hatch from the
+  closed-vocab `find_motif` registry — composes cleanly with
+  `pair_edge_count`, `position_in_chain`, `time_since_pair_last_edge`,
+  `pair_amount_zscore`, `find_motif_structuring`. New `HopPredicate`
+  frozen dataclass in `hypertopos.model.sphere` (re-exported from the
+  package root). Seeded queries (`seed_keys` provided) build a scoped
+  `AdjacencyIndex` via Lance BTREE-pushdown reads expanding the BFS
+  frontier hop-by-hop — the visited subgraph alone is materialised, not
+  the full edge table. Unseeded full enumeration uses the cached global
+  `AdjacencyIndex` so repeat calls are O(1) per node lookup. Bounded
+  MVP — `amount_ratio_to_prev` and
+  `require_anomalous_entity` predicates plus k>6 land in a follow-up.
+  Scoring path uses the existing `_score_motif_from_edges` infrastructure
+  on anchor patterns; on event patterns the score is silently skipped
+  (anchor-companion scoring is the follow-up wiring); `score` defaults to
+  `False` since only event patterns are accepted today. Direction-aware
+  temporal monotonicity: `direction="forward"` enforces strict-increasing
+  timestamps, `direction="reverse"` enforces strict-decreasing
+  (causal-predecessor chain), `direction="any"` drops the monotonic
+  constraint and treats the time window as `|Δt|`. `hops[0].time_delta_max_hours`
+  must be `None` (rejected at validation — first hop has no previous
+  timestamp); `time_delta_max_hours` on subsequent hops must be positive.
+  Sidecar lookup is materialised lazily as `ek→idx` plus per-dim parallel
+  lists (rather than a 5M-row dict-of-dicts) — avoids the per-event
+  nested-dict allocation when `edge_dim_predicates` are used.
+- `GDSNavigator.find_density_gaps(pattern_id, *, top_n, dim_pairs, bins, alpha, r_min, r_max, sample_size)`
+  — joint density gap detection via probability integral transform plus
+  independence null on dim pairs. For each pattern dim that survives the
+  usability check (≥30 finite values, σ > 0, more than 2 unique levels)
+  the empirical CDF transform produces a uniform marginal on `[0, 1]`.
+  Pairs whose Pearson `|r|` lands inside the configurable
+  `[r_min, r_max]` window become the test set. Per pair the `bins x bins`
+  joint histogram is compared against the uniform-independence
+  expectation `N / bins²` via per-cell chi² residual; only
+  under-populated cells are kept and Benjamini-Hochberg correction is
+  applied across all under-populated cells to control FDR. Each flagged
+  cell maps back to a named delta-space (z-score) range via
+  `ECDFEntry.inverse` — values live on geometry-delta units; raw
+  property unit mapping is deferred follow-up.
+  Returns a dict with `gaps` (sorted by `expected/observed` ratio
+  descending), `excluded_dims` reporting (with reason), and
+  `n_pairs_tested`. Anchor patterns only (event patterns are not the
+  primary use case); patterns with `< 100` entities raise. Geometry is
+  read with column projection narrowed to `["delta"]` and Lance-side
+  random sampling via `sample_size` (default `100,000`; pass `0` to
+  scan the full population). Delta matrix is built via
+  `combine_chunks().values.to_numpy()` reshape rather than
+  `to_pylist()` + `np.array`. New `engine.density_gaps` module exposes
+  `ECDFEntry`, `compute_density_gaps_for_pair`, `is_usable_for_gap`,
+  and `select_pairs_by_corr` as building blocks.
+- Edge-derived dimensions on event patterns:
+  `engine.edge_features` exposes five build-time per-edge dim functions
+  (`pair_edge_count`, `position_in_chain` with default `min_position=5`
+  and parse-time reject below 3, `time_since_pair_last_edge`,
+  `pair_amount_zscore` LOW_VAR pairs only, `find_motif_structuring`)
+  plus an orchestrator `compute_all_edge_dims(edges, config)` that runs
+  every dim listed in a config dict and returns a single Arrow table
+  keyed by `event_key`. `EDGE_DIM_KINDS` table publishes the kind tag
+  (poisson / gaussian / bernoulli) for each dim so builder calibration
+  can pick the right normaliser. New `engine.structuring` module hosts
+  the structuring motif enumerator (single-seed +
+  all-seeds sweep returning the set of `event_key`s in any motif) for
+  the build-time `find_motif_structuring` dim; the navigator runtime
+  `_enumerate_structuring` path is unchanged. New
+  `EDGE_FEATURES_SCHEMA` constant in `storage._schemas` describes the
+  per-edge sidecar Lance dataset layout. New
+  `GDSReader.read_edge_features(pattern_id)` reads
+  `_gds_meta/edge_features/{pid}/data.lance` (empty table when sidecar
+  absent), forward-compatible with the
+  HopPredicate.edge_dim_predicates query API planned in a future
+  release. YAML surface for the new dims: `patterns.<pid>.edge_dimensions`
+  list of either bare dim names or single-key dicts with overrides;
+  parsed into `EdgeDimensionsConfig` and attached to `PatternMapping`.
+  Builder integration baked the per-event dim values into the event
+  polygon `shape_snapshot` (one extra dim per declared entry) and
+  extends `dimension_kinds` so downstream Bregman / theta-norm
+  calibration treats the new dims natively. Sidecar Lance dataset at
+  `_gds_meta/edge_features/{pid}/data.lance` is written alongside,
+  forward-compatible with the planned HopPredicate.edge_dim_predicates
+  query API. Anchor patterns and event patterns without edge_dimensions
+  are byte-identical to builds without the new YAML block.
+- Multi-epoch calibration retention: builder writes per-pattern historical
+  fits to `_gds_meta/calibration_history/{pid}/v={N}.json` on every full
+  build; sphere format bumps to 2.4 with `pattern.calibration_epoch`,
+  `pattern.schema_hash`, and root `calibration_history_policy`. New reader
+  API: `read_calibration_fit`, `list_calibration_versions`,
+  `read_calibration_history_policy`. New types: `CalibrationFit`,
+  `CalibrationNotFoundError`. GC keeps the most-recent K epochs (default 5).
+  Schema drift wipes history; 2.3 spheres open read-only and migrate on
+  first 0.6.0 build.
+- `GDSNavigator.compare_calibrations(pattern_id, v_from, v_to, top_n, verbose)`
+  — per-dimension μ/σ/θ drift between two calibration epochs, with auto-resolve
+  defaults and aggregate RMS scalar. New types: `CalibrationDriftReport`,
+  `DimensionDrift`. Diagnostic for inspecting calibration shifts after a
+  builder rebuild; reads via the multi-epoch retention API added earlier in
+  this release.
+- `GDSNavigator.decompose_drift(entity_key, pattern_id, v_from, v_to, timestamp_from, timestamp_to, top_n, verbose)`
+  — per-entity intrinsic vs extrinsic decomposition of geometric drift between
+  two temporal slices viewed across two calibration epochs. Returns
+  `IntrinsicExtrinsicReport` with aggregate L2 displacements, sum-of-squares
+  `intrinsic_fraction` bounded `[0, 1]`, and ranked per-dimension breakdown.
+  New types: `IntrinsicExtrinsicReport`, `DimensionDecomposition`.
+- `find_drifting_entities` per-entity dict gains 3 additive scalar fields:
+  `intrinsic_displacement`, `extrinsic_displacement`, `intrinsic_fraction`.
+  Auto-defaults to (oldest retained, current) calibration epochs;
+  resolves to `null` per-entity when decomposition isn't computable.
+- `GDSNavigator.find_calibration_influencers(pattern_id, top_n, classify, high_threshold_pct, sample_size, verbose)`
+  — per-entity exact leave-one-out impact on coordinate system calibration with
+  4-cell classification matrix (hidden / distorter / standard_anomaly / normal).
+  Math uses exact leave-one-out via rolling Σs/Σs² (NOT first-order μ-only
+  approximation — that approximation makes the "hidden influencer" cell empty
+  by construction; corrected during brainstorm). New types:
+  `DimensionContribution`, `InfluenceEntry`, `InfluenceReport`. `verbose=True`
+  attaches `cascading_flip_count` per entry — count of OTHER entities
+  flipping is_anomaly after this entity's removal.
+- `GDSNavigator.find_group_influence(pattern_id, groups)` — caller-
+  supplied leave-set-out impact with `reinforcing_factor = total_impact_set
+  / Σ_individuals`. Reinforcing > 1 detects coordinated population-shift
+  attacks (collusion rings, duplicate-record contamination); < 1 detects
+  canceling sets. New type: `GroupInfluenceReport`.
+- `find_anomalies` MCP per-entity dict gains 2 additive scalar fields:
+  `total_impact`, `classification`. Hooked at the MCP-layer polygon→dict
+  conversion via `_attach_influence_fields_to_anomaly_entries`; resolves to
+  `null` per-entity when pattern is event-type, N<2, or storage backend
+  lacks shape-reconstruction prerequisites.
+- `GDSNavigator.find_lead_lag(pattern_a, pattern_b, *, timestamp_from, timestamp_to, cohort, min_epochs, max_lag, fdr_alpha, fdr_method, verbose, entity_key)`
+  — cross-pattern temporal lead-lag in population-relative coordinates.
+  Population-aggregated centroid drift cross-correlation (primary signal,
+  patent-line) plus mean step-magnitude volatility confirmation series with
+  `agreement` label. Per-dim D_A × D_B matrix with BH or Storey FDR over
+  Bonferroni-over-lag-adjusted p-values (`top_dim_pairs` ranked by ascending
+  q-value, full matrix in `per_dim_pairs` when `verbose=True`). Per-entity
+  drill-down via `entity_key` parameter. Time alignment by intersection of
+  pattern timestamp sets, hard floor `min_epochs=8`, default
+  `cohort="fixed"` (panel-clean centroid). Significance: peak Bonferroni
+  adjustment for the population peak (`max_corr_threshold` cut-off,
+  `bartlett_ci_95` reported alongside, `is_significant` boolean,
+  `degenerate_signal` flag set when either centroid drift series has zero
+  variance — agreement forced to `"divergent"`). Reliability label mirrors
+  `engine.forecast.reliability_label` convention (high N-1 ≥ 24, medium
+  ≥ 12, else low). New types: `LeadLagReport`, `DimPairLeadLag`. Two-phase
+  Lance scan: a column-projected meta read picks the cohort and
+  pre-validates a 1 GB tensor budget against `count_geometry_rows` upper
+  bounds, so cross-pattern queries over disjoint entity_lines (e.g. AML
+  accounts vs account_pairs) raise immediately with an actionable error
+  pointing the agent at `cohort='fixed'` or `entity_key=<id>` instead of
+  allocating gigabytes. `read_temporal_batched` gains optional `columns=`
+  projection.
+
+### Fixed
+- `find_anomalies` polygon construction crashed with
+  `TypeError: float() argument must be a string or a real number, not 'NoneType'`
+  on rows whose `delta_rank_pct` / `bregman_divergence` / `anomaly_confidence`
+  column existed but stored a null Arrow value. The reconstruction code
+  used `float(row.get(field, 0.0))` guarded by `if field in row`, but
+  `row.get` returns `None` (not the default) for null cells, so the
+  default never fired. Replaced with explicit
+  `None if row.get(field) is None else float(row[field])` across both
+  `engine.geometry._reconstruct_polygons_from_geometry_table` and the
+  two find_anomalies branches in `navigation.navigator` (full-rank and
+  rank-by-property). No agent-visible API change.
+- `aggregate_anomalies`: negative `ungrouped_anomalies` when
+  `read_points_batch` returns duplicate rows per entity across Lance
+  partitions. Added dedup via `seen_pks` set — each entity is now counted
+  in exactly one group regardless of partition layout. `ungrouped_anomalies`
+  is now guaranteed non-negative.
+- `detect_neighbor_contamination`: replaced row-by-row `as_py()` loop
+  (O(N) PyArrow element access) with vectorised `to_pylist()` for the
+  initial geometry scan. Also vectorised the small batch-read in the
+  unknown-keys path.
+- `detect_segment_shift`: removed internal `π12_attract_regime_change`
+  call used only to populate the non-essential `changepoint_date` output
+  field. Calling full changepoint detection (O(N×buckets)) for a single
+  optional output field dominated the tool's wall-clock time. Field
+  removed from output; callers needing changepoint context should call
+  `find_regime_changes` separately. Per-segment Python loop over the
+  points table also replaced with vectorised PyArrow ops — `pc.is_in`
+  for the anomalous-PK mask, `pc.count_distinct` for the high-
+  cardinality early exit, and
+  `group_by(...).aggregate([("_pk","count"),("is_anomaly","sum")])` for
+  the per-segment counts.
+- `find_high_potential_edges` (`attract_edge_potential`) on event
+  patterns with large edge tables: replaced the
+  `AdjacencyIndex.from_lance()` rebuild — which read all five edge
+  columns and called `to_pylist()` over the full table — with a direct
+  two-column PyArrow `group_by(["from_key","to_key"])` aggregate.
+  Eliminates the per-call full-table materialisation that dominated
+  cost on multi-million-edge event patterns. Added an entity-type ratio
+  guard that fires BEFORE the groupby: read the cached
+  `_gds_meta/edge_stats/<pid>.json` (built at sphere-write time) for
+  `unique_from + unique_to` and divide by `pattern.population_size`
+  (already loaded from `sphere.json`). When the ratio is < 1 % the
+  edge endpoints belong to a different entity type than the host
+  geometry (e.g. zone IDs in a trip-edge pattern whose geometry holds
+  trips); the tool returns an empty ranking without opening either the
+  Lance edge table or the geometry dataset. New
+  `GDSReader.edge_stats_cached(pid)` helper that reads the build-time
+  JSON only — never falls back to the live full-table scan that
+  `edge_table_stats` performs as a recovery path — so primitives that
+  need a cheap guard cannot accidentally trigger a scan when the cache
+  is missing.
+- `detect_trajectory_anomaly`: changed `sample_size` default from
+  `None` (full population scan) to `10,000`. Full-population temporal
+  streaming on large spheres caused multi-minute latency; the default
+  now caps at 10k entities. Pass `sample_size=0` to restore the full
+  scan.
+
 ## [0.5.2] — 2026-04-28
 
 ### Added

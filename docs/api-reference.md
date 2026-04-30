@@ -245,6 +245,7 @@ class RelationSpec:
 | `read_edges(pattern_id, from_keys=None, to_keys=None, timestamp_from=None, timestamp_to=None, columns=None)` | Read edge table with Lance BTREE-indexed push-down filters. Returns `pa.Table` |
 | `has_edge_table(pattern_id)` | Check if an edge table exists for a pattern. Returns `bool` |
 | `edge_table_stats(pattern_id)` | Quick statistics (row count, unique entities, timestamp/amount ranges). Returns `dict` or `None` |
+| `edge_stats_cached(pattern_id)` | Read precomputed edge_stats JSON only — never falls back to a live scan. Returns `dict` or `None` if cache missing |
 
 ### Edge Table (GDSWriter)
 
@@ -253,6 +254,299 @@ class RelationSpec:
 | `write_edges(pattern_id, edges_table)` | Write edge table as a Lance dataset with BTREE indexes on `from_key` and `to_key` |
 | `append_edges(pattern_id, new_edges)` | Append new edges to an existing Lance dataset (streaming build) |
 | `create_edge_indexes(pattern_id)` | Build BTREE indexes on `from_key` and `to_key` after streaming writes |
+
+### Edge Features Sidecar (GDSReader)
+
+| Method | Description |
+|--------|-------------|
+| `read_edge_features(pattern_id)` | Read the per-edge derived dimension sidecar at `_gds_meta/edge_features/{pattern_id}/data.lance`. Returns an empty `pa.Table` conforming to `EDGE_FEATURES_SCHEMA` when no sidecar exists (the pattern did not declare an `edge_dimensions:` block). Forward-compatibility entry for a future HopPredicate query API; current navigator primitives read the dim values from the polygon `shape_snapshot` directly. |
+
+### `GDSNavigator.find_motif_by_hops`
+
+```python
+nav.find_motif_by_hops(
+    pattern_id: str,
+    hops: list[HopPredicate],
+    *,
+    seed_keys: list[str] | None = None,
+    max_results: int = 100,
+    score: bool = True,
+) -> dict
+```
+
+Declarative motif API — power-user escape hatch from the closed-vocab `find_motif` registry. Caller passes a list of `HopPredicate`s describing per-hop constraints (`amount_min`, `amount_max`, `time_delta_max_hours`, `direction` (`"forward"` / `"reverse"` / `"any"`), `edge_dim_predicates: dict[str, tuple[op, value]]`); the navigator walks the in-memory `AdjacencyIndex` for matching chains. `seed_keys=None` enumerates from all `from_key` nodes (capped at `max_results`). Returns `{pattern_id, n_results, motifs}` with each motif carrying `nodes`, `edges` (event_keys), `timestamps`, `amounts`, `dim_values_per_hop` (only when `edge_dim_predicates` were used), optional `score` (anchor patterns only) and `score_breakdown`. Raises on anchor pattern (event-only), unknown pattern, empty hops, k>6, `max_results<1`. Bounded MVP — `amount_ratio_to_prev` and `require_anomalous_entity` predicates plus k>6 land in a follow-up.
+
+### `HopPredicate` (dataclass, frozen)
+
+Fields: `amount_min`, `amount_max`, `time_delta_max_hours`, `direction` (Literal["forward", "reverse", "any"], default `"forward"`), `edge_dim_predicates` (`dict[str, tuple[str, float]]`, e.g. `{"pair_edge_count": (">=", 20.0)}`). Operators: `<`, `<=`, `>`, `>=`, `==`.
+
+### Density Gaps Engine (`hypertopos.engine.density_gaps`)
+
+| Symbol | Description |
+|--------|-------------|
+| `ECDFEntry(sorted_values)` | Frozen dataclass with `transform(x)` (raw → uniform `[0, 1]`) and `inverse(u)` (uniform → raw). Constructed via `ECDFEntry.from_values(x)` |
+| `is_usable_for_gap(col)` | `(bool, reason)` admissibility check — rejects `too_sparse` (<30 finite), `degenerate` (σ≈0), `bernoulli_like` (≤2 unique) |
+| `select_pairs_by_corr(corr, *, r_min, r_max, top_k)` | Pick top-`top_k` dim pairs with Pearson `|r| ∈ [r_min, r_max]`, sorted by `|r|` desc |
+| `compute_density_gaps_for_pair(u_i, u_j, *, n, bins, alpha)` | Per-cell chi² residuals against uniform-independence expectation, Benjamini-Hochberg correction. Returns under-populated cells with `p_value`, `q_value`, `is_gap` |
+
+### `GDSNavigator.find_density_gaps`
+
+```python
+nav.find_density_gaps(
+    pattern_id: str,
+    *,
+    top_n: int = 10,
+    dim_pairs: list[tuple[str, str]] | None = None,
+    bins: int = 10,
+    alpha: float = 0.05,
+    r_min: float = 0.1,
+    r_max: float = 0.7,
+) -> dict
+```
+
+Returns dict with `pattern_id`, `n_entities`, `gaps` (each sorted by
+`ratio` desc with `dim_i` / `dim_j` / `delta_range_i` / `delta_range_j`
+(z-score space — geometry deltas, not raw property values) / `u_range_i`
+/ `u_range_j` / `observed` / `expected` / `q_value` / `correlation`), `excluded_dims`, and `n_pairs_tested`. Raises
+`GDSNavigationError` for unknown pattern, fewer than 100 entities,
+invalid `alpha` / `bins` / `r_min`/`r_max` / `top_n`, or unknown dim
+names in user-supplied `dim_pairs`.
+
+### Edge Features Engine (`hypertopos.engine.edge_features`)
+
+| Symbol | Description |
+|--------|-------------|
+| `EDGE_DIM_KINDS: dict[str, str]` | Per-dim Bregman kind tag (poisson / gaussian / bernoulli) keyed by dim name |
+| `compute_pair_edge_count(edges)` | edges per `(from_key, to_key)` directed pair |
+| `compute_position_in_chain(edges, *, min_position)` | depth in longest reverse-temporal chain ending at this edge; values below `min_position` zero out |
+| `compute_time_since_pair_last_edge(edges, *, burst_seconds, dormant_seconds)` | seconds since previous edge in same pair; first edge → `dormant_seconds` |
+| `compute_pair_amount_zscore(edges, *, cv_threshold, min_count)` | signed z-score of amount within LOW_VAR pairs |
+| `compute_find_motif_structuring(edges, *, time_window_hours, amt1_min, amt2_max)` | 1.0 if edge participates in any A→B→C→D structuring motif |
+| `compute_all_edge_dims(edges, config)` | orchestrator — runs each dim listed in config, returns Arrow table keyed by `event_key` |
+
+### Structuring Engine (`hypertopos.engine.structuring`)
+
+| Symbol | Description |
+|--------|-------------|
+| `enumerate_structuring_for_seed(seed, edges, *, time_window_sec, amt1_min, amt2_max, max_instances)` | Single-seed enumeration of A→B→C→D motifs anchored at `seed`; returns list of motif dicts |
+| `enumerate_structuring_event_keys(edges, *, time_window_sec, amt1_min, amt2_max)` | All-seeds sweep — returns the set of `event_key`s participating in any motif. Build-time helper for `compute_find_motif_structuring` |
+
+### Edge Dimensions YAML Parser (`hypertopos.builder.mapping`)
+
+| Symbol | Description |
+|--------|-------------|
+| `EdgeDimensionsConfig(dims: dict[str, dict])` | Parsed `edge_dimensions:` block — frozen dataclass attached to `PatternMapping.edge_dimensions` |
+| `parse_edge_dimensions(raw_list, *, pattern_type)` | Parse + validate the YAML list of dim entries (bare strings or single-key dicts). Raises `ValueError` on anchor pattern, `min_position < 3`, `cv_threshold` outside `(0, 1]`, `min_count < 2`, non-positive `amt1_min` / `amt2_max` / `time_window_hours`, negative `burst_seconds`, duplicate or unknown dim names, malformed entries |
+
+### Calibration History (GDSReader)
+
+| Method | Description |
+|--------|-------------|
+| `read_calibration_fit(pattern_id, version=None)` | Load one calibration epoch as a frozen `CalibrationFit` dataclass. `version=None` resolves to the pattern's current `calibration_epoch` from sphere.json. Raises `CalibrationNotFoundError` if the requested version does not exist on disk (trimmed by GC, or schema bump wiped history). For 2.3 spheres, `version=None` and `version=1` both reconstruct a `CalibrationFit` from the inline sphere.json fields; any `version >= 2` raises `CalibrationNotFoundError`. |
+| `list_calibration_versions(pattern_id)` | Return all available calibration epochs for a pattern, ascending. On a 2.3 sphere returns `[1]`. On a 2.4 sphere returns the integers N present in `_gds_meta/calibration_history/{pattern_id}/v={N}.json`. |
+| `read_calibration_history_policy()` | Read the `calibration_history_policy` from sphere.json. Defaults to `{"last_k": 5}` if absent. Raises `ValueError` if `last_k < 1`. |
+
+### `CalibrationFit` (dataclass, frozen)
+
+Fields: `pattern_id`, `calibration_epoch`, `schema_version`, `schema_hash`,
+`mu`, `sigma_diag`, `theta`, `population_size`, `dimension_weights`,
+`dimension_kinds`, `dim_percentiles`, `group_stats`, `gmm_components`,
+`edge_max`, `computed_at`, `last_calibrated_at`.
+
+### `CalibrationNotFoundError` (exception)
+
+Extends `GDSError`. Raised by `read_calibration_fit` when the requested epoch
+is not on disk.
+
+### Calibration drift
+
+#### `GDSNavigator.compare_calibrations(pattern_id, v_from=None, v_to=None, top_n=10, verbose=False) -> CalibrationDriftReport`
+
+Per-dimension μ/σ/θ drift between two calibration epochs of the same pattern.
+Auto-resolves: both `None` → second-to-last vs last; only `v_to=None` →
+explicit `v_from` vs latest. Returns a `CalibrationDriftReport` with an
+aggregate `overall_drift_rms` (RMS in σ units), ranked `top_drifted`
+list, and optional full `per_dimension` breakdown when `verbose=True`.
+
+Raises `ValueError` on `v_from == v_to`, single-epoch auto-resolve, or
+schema_hash mismatch (cross-schema mu vectors are not dimensionally
+comparable). `CalibrationNotFoundError` bubbles from missing versions.
+
+#### `CalibrationDriftReport` (dataclass, frozen)
+
+Fields: `pattern_id`, `v_from`, `v_to`, `schema_hash`,
+`population_size_from`, `population_size_to`, `overall_drift_rms`,
+`top_drifted: list[DimensionDrift]`, `per_dimension: list[DimensionDrift] | None`.
+
+#### `DimensionDrift` (dataclass, frozen)
+
+Fields: `dim_index`, `dim_kind`, `mu_from`, `mu_to`, `mu_delta`,
+`mu_delta_normalized` (z-score: `(mu_to - mu_from) / sigma_from` with
+`sigma_safe` guard for degenerate dims), `sigma_from`, `sigma_to`,
+`sigma_delta`, `theta_from`, `theta_to`, `theta_delta`.
+
+### Drift decomposition
+
+#### `GDSNavigator.decompose_drift(entity_key, pattern_id, v_from=None, v_to=None, timestamp_from=None, timestamp_to=None, top_n=10, verbose=False) -> IntrinsicExtrinsicReport`
+
+Decompose an entity's drift between two temporal slices into intrinsic
+(entity-driven, σ_v1-normalised shape change) and extrinsic (population-
+recalibration-driven, residual) components, viewed across two calibration
+epochs. Auto-resolves: both version args `None` → oldest retained vs current;
+both timestamp args `None` → first vs last temporal slice. Returns an
+`IntrinsicExtrinsicReport` with aggregate L2 displacements, sum-of-squares
+`intrinsic_fraction` in [0, 1], ranked `top_dimensions`, and optional full
+`per_dimension` breakdown when `verbose=True`.
+
+Raises `ValueError` on `<2` retained epochs, `v_from == v_to`, schema_hash
+mismatch, `<2` slices in window, or event pattern. `CalibrationNotFoundError`
+bubbles up from missing versions.
+
+#### `IntrinsicExtrinsicReport` (dataclass, frozen)
+
+Fields: `pattern_id`, `entity_key`, `v_from`, `v_to`, `schema_hash`,
+`timestamp_from`, `timestamp_to`, `intrinsic_displacement`,
+`extrinsic_displacement`, `total_displacement`, `intrinsic_fraction`,
+`top_dimensions: list[DimensionDecomposition]`, `per_dimension: list[DimensionDecomposition] | None`.
+
+#### `DimensionDecomposition` (dataclass, frozen)
+
+Fields: `dim_index`, `dim_kind`, `dim_label`, `total` (delta_b - delta_a),
+`intrinsic` ((s_b - s_a) / σ_v1), `extrinsic` (residual), `intrinsic_fraction`
+(per-dim sum-of-squares ratio in [0, 1]).
+
+### Influence analysis
+
+#### `GDSNavigator.find_calibration_influencers(pattern_id, top_n=10, classify="hidden", high_threshold_pct=90.0, sample_size=None, verbose=False) -> InfluenceReport`
+
+Detect entities with high influence on coordinate system calibration. Classifies
+into the 4-cell influence × anomaly matrix (hidden / distorter /
+standard_anomaly / normal); default `classify="hidden"` returns top_n entities
+with high `total_impact` but low anomaly score (the patent's primary detection
+cell — entities defining what 'normal' means without being detected as anomalous).
+
+Math: exact leave-one-out via rolling Σs/Σs². For each entity E:
+- `μ_without[i] = (Σs[i] - s_E[i]) / (N-1)`
+- `σ²_without[i] = (Σs²[i] - s_E[i]²) / (N-1) - μ_without[i]²`
+- `mu_impact = ‖(μ_full - μ_without) / σ_full_safe‖`
+- `sigma_impact = ‖(σ_full - σ_without) / σ_full_safe‖`
+- `total_impact = sqrt(mu_impact² + sigma_impact²)`
+
+Classification: `high_impact = total_impact ≥ percentile(total_impact, high_threshold_pct)`;
+`high_anomaly = ‖δ(E)‖ ≥ θ_norm`.
+
+`verbose=True` attaches per-entry `cascading_flip_count` — count of
+OTHER entities flipping `is_anomaly` after this entity's removal.
+
+Raises `ValueError` on event pattern, `N<2`, `high_threshold_pct ∉ (0, 100)`,
+invalid `classify`, or `top_n ∉ [1, 50]`.
+
+#### `GDSNavigator.find_group_influence(pattern_id, groups) -> list[GroupInfluenceReport]`
+
+Caller-supplied per-group leave-set-out impact. For each input
+group, computes the set's collective μ/σ shift plus
+`reinforcing_factor = total_impact_set / Σ_individuals`. Reinforcing > 1
+indicates members pull together (coordinated injection or duplicate-record
+contamination); < 1 indicates canceling (members offset each other).
+
+Returns `list[GroupInfluenceReport]` (input order preserved).
+
+Raises `ValueError` on event pattern, `N<3`, empty groups list, group with
+`<2` members, group `≥ N`, missing entity_key, duplicate entity in group, or
+undefined reinforcing factor (sum of individual impacts = 0).
+
+#### Additive surface on `find_anomalies` MCP tool
+
+Each per-entity polygon dict gains 2 scalar fields: `total_impact` (M4
+leave-one-out scalar) and `classification` (`"hidden"` / `"distorter"` /
+`"standard_anomaly"` / `"normal"`). Resolves to `null` per-entry when pattern
+is event-type, `N<2`, or storage backend lacks shape-reconstruction
+prerequisites — keeps batch response intact.
+
+#### `InfluenceReport` (dataclass, frozen)
+
+Fields: `pattern_id`, `pattern_version`, `population_size`, `high_threshold_pct`,
+`total_impact_threshold`, `theta_norm`, `classify_filter`,
+`cell_counts: dict[str, int]`, `entries: list[InfluenceEntry]`.
+
+#### `InfluenceEntry` (dataclass, frozen)
+
+Fields: `entity_key`, `mu_impact`, `sigma_impact`, `total_impact`, `delta_norm`,
+`classification`, `top_dim_contributions: list[DimensionContribution]`,
+`cascading_flip_count: int | None`.
+
+#### `GroupInfluenceReport` (dataclass, frozen)
+
+Fields: `pattern_id`, `pattern_version`, `group_index`, `member_count`,
+`members: list[str]`, `mu_impact_set`, `sigma_impact_set`, `total_impact_set`,
+`sum_individual_impacts`, `reinforcing_factor`,
+`top_dim_contributions: list[DimensionContribution]`.
+
+#### `DimensionContribution` (dataclass, frozen)
+
+Fields: `dim_index`, `dim_kind`, `dim_label`, `mu_shift`, `sigma_shift`,
+`contribution` (sqrt(mu_shift² + sigma_shift²)).
+
+### Cross-pattern temporal lead-lag
+
+#### `Navigator.find_lead_lag`
+
+```python
+nav.find_lead_lag(
+    pattern_a: str,
+    pattern_b: str,
+    *,
+    timestamp_from: str | None = None,
+    timestamp_to: str | None = None,
+    cohort: Literal["fixed", "all"] = "fixed",
+    min_epochs: int = 8,
+    max_lag: int | None = None,
+    fdr_alpha: float = 0.05,
+    fdr_method: Literal["bh", "storey"] = "storey",
+    verbose: bool = False,
+    entity_key: str | None = None,
+) -> LeadLagReport
+```
+
+Cross-pattern temporal lead-lag in population-relative coordinates. Both
+patterns must be `pattern_type="anchor"` and (effectively) over the same
+entity space — `cohort="fixed"` raises empty-cohort otherwise. Time alignment
+uses the intersection of pattern timestamp sets; `min_epochs` is a hard
+floor. Default `max_lag = (N - 1) // 4`.
+
+Three nested answer levels:
+
+1. **Population scalar.** `lag` and `correlation` from the cross-correlation
+   of differenced population centroid drift series. Bonferroni-adjusted peak
+   threshold (`max_corr_threshold` field) is the cut-off used by
+   `is_significant`.
+2. **Per-dim D_A × D_B matrix.** `top_dim_pairs` (top 10 by ascending
+   q-value, ties broken by descending |corr|) with full sorted matrix in
+   `per_dim_pairs` when `verbose=True`. BH or Storey FDR applied to
+   Bonferroni-over-lag-adjusted p-values across all `D_A * D_B` pairs.
+3. **Per-entity drill-down.** Pass `entity_key` to replace the population
+   centroid by that entity's own delta trajectory.
+
+#### `LeadLagReport` (dataclass, frozen)
+
+Fields: `pattern_a`, `pattern_b`, `entity_key: str | None`, `n_epochs_used`,
+`n_dropped_a`, `n_dropped_b`, `cohort_size`, `cohort_dropped: int | None`,
+`timestamp_from: datetime`, `timestamp_to: datetime`, `schema_hash_a`,
+`schema_hash_b`, `lag`, `correlation`,
+`centroid_drift_series_a/b: list[float]`, `lag_volatility`,
+`correlation_volatility`, `volatility_series_a/b: list[float]`, `agreement`
+(`"strong"` / `"weak"` / `"divergent"`), `bartlett_ci_95`,
+`max_corr_threshold`, `is_significant`, `fdr_alpha`, `fdr_method`,
+`n_dim_pairs`, `n_significant_pairs`, `top_dim_pairs: list[DimPairLeadLag]`,
+`per_dim_pairs: list[DimPairLeadLag] | None`, `reliability`
+(`"high"` / `"medium"` / `"low"`), `max_lag`,
+`correlation_by_lag: list[float]`, `coverage_warning`, `degenerate_signal`.
+
+#### `DimPairLeadLag` (dataclass, frozen)
+
+Fields: `dim_index_a`, `dim_index_b`, `dim_label_a: str | None`,
+`dim_label_b: str | None`, `lag`, `correlation`, `p_value`, `q_value`,
+`is_significant`.
 
 ---
 

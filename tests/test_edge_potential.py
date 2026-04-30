@@ -39,6 +39,9 @@ def _make_nav_with_edges(pairs: list[tuple[str, str]]) -> GDSNavigator:
     storage = MagicMock()
     storage.read_edges = MagicMock(return_value=_mock_edges_table(pairs))
     storage.get_adjacency = MagicMock(return_value=_make_adjacency(pairs))
+    storage.count_geometry_rows = MagicMock(
+        return_value=max(1, len({k for p in pairs for k in p}))
+    )
     sphere = MagicMock()
     sphere.patterns = {
         "tx_pattern": MagicMock(pattern_type="event"),
@@ -82,6 +85,7 @@ class TestEdgePotentialScoring:
         storage = MagicMock()
         storage.read_edges = MagicMock(return_value=_mock_edges_table(edges))
         storage.get_adjacency = MagicMock(return_value=_make_adjacency(edges))
+        storage.count_geometry_rows = MagicMock(return_value=max(1, len(deltas)))
         sphere = MagicMock()
         anchor = MagicMock(pattern_type="anchor")
         sphere.patterns = {"account_pattern": anchor, "tx_pattern": MagicMock(pattern_type="event")}
@@ -180,6 +184,7 @@ class TestAttractEdgePotential:
         storage = MagicMock()
         storage.read_edges = MagicMock(return_value=_mock_edges_table(edges))
         storage.get_adjacency = MagicMock(return_value=_make_adjacency(edges))
+        storage.count_geometry_rows = MagicMock(return_value=max(1, len(deltas)))
         sphere = MagicMock()
         sphere.patterns = {
             "account_pattern": MagicMock(pattern_type="anchor"),
@@ -245,6 +250,7 @@ class TestAttractEdgePotential:
         storage = MagicMock()
         storage.read_edges = MagicMock(return_value=_mock_edges_table(edges))
         storage.get_adjacency = MagicMock(return_value=_make_adjacency(edges))
+        storage.count_geometry_rows = MagicMock(return_value=len(deltas))
         sphere = MagicMock()
         sphere.patterns = {
             "account_pattern": MagicMock(pattern_type="anchor"),
@@ -377,6 +383,7 @@ class TestGlobalVsFilterRankPct:
         storage = MagicMock()
         storage.read_edges = MagicMock(return_value=_mock_edges_table(edges))
         storage.get_adjacency = MagicMock(return_value=_make_adjacency(edges))
+        storage.count_geometry_rows = MagicMock(return_value=max(1, len(deltas)))
         sphere = MagicMock()
         sphere.patterns = {
             "account_pattern": MagicMock(pattern_type="anchor"),

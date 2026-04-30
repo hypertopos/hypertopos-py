@@ -312,3 +312,286 @@ class Sphere:
             if line.pattern_id == pattern_id and line.line_role == "event":
                 return line_id
         return None
+
+
+@dataclass(frozen=True)
+class CalibrationFit:
+    """Frozen snapshot of a pattern's statistical fit at one calibration epoch.
+
+    Captures everything that changes when a pattern is re-fitted on the same
+    schema: population statistics (mu/sigma/theta), dimension metadata that
+    depends on the fit (kinds, weights, percentiles), and segmented variants
+    (group_stats, gmm_components). Structural definition (relations,
+    event_dimensions, prop_columns) lives in the parent Pattern and is not
+    duplicated here. Schema change invalidates and discards all prior
+    CalibrationFit entries for a pattern.
+    """
+
+    pattern_id: str
+    calibration_epoch: int
+    schema_version: int
+    schema_hash: str
+    mu: np.ndarray
+    sigma_diag: np.ndarray
+    theta: np.ndarray
+    population_size: int
+    dimension_weights: np.ndarray | None
+    dimension_kinds: list[str] | None
+    dim_percentiles: dict[str, dict[str, float]] | None
+    group_stats: dict[str, GroupStats] | None
+    gmm_components: list[GMMComponent] | None
+    edge_max: np.ndarray | None
+    computed_at: datetime
+    last_calibrated_at: datetime
+
+
+@dataclass(frozen=True)
+class DimensionDrift:
+    """Per-dimension drift between two calibration epochs of the same pattern.
+
+    `mu_delta_normalized` is `(mu_to - mu_from) / sigma_from` — the z-score
+    of the centroid shift. For dimensions with `sigma_from == 0`
+    (degenerate), the normalization falls back to raw `mu_delta`.
+    """
+
+    dim_index: int
+    dim_kind: str | None
+    mu_from: float
+    mu_to: float
+    mu_delta: float
+    mu_delta_normalized: float
+    sigma_from: float
+    sigma_to: float
+    sigma_delta: float
+    theta_from: float
+    theta_to: float
+    theta_delta: float
+
+
+@dataclass(frozen=True)
+class CalibrationDriftReport:
+    """Drift report between two calibration epochs of one pattern.
+
+    `overall_drift_rms` is `||mu_delta_normalized||_2 / sqrt(D)` — RMS drift
+    per dimension in σ units, comparable across patterns of different
+    dimensionality. `top_drifted` is sorted by `|mu_delta_normalized|` desc.
+    `per_dimension` is populated only when the caller passes verbose=True.
+    """
+
+    pattern_id: str
+    v_from: int
+    v_to: int
+    schema_hash: str
+    population_size_from: int
+    population_size_to: int
+    overall_drift_rms: float
+    top_drifted: list[DimensionDrift]
+    per_dimension: list[DimensionDrift] | None
+
+
+@dataclass(frozen=True)
+class DimensionDecomposition:
+    """Per-dimension intrinsic vs extrinsic split for one entity drift.
+
+    `total` = `delta_b - delta_a` per-dim z-score change.
+    `intrinsic` = `(shape_b - shape_a) / sigma_v1[i]` — entity's own structural change
+    measured under the earlier-epoch sigma.
+    `extrinsic` = `total - intrinsic` — residual attributable to population recalibration.
+    `intrinsic_fraction` = `intrinsic^2 / (intrinsic^2 + extrinsic^2)`, bounded [0, 1].
+    Falls back to 0.0 when total is exactly zero (no change either component).
+    """
+
+    dim_index: int
+    dim_kind: str | None
+    dim_label: str | None
+    total: float
+    intrinsic: float
+    extrinsic: float
+    intrinsic_fraction: float
+
+
+@dataclass(frozen=True)
+class IntrinsicExtrinsicReport:
+    """M3 decomposition report for a single entity drift between two epochs.
+
+    `intrinsic_displacement` = `||intrinsic||_2` (entity-driven L2 magnitude).
+    `extrinsic_displacement` = `||extrinsic||_2` (population-driven L2 magnitude).
+    `total_displacement` = `||total||_2`.
+    `intrinsic_fraction` = `||intrinsic||^2 / (||intrinsic||^2 + ||extrinsic||^2)`,
+    bounded [0, 1] — what proportion of the squared change is entity-caused.
+    `top_dimensions` is sorted by `|total|` desc.
+    `per_dimension` is populated only when the caller passes `verbose=True`.
+    """
+
+    pattern_id: str
+    entity_key: str
+    v_from: int
+    v_to: int
+    schema_hash: str
+    timestamp_from: datetime
+    timestamp_to: datetime
+    intrinsic_displacement: float
+    extrinsic_displacement: float
+    total_displacement: float
+    intrinsic_fraction: float
+    top_dimensions: list[DimensionDecomposition]
+    per_dimension: list[DimensionDecomposition] | None
+
+
+@dataclass(frozen=True)
+class DimensionContribution:
+    """Per-dimension breakdown of one entity's (or group's) influence on the
+    coordinate system.
+
+    Hidden-influencer matrix. See
+    `engine.geometry._compute_leave_one_out_impact` for math.
+    """
+    dim_index: int
+    dim_kind: str | None
+    dim_label: str | None
+    mu_shift: float
+    sigma_shift: float
+    contribution: float
+
+
+@dataclass(frozen=True)
+class InfluenceEntry:
+    """Per-entity influence record returned by find_calibration_influencers."""
+    entity_key: str
+    mu_impact: float
+    sigma_impact: float
+    total_impact: float
+    delta_norm: float
+    classification: str
+    top_dim_contributions: list[DimensionContribution]
+    cascading_flip_count: int | None = None
+
+
+@dataclass(frozen=True)
+class InfluenceReport:
+    """Aggregate report from find_calibration_influencers."""
+    pattern_id: str
+    pattern_version: int
+    population_size: int
+    high_threshold_pct: float
+    total_impact_threshold: float
+    theta_norm: float
+    classify_filter: str
+    cell_counts: dict[str, int]
+    entries: list[InfluenceEntry]
+
+
+@dataclass(frozen=True)
+class GroupInfluenceReport:
+    """Per-group influence record from find_group_influence (caller-supplied form)."""
+    pattern_id: str
+    pattern_version: int
+    group_index: int
+    member_count: int
+    members: list[str]
+    mu_impact_set: float
+    sigma_impact_set: float
+    total_impact_set: float
+    sum_individual_impacts: float
+    reinforcing_factor: float
+    top_dim_contributions: list[DimensionContribution]
+
+
+@dataclass(frozen=True)
+class DimPairLeadLag:
+    """One (dim_a, dim_b) cross-pattern lead-lag entry from find_lead_lag.
+
+    `lag` is the peak lag in epochs (positive: dim_a in pattern A leads
+    dim_b in pattern B). `correlation` is the Pearson correlation of the
+    differenced centroid coordinate series at that lag. `q_value` is BH
+    or Storey-adjusted across all D_A * D_B pairs at the same `fdr_alpha`;
+    `is_significant` is `q_value < fdr_alpha`.
+    """
+    dim_index_a: int
+    dim_index_b: int
+    dim_label_a: str | None
+    dim_label_b: str | None
+    lag: int
+    correlation: float
+    p_value: float
+    q_value: float
+    is_significant: bool
+
+
+@dataclass(frozen=True)
+class LeadLagReport:
+    """Cross-pattern lead-lag report.
+
+    Three answer levels live in one report:
+      1. Headline (population, scalar): `lag`, `correlation` from differenced
+         centroid drift series of P_A vs P_B.
+      2. Per-dim drill-down: `top_dim_pairs` (top 10 by ascending q_value);
+         full matrix in `per_dim_pairs` when verbose=True.
+      3. Per-entity drill-down: when `entity_key` is given, the population
+         centroid is replaced by that entity's own delta trajectory.
+
+    Significance: peak Bonferroni-adjusted threshold (`max_corr_threshold`)
+    for the population peak; BH or Storey FDR across D_A * D_B for per-dim.
+    `bartlett_ci_95` reports the unadjusted single-test 95% CI for
+    transparency; `is_significant` uses `max_corr_threshold` (peak-adjusted).
+    """
+    pattern_a: str
+    pattern_b: str
+    entity_key: str | None
+    n_epochs_used: int
+    n_dropped_a: int
+    n_dropped_b: int
+    cohort_size: int
+    cohort_dropped: int | None
+    timestamp_from: datetime
+    timestamp_to: datetime
+    schema_hash_a: str
+    schema_hash_b: str
+    lag: int
+    correlation: float
+    centroid_drift_series_a: list[float]
+    centroid_drift_series_b: list[float]
+    lag_volatility: int
+    correlation_volatility: float
+    volatility_series_a: list[float]
+    volatility_series_b: list[float]
+    agreement: str
+    bartlett_ci_95: float
+    max_corr_threshold: float
+    is_significant: bool
+    fdr_alpha: float
+    fdr_method: str
+    n_dim_pairs: int
+    n_significant_pairs: int
+    top_dim_pairs: list[DimPairLeadLag]
+    per_dim_pairs: list[DimPairLeadLag] | None
+    reliability: str
+    max_lag: int
+    correlation_by_lag: list[float]
+    coverage_warning: bool
+    degenerate_signal: bool
+
+
+@dataclass(frozen=True)
+class HopPredicate:
+    """Per-hop constraints for the declarative motif API.
+
+    Used by ``GDSNavigator.find_motif_by_hops`` to describe a custom motif
+    as a list of per-hop predicates instead of a closed-vocabulary
+    ``motif_type``. The bounded MVP (0.6.0) supports ``amount_min`` /
+    ``amount_max`` / ``time_delta_max_hours`` / ``direction`` /
+    ``edge_dim_predicates``; ``amount_ratio_to_prev`` and
+    ``require_anomalous_entity`` ship in a follow-up release.
+    """
+
+    amount_min: float | None = None
+    amount_max: float | None = None
+    time_delta_max_hours: float | None = None
+    direction: Literal["forward", "reverse", "any"] = "forward"
+    # ``edge_dim_predicates`` maps a dim name (e.g. ``pair_edge_count``) to
+    # a (operator, value) tuple. Operators: ``"<"``, ``"<="``, ``">"``,
+    # ``">="``, ``"=="``. Dim names must exist in the event pattern's
+    # edge_features sidecar (declared via the ``edge_dimensions:`` YAML).
+    edge_dim_predicates: dict[str, tuple[str, float]] = field(
+        default_factory=dict,
+    )

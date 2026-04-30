@@ -124,6 +124,8 @@ class PatternConfig:
     geo_properties: list[str] | None = None
     metric_properties: list[str] | None = None
     semantic_dim: dict | None = None  # {"columns": [...], "n_components": int}
+    # --- Edge-derived dimensions ---
+    edge_dimensions: list | None = None  # list[str | dict] from YAML — parsed lazily
 
 
 @dataclass
@@ -589,6 +591,7 @@ def _parse_one_pattern(
         geo_properties=geo_props,
         metric_properties=metric_props,
         semantic_dim=semantic_dim,
+        edge_dimensions=spec.get("edge_dimensions"),
     )
 
 

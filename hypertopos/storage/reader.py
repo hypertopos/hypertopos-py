@@ -35,6 +35,15 @@ from hypertopos.model.sphere import (  # noqa: E402
     Sphere,
     StorageConfig,
 )
+from hypertopos.storage.calibration_history import (
+    CalibrationNotFoundError,
+    _compute_schema_hash_from_pattern_node,
+    _opt_array,
+    _parse_dt,
+    deserialize_fit,
+    history_dir,
+    list_calibration_versions as _list_versions_on_disk,
+)
 
 _RECOVERABLE_READ_ERRORS = (
     OSError,
@@ -461,6 +470,26 @@ class GDSReader:
             )
         return self._lance_dataset_cache[cache_key].count_rows(filter=filter)
 
+    def read_edge_features(self, pattern_id: str) -> pa.Table:
+        """Read the per-edge derived dimension sidecar for an event pattern.
+
+        Returns an empty table with EDGE_FEATURES_SCHEMA columns when no
+        sidecar was emitted (the pattern's YAML did not declare an
+        edge_dimensions: block, or the sphere predates the feature).
+
+        Forward-compatibility entry point for the planned
+        HopPredicate.edge_dim_predicates query API — no current primitive
+        reads this on the navigator hot path.
+        """
+        from hypertopos.storage._schemas import EDGE_FEATURES_SCHEMA
+
+        lance_path = (
+            self._base / "_gds_meta" / "edge_features" / pattern_id / "data.lance"
+        )
+        if not lance_path.exists():
+            return EDGE_FEATURES_SCHEMA.empty_table()
+        return _lance.dataset(str(lance_path)).to_table()
+
     def read_geometry_batched(
         self,
         pattern_id: str,
@@ -618,6 +647,7 @@ class GDSReader:
         timestamp_from: str | None = None,
         timestamp_to: str | None = None,
         keys: list[str] | None = None,
+        columns: list[str] | None = None,
     ) -> Iterator[pa.RecordBatch]:
         """Streaming read of temporal slices for a pattern.
 
@@ -667,7 +697,9 @@ class GDSReader:
             )
             filter_parts.append(f"CAST(timestamp AS BIGINT) < {to_us}")
         sql_filter: str | None = " AND ".join(filter_parts) if filter_parts else None
-        yield from ds.scanner(filter=sql_filter, batch_size=batch_size).to_batches()
+        yield from ds.scanner(
+            columns=columns, filter=sql_filter, batch_size=batch_size,
+        ).to_batches()
 
     def _apply_temporal_filters(
         self,
@@ -976,6 +1008,100 @@ class GDSReader:
         if filter_parts:
             return ds.scanner(filter=" AND ".join(filter_parts)).to_table()
         return ds.to_table()
+
+    # ------------------------------------------------------------------
+    # Calibration history reader API
+    # ------------------------------------------------------------------
+
+    def read_calibration_fit(
+        self, pattern_id: str, version: int | None = None
+    ) -> CalibrationFit:  # noqa: F821
+        """Load one calibration epoch as a CalibrationFit.
+
+        version=None resolves to the pattern's current calibration_epoch from
+        sphere.json. Raises CalibrationNotFoundError if the requested version
+        does not exist on disk. On a 2.3 sphere (no calibration_history dir),
+        version=None and version=1 reconstruct from inline sphere.json fields;
+        version >= 2 raises.
+        """
+        sphere_meta = self._load_sphere_json()
+        pattern_node = sphere_meta["patterns"][pattern_id]
+        current_epoch = pattern_node.get("calibration_epoch", 1)
+        if version is None:
+            version = current_epoch
+
+        epoch_path = history_dir(self._base, pattern_id) / f"v={version}.json"
+        if epoch_path.exists():
+            blob = json.loads(epoch_path.read_text(encoding="utf-8"))
+            return deserialize_fit(blob)
+
+        # 2.3 fallback: only reconstruct when no calibration_history dir exists
+        # (i.e. legacy sphere that never wrote epoch files) and version==1.
+        # On a 2.4 sphere that has the history dir, a missing v=N.json means
+        # the epoch was GC'd or never written — raise CalibrationNotFoundError.
+        hdir = history_dir(self._base, pattern_id)
+        if version == 1 and not hdir.exists():
+            return self._reconstruct_fit_from_pattern_node(pattern_id, pattern_node)
+
+        raise CalibrationNotFoundError(f"pattern={pattern_id} version={version}")
+
+    def list_calibration_versions(self, pattern_id: str) -> list[int]:
+        """Return sorted calibration epochs available on disk.
+
+        On a 2.3 sphere returns [1] (the inline-reconstructed virtual epoch).
+        On a 2.4 sphere returns the integers N present in
+        _gds_meta/calibration_history/{pattern_id}/v={N}.json.
+        """
+        on_disk = _list_versions_on_disk(self._base, pattern_id)
+        if on_disk:
+            return on_disk
+        sphere_meta = self._load_sphere_json()
+        if pattern_id in sphere_meta.get("patterns", {}):
+            return [1]
+        return []
+
+    def _load_sphere_json(self) -> dict:
+        return json.loads((self._base / "_gds_meta" / "sphere.json").read_text(encoding="utf-8"))
+
+    def _reconstruct_fit_from_pattern_node(
+        self, pattern_id: str, pattern_node: dict
+    ) -> CalibrationFit:  # noqa: F821
+        """Build a CalibrationFit from the inline sphere.json pattern node (2.3 fallback)."""
+        from hypertopos.model.sphere import CalibrationFit
+
+        schema_hash = pattern_node.get("schema_hash") or _compute_schema_hash_from_pattern_node(pattern_node)
+        return CalibrationFit(
+            pattern_id=pattern_id,
+            calibration_epoch=1,
+            schema_version=pattern_node.get("version", 1),
+            schema_hash=schema_hash,
+            mu=np.asarray(pattern_node["mu"], dtype=np.float32),
+            sigma_diag=np.asarray(pattern_node["sigma_diag"], dtype=np.float32),
+            theta=np.asarray(pattern_node["theta"], dtype=np.float32),
+            population_size=pattern_node["population_size"],
+            dimension_weights=_opt_array(pattern_node.get("dimension_weights")),
+            dimension_kinds=pattern_node.get("dimension_kinds"),
+            dim_percentiles=pattern_node.get("dim_percentiles"),
+            group_stats=pattern_node.get("group_stats"),
+            gmm_components=pattern_node.get("gmm_components"),
+            edge_max=_opt_array(pattern_node.get("edge_max")),
+            computed_at=_parse_dt(pattern_node["computed_at"]),
+            last_calibrated_at=_parse_dt(
+                pattern_node.get("last_calibrated_at") or pattern_node["computed_at"]
+            ),
+        )
+
+    def read_calibration_history_policy(self) -> dict[str, int]:
+        """Read and validate `calibration_history_policy` from sphere.json.
+
+        Defaults to {"last_k": 5} if absent. Rejects last_k < 1 with ValueError.
+        """
+        sphere_meta = self._load_sphere_json()
+        policy = sphere_meta.get("calibration_history_policy") or {"last_k": 5}
+        last_k = policy.get("last_k", 5)
+        if last_k < 1:
+            raise ValueError(f"calibration_history_policy.last_k must be >= 1, got {last_k}")
+        return {"last_k": last_k}
 
     def _read_files(self, paths: list[str]) -> pa.Table:
         if not paths:
@@ -1294,12 +1420,25 @@ class GDSReader:
             self._base / "_gds_meta" / "contagion_stats" / f"{pattern_id}.lance"
         ).exists()
 
-    def edge_table_stats(self, pattern_id: str) -> dict | None:
-        """Quick statistics about the edge table. Returns None if not present."""
-        # Try cached stats first (written at build time)
+    def edge_stats_cached(self, pattern_id: str) -> dict | None:
+        """Return precomputed edge_stats JSON only — never falls back to a live scan.
+
+        Build-time produces this cache; primitives that need a CHEAP guard
+        (e.g. entity-type ratio check before scoring) call this rather than
+        edge_table_stats, which can trigger an O(N) Lance scan when the cache
+        is missing — defeating the purpose of a fast bail.
+        """
         cache_path = self._base / "_gds_meta" / "edge_stats" / f"{pattern_id}.json"
         if cache_path.exists():
             return json.loads(cache_path.read_text())
+        return None
+
+    def edge_table_stats(self, pattern_id: str) -> dict | None:
+        """Quick statistics about the edge table. Returns None if not present."""
+        # Try cached stats first (written at build time)
+        cached = self.edge_stats_cached(pattern_id)
+        if cached is not None:
+            return cached
         # Fall back to live scan
         lance_path = self._base / "edges" / pattern_id / "data.lance"
         if not lance_path.exists():

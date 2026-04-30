@@ -18,6 +18,9 @@ gds_{sphere_id}/
 │   ├── trajectory/              # ANN index for trajectory similarity search
 │   ├── temporal_centroids/      # cached population centroids per time window
 │   ├── edge_stats/              # per-event-pattern edge table summary cache (row count, unique from/to, ts/amount range)
+│   ├── edge_features/           # per-edge derived dim sidecar (event patterns with edge_dimensions: in YAML)
+│   │   └── {pattern_id}/
+│   │       └── data.lance       # event_key + 5 dim columns; same values baked into polygon shape
 │   └── contagion_stats/         # per-pattern (primary_key, neighbor_count, anomalous_neighbor_count, contagion_ratio) — feeds the graph contagion scanner directly, BTREE-indexed on primary_key
 ├── points/
 │   ├── {line_id}/v={n}/
@@ -128,6 +131,19 @@ The `delta` vector length equals the number of dimensions in the pattern. Geomet
 
 Emitted automatically for event patterns with 2+ FK relations to the same anchor line, or explicitly via YAML `edge_table` config. Skipped with `--no-edges` CLI flag. The dataset carries BTREE indexes on `from_key` and `to_key` for O(log n) lookups at any scale.
 
+### Edge features (`_gds_meta/edge_features/{pattern_id}/data.lance`)
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `event_key` | string | Event primary key (joins to the polygon table and the edge table) |
+| `pair_edge_count` | float32 | Edges per `(from_key, to_key)` directed pair, broadcast to every edge in the pair |
+| `position_in_chain` | float32 | Depth in the longest reverse-temporal chain ending at this edge; values below `min_position` set to 0.0 |
+| `time_since_pair_last_edge` | float32 | Seconds since the previous edge in the same pair; first edge in a pair gets a sentinel = `dormant_seconds` (auto-resolved to sphere span) |
+| `pair_amount_zscore` | float32 | Signed z-score of amount within `(from_key, to_key)` pairs whose CV < `cv_threshold`; HIGH_VAR pairs and pairs below `min_count` write 0.0 |
+| `find_motif_structuring` | float32 | 1.0 if the edge participates in any A→B→C→D structuring motif within `time_window_hours`; else 0.0 |
+
+Written when an event pattern declares an `edge_dimensions:` block. The same per-event values are also baked into the polygon `shape_snapshot` (event polygons grow by the declared dim count) so `find_anomalies` and other navigator primitives transparently include them in `delta` / `delta_norm` / classification. The sidecar persists separately for forward-compatibility with a future HopPredicate query API that will reference per-edge dim values directly. Patterns without the YAML block emit no sidecar.
+
 ### Temporal (`temporal/{pattern_id}/data.lance`)
 
 | Column | Type | Description |
@@ -191,6 +207,45 @@ stateDiagram-v2
 - **orphaned** -- no longer referenced; eligible for garbage collection after the grace period.
 
 Only one version per line or pattern is in `production` at any time.
+
+---
+
+## Multi-epoch calibration
+
+`_gds_meta/calibration_history/{pattern_id}/v={N}.json` — each full builder run
+that re-fits a pattern writes one such file containing a frozen
+`CalibrationFit` (population statistics `mu/sigma_diag/theta`, plus
+ancillary fit-time fields like `dimension_weights`, `dim_percentiles`,
+`group_stats`, `gmm_components`, `edge_max`). The file is immutable for the
+lifetime of the epoch.
+
+`sphere.json` adds three fields starting at format_version `2.4`:
+
+- root: `calibration_history_policy: {"last_k": 5}` — number of most-recent
+  epochs to keep on disk. `last_k < 1` is rejected with `ValueError` at load
+  time. Default 5.
+- per-pattern: `calibration_epoch: int` — N of the latest epoch on disk.
+- per-pattern: `schema_hash: str` — sha256 hex digest of the schema-relevant
+  fields (`relations`, `event_dimensions`, `prop_columns`, `dimension_kinds`).
+  Used by the next builder run to detect schema drift.
+
+**Schema change**: when `schema_hash` differs across builder runs (or a new
+pattern is added), the prior `_gds_meta/calibration_history/{pid}/` is wiped
+and the next epoch becomes `v=1`. mu/sigma vectors from a previous schema
+have different dimensionality and would be unreadable, so retention serves
+no purpose.
+
+**Pattern removed**: when a pattern is dropped from the builder definition,
+its `_gds_meta/calibration_history/{pid}/` is left on disk untouched.
+Cosmetic cleanup is a future "sphere janitor" feature concern.
+
+**GC**: at the end of every full builder run, each pattern's history dir is
+trimmed to the most-recent `last_k` epochs by deleting oldest by N.
+
+**Inline cache**: `sphere.json` continues to carry the latest `mu/sigma/theta/...`
+inline at the pattern node — this is a cached snapshot of the latest epoch
+that existing readers continue to use unchanged. The history dir is purely
+additive.
 
 ---
 

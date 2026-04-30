@@ -522,6 +522,14 @@ def _add_pattern(
             amount_col=pat_cfg.edge_table.amount_col,
         )
 
+    # Edge-derived dimensions config (YAML list → EdgeDimensionsConfig)
+    _edge_dims_cfg = None
+    if pat_cfg.edge_dimensions:
+        from hypertopos.builder.mapping import parse_edge_dimensions
+        _edge_dims_cfg = parse_edge_dimensions(
+            pat_cfg.edge_dimensions, pattern_type=pat_cfg.type,
+        )
+
     builder.add_pattern(  # type: ignore[union-attr]
         pid,
         pattern_type=pat_cfg.type,
@@ -538,6 +546,7 @@ def _add_pattern(
         geo_properties=pat_cfg.geo_properties,
         metric_properties=pat_cfg.metric_properties,
         semantic_dim=pat_cfg.semantic_dim,
+        edge_dimensions=_edge_dims_cfg,
     )
 
     # Event dimensions

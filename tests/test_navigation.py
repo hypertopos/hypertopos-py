@@ -6383,6 +6383,56 @@ def test_drift_slice_window_days():
     assert entry["slice_window_days"] == 91
 
 
+def test_drift_decomposition_fields_none_when_storage_lacks_calibration_history():
+    """π9 sets the 3 M3 additive fields to None when the storage backend does not
+    expose multi-epoch calibration retention (hasattr guard for _MockStorageDrift)."""
+    from hypertopos.model.sphere import Pattern, RelationDef
+
+    d = 2
+    pattern = Pattern(
+        pattern_id="p1",
+        entity_type="test",
+        pattern_type="anchor",
+        relations=[
+            RelationDef(line_id="a", direction="in", required=True),
+            RelationDef(line_id="b", direction="in", required=True),
+        ],
+        mu=np.zeros(d, dtype=np.float32),
+        sigma_diag=np.ones(d, dtype=np.float32),
+        theta=np.array([2.0, 2.0], dtype=np.float32),
+        population_size=5,
+        computed_at=datetime(2024, 1, 1, tzinfo=UTC),
+        version=1,
+        status="production",
+    )
+    ts1 = datetime(2024, 1, 1, tzinfo=UTC)
+    ts2 = datetime(2024, 2, 1, tzinfo=UTC)
+    temporal_rows = [
+        {"pk": "E-001", "ts": ts1, "shape": [1.0, 0.0]},
+        {"pk": "E-001", "ts": ts2, "shape": [2.0, 0.0]},
+    ]
+    storage = _MockStorageDrift(pattern, temporal_rows)
+    nav = GDSNavigator(
+        engine=_MockEngine(),
+        storage=storage,
+        manifest=Manifest(
+            manifest_id="m",
+            agent_id="a",
+            snapshot_time=datetime(2024, 1, 1, tzinfo=UTC),
+            status="active",
+            line_versions={"test": 1},
+            pattern_versions={"p1": 1},
+        ),
+        contract=Contract("m", ["p1"]),
+    )
+    results = nav.π9_attract_drift("p1", top_n=10)
+    assert len(results) == 1
+    entry = results[0]
+    assert entry["intrinsic_displacement"] is None
+    assert entry["extrinsic_displacement"] is None
+    assert entry["intrinsic_fraction"] is None
+
+
 # ---------------------------------------------------------------------------
 # B6: π7_attract_hub_and_stats — hub_score_pct and max_hub_score
 # ---------------------------------------------------------------------------

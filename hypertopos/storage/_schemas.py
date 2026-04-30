@@ -50,3 +50,16 @@ EDGE_TABLE_SCHEMA = pa.schema([
     pa.field("timestamp",  pa.float64()),
     pa.field("amount",     pa.float64()),
 ])
+
+# Per-edge derived dimensions sidecar — written at build time per event pattern
+# whose YAML declares an edge_dimensions: block. Joined to the polygon table
+# on event_key. Forward-compatible with the planned HopPredicate query API
+# that will read per-edge predicates directly at runtime.
+EDGE_FEATURES_SCHEMA = pa.schema([
+    pa.field("event_key",                 pa.string()),
+    pa.field("pair_edge_count",           pa.float32()),
+    pa.field("position_in_chain",         pa.float32()),
+    pa.field("time_since_pair_last_edge", pa.float32()),
+    pa.field("pair_amount_zscore",        pa.float32()),
+    pa.field("find_motif_structuring",    pa.float32()),
+])

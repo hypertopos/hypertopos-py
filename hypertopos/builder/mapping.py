@@ -14,10 +14,113 @@ import pyarrow.parquet as pq
 import yaml
 
 from hypertopos.builder.builder import GDSBuilder, RelationSpec
+from hypertopos.engine.edge_features import EDGE_DIM_KINDS
 
 _VALID_PATTERN_TYPES: frozenset[str] = frozenset({"anchor", "event"})
 _VALID_ROLES: frozenset[str] = frozenset({"anchor", "context", "event"})
 _VALID_DIRECTIONS: frozenset[str] = frozenset({"in", "out", "self"})
+
+
+_EDGE_DIM_DEFAULTS: dict[str, dict[str, Any]] = {
+    "pair_edge_count":           {},
+    "position_in_chain":         {"min_position": 5},
+    "time_since_pair_last_edge": {"burst_seconds": 60.0,
+                                  "dormant_seconds": "auto"},
+    "pair_amount_zscore":        {"cv_threshold": 0.05, "min_count": 3},
+    "find_motif_structuring":    {"time_window_hours": 1.0,
+                                  "amt1_min": 10000.0, "amt2_max": 10000.0},
+}
+
+
+@dataclass(frozen=True)
+class EdgeDimensionsConfig:
+    """Parsed edge_dimensions: block from a pattern YAML stanza."""
+    dims: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
+def _validate_dim_params(name: str, params: dict[str, Any]) -> None:
+    if name == "position_in_chain":
+        mp = int(params.get("min_position", 5))
+        if mp < 3:
+            raise ValueError(
+                f"min_position must be >= 3 (pos2+ flags too much "
+                f"of the population to be selective); got {mp}",
+            )
+    elif name == "pair_amount_zscore":
+        cv = float(params.get("cv_threshold", 0.05))
+        if not (0.0 < cv <= 1.0):
+            raise ValueError(f"cv_threshold must be in (0, 1]; got {cv}")
+        mc = int(params.get("min_count", 3))
+        if mc < 2:
+            raise ValueError(f"min_count must be >= 2; got {mc}")
+    elif name == "find_motif_structuring":
+        if float(params.get("amt1_min", 0)) <= 0:
+            raise ValueError(
+                "amt1_min must be positive for find_motif_structuring",
+            )
+        if float(params.get("amt2_max", 0)) <= 0:
+            raise ValueError(
+                "amt2_max must be positive for find_motif_structuring",
+            )
+        if float(params.get("time_window_hours", 0)) <= 0:
+            raise ValueError(
+                "time_window_hours must be positive for find_motif_structuring",
+            )
+    elif name == "time_since_pair_last_edge":
+        bs = float(params.get("burst_seconds", 0))
+        if bs < 0:
+            raise ValueError(f"burst_seconds must be >= 0; got {bs}")
+
+
+def parse_edge_dimensions(
+    raw: list[Any], *, pattern_type: str,
+) -> EdgeDimensionsConfig:
+    """Parse the YAML edge_dimensions: list and validate.
+
+    Raises ValueError on any rule violation. Returns frozen dataclass.
+    """
+    if pattern_type != "event":
+        raise ValueError(
+            f"edge_dimensions are only supported on event patterns; "
+            f"got pattern_type={pattern_type!r}",
+        )
+    if not isinstance(raw, list):
+        raise ValueError(
+            f"edge_dimensions must be a list of dim entries; "
+            f"got {type(raw).__name__}",
+        )
+
+    out: dict[str, dict[str, Any]] = {}
+    for entry in raw:
+        if isinstance(entry, str):
+            name, override = entry, {}
+        elif isinstance(entry, dict) and len(entry) == 1:
+            name, override = next(iter(entry.items()))
+            override = override or {}
+            if not isinstance(override, dict):
+                raise ValueError(
+                    f"edge dimension {name!r} parameters must be a dict; "
+                    f"got {type(override).__name__}",
+                )
+        else:
+            raise ValueError(
+                f"edge_dimensions entries must be a string or single-key dict; "
+                f"got {entry!r}",
+            )
+
+        if name not in EDGE_DIM_KINDS:
+            raise ValueError(
+                f"unknown edge dimension: {name!r}; "
+                f"valid: {sorted(EDGE_DIM_KINDS)}",
+            )
+        if name in out:
+            raise ValueError(f"edge dimension {name!r} declared twice")
+
+        merged = {**_EDGE_DIM_DEFAULTS[name], **override}
+        _validate_dim_params(name, merged)
+        out[name] = merged
+
+    return EdgeDimensionsConfig(dims=out)
 
 
 @dataclass
@@ -47,6 +150,7 @@ class PatternMapping:
     relations: list[RelationMapping] = field(default_factory=list)
     anomaly_percentile: float = 95.0
     tracked_properties: list[str] = field(default_factory=list)
+    edge_dimensions: "EdgeDimensionsConfig | None" = None
 
 
 @dataclass
@@ -135,12 +239,19 @@ def _parse_patterns(
                 f"Pattern '{pattern_id}' has invalid type '{pattern_type}'. "
                 f"Valid values: {sorted(_VALID_PATTERN_TYPES)}"
             )
+        edge_dims_raw = spec.get("edge_dimensions")
+        edge_dimensions = (
+            parse_edge_dimensions(edge_dims_raw, pattern_type=pattern_type)
+            if edge_dims_raw is not None
+            else None
+        )
         result[pattern_id] = PatternMapping(
             pattern_type=pattern_type,
             entity_line=str(entity_line),
             relations=relations,
             anomaly_percentile=float(spec.get("anomaly_percentile", 95.0)),
             tracked_properties=list(spec.get("tracked_properties") or []),
+            edge_dimensions=edge_dimensions,
         )
     return result
 
@@ -238,6 +349,7 @@ def build_from_mapping(
             relations=relations,
             anomaly_percentile=pattern_spec.anomaly_percentile,
             tracked_properties=pattern_spec.tracked_properties,
+            edge_dimensions=pattern_spec.edge_dimensions,
         )
 
     return builder.build()

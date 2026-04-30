@@ -2,18 +2,25 @@
 
 > Planned direction. Priorities may change based on feedback.
 
-## Plan: 0.6.0
+## Plan: 0.6.1
 
-Theme: **architecture-emergent analytics, properly enabled.**
+Theme stays **architecture-emergent analytics, properly enabled** — 0.6.1 is a fast-follow patch that finishes the items deferred from the 0.6.0 MVP and lands the natural extensions of S1 / X1 once the 0.6.0 stress test surfaces real workloads.
 
-- Multi-epoch calibration retention in the builder (versioned μ/σ/θ per pattern) — prerequisite infrastructure that gates the three patent-aligned analytics below.
-- Intrinsic/extrinsic decomposition — split an entity's temporal position change into entity-caused vs population-caused components.
-- Entity influence on coordinate system — leave-one-out influence score; hidden-influencer detection.
-- Cross-pattern temporal lead-lag — cross-correlation between per-entity displacement series across independently calibrated patterns.
-- Edge-derived dimensions on event patterns — five build-time edge dimensions empirically validated for AML recall.
-- Joint density gap detection — distribution-free "anomaly by absence" via probability integral transform + independence null.
+- **Anchor-pattern aggregation of edge-derived dimensions** — extension of S1: aggregate the per-edge sidecar (`pair_edge_count`, `position_in_chain`, `time_since_pair_last_edge`, `pair_amount_zscore`, `find_motif_structuring`) up to the entity / pair / chain anchor patterns so account-level recall benefits from the same structural signals that lifted transaction-level recall in 0.6.0.
+- **HopPredicate full PBL vectorisation + k>6** — replace the depth-first Python walk with the full Paranjape-Benson-Leskovec δ-temporal-motif algorithm; bumps the bound on hop count and unlocks the larger temporal windows where structuring chains nest inside each other.
+- **`HopPredicate.amount_ratio_to_prev` and `require_anomalous_entity`** — the two predicate vocab items deferred from the 0.6.0 X1 MVP. `amount_ratio_to_prev` lets a hop assert "≤ 60% of the previous hop's amount" without baking absolute thresholds; `require_anomalous_entity` filters intermediates by their anchor-pattern anomaly score.
+- **`find_motif_by_hops` anchor-companion scoring** — wire the existing `_score_motif_from_edges` infrastructure to event-pattern motif results via the anchor-companion lookup, so callers get a `score` field instead of the silent 0.6.0 skip.
+- **Stress-test-driven fixes** — anything the 0.6.0 multi-sphere stress test surfaces (perf regressions, edge-case crashes, MCP serialisation gaps) lands here.
 
-Any item may slip to 0.7.0 if scope pressure requires. The multi-epoch retention infrastructure is non-negotiable for the theme.
+The 0.6.1 surface stays additive — no sphere format bump, no new tools beyond the deferred predicate fields. If any item turns out to need a format change, it slips to 0.7.0.
+
+---
+
+## 0.6.0
+
+Architecture-emergent analytics, properly enabled — calibration is now **versioned**, and the patent-aligned analytics ride on that versioning.
+
+- **0.6.0** — Multi-epoch calibration retention in the builder (sphere format 2.4, back-compat for 2.3) makes calibration `(pattern_id, version)`-keyed; the previous epoch is retained alongside the active one so all subsequent analytics can compare epochs without rebuilding the sphere. `compare_calibrations(pattern_id, v1, v2)` reports per-dim μ/σ drift between any two retained epochs. Intrinsic / extrinsic drift decomposition splits an entity's temporal position change into entity-caused vs population-caused components and ships through `decompose_drift` plus an inline path on `find_drifting_entities`. Hidden-influencer matrix (`find_group_influence`) computes leave-one-out influence on the coordinate system to surface entities whose presence reshapes the population geometry without themselves being anomalous. Cross-pattern temporal lead-lag (`find_lead_lag`) cross-correlates per-entity displacement series across independently calibrated patterns and reports significant leaders / laggards with FDR control. Edge-derived dimensions on event patterns ship five build-time per-edge dim functions (`pair_edge_count`, `position_in_chain`, `time_since_pair_last_edge`, `pair_amount_zscore` LOW_VAR pairs only, `find_motif_structuring`) baked into the polygon shape via the `edge_dimensions:` YAML block; sidecar Lance dataset at `_gds_meta/edge_features/{pid}/data.lance` enables runtime per-edge predicate filtering. Joint density gap detection (`find_density_gaps`) produces distribution-free "anomaly by absence" via probability integral transform plus independence null on dim pairs, with BH-corrected χ² residuals on a 2-D histogram. Declarative motif API (`find_motif_by_hops`) ships as a power-user escape hatch from the closed-vocab `find_motif` registry — `HopPredicate` per-hop predicates (`amount_min` / `amount_max` / `time_delta_max_hours` / `direction` ∈ {forward, reverse, any} / `edge_dim_predicates`) walk chains of length 1..6 over the cached `AdjacencyIndex`, with direction-aware temporal monotonicity (forward = strict-↑, reverse = strict-↓ causal-predecessor, any = `|Δt|` window) and a lazy ek→idx + per-dim sidecar lookup that avoids the per-event nested-dict allocation.
 
 ---
 

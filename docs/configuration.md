@@ -78,6 +78,8 @@ lines: { ... }                # Required. Entity line definitions.
 patterns: { ... }             # Required. Pattern (anomaly model) definitions.
 composite_lines: { ... }      # Optional. Composite anchor lines from event co-occurrence.
 temporal: [ ... ]              # Optional. Temporal snapshot configurations.
+calibration_history_policy:    # Optional. Multi-epoch calibration retention.
+  last_k: 5                    #   Number of historical epochs to retain (default 5).
 ```
 
 ---
@@ -310,9 +312,18 @@ patterns:
       - column: amount                 # Numeric column → continuous geometry dimension.
         display_name: amount
       - column: balance
+    edge_dimensions:                    # Optional. Build-time per-edge dims for event patterns.
+      - pair_edge_count                 #   Bare name → defaults.
+      - position_in_chain:              #   Single-key dict → overrides.
+          min_position: 5
+      - time_since_pair_last_edge
+      - pair_amount_zscore              #   LOW_VAR pairs only.
+      - find_motif_structuring
     anomaly_percentile: 95             # Theta threshold percentile (default: 95).
     dimension_weights: kurtosis        # "kurtosis" (recommended), "auto", or [0.5, 0.3, ...].
 ```
+
+The five available `edge_dimensions` functions: `pair_edge_count` (Poisson, count of edges between this pair), `position_in_chain` (Poisson, ordinal position in detected chain — `min_position` rejects below 3 at YAML parse), `time_since_pair_last_edge` (Gaussian, seconds since this `(from, to)` pair last had an edge), `pair_amount_zscore` (Gaussian, per-pair amount z-score on LOW_VAR pairs only), `find_motif_structuring` (Bernoulli, 1 if this edge participates in any structuring motif). Values are baked into the event polygon shape via `dimension_kinds` and written as a sidecar Lance dataset at `_gds_meta/edge_features/{pid}/data.lance` for runtime per-edge predicate filtering.
 
 ### Anchor pattern
 
@@ -361,6 +372,7 @@ patterns:
 | `graph_features` | dict | `null` | Auto-compute graph structural features from event from/to columns. |
 | `description` | string | `null` | Human-readable description. Stored in sphere.json — visible to agents via `get_sphere_info`. |
 | `edge_table` | dict | `null` | Explicit edge table config (see below). Auto-emitted for event patterns with 2+ FK relations to same anchor line. |
+| `edge_dimensions` | list | `null` | Build-time per-edge dims for event patterns. Each item is either a bare dim name or a single-key dict with overrides. Five dims available: `pair_edge_count`, `position_in_chain` (`min_position` ≥ 3, default 5), `time_since_pair_last_edge`, `pair_amount_zscore` (LOW_VAR pairs only), `find_motif_structuring`. |
 | `bootstrap_iterations` | int | `200` | Number of bootstrap resamples used to compute `anomaly_confidence` per entity. Skipped automatically for N > 50K, `group_by_property`, or `use_mahalanobis`. |
 
 ### Edge Table

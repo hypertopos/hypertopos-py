@@ -20,6 +20,7 @@ from hypertopos.storage._schemas import (  # noqa: F401,E501
     GEOMETRY_EVENT_SCHEMA,
     GEOMETRY_SCHEMA,
 )
+from hypertopos.storage.calibration_history import compute_pattern_schema_hash
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,65 @@ GEOMETRY_CHUNK_SIZE: int = 500_000  # entities above this threshold trigger chun
 _BOOTSTRAP_MAX_N: int = 50_000  # bootstrap skipped for populations above this size
 
 _INTERNAL_COLUMNS = {"version", "status", "created_at", "changed_at"}
+
+
+def _compute_schema_hash_for_pattern_def(
+    pattern_def,
+    *,
+    prop_columns: list[str] | None = None,
+    dimension_kinds: list[str] | None = None,
+) -> str:
+    """Compute schema_hash from a builder Pattern definition (duck-typed).
+
+    The payload composition matches `_compute_schema_hash_from_pattern_node`
+    so a fresh build produces a hash byte-identical to the one a reader
+    reconstructs from the resulting sphere.json node.
+
+    `prop_columns` / `dimension_kinds` overrides exist because builder's
+    `_PatternReg` does not carry them — they are produced as part of the
+    geometry refit. Callers in the build pipeline must pass the freshly
+    computed values so the hash matches what gets written into sphere.json.
+    """
+    relations = []
+    for rel in getattr(pattern_def, "relations", None) or []:
+        relations.append(
+            {
+                "line_id": getattr(rel, "line_id", None) or getattr(rel, "line", None),
+                "event_columns": list(getattr(rel, "event_columns", None) or []),
+            }
+        )
+    # event_dimensions on a builder Pattern can be either list[str] (test
+    # doubles) or list[EventDimSpec] (real builds). Reduce to column names so
+    # the resulting payload matches the list-of-strings shape stored in
+    # sphere.json that _compute_schema_hash_from_pattern_node sees on read.
+    event_dims_raw = getattr(pattern_def, "event_dimensions", None) or []
+    event_dimensions = [
+        getattr(ed, "column", ed) for ed in event_dims_raw
+    ]
+    # prop_columns / dimension_kinds: prefer caller-supplied (post-refit)
+    # values when given; otherwise fall back to whatever the pattern_def
+    # carries (test doubles set these directly). Falling back to an empty
+    # list keeps the 2.3 reconstructor reachable from a builder Pattern that
+    # has not been through a refit yet.
+    if prop_columns is None:
+        prop_columns_raw = getattr(pattern_def, "prop_columns", None) or []
+        prop_columns_final = list(prop_columns_raw)
+    else:
+        prop_columns_final = list(prop_columns)
+    if dimension_kinds is None:
+        dimension_kinds_raw = (
+            getattr(pattern_def, "dimension_kinds", None) or []
+        )
+        dimension_kinds_final = list(dimension_kinds_raw)
+    else:
+        dimension_kinds_final = list(dimension_kinds)
+    payload = {
+        "relations": relations,
+        "event_dimensions": event_dimensions,
+        "prop_columns": prop_columns_final,
+        "dimension_kinds": dimension_kinds_final,
+    }
+    return compute_pattern_schema_hash(payload)
 
 
 def _is_textual_or_binary_col(field: pa.Field) -> bool:
@@ -246,6 +306,9 @@ class _PatternReg:
     geo_properties: list[str] | None = None
     metric_properties: list[str] | None = None
     semantic_dim: dict | None = None  # {"columns": [...], "n_components": int}
+    # Per-edge derived dim catalog (event patterns only).
+    # ``EdgeDimensionsConfig.dims`` keyed by dim_name → params dict.
+    edge_dimensions: Any = None  # EdgeDimensionsConfig | None
 
 
 @dataclass
@@ -436,6 +499,10 @@ class GDSBuilder:
         self._precomputed_dims: list = []  # PrecomputedDimSpec list
         self._aliases: dict[str, _AliasReg] = {}
         self._no_edges: bool = False  # set by CLI --no-edges
+        # Per-pattern calibration epoch state populated during build by
+        # _write_calibration_epoch_for_pattern. Each thread writes a distinct
+        # pattern_id key, so plain assignment is safe under ThreadPoolExecutor.
+        self._calibration_state: dict[str, dict] = {}
 
     def add_line(
         self,
@@ -514,6 +581,7 @@ class GDSBuilder:
         metric_properties: list[str] | None = None,
         semantic_dim: dict | None = None,
         bootstrap_iterations: int = 200,
+        edge_dimensions: Any = None,
     ) -> GDSBuilder:
         _VALID_DW = ("auto", "kurtosis", "uniform")
         if isinstance(dimension_weights, str) and dimension_weights not in _VALID_DW:
@@ -538,6 +606,7 @@ class GDSBuilder:
             geo_properties=geo_properties,
             metric_properties=metric_properties,
             semantic_dim=semantic_dim,
+            edge_dimensions=edge_dimensions,
         )
         return self
 
@@ -893,6 +962,105 @@ class GDSBuilder:
                     zero_copy_only=False
                 ).astype(np.float32)
 
+        # 1a. Build edge-derived dimension values (event patterns only).
+        # Computed at edge-table emission time, baked into shape vector AND
+        # written to sidecar at _gds_meta/edge_features/{pid}/data.lance.
+        edge_dim_matrix = np.empty((n, 0), dtype=np.float32)
+        edge_dim_names: list[str] = []
+        if (
+            pat.edge_dimensions is not None
+            and pat.pattern_type == "event"
+            and getattr(pat.edge_dimensions, "dims", None)
+        ):
+            from hypertopos.engine.edge_features import (
+                EDGE_DIM_KINDS,
+                compute_all_edge_dims,
+            )
+
+            edge_cfg = pat.edge_table
+            if edge_cfg is None:
+                raise ValueError(
+                    f"Pattern {pat.pattern_id!r} declares edge_dimensions "
+                    f"but no edge_table — edge_dimensions require an "
+                    f"edge_table block on the same pattern.",
+                )
+            edges_tbl = self._extract_edge_table(pat, edge_cfg)
+
+            # Resolve dormant_seconds: "auto" → sphere temporal span.
+            dims_cfg = dict(pat.edge_dimensions.dims)
+            tsl = dims_cfg.get("time_since_pair_last_edge")
+            if (
+                tsl is not None
+                and isinstance(tsl, dict)
+                and tsl.get("dormant_seconds") == "auto"
+            ):
+                if edges_tbl.num_rows > 0:
+                    ts = edges_tbl["timestamp"].to_numpy()
+                    span = float(ts.max() - ts.min())
+                    span = max(span, 1.0)
+                else:
+                    span = 1.0
+                dims_cfg["time_since_pair_last_edge"] = {
+                    **tsl, "dormant_seconds": span,
+                }
+
+            features = compute_all_edge_dims(edges_tbl, dims_cfg)
+            edge_dim_names = [
+                c for c in features.column_names if c != "event_key"
+            ]
+            if edge_dim_names and edges_tbl.num_rows > 0:
+                # Map per-event values to per-entity rows. For event patterns
+                # entity.primary_key == edge.event_key 1:1.
+                pk_to_idx = {
+                    pk: i
+                    for i, pk in enumerate(
+                        entity_table["primary_key"].to_pylist(),
+                    )
+                }
+                edge_dim_matrix = np.zeros(
+                    (n, len(edge_dim_names)), dtype=np.float32,
+                )
+                event_keys = features["event_key"].to_pylist()
+                for col_idx, name in enumerate(edge_dim_names):
+                    vals = features[name].to_numpy()
+                    for row_idx, ek in enumerate(event_keys):
+                        ent_idx = pk_to_idx.get(ek)
+                        if ent_idx is not None:
+                            edge_dim_matrix[ent_idx, col_idx] = vals[row_idx]
+            elif edge_dim_names:
+                edge_dim_matrix = np.zeros(
+                    (n, len(edge_dim_names)), dtype=np.float32,
+                )
+
+            # Persist sidecar Lance — forward-compat for the planned
+            # HopPredicate.edge_dim_predicates query API.
+            if edge_dim_names:
+                try:
+                    import lance
+
+                    sidecar_dir = (
+                        self.output_path
+                        / "_gds_meta" / "edge_features" / pat.pattern_id
+                    )
+                    sidecar_dir.mkdir(parents=True, exist_ok=True)
+                    lance.write_dataset(
+                        features,
+                        str(sidecar_dir / "data.lance"),
+                        mode="overwrite",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "edge_features sidecar write failed for %s: %s",
+                        pat.pattern_id, exc,
+                    )
+
+        # Stash kinds for downstream concatenation step (3.2).
+        if edge_dim_names:
+            from hypertopos.engine.edge_features import EDGE_DIM_KINDS
+            edge_dim_kinds = [EDGE_DIM_KINDS[name] for name in edge_dim_names]
+        else:
+            edge_dim_kinds = []
+
         # 1b. Build event dimension values
         event_dim_matrix = np.empty((n, 0), dtype=np.float32)
         if pat.event_dimensions:
@@ -1065,6 +1233,8 @@ class GDSBuilder:
         parts = [shape_vectors]
         if event_dim_matrix.shape[1] > 0:
             parts.append(event_dim_matrix)
+        if edge_dim_matrix.shape[1] > 0:
+            parts.append(edge_dim_matrix)
         if prop_fill_matrix.shape[1] > 0:
             parts.append(prop_fill_matrix)
         for blk in dim_block_matrices:
@@ -1133,6 +1303,9 @@ class GDSBuilder:
                 col = entity_table[edim.column]
                 vals = pc.fill_null(col, 0).to_numpy(zero_copy_only=False).astype(np.float64)
                 dimension_kinds.append(detect_kind_for_column(vals))
+
+        # Edge-derived dimensions
+        dimension_kinds.extend(edge_dim_kinds)
 
         # Prop fill (binary 0/1)
         dimension_kinds.extend(["bernoulli"] * len(prop_columns))
@@ -2214,11 +2387,16 @@ class GDSBuilder:
                     if edge_cfg.amount_col:
                         edge_meta["amount_col"] = edge_cfg.amount_col
                     pat_dict["edge_table"] = edge_meta
+            # Calibration epoch metadata (populated by _build_and_write)
+            cal_state = self._calibration_state.get(pat_id, {})
+            pat_dict["calibration_epoch"] = cal_state.get("calibration_epoch", 1)
+            pat_dict["schema_hash"] = cal_state.get("schema_hash")
             patterns_dict[pat_id] = pat_dict
 
         sphere_dict: dict[str, Any] = {
             "sphere_id": self.sphere_id,
-            "format_version": "2.3",
+            "format_version": "2.4",
+            "calibration_history_policy": {"last_k": 5},
             "name": self._name or self.sphere_id,
             "lines": lines_dict,
             "patterns": patterns_dict,
@@ -2574,14 +2752,17 @@ class GDSBuilder:
                 if (pat.group_by_property
                         or pat.gmm_n_components
                         or pat.use_mahalanobis):
-                    return self._build_and_write_chunked(
+                    pat_id_out, pbr = self._build_and_write_chunked(
                         pat_id, pat, _stats_writer,
                         write_geometry_chunk, finalize_geometry_chunks,
                     )
-                return self._build_and_write_streaming(
-                    pat_id, pat, _stats_writer,
-                    write_geometry_chunk, finalize_geometry_chunks,
-                )
+                else:
+                    pat_id_out, pbr = self._build_and_write_streaming(
+                        pat_id, pat, _stats_writer,
+                        write_geometry_chunk, finalize_geometry_chunks,
+                    )
+                self._write_calibration_epoch_for_pattern(pat, pbr)
+                return pat_id_out, pbr
 
             geom_table, ps = self._build_geometry_table(pat)
             write_geometry(
@@ -2617,7 +2798,7 @@ class GDSBuilder:
                         "amount_max": float(_pc.max(edge_table["amount"]).as_py()),
                     })
 
-            return pat_id, PatternBuildResult(
+            pbr = PatternBuildResult(
                 mu=ps.mu, sigma=ps.sigma, theta=ps.theta,
                 population_size=n,
                 prop_columns=ps.prop_columns,
@@ -2633,6 +2814,8 @@ class GDSBuilder:
                 dim_block_names=ps.dim_block_names,
                 dim_block_stats=ps.dim_block_stats,
             )
+            self._write_calibration_epoch_for_pattern(pat, pbr)
+            return pat_id, pbr
 
         # ── Pipeline mode: geometry → temporal per-pattern ──
         if temporal_configs:
@@ -2704,6 +2887,170 @@ class GDSBuilder:
             _stats_writer.write_calibration_tracker(pid, tracker)
 
         return str(self.output_path)
+
+    def _write_calibration_epoch_for_pattern(
+        self,
+        pat: _PatternReg,
+        pbr: PatternBuildResult,
+    ) -> None:
+        """Write a fresh calibration_history epoch for one pattern.
+
+        Decides reset-vs-increment by comparing the new schema_hash against
+        the prior sphere.json's pattern.schema_hash, writes v={N}.json under
+        _gds_meta/calibration_history/{pattern_id}/, trims to last_k, and
+        stashes (calibration_epoch, schema_hash) on self._calibration_state
+        for the sphere.json composer to pick up.
+
+        Safe to call from inside ThreadPoolExecutor: each pattern_id has a
+        distinct on-disk dir and a distinct dict key on _calibration_state.
+        The prior sphere.json is only read here (not written) — the new
+        sphere.json is written sequentially after the pool joins.
+        """
+        from datetime import datetime, timezone
+
+        from hypertopos.model.sphere import CalibrationFit
+        from hypertopos.storage.calibration_history import (
+            history_dir,
+            reset_calibration_history,
+            write_calibration_history_epoch,
+        )
+
+        # Use the post-refit prop_columns + dimension_kinds so the hash
+        # matches what _build_sphere_json writes into the pattern node.
+        new_schema_hash = _compute_schema_hash_for_pattern_def(
+            pat,
+            prop_columns=pbr.prop_columns,
+            dimension_kinds=pbr.dimension_kinds,
+        )
+
+        prev_sphere_path = self.output_path / "_gds_meta" / "sphere.json"
+        prev_meta: dict = {}
+        prev_schema_hash: str | None = None
+        prev_calibration_epoch: int = 0
+        if prev_sphere_path.exists():
+            prev_meta = json.loads(
+                prev_sphere_path.read_text(encoding="utf-8"),
+            )
+            prev_pattern_node = prev_meta.get("patterns", {}).get(
+                pat.pattern_id,
+            )
+            if prev_pattern_node is not None:
+                prev_schema_hash = prev_pattern_node.get("schema_hash")
+                prev_calibration_epoch = prev_pattern_node.get(
+                    "calibration_epoch", 0,
+                ) or 0
+
+        last_k = (
+            prev_meta.get("calibration_history_policy") or {}
+        ).get("last_k", 5)
+        if last_k < 1:
+            raise ValueError(
+                f"calibration_history_policy.last_k must be >= 1, got {last_k} "
+                f"in {prev_sphere_path}"
+            )
+
+        history_present = history_dir(
+            self.output_path, pat.pattern_id,
+        ).exists()
+
+        reset = (
+            prev_schema_hash is None
+            or prev_schema_hash != new_schema_hash
+            or not history_present
+        )
+        if reset:
+            reset_calibration_history(self.output_path, pat.pattern_id)
+            new_epoch = 1
+        else:
+            new_epoch = prev_calibration_epoch + 1
+
+        # Convert group_stats / gmm_components from internal numpy tuples
+        # into the JSON-friendly dicts that sphere.json itself stores. The
+        # CalibrationFit serializer round-trips these via json.dumps, so
+        # numpy arrays must be tolist()'d here.
+        if pbr.group_stats:
+            group_stats_json: dict | None = {
+                gid: {
+                    "mu": g_mu.tolist(),
+                    "sigma_diag": g_sigma.tolist(),
+                    "theta": g_theta.tolist(),
+                    "population_size": int(g_pop),
+                }
+                for gid, (g_mu, g_sigma, g_theta, g_pop)
+                in pbr.group_stats.items()
+            }
+        else:
+            group_stats_json = None
+
+        if pbr.gmm_components is not None:
+            gmm_components_json: list | None = [
+                {
+                    "mu": c_mu.tolist(),
+                    "sigma_diag": c_sig.tolist(),
+                    "theta": c_th.tolist(),
+                    "population_size": int(c_pop),
+                }
+                for c_mu, c_sig, c_th, c_pop in pbr.gmm_components
+            ]
+        else:
+            gmm_components_json = None
+
+        # Reconstruct edge_max vector matching sphere.json composition: one
+        # entry per relation, then per event_dim, then zero per prop_column.
+        # Mirrors the shape used at sphere.json build time.
+        if (
+            any(r.edge_max is not None for r in pat.relations)
+            or pat.event_dimensions
+        ):
+            edge_max_list = (
+                [
+                    1 if r.direction == "self"
+                    else r.edge_max if r.edge_max is not None
+                    else 1
+                    for r in pat.relations
+                ]
+                + [edim.edge_max for edim in pat.event_dimensions]
+                + [0] * len(pbr.prop_columns)
+            )
+            edge_max_arr: np.ndarray | None = np.asarray(
+                edge_max_list, dtype=np.float32,
+            )
+        else:
+            edge_max_arr = None
+
+        now = datetime.now(timezone.utc)
+        fit = CalibrationFit(
+            pattern_id=pat.pattern_id,
+            calibration_epoch=new_epoch,
+            schema_version=1,
+            schema_hash=new_schema_hash,
+            mu=np.asarray(pbr.mu, dtype=np.float32),
+            sigma_diag=np.asarray(pbr.sigma, dtype=np.float32),
+            theta=np.asarray(pbr.theta, dtype=np.float32),
+            population_size=int(pbr.population_size),
+            dimension_weights=(
+                np.asarray(pbr.dimension_weights, dtype=np.float32)
+                if pbr.dimension_weights is not None else None
+            ),
+            dimension_kinds=(
+                list(pbr.dimension_kinds)
+                if pbr.dimension_kinds is not None else None
+            ),
+            dim_percentiles=pbr.dim_percentiles,
+            group_stats=group_stats_json,
+            gmm_components=gmm_components_json,
+            edge_max=edge_max_arr,
+            computed_at=now,
+            last_calibrated_at=now,
+        )
+        write_calibration_history_epoch(
+            self.output_path, fit, last_k=last_k,
+        )
+
+        self._calibration_state[pat.pattern_id] = {
+            "calibration_epoch": new_epoch,
+            "schema_hash": new_schema_hash,
+        }
 
     def _prepare_temporal_context(
         self,
@@ -3426,6 +3773,97 @@ class GDSBuilder:
         D_event = len(pat.event_dimensions)
         chunk_size = GEOMETRY_CHUNK_SIZE
 
+        # ── Edge-derived dims — precompute matrix + sidecar once ──
+        # Streaming path doesn't go through _compute_population_stats, so we
+        # bake the edge_dim values here and slice them into each chunk's
+        # shape vector below.
+        edge_dim_matrix = np.empty((n, 0), dtype=np.float32)
+        edge_dim_names: list[str] = []
+        edge_dim_kinds: list[str] = []
+        if (
+            pat.edge_dimensions is not None
+            and pat.pattern_type == "event"
+            and getattr(pat.edge_dimensions, "dims", None)
+        ):
+            from hypertopos.engine.edge_features import (
+                EDGE_DIM_KINDS,
+                compute_all_edge_dims,
+            )
+
+            edge_cfg = pat.edge_table
+            if edge_cfg is None:
+                raise ValueError(
+                    f"Pattern {pat.pattern_id!r} declares edge_dimensions "
+                    f"but no edge_table — edge_dimensions require an "
+                    f"edge_table block on the same pattern.",
+                )
+            edges_tbl = self._extract_edge_table(pat, edge_cfg)
+
+            dims_cfg = dict(pat.edge_dimensions.dims)
+            tsl = dims_cfg.get("time_since_pair_last_edge")
+            if (
+                tsl is not None
+                and isinstance(tsl, dict)
+                and tsl.get("dormant_seconds") == "auto"
+            ):
+                if edges_tbl.num_rows > 0:
+                    ts = edges_tbl["timestamp"].to_numpy()
+                    span = float(ts.max() - ts.min())
+                    span = max(span, 1.0)
+                else:
+                    span = 1.0
+                dims_cfg["time_since_pair_last_edge"] = {
+                    **tsl, "dormant_seconds": span,
+                }
+
+            features = compute_all_edge_dims(edges_tbl, dims_cfg)
+            edge_dim_names = [
+                c for c in features.column_names if c != "event_key"
+            ]
+            edge_dim_kinds = [EDGE_DIM_KINDS[name] for name in edge_dim_names]
+            if edge_dim_names and edges_tbl.num_rows > 0:
+                pk_to_idx = {
+                    pk: i
+                    for i, pk in enumerate(
+                        entity_table["primary_key"].to_pylist(),
+                    )
+                }
+                edge_dim_matrix = np.zeros(
+                    (n, len(edge_dim_names)), dtype=np.float32,
+                )
+                event_keys = features["event_key"].to_pylist()
+                for col_idx, name in enumerate(edge_dim_names):
+                    vals = features[name].to_numpy()
+                    for row_idx, ek in enumerate(event_keys):
+                        ent_idx = pk_to_idx.get(ek)
+                        if ent_idx is not None:
+                            edge_dim_matrix[ent_idx, col_idx] = vals[row_idx]
+            elif edge_dim_names:
+                edge_dim_matrix = np.zeros(
+                    (n, len(edge_dim_names)), dtype=np.float32,
+                )
+
+            if edge_dim_names:
+                try:
+                    import lance
+                    sidecar_dir = (
+                        self.output_path
+                        / "_gds_meta" / "edge_features" / pat.pattern_id
+                    )
+                    sidecar_dir.mkdir(parents=True, exist_ok=True)
+                    lance.write_dataset(
+                        features,
+                        str(sidecar_dir / "data.lance"),
+                        mode="overwrite",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "edge_features sidecar write failed for %s: %s",
+                        pat.pattern_id, exc,
+                    )
+
+        D_edge = len(edge_dim_names)
+
         # Pre-compute event dimension edge_max (needs full column scan)
         for edim in pat.event_dimensions:
             if edim.edge_max is None or edim.edge_max == "auto":
@@ -3452,7 +3890,7 @@ class GDSBuilder:
         # Welford accumulators — we don't know D_full yet (depends on prop_columns)
         # So first pass accumulates edge dims + event dims + ALL tracked prop candidates,
         # then we trim after determining which props pass MIN_FILL_RATE.
-        D_max = D_rel + D_event + len(tracked)
+        D_max = D_rel + D_event + D_edge + len(tracked)
         w_mean = np.zeros(D_max, dtype=np.float64)
         w_m2 = np.zeros(D_max, dtype=np.float64)
         w_n = 0
@@ -3465,6 +3903,12 @@ class GDSBuilder:
             end = min(start + chunk_size, n)
             chunk_table = entity_table.slice(start, end - start)
             shapes, _ = self._build_shape_chunk(pat, chunk_table)
+
+            # Append edge_dim slice
+            if D_edge > 0:
+                shapes = np.concatenate(
+                    [shapes, edge_dim_matrix[start:end]], axis=1,
+                )
 
             # Prop fill for this chunk (all tracked, not yet filtered)
             if tracked:
@@ -3518,8 +3962,8 @@ class GDSBuilder:
                     prop_indices.append(j)
 
         # Trim mu/sigma to included prop dims only
-        # Dims order: [relations] + [event dims] + [included props]
-        D_base = D_rel + D_event
+        # Dims order: [relations] + [event dims] + [edge dims] + [included props]
+        D_base = D_rel + D_event + D_edge
         if prop_columns:
             keep_dims = list(range(D_base)) + [D_base + j for j in prop_indices]
             mu = mu_full[keep_dims]
@@ -3550,6 +3994,10 @@ class GDSBuilder:
                 end = min(start + chunk_size, n)
                 chunk_table = entity_table.slice(start, end - start)
                 shapes, _ = self._build_shape_chunk(pat, chunk_table)
+                if D_edge > 0:
+                    shapes = np.concatenate(
+                        [shapes, edge_dim_matrix[start:end]], axis=1,
+                    )
                 if prop_columns:
                     prop_fill = self._build_prop_fill_chunk(
                         pat, chunk_table, prop_columns,
@@ -3633,6 +4081,9 @@ class GDSBuilder:
                 ).astype(np.float64)
                 dimension_kinds.append(_detect_kind_for_column(vals))
 
+        # Edge-derived dimensions
+        dimension_kinds.extend(edge_dim_kinds)
+
         # Prop fill (binary 0/1)
         dimension_kinds.extend(["bernoulli"] * len(prop_columns))
 
@@ -3663,6 +4114,10 @@ class GDSBuilder:
             end = min(start + chunk_size, n)
             chunk_table = entity_table.slice(start, end - start)
             shapes, _ = self._build_shape_chunk(pat, chunk_table)
+            if D_edge > 0:
+                shapes = np.concatenate(
+                    [shapes, edge_dim_matrix[start:end]], axis=1,
+                )
             if prop_columns:
                 prop_fill = self._build_prop_fill_chunk(
                     pat, chunk_table, prop_columns,
@@ -3721,6 +4176,10 @@ class GDSBuilder:
             shapes, fk_slices = self._build_shape_chunk(
                 pat, chunk_entity_table,
             )
+            if D_edge > 0:
+                shapes = np.concatenate(
+                    [shapes, edge_dim_matrix[start:end]], axis=1,
+                )
             if prop_columns:
                 prop_fill = self._build_prop_fill_chunk(
                     pat, chunk_entity_table, prop_columns,

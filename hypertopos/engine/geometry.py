@@ -11,6 +11,11 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from hypertopos.model.objects import Edge, Polygon, Solid, SolidSlice
+from hypertopos.model.sphere import (
+    CalibrationFit,
+    DimensionDecomposition,
+    IntrinsicExtrinsicReport,
+)
 from hypertopos.navigation.navigator import GDSNavigationError
 from hypertopos.utils.arrow import delta_matrix_from_arrow
 
@@ -110,7 +115,10 @@ class GDSEngine:
             edges=edges,
             last_refresh_at=row["last_refresh_at"],
             updated_at=row["updated_at"],
-            delta_rank_pct=float(row["delta_rank_pct"]) if "delta_rank_pct" in row else None,
+            delta_rank_pct=(
+                None if row.get("delta_rank_pct") is None
+                else float(row["delta_rank_pct"])
+            ),
         )
         if pattern.edge_max is None:
             # Discrete mode: recompute delta from edges + prop_fill (prop values may have changed).
@@ -953,16 +961,16 @@ class GDSEngine:
                 last_refresh_at=row["last_refresh_at"],
                 updated_at=row["updated_at"],
                 delta_rank_pct=(
-                    float(row["delta_rank_pct"])
-                    if "delta_rank_pct" in row else None
+                    None if row.get("delta_rank_pct") is None
+                    else float(row["delta_rank_pct"])
                 ),
                 bregman_divergence=(
-                    float(row.get("bregman_divergence", 0.0))
-                    if "bregman_divergence" in row else None
+                    None if row.get("bregman_divergence") is None
+                    else float(row["bregman_divergence"])
                 ),
                 anomaly_confidence=(
-                    float(row.get("anomaly_confidence", 0.0))
-                    if "anomaly_confidence" in row else None
+                    None if row.get("anomaly_confidence") is None
+                    else float(row["anomaly_confidence"])
                 ),
             ))
 
@@ -1186,3 +1194,592 @@ class GDSEngine:
             "reputation": reputation,
             "anomaly_tenure": tenure,
         }
+
+
+_M3_SIGMA_SAFE_FLOOR = 1e-12
+
+
+def _compute_decomposition_vectors(
+    shape_a: np.ndarray,
+    shape_b: np.ndarray,
+    fit_v1: CalibrationFit,
+    fit_v2: CalibrationFit,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return (total, intrinsic, extrinsic) decomposition vectors. Pure math."""
+    s_a = shape_a.astype(np.float64)
+    s_b = shape_b.astype(np.float64)
+    mu_v1 = fit_v1.mu.astype(np.float64)
+    mu_v2 = fit_v2.mu.astype(np.float64)
+    sigma_v1 = fit_v1.sigma_diag.astype(np.float64)
+    sigma_v2 = fit_v2.sigma_diag.astype(np.float64)
+
+    sigma_v1_safe = np.where(sigma_v1 > _M3_SIGMA_SAFE_FLOOR, sigma_v1, 1.0)
+    sigma_v2_safe = np.where(sigma_v2 > _M3_SIGMA_SAFE_FLOOR, sigma_v2, 1.0)
+
+    delta_a = (s_a - mu_v1) / sigma_v1_safe
+    delta_b = (s_b - mu_v2) / sigma_v2_safe
+    total = delta_b - delta_a
+    intrinsic = (s_b - s_a) / sigma_v1_safe
+    extrinsic = total - intrinsic
+    return total, intrinsic, extrinsic
+
+
+def _decomposition_scalars(
+    shape_a: np.ndarray,
+    shape_b: np.ndarray,
+    fit_v1: CalibrationFit,
+    fit_v2: CalibrationFit,
+) -> tuple[float, float, float]:
+    """Aggregate scalars only — (intrinsic_disp, extrinsic_disp, intrinsic_fraction).
+
+    For batch hot paths (π9 find_drifting_entities) where per-dim breakdown
+    and ranking are not needed.
+    """
+    _, intrinsic, extrinsic = _compute_decomposition_vectors(
+        shape_a, shape_b, fit_v1, fit_v2,
+    )
+    intrinsic_disp = float(np.linalg.norm(intrinsic))
+    extrinsic_disp = float(np.linalg.norm(extrinsic))
+    denom = intrinsic_disp ** 2 + extrinsic_disp ** 2
+    intrinsic_fraction = float(intrinsic_disp ** 2 / denom) if denom > 0.0 else 0.0
+    return intrinsic_disp, extrinsic_disp, intrinsic_fraction
+
+
+def _compute_intrinsic_extrinsic_decomposition(
+    *,
+    shape_a: np.ndarray,
+    shape_b: np.ndarray,
+    fit_v1: CalibrationFit,
+    fit_v2: CalibrationFit,
+    entity_key: str,
+    pattern_id: str,
+    timestamp_from: datetime,
+    timestamp_to: datetime,
+    dim_labels: list[str] | None,
+    top_n: int,
+    verbose: bool,
+) -> IntrinsicExtrinsicReport:
+    """Pure math: decompose drift between two temporal slices given two calibrations.
+
+    Caller verifies schema_hash agreement, distinct versions, anchor pattern type,
+    and slice availability before calling. Helper trusts its inputs.
+    """
+    total, intrinsic, extrinsic = _compute_decomposition_vectors(
+        shape_a, shape_b, fit_v1, fit_v2,
+    )
+
+    intrinsic_disp = float(np.linalg.norm(intrinsic))
+    extrinsic_disp = float(np.linalg.norm(extrinsic))
+    total_disp = float(np.linalg.norm(total))
+
+    denom = intrinsic_disp ** 2 + extrinsic_disp ** 2
+    intrinsic_fraction = float(intrinsic_disp ** 2 / denom) if denom > 0.0 else 0.0
+
+    kinds_v1 = fit_v1.dimension_kinds
+    D = total.shape[0]
+    per_dim: list[DimensionDecomposition] = []
+    for i in range(D):
+        i_sq = float(intrinsic[i]) ** 2
+        e_sq = float(extrinsic[i]) ** 2
+        per_dim_denom = i_sq + e_sq
+        per_dim_frac = i_sq / per_dim_denom if per_dim_denom > 0.0 else 0.0
+        per_dim.append(
+            DimensionDecomposition(
+                dim_index=i,
+                dim_kind=kinds_v1[i] if kinds_v1 is not None else None,
+                dim_label=dim_labels[i] if dim_labels is not None and i < len(dim_labels) else None,
+                total=float(total[i]),
+                intrinsic=float(intrinsic[i]),
+                extrinsic=float(extrinsic[i]),
+                intrinsic_fraction=per_dim_frac,
+            )
+        )
+
+    ranked = sorted(per_dim, key=lambda d: abs(d.total), reverse=True)
+    top = ranked[: min(top_n, D)]
+
+    return IntrinsicExtrinsicReport(
+        pattern_id=pattern_id,
+        entity_key=entity_key,
+        v_from=fit_v1.calibration_epoch,
+        v_to=fit_v2.calibration_epoch,
+        schema_hash=fit_v1.schema_hash,
+        timestamp_from=timestamp_from,
+        timestamp_to=timestamp_to,
+        intrinsic_displacement=intrinsic_disp,
+        extrinsic_displacement=extrinsic_disp,
+        total_displacement=total_disp,
+        intrinsic_fraction=intrinsic_fraction,
+        top_dimensions=top,
+        per_dimension=per_dim if verbose else None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Hidden-influencer / coordinate-system influence
+# ---------------------------------------------------------------------------
+
+_M4_SIGMA_SAFE_FLOOR = 1e-12
+
+
+def _compute_leave_one_out_impact(
+    shapes: np.ndarray,
+    mu_full: np.ndarray,
+    sigma_full: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Per-entity exact leave-one-out impact on coordinate system calibration.
+
+    Pure math. Inputs trusted (validated by orchestrator).
+
+    Returns:
+      mu_impact:     (N,)    L2 norm of per-entity μ-shift (σ-normalised)
+      sigma_impact:  (N,)    L2 norm of per-entity σ-shift (σ-normalised)
+      total_impact:  (N,)    sqrt(mu_impact² + sigma_impact²)
+      contributions: (N, D)  per-dim sqrt(mu_shift_i² + sigma_shift_i²)
+    """
+    N, D = shapes.shape
+    if N < 2:
+        raise ValueError(
+            f"_compute_leave_one_out_impact: requires N >= 2; got N={N}"
+        )
+
+    sum_s = shapes.sum(axis=0)
+    sum_s_sq = (shapes ** 2).sum(axis=0)
+
+    sigma_full_safe = np.maximum(sigma_full, _M4_SIGMA_SAFE_FLOOR)
+
+    mu_without = (sum_s[None, :] - shapes) / (N - 1)
+    var_without = (sum_s_sq[None, :] - shapes ** 2) / (N - 1) - mu_without ** 2
+    var_without = np.maximum(var_without, 0.0)
+    sigma_without = np.sqrt(var_without)
+
+    mu_shift = (mu_full[None, :] - mu_without) / sigma_full_safe[None, :]
+    sigma_shift = (sigma_full[None, :] - sigma_without) / sigma_full_safe[None, :]
+
+    contributions = np.sqrt(mu_shift ** 2 + sigma_shift ** 2)
+    mu_impact = np.linalg.norm(mu_shift, axis=1)
+    sigma_impact = np.linalg.norm(sigma_shift, axis=1)
+    total_impact = np.sqrt(mu_impact ** 2 + sigma_impact ** 2)
+
+    if not np.all(np.isfinite(total_impact)):
+        raise ValueError(
+            "_compute_leave_one_out_impact: produced non-finite values; "
+            "Welford precision artefact — investigate input shapes/sigma_full"
+        )
+
+    return mu_impact, sigma_impact, total_impact, contributions
+
+
+def _classify_influence(
+    total_impact: np.ndarray,
+    delta_norm: np.ndarray,
+    theta_norm: float,
+    high_threshold_pct: float = 90.0,
+) -> list[str]:
+    """4-cell classification by (impact percentile, anomaly threshold).
+
+    Returns list[str] of length N with one of:
+      "hidden", "distorter", "standard_anomaly", "normal"
+    """
+    if total_impact.shape != delta_norm.shape:
+        raise ValueError(
+            f"_classify_influence: shape mismatch total_impact={total_impact.shape} "
+            f"vs delta_norm={delta_norm.shape}"
+        )
+    impact_threshold = float(np.percentile(total_impact, high_threshold_pct))
+    high_impact = total_impact >= impact_threshold
+    high_anomaly = delta_norm >= theta_norm
+
+    classes: list[str] = []
+    for hi, ha in zip(high_impact.tolist(), high_anomaly.tolist(), strict=True):
+        if hi and not ha:
+            classes.append("hidden")
+        elif hi and ha:
+            classes.append("distorter")
+        elif (not hi) and ha:
+            classes.append("standard_anomaly")
+        else:
+            classes.append("normal")
+    return classes
+
+
+def _count_cascading_flips(
+    *,
+    shape_E: np.ndarray,
+    sum_s: np.ndarray,
+    sum_s_sq: np.ndarray,
+    shapes: np.ndarray,
+    is_anomaly_full: np.ndarray,
+    e_idx: int,
+    theta_norm: float,
+) -> int:
+    """Count how many other entities flip is_anomaly classification
+    after removing entity E from the population stats."""
+    N, _ = shapes.shape
+    mu_without = (sum_s - shape_E) / (N - 1)
+    var_without = (sum_s_sq - shape_E ** 2) / (N - 1) - mu_without ** 2
+    var_without = np.maximum(var_without, 0.0)
+    sigma_without = np.sqrt(var_without)
+    sigma_without_safe = np.maximum(sigma_without, _M4_SIGMA_SAFE_FLOOR)
+
+    deltas_without = (shapes - mu_without) / sigma_without_safe
+    delta_norms_without = np.linalg.norm(deltas_without, axis=1)
+    is_anomaly_without = delta_norms_without >= theta_norm
+
+    flipped = is_anomaly_full != is_anomaly_without
+    flipped[e_idx] = False
+    return int(flipped.sum())
+
+
+def _compute_leave_set_out_impact(
+    *,
+    shapes: np.ndarray,
+    members_idx: np.ndarray,
+    mu_full: np.ndarray,
+    sigma_full: np.ndarray,
+) -> tuple[float, float, float, np.ndarray]:
+    """Leave-set-out impact for one group of entity indices."""
+    N, D = shapes.shape
+    k = len(members_idx)
+    if k < 2:
+        raise ValueError(
+            f"_compute_leave_set_out_impact: group must have >=2 members; got {k}"
+        )
+    if k >= N:
+        raise ValueError(
+            f"_compute_leave_set_out_impact: group size {k} >= N={N}; "
+            f"cannot leave non-empty population"
+        )
+
+    sum_s = shapes.sum(axis=0)
+    sum_s_sq = (shapes ** 2).sum(axis=0)
+    set_shapes = shapes[members_idx]
+    set_sum = set_shapes.sum(axis=0)
+    set_sum_sq = (set_shapes ** 2).sum(axis=0)
+
+    mu_without_set = (sum_s - set_sum) / (N - k)
+    var_without_set = (sum_s_sq - set_sum_sq) / (N - k) - mu_without_set ** 2
+    var_without_set = np.maximum(var_without_set, 0.0)
+    sigma_without_set = np.sqrt(var_without_set)
+
+    sigma_full_safe = np.maximum(sigma_full, _M4_SIGMA_SAFE_FLOOR)
+    mu_shift = (mu_full - mu_without_set) / sigma_full_safe
+    sigma_shift = (sigma_full - sigma_without_set) / sigma_full_safe
+
+    contributions = np.sqrt(mu_shift ** 2 + sigma_shift ** 2)
+    mu_impact_set = float(np.linalg.norm(mu_shift))
+    sigma_impact_set = float(np.linalg.norm(sigma_shift))
+    total_impact_set = float(
+        np.sqrt(mu_impact_set ** 2 + sigma_impact_set ** 2)
+    )
+    return mu_impact_set, sigma_impact_set, total_impact_set, contributions
+
+
+# ── Cross-pattern lead-lag ────────────────────────────────────────────────────
+
+
+def _compute_centroid_drift_series(
+    shapes: np.ndarray,           # (n_epochs, n_entities, D), float32
+    mu: np.ndarray,               # (D,)
+    sigma: np.ndarray,             # (D,)
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Population centroid drift + per-entity volatility series + raw mu_pop.
+
+    Returns (centroid_drift, volatility, mu_pop) where:
+      centroid_drift : (n_epochs - 1,)  ||mu_pop(t+1) - mu_pop(t)||
+      volatility     : (n_epochs - 1,)  mean over entities of step magnitude
+      mu_pop         : (n_epochs, D)    population centroid trajectory
+
+    Inputs are raw shapes; delta = (shape - mu) / max(sigma, 1e-2). The
+    sigma floor mirrors navigator convention.
+    """
+    sigma_safe = np.maximum(sigma, 1e-2).astype(np.float32, copy=False)
+    delta = (shapes - mu.astype(np.float32, copy=False)) / sigma_safe
+    mu_pop = delta.mean(axis=1)
+    diff_pop = np.diff(mu_pop, axis=0)
+    centroid_drift = np.sqrt(np.einsum("ij,ij->i", diff_pop, diff_pop)).astype(np.float64)
+    diff_per_entity = np.diff(delta, axis=0)
+    per_entity_step = np.sqrt(
+        np.einsum("ijk,ijk->ij", diff_per_entity, diff_per_entity)
+    )
+    volatility = per_entity_step.mean(axis=1).astype(np.float64)
+    return centroid_drift, volatility, mu_pop.astype(np.float64)
+
+
+def _cross_correlate_with_lag(
+    a: np.ndarray,            # (L_full,)
+    b: np.ndarray,            # (L_full,)
+    max_lag: int,
+) -> tuple[np.ndarray, int, float]:
+    """Cross-correlate two equal-length series at lags [-max_lag, +max_lag].
+
+    Constant-window convention: at every lag both series are trimmed on
+    both sides so the pair entering Pearson has length L = L_full - 2*max_lag.
+    Keeps Bartlett SE comparable across lags. Positive lag means `a` leads
+    `b` (a[t] correlates with b[t + lag]).
+
+    Returns (corr_by_lag, peak_lag, peak_corr) where corr_by_lag has length
+    2*max_lag + 1 and peak_corr is signed.
+    """
+    L_full = a.shape[0]
+    if L_full != b.shape[0]:
+        raise ValueError(
+            f"_cross_correlate_with_lag: length mismatch {L_full} vs {b.shape[0]}"
+        )
+    if L_full <= 2 * max_lag:
+        raise ValueError(
+            f"_cross_correlate_with_lag: series length {L_full} too short for "
+            f"max_lag={max_lag}"
+        )
+    L = L_full - 2 * max_lag
+    corr_by_lag = np.empty(2 * max_lag + 1, dtype=np.float64)
+    a_centre = a[max_lag : max_lag + L]
+    a_std = a_centre.std()
+    for k, lag in enumerate(range(-max_lag, max_lag + 1)):
+        b_slice = b[max_lag + lag : max_lag + lag + L]
+        if a_std == 0.0 or b_slice.std() == 0.0:
+            corr_by_lag[k] = 0.0
+            continue
+        corr_by_lag[k] = float(np.corrcoef(a_centre, b_slice)[0, 1])
+    abs_corrs = np.abs(corr_by_lag)
+    peak_idx = int(np.argmax(abs_corrs))
+    peak_lag = peak_idx - max_lag
+    peak_corr = float(corr_by_lag[peak_idx])
+    return corr_by_lag, peak_lag, peak_corr
+
+
+def _compute_per_dim_lead_lag(
+    mu_pop_a: np.ndarray,         # (n_epochs, D_a)
+    mu_pop_b: np.ndarray,         # (n_epochs, D_b)
+    *,
+    max_lag: int,
+    fdr_alpha: float,
+    fdr_method: str,              # "bh" | "storey"
+    dim_labels_a: list[str] | None,
+    dim_labels_b: list[str] | None,
+) -> tuple[list, np.ndarray, np.ndarray]:
+    """D_A x D_B per-dim cross-pattern lead-lag with BH or Storey FDR.
+
+    Differences each population centroid coordinate to a length-(n_epochs-1)
+    series, cross-correlates every (i, j) pair, takes the peak |corr| / lag,
+    computes a Bartlett single-test two-sided p-value with the trimmed
+    window length L = n_epochs - 1 - 2*max_lag, and applies BH/Storey FDR
+    across all D_a * D_b p-values.
+
+    Returns (pairs, p_values, q_values). Pairs are sorted ascending by
+    q_value with tie-break on descending |correlation|.
+    """
+    from scipy import stats
+
+    from hypertopos.engine.fdr import benjamini_hochberg
+    from hypertopos.model.sphere import DimPairLeadLag
+
+    D_a = mu_pop_a.shape[1]
+    D_b = mu_pop_b.shape[1]
+    da = np.diff(mu_pop_a, axis=0)
+    db = np.diff(mu_pop_b, axis=0)
+    L_full = da.shape[0]
+    L = L_full - 2 * max_lag
+    if L < 2:
+        raise ValueError(
+            f"_compute_per_dim_lead_lag: trimmed window L={L} < 2; "
+            f"max_lag={max_lag} too large for n_epochs-1={L_full}"
+        )
+    n_pairs = D_a * D_b
+    n_lags = 2 * max_lag + 1
+    p_values = np.empty(n_pairs, dtype=np.float64)
+    raw: list[tuple[int, int, int, float, float]] = []
+    for i in range(D_a):
+        a_dim = da[:, i]
+        for j in range(D_b):
+            b_dim = db[:, j]
+            _, peak_lag, peak_corr = _cross_correlate_with_lag(a_dim, b_dim, max_lag)
+            z = abs(peak_corr) * np.sqrt(L)
+            p_single = 2.0 * (1.0 - float(stats.norm.cdf(z)))
+            # Bonferroni over the lag grid: peak-of-n_lags single-test → multiply by n_lags
+            # (matches the population-level max_corr_threshold philosophy and prevents
+            # false-positive inflation when the peak |corr| is taken over the lag grid).
+            p_pair = float(min(max(p_single * n_lags, 0.0), 1.0))
+            idx = i * D_b + j
+            p_values[idx] = p_pair
+            raw.append((i, j, int(peak_lag), float(peak_corr), p_pair))
+    rejected, q_values = benjamini_hochberg(p_values, fdr_alpha, method=fdr_method)
+    pairs: list[DimPairLeadLag] = []
+    for idx, (i, j, lag, corr, p) in enumerate(raw):
+        pairs.append(
+            DimPairLeadLag(
+                dim_index_a=i,
+                dim_index_b=j,
+                dim_label_a=(
+                    dim_labels_a[i]
+                    if dim_labels_a is not None and i < len(dim_labels_a)
+                    else None
+                ),
+                dim_label_b=(
+                    dim_labels_b[j]
+                    if dim_labels_b is not None and j < len(dim_labels_b)
+                    else None
+                ),
+                lag=int(lag),
+                correlation=round(float(corr), 4),
+                p_value=round(float(p), 6),
+                q_value=round(float(q_values[idx]), 6),
+                is_significant=bool(rejected[idx]),
+            )
+        )
+    pairs.sort(key=lambda x: (x.q_value, -abs(x.correlation)))
+    return pairs, p_values, q_values
+
+
+def _reliability_label_for_lead_lag(n_epochs: int) -> str:
+    """Mirror engine.forecast.reliability_label: high >= 24, medium >= 12, else low."""
+    n_eff = n_epochs - 1
+    if n_eff >= 24:
+        return "high"
+    if n_eff >= 12:
+        return "medium"
+    return "low"
+
+
+def _compute_lead_lag_report(
+    *,
+    pattern_a: str,
+    pattern_b: str,
+    entity_key: str | None,
+    shapes_a: np.ndarray,           # (n_epochs, n_entities, D_a)
+    shapes_b: np.ndarray,           # (n_epochs, n_entities, D_b)
+    mu_a: np.ndarray,
+    sigma_a: np.ndarray,
+    mu_b: np.ndarray,
+    sigma_b: np.ndarray,
+    dim_labels_a: list[str] | None,
+    dim_labels_b: list[str] | None,
+    timestamps: list,                # list[datetime] of length n_epochs
+    n_dropped_a: int,
+    n_dropped_b: int,
+    cohort_size: int,
+    cohort_dropped: int | None,
+    schema_hash_a: str,
+    schema_hash_b: str,
+    max_lag: int,
+    fdr_alpha: float,
+    fdr_method: str,
+    verbose: bool,
+):
+    """Pure-numpy orchestrator. Builds LeadLagReport from aligned shape tensors.
+
+    Caller is responsible for time alignment, cohort selection, and reading
+    the (n_epochs, n_entities, D) tensors from temporal storage.
+    """
+    from scipy import stats
+
+    from hypertopos.model.sphere import LeadLagReport
+
+    n_epochs = shapes_a.shape[0]
+    if shapes_b.shape[0] != n_epochs:
+        raise ValueError(
+            f"_compute_lead_lag_report: shape mismatch shapes_a[0]={n_epochs} "
+            f"shapes_b[0]={shapes_b.shape[0]}"
+        )
+    L_full = n_epochs - 1
+    L = L_full - 2 * max_lag
+    if L < 2:
+        raise ValueError(
+            f"_compute_lead_lag_report: trimmed window L={L} too small; "
+            f"max_lag={max_lag} too large for n_epochs={n_epochs}"
+        )
+
+    centroid_a, vol_a, mu_pop_a = _compute_centroid_drift_series(
+        shapes_a, mu_a, sigma_a,
+    )
+    centroid_b, vol_b, mu_pop_b = _compute_centroid_drift_series(
+        shapes_b, mu_b, sigma_b,
+    )
+
+    # Degenerate-signal guard: when either centroid drift series is
+    # essentially constant (e.g. AML temporal data with near-identical
+    # shapes per epoch), Pearson correlation is undefined and the navigator
+    # would silently report corr=0 across all dim pairs. Surface this
+    # explicitly so the agent does not over-claim signal absence.
+    degenerate_signal = bool(
+        float(centroid_a.std()) < 1e-12
+        or float(centroid_b.std()) < 1e-12
+    )
+
+    corr_centroid_full, peak_lag, peak_corr = _cross_correlate_with_lag(
+        centroid_a, centroid_b, max_lag,
+    )
+    _, peak_lag_vol, peak_corr_vol = _cross_correlate_with_lag(
+        vol_a, vol_b, max_lag,
+    )
+
+    if degenerate_signal:
+        agreement = "divergent"
+    elif (
+        abs(peak_lag - peak_lag_vol) <= 1
+        and (peak_corr * peak_corr_vol > 0)
+        and abs(peak_corr) > 0.3
+        and abs(peak_corr_vol) > 0.3
+    ):
+        agreement = "strong"
+    elif abs(peak_corr) > 0.2 and abs(peak_corr_vol) > 0.2:
+        agreement = "weak"
+    else:
+        agreement = "divergent"
+
+    bartlett_ci_95 = float(1.96 / np.sqrt(L))
+    n_lags = 2 * max_lag + 1
+    alpha_per_lag = 0.05 / n_lags
+    z_adj = float(stats.norm.isf(alpha_per_lag / 2.0))
+    max_corr_threshold = float(z_adj / np.sqrt(L))
+    is_significant = bool(abs(peak_corr) > max_corr_threshold)
+
+    pairs, p_values, q_values = _compute_per_dim_lead_lag(
+        mu_pop_a, mu_pop_b,
+        max_lag=max_lag,
+        fdr_alpha=fdr_alpha,
+        fdr_method=fdr_method,
+        dim_labels_a=dim_labels_a,
+        dim_labels_b=dim_labels_b,
+    )
+    n_significant_pairs = int(sum(1 for p in pairs if p.is_significant))
+    top_dim_pairs = list(pairs[:10])
+    per_dim_pairs = list(pairs) if verbose else None
+
+    return LeadLagReport(
+        pattern_a=pattern_a,
+        pattern_b=pattern_b,
+        entity_key=entity_key,
+        n_epochs_used=int(n_epochs),
+        n_dropped_a=int(n_dropped_a),
+        n_dropped_b=int(n_dropped_b),
+        cohort_size=int(cohort_size),
+        cohort_dropped=cohort_dropped,
+        timestamp_from=timestamps[0],
+        timestamp_to=timestamps[-1],
+        schema_hash_a=schema_hash_a,
+        schema_hash_b=schema_hash_b,
+        lag=int(peak_lag),
+        correlation=round(float(peak_corr), 4),
+        centroid_drift_series_a=[round(float(x), 4) for x in centroid_a.tolist()],
+        centroid_drift_series_b=[round(float(x), 4) for x in centroid_b.tolist()],
+        lag_volatility=int(peak_lag_vol),
+        correlation_volatility=round(float(peak_corr_vol), 4),
+        volatility_series_a=[round(float(x), 4) for x in vol_a.tolist()],
+        volatility_series_b=[round(float(x), 4) for x in vol_b.tolist()],
+        agreement=agreement,
+        bartlett_ci_95=round(bartlett_ci_95, 4),
+        max_corr_threshold=round(max_corr_threshold, 4),
+        is_significant=is_significant,
+        fdr_alpha=float(fdr_alpha),
+        fdr_method=str(fdr_method),
+        n_dim_pairs=int(mu_pop_a.shape[1] * mu_pop_b.shape[1]),
+        n_significant_pairs=n_significant_pairs,
+        top_dim_pairs=top_dim_pairs,
+        per_dim_pairs=per_dim_pairs,
+        reliability=_reliability_label_for_lead_lag(n_epochs),
+        max_lag=int(max_lag),
+        correlation_by_lag=[round(float(x), 4) for x in corr_centroid_full.tolist()],
+        coverage_warning=bool(cohort_size is not None and cohort_size < 30),
+        degenerate_signal=degenerate_signal,
+    )

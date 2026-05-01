@@ -309,6 +309,7 @@ class _PatternReg:
     # Per-edge derived dim catalog (event patterns only).
     # ``EdgeDimensionsConfig.dims`` keyed by dim_name → params dict.
     edge_dimensions: Any = None  # EdgeDimensionsConfig | None
+    edge_dim_aggregations: Any = None  # EdgeDimAggregationsConfig | None
 
 
 @dataclass
@@ -582,6 +583,7 @@ class GDSBuilder:
         semantic_dim: dict | None = None,
         bootstrap_iterations: int = 200,
         edge_dimensions: Any = None,
+        edge_dim_aggregations: Any = None,
     ) -> GDSBuilder:
         _VALID_DW = ("auto", "kurtosis", "uniform")
         if isinstance(dimension_weights, str) and dimension_weights not in _VALID_DW:
@@ -607,6 +609,7 @@ class GDSBuilder:
             metric_properties=metric_properties,
             semantic_dim=semantic_dim,
             edge_dimensions=edge_dimensions,
+            edge_dim_aggregations=edge_dim_aggregations,
         )
         return self
 
@@ -1061,6 +1064,103 @@ class GDSBuilder:
         else:
             edge_dim_kinds = []
 
+        # 1a-bis. Anchor-pattern aggregation of edge-derived dims (S1 ext, 0.6.1).
+        edge_dim_agg_matrix = np.empty((n, 0), dtype=np.float32)
+        edge_dim_agg_kinds: list[str] = []
+        if (
+            pat.edge_dim_aggregations is not None
+            and pat.pattern_type == "anchor"
+        ):
+            from hypertopos.engine.edge_features import (
+                AGGREGATE_NAMES,
+                EDGE_DIM_KINDS,
+                aggregate_edge_dims_for_anchor,
+                aggregate_kind,
+            )
+
+            cfg = pat.edge_dim_aggregations
+            src_pat = self._patterns.get(cfg.from_event_pattern)
+            if src_pat is None or src_pat.pattern_type != "event":
+                raise ValueError(
+                    f"Pattern {pat.pattern_id!r} edge_dim_aggregations.from "
+                    f"={cfg.from_event_pattern!r} must reference an event "
+                    f"pattern in this build",
+                )
+            if src_pat.edge_table is None:
+                raise ValueError(
+                    f"Pattern {pat.pattern_id!r} edge_dim_aggregations.from "
+                    f"={cfg.from_event_pattern!r} has no edge_table — "
+                    f"declare edge_table on that event pattern",
+                )
+            sidecar_path = (
+                self.output_path / "_gds_meta" / "edge_features"
+                / cfg.from_event_pattern / "data.lance"
+            )
+            if not sidecar_path.exists():
+                raise ValueError(
+                    f"Pattern {pat.pattern_id!r} edge_dim_aggregations expects "
+                    f"sidecar at {sidecar_path}; declare edge_dimensions: on "
+                    f"{cfg.from_event_pattern!r} and order it BEFORE this "
+                    f"anchor pattern in YAML so it is built first",
+                )
+            import lance
+            sidecar_tbl = lance.dataset(str(sidecar_path)).to_table()
+            avail = [c for c in sidecar_tbl.column_names if c != "event_key"]
+            agg_dims = list(cfg.dims) if cfg.dims is not None else avail
+            src_edges = self._extract_edge_table(src_pat, src_pat.edge_table)
+
+            src_lines = {r.line_id for r in src_pat.relations}
+            composite_match = next(
+                (cs for cs in self._composite_lines
+                 if cs.line_id == pat.entity_line),
+                None,
+            )
+            if pat.entity_line in src_lines:
+                anchor_kind = "single"
+                pair_separator = "→"
+            elif composite_match is not None:
+                if len(composite_match.key_cols) == 2:
+                    anchor_kind = "pair"
+                    pair_separator = composite_match.separator
+                else:
+                    raise NotImplementedError(
+                        f"Pattern {pat.pattern_id!r}: edge_dim_aggregations "
+                        f"on a composite anchor with k="
+                        f"{len(composite_match.key_cols)} keys ships in "
+                        f"0.7.0; only k=2 (pair) is supported in 0.6.1",
+                    )
+            else:
+                raise NotImplementedError(
+                    f"Pattern {pat.pattern_id!r}: edge_dim_aggregations "
+                    f"could not resolve anchor regime — entity_line "
+                    f"{pat.entity_line!r} is neither a relation of the "
+                    f"source event pattern {cfg.from_event_pattern!r} "
+                    f"(single-key regime) nor a registered composite_line "
+                    f"(pair regime). Chain-anchor aggregation ships in "
+                    f"0.6.2; other regimes are not supported.",
+                )
+
+            primary_keys = entity_table["primary_key"].to_pylist()
+            extra = aggregate_edge_dims_for_anchor(
+                anchor_keys=primary_keys,
+                edges=src_edges,
+                sidecar=sidecar_tbl,
+                dims=agg_dims,
+                anchor_kind=anchor_kind,
+                pair_separator=pair_separator,
+            )
+            n_cols = len(agg_dims) * len(AGGREGATE_NAMES)
+            edge_dim_agg_matrix = np.zeros((n, n_cols), dtype=np.float32)
+            col_idx = 0
+            for d in agg_dims:
+                src_kind = EDGE_DIM_KINDS[d]
+                for agg in AGGREGATE_NAMES:
+                    edge_dim_agg_matrix[:, col_idx] = (
+                        extra[f"{d}_{agg}"].to_numpy()
+                    )
+                    edge_dim_agg_kinds.append(aggregate_kind(src_kind, agg))
+                    col_idx += 1
+
         # 1b. Build event dimension values
         event_dim_matrix = np.empty((n, 0), dtype=np.float32)
         if pat.event_dimensions:
@@ -1235,6 +1335,8 @@ class GDSBuilder:
             parts.append(event_dim_matrix)
         if edge_dim_matrix.shape[1] > 0:
             parts.append(edge_dim_matrix)
+        if edge_dim_agg_matrix.shape[1] > 0:
+            parts.append(edge_dim_agg_matrix)
         if prop_fill_matrix.shape[1] > 0:
             parts.append(prop_fill_matrix)
         for blk in dim_block_matrices:
@@ -1306,6 +1408,9 @@ class GDSBuilder:
 
         # Edge-derived dimensions
         dimension_kinds.extend(edge_dim_kinds)
+
+        # Edge-derived aggregations on anchor patterns (S1 ext)
+        dimension_kinds.extend(edge_dim_agg_kinds)
 
         # Prop fill (binary 0/1)
         dimension_kinds.extend(["bernoulli"] * len(prop_columns))
@@ -2387,6 +2492,15 @@ class GDSBuilder:
                     if edge_cfg.amount_col:
                         edge_meta["amount_col"] = edge_cfg.amount_col
                     pat_dict["edge_table"] = edge_meta
+            # Edge-dim aggregations metadata (S1 ext)
+            if pat.edge_dim_aggregations is not None:
+                eda = pat.edge_dim_aggregations
+                pat_dict["edge_dim_aggregations"] = {
+                    "from": eda.from_event_pattern,
+                    "dims": (
+                        list(eda.dims) if eda.dims is not None else None
+                    ),
+                }
             # Calibration epoch metadata (populated by _build_and_write)
             cal_state = self._calibration_state.get(pat_id, {})
             pat_dict["calibration_epoch"] = cal_state.get("calibration_epoch", 1)
@@ -2835,38 +2949,73 @@ class GDSBuilder:
                     )
                 return pat_id, stats
 
-            if len(self._patterns) > 1:
-                with ThreadPoolExecutor(
-                    max_workers=min(4, len(self._patterns)),
-                ) as pool:
-                    futs = {
-                        pool.submit(_pipeline, pid, p): pid
-                        for pid, p in self._patterns.items()
-                    }
-                    for fut in as_completed(futs):
-                        pat_id, stats = fut.result()
+            event_items_p = [
+                (pid, p) for pid, p in self._patterns.items()
+                if p.pattern_type == "event"
+            ]
+            anchor_items_p = [
+                (pid, p) for pid, p in self._patterns.items()
+                if p.pattern_type == "anchor"
+            ]
+
+            def _run_phase_pipeline(
+                items: list[tuple[str, _PatternReg]],
+            ) -> None:
+                if not items:
+                    return
+                if len(items) > 1:
+                    with ThreadPoolExecutor(
+                        max_workers=min(4, len(items)),
+                    ) as pool:
+                        futs = {
+                            pool.submit(_pipeline, pid, p): pid
+                            for pid, p in items
+                        }
+                        for fut in as_completed(futs):
+                            pat_id, stats = fut.result()
+                            pattern_stats[pat_id] = stats
+                else:
+                    for pat_id, pat in items:
+                        _, stats = _pipeline(pat_id, pat)
                         pattern_stats[pat_id] = stats
-            else:
-                for pat_id, pat in self._patterns.items():
-                    _, stats = _pipeline(pat_id, pat)
-                    pattern_stats[pat_id] = stats
+
+            _run_phase_pipeline(event_items_p)
+            _run_phase_pipeline(anchor_items_p)
         else:
             # ── Original mode: geometry only ──
-            if len(self._patterns) > 1:
-                with ThreadPoolExecutor(
-                    max_workers=min(4, len(self._patterns)),
-                ) as pool:
-                    futures = [
-                        pool.submit(_build_and_write, pid, p)
-                        for pid, p in self._patterns.items()
-                    ]
-                    for fut in futures:
-                        pat_id, stats = fut.result()
+            # Anchor patterns with edge_dim_aggregations consume the
+            # event pattern's edge_features sidecar — built in two phases
+            # so the dependency holds without a topo sort.
+            event_items = [
+                (pid, p) for pid, p in self._patterns.items()
+                if p.pattern_type == "event"
+            ]
+            anchor_items = [
+                (pid, p) for pid, p in self._patterns.items()
+                if p.pattern_type == "anchor"
+            ]
+
+            def _run_phase(items: list[tuple[str, _PatternReg]]) -> None:
+                if not items:
+                    return
+                if len(items) > 1:
+                    with ThreadPoolExecutor(
+                        max_workers=min(4, len(items)),
+                    ) as pool:
+                        futures = [
+                            pool.submit(_build_and_write, pid, p)
+                            for pid, p in items
+                        ]
+                        for fut in futures:
+                            pat_id, stats = fut.result()
+                            pattern_stats[pat_id] = stats
+                else:
+                    for pat_id, pat in items:
+                        _, stats = _build_and_write(pat_id, pat)
                         pattern_stats[pat_id] = stats
-            else:
-                for pat_id, pat in self._patterns.items():
-                    _, stats = _build_and_write(pat_id, pat)
-                    pattern_stats[pat_id] = stats
+
+            _run_phase(event_items)
+            _run_phase(anchor_items)
 
         # 2.5 Precompute per-entity contagion stats
         self._build_contagion_stats(_stats_writer)
@@ -3864,6 +4013,104 @@ class GDSBuilder:
 
         D_edge = len(edge_dim_names)
 
+        # ── Anchor-pattern edge-dim aggregation (S1 ext, 0.6.1) ──
+        edge_dim_agg_matrix = np.empty((n, 0), dtype=np.float32)
+        edge_dim_agg_kinds: list[str] = []
+        if (
+            pat.edge_dim_aggregations is not None
+            and pat.pattern_type == "anchor"
+        ):
+            from hypertopos.engine.edge_features import (
+                AGGREGATE_NAMES,
+                EDGE_DIM_KINDS,
+                aggregate_edge_dims_for_anchor,
+                aggregate_kind,
+            )
+
+            cfg = pat.edge_dim_aggregations
+            src_pat = self._patterns.get(cfg.from_event_pattern)
+            if src_pat is None or src_pat.pattern_type != "event":
+                raise ValueError(
+                    f"Pattern {pat.pattern_id!r} edge_dim_aggregations.from "
+                    f"={cfg.from_event_pattern!r} must reference an event "
+                    f"pattern in this build",
+                )
+            if src_pat.edge_table is None:
+                raise ValueError(
+                    f"Pattern {pat.pattern_id!r} edge_dim_aggregations.from "
+                    f"={cfg.from_event_pattern!r} has no edge_table",
+                )
+            sidecar_path = (
+                self.output_path / "_gds_meta" / "edge_features"
+                / cfg.from_event_pattern / "data.lance"
+            )
+            if not sidecar_path.exists():
+                raise ValueError(
+                    f"Pattern {pat.pattern_id!r} edge_dim_aggregations expects "
+                    f"sidecar at {sidecar_path}; declare edge_dimensions: on "
+                    f"{cfg.from_event_pattern!r} and order it BEFORE this "
+                    f"anchor pattern in YAML so it is built first",
+                )
+            import lance
+            sidecar_tbl = lance.dataset(str(sidecar_path)).to_table()
+            avail = [c for c in sidecar_tbl.column_names if c != "event_key"]
+            agg_dims = list(cfg.dims) if cfg.dims is not None else avail
+            src_edges = self._extract_edge_table(src_pat, src_pat.edge_table)
+
+            src_lines = {r.line_id for r in src_pat.relations}
+            composite_match = next(
+                (cs for cs in self._composite_lines
+                 if cs.line_id == pat.entity_line),
+                None,
+            )
+            if pat.entity_line in src_lines:
+                anchor_kind = "single"
+                pair_separator = "→"
+            elif composite_match is not None:
+                if len(composite_match.key_cols) == 2:
+                    anchor_kind = "pair"
+                    pair_separator = composite_match.separator
+                else:
+                    raise NotImplementedError(
+                        f"Pattern {pat.pattern_id!r}: edge_dim_aggregations "
+                        f"on a composite anchor with k="
+                        f"{len(composite_match.key_cols)} keys ships in "
+                        f"0.7.0; only k=2 (pair) is supported in 0.6.1",
+                    )
+            else:
+                raise NotImplementedError(
+                    f"Pattern {pat.pattern_id!r}: edge_dim_aggregations "
+                    f"could not resolve anchor regime — entity_line "
+                    f"{pat.entity_line!r} is neither a relation of the "
+                    f"source event pattern {cfg.from_event_pattern!r} "
+                    f"(single-key regime) nor a registered composite_line "
+                    f"(pair regime). Chain-anchor aggregation ships in "
+                    f"0.6.2; other regimes are not supported.",
+                )
+
+            primary_keys = entity_table["primary_key"].to_pylist()
+            extra = aggregate_edge_dims_for_anchor(
+                anchor_keys=primary_keys,
+                edges=src_edges,
+                sidecar=sidecar_tbl,
+                dims=agg_dims,
+                anchor_kind=anchor_kind,
+                pair_separator=pair_separator,
+            )
+            n_cols = len(agg_dims) * len(AGGREGATE_NAMES)
+            edge_dim_agg_matrix = np.zeros((n, n_cols), dtype=np.float32)
+            col_idx = 0
+            for d in agg_dims:
+                src_kind = EDGE_DIM_KINDS[d]
+                for agg in AGGREGATE_NAMES:
+                    edge_dim_agg_matrix[:, col_idx] = (
+                        extra[f"{d}_{agg}"].to_numpy()
+                    )
+                    edge_dim_agg_kinds.append(aggregate_kind(src_kind, agg))
+                    col_idx += 1
+
+        D_edge_agg = edge_dim_agg_matrix.shape[1]
+
         # Pre-compute event dimension edge_max (needs full column scan)
         for edim in pat.event_dimensions:
             if edim.edge_max is None or edim.edge_max == "auto":
@@ -3890,7 +4137,7 @@ class GDSBuilder:
         # Welford accumulators — we don't know D_full yet (depends on prop_columns)
         # So first pass accumulates edge dims + event dims + ALL tracked prop candidates,
         # then we trim after determining which props pass MIN_FILL_RATE.
-        D_max = D_rel + D_event + D_edge + len(tracked)
+        D_max = D_rel + D_event + D_edge + D_edge_agg + len(tracked)
         w_mean = np.zeros(D_max, dtype=np.float64)
         w_m2 = np.zeros(D_max, dtype=np.float64)
         w_n = 0
@@ -3908,6 +4155,12 @@ class GDSBuilder:
             if D_edge > 0:
                 shapes = np.concatenate(
                     [shapes, edge_dim_matrix[start:end]], axis=1,
+                )
+
+            # Append edge_dim aggregations slice (S1 ext)
+            if D_edge_agg > 0:
+                shapes = np.concatenate(
+                    [shapes, edge_dim_agg_matrix[start:end]], axis=1,
                 )
 
             # Prop fill for this chunk (all tracked, not yet filtered)
@@ -3998,6 +4251,10 @@ class GDSBuilder:
                     shapes = np.concatenate(
                         [shapes, edge_dim_matrix[start:end]], axis=1,
                     )
+                if D_edge_agg > 0:
+                    shapes = np.concatenate(
+                        [shapes, edge_dim_agg_matrix[start:end]], axis=1,
+                    )
                 if prop_columns:
                     prop_fill = self._build_prop_fill_chunk(
                         pat, chunk_table, prop_columns,
@@ -4084,6 +4341,9 @@ class GDSBuilder:
         # Edge-derived dimensions
         dimension_kinds.extend(edge_dim_kinds)
 
+        # Edge-derived aggregations on anchor patterns (S1 ext)
+        dimension_kinds.extend(edge_dim_agg_kinds)
+
         # Prop fill (binary 0/1)
         dimension_kinds.extend(["bernoulli"] * len(prop_columns))
 
@@ -4117,6 +4377,10 @@ class GDSBuilder:
             if D_edge > 0:
                 shapes = np.concatenate(
                     [shapes, edge_dim_matrix[start:end]], axis=1,
+                )
+            if D_edge_agg > 0:
+                shapes = np.concatenate(
+                    [shapes, edge_dim_agg_matrix[start:end]], axis=1,
                 )
             if prop_columns:
                 prop_fill = self._build_prop_fill_chunk(
@@ -4179,6 +4443,10 @@ class GDSBuilder:
             if D_edge > 0:
                 shapes = np.concatenate(
                     [shapes, edge_dim_matrix[start:end]], axis=1,
+                )
+            if D_edge_agg > 0:
+                shapes = np.concatenate(
+                    [shapes, edge_dim_agg_matrix[start:end]], axis=1,
                 )
             if prop_columns:
                 prop_fill = self._build_prop_fill_chunk(
@@ -4419,8 +4687,15 @@ class GDSBuilder:
                 mu = np.array(pat_meta["mu"], dtype=np.float32)
                 sigma = np.array(pat_meta["sigma_diag"], dtype=np.float32)
                 sigma_safe = np.where(sigma < 1e-6, 1.0, sigma)
+                # Temporal shape_tensor covers only the time-varying dims
+                # (relations + event/prop). When the pattern has time-invariant
+                # build-time aggregates (edge_dim_aggregations, S1 ext) those
+                # tail dims are NOT in the tensor — slice mu/sigma to match.
+                D_shape = shape_tensor.shape[2]
+                mu = mu[:D_shape]
+                sigma_safe = sigma_safe[:D_shape]
                 theta_norm = float(np.linalg.norm(
-                    np.array(pat_meta["theta"], dtype=np.float32),
+                    np.array(pat_meta["theta"], dtype=np.float32)[:D_shape],
                 ))
                 centroids: list[dict] = []
                 for b in range(n_buckets):

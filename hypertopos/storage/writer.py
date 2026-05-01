@@ -590,9 +590,15 @@ class GDSWriter:
             np.maximum(sigma_diag, 1e-2) if sigma_diag is not None else None
         )
 
-        # Z-score shape → delta if mu/sigma provided
+        # Z-score shape → delta if mu/sigma provided.
+        # Trajectory tensor covers only the time-varying dims; pattern
+        # mu/sigma may include trailing time-invariant aggregates
+        # (edge_dim_aggregations) — slice to match.
         if mu is not None and _sigma is not None:
-            data = (shape_tensor - mu) / _sigma
+            D_shape = shape_tensor.shape[-1]
+            mu_slice = mu[:D_shape]
+            sigma_slice = _sigma[:D_shape]
+            data = (shape_tensor - mu_slice) / sigma_slice
         else:
             data = shape_tensor
 

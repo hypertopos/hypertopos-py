@@ -270,15 +270,16 @@ nav.find_motif_by_hops(
     *,
     seed_keys: list[str] | None = None,
     max_results: int = 100,
-    score: bool = True,
+    score: bool = False,
+    time_window_hours: float | None = None,
 ) -> dict
 ```
 
-Declarative motif API — power-user escape hatch from the closed-vocab `find_motif` registry. Caller passes a list of `HopPredicate`s describing per-hop constraints (`amount_min`, `amount_max`, `time_delta_max_hours`, `direction` (`"forward"` / `"reverse"` / `"any"`), `edge_dim_predicates: dict[str, tuple[op, value]]`); the navigator walks the in-memory `AdjacencyIndex` for matching chains. `seed_keys=None` enumerates from all `from_key` nodes (capped at `max_results`). Returns `{pattern_id, n_results, motifs}` with each motif carrying `nodes`, `edges` (event_keys), `timestamps`, `amounts`, `dim_values_per_hop` (only when `edge_dim_predicates` were used), optional `score` (anchor patterns only) and `score_breakdown`. Raises on anchor pattern (event-only), unknown pattern, empty hops, k>6, `max_results<1`. Bounded MVP — `amount_ratio_to_prev` and `require_anomalous_entity` predicates plus k>6 land in a follow-up.
+Declarative motif API — power-user escape hatch from the closed-vocab `find_motif` registry. Caller passes a list of `HopPredicate`s describing per-hop constraints (`amount_min`, `amount_max`, `time_delta_max_hours`, `amount_ratio_to_prev`, `direction` (`"forward"` / `"reverse"` / `"any"`), `edge_dim_predicates: dict[str, tuple[op, value]]`); the navigator walks the in-memory `AdjacencyIndex` for matching chains via level-synchronous BFS. `seed_keys=None` enumerates from all `from_key` nodes (capped at `max_results`). `time_window_hours` (optional, default `None`) caps the total chain span: when set, every hop after the first must satisfy `abs(current_edge_ts - first_edge_ts) <= time_window_hours`; independent of per-hop `time_delta_max_hours`, both apply when both are set. When `score=True`, the navigator resolves the event pattern's anchor companion via `_resolve_anchor_pattern_for_scoring` and scores each motif as the product of event-aware `edge_potential` (`delta_distance × (1/effective_pair_count) × (1 + event_norm)`) across its edges. The `event_norm` factor (norm of the event pattern's per-transaction polygon for each edge's `event_key`) breaks ties between motifs that share a node sequence but use different transactions. Scored motifs gain `score`, `score_breakdown` (per-edge entries carry `edge_potential`, `delta_distance`, `pair_tx_count`, `effective_weight`, `event_factor`), and `anchor_pattern_id` fields together (sorted descending on score, unscored motifs at tail). Returns `{pattern_id, n_results, motifs}` with each motif carrying `nodes`, `edges` (event_keys), `timestamps`, `amounts`, `dim_values_per_hop` (only when `edge_dim_predicates` were used), and the score triple when `score=True` succeeds. Raises on anchor pattern (event-only), unknown pattern, empty hops, hop count outside `1..8`, non-positive `time_window_hours`, `max_results<1`, or `score=True` with no anchor companion configured for the pattern.
 
 ### `HopPredicate` (dataclass, frozen)
 
-Fields: `amount_min`, `amount_max`, `time_delta_max_hours`, `direction` (Literal["forward", "reverse", "any"], default `"forward"`), `edge_dim_predicates` (`dict[str, tuple[str, float]]`, e.g. `{"pair_edge_count": (">=", 20.0)}`). Operators: `<`, `<=`, `>`, `>=`, `==`.
+Fields: `amount_min`, `amount_max`, `time_delta_max_hours`, `amount_ratio_to_prev` (`float | None`, decreasing-chain ratio in `(0, 1.0]`; rejects edge unless `current_amount / prev_hop_amount ≤ ratio`; must be `None` on `hops[0]`; edges with non-positive amounts are silently skipped), `direction` (Literal["forward", "reverse", "any"], default `"forward"`), `edge_dim_predicates` (`dict[str, tuple[str, float]]`, e.g. `{"pair_edge_count": (">=", 20.0)}`). Operators: `<`, `<=`, `>`, `>=`, `==`. `require_anomalous_entity` (`bool`, default `False`) — when `True` on hop `i`, the destination entity (`nodes[i+1]`) must satisfy `is_anomaly=True` in the resolved anchor companion pattern's geometry; constraints AND across hops; filter runs at the navigator post-BFS, pre-scoring; `max_results` applies AFTER the filter; raises `GDSNavigationError` when no anchor companion is configured.
 
 ### Density Gaps Engine (`hypertopos.engine.density_gaps`)
 
@@ -337,6 +338,9 @@ names in user-supplied `dim_pairs`.
 |--------|-------------|
 | `EdgeDimensionsConfig(dims: dict[str, dict])` | Parsed `edge_dimensions:` block — frozen dataclass attached to `PatternMapping.edge_dimensions` |
 | `parse_edge_dimensions(raw_list, *, pattern_type)` | Parse + validate the YAML list of dim entries (bare strings or single-key dicts). Raises `ValueError` on anchor pattern, `min_position < 3`, `cv_threshold` outside `(0, 1]`, `min_count < 2`, non-positive `amt1_min` / `amt2_max` / `time_window_hours`, negative `burst_seconds`, duplicate or unknown dim names, malformed entries |
+| `EdgeDimAggregationsConfig(from_event_pattern: str, dims: tuple[str, ...])` | Parsed `edge_dim_aggregations:` block on an anchor pattern — frozen dataclass attached to `PatternMapping.edge_dim_aggregations`. `dims` is a non-empty tuple of source dim names |
+| `parse_edge_dim_aggregations(raw_dict, *, pattern_type)` | Parse + validate the YAML mapping. Raises `ValueError` on event pattern, missing `from`, missing or empty `dims` (non-empty list required), non-list `dims`, or unknown dim name |
+| `aggregate_edge_dims_for_anchor(*, anchor_keys, edges, sidecar, dims, anchor_kind)` | Aggregate per-edge sidecar dim values up to per-anchor `_mean` / `_max` columns. `anchor_kind` ∈ `{single, pair}`; `chain` raises `NotImplementedError`. Returns a `pa.Table` keyed by `primary_key` |
 
 ### Calibration History (GDSReader)
 

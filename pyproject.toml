@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hypertopos"
-version = "0.6.0"
+version = "0.6.1"
 description = "Understand the structure of your data — without training machine learning models"
 requires-python = ">=3.12"
 license = {text = "BSL-1.1"}

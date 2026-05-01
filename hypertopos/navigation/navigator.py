@@ -4065,7 +4065,12 @@ class GDSNavigator:
         return registry
 
     def _score_motif_from_edges(
-        self, edges: list[tuple[str, str]], pattern_id: str,
+        self,
+        edges: list[tuple[str, str]],
+        pattern_id: str,
+        *,
+        event_keys: list[str] | None = None,
+        event_pattern_id: str | None = None,
     ) -> dict[str, Any]:
         """Score a motif as the product of edge_potential across its edges.
 
@@ -4073,6 +4078,19 @@ class GDSNavigator:
         single filtered Lance scan, then reuses the warm AdjacencyIndex
         pair_counts cache. Cuts geometry I/O from O(num_edges) per-endpoint
         Lance reads to O(1) batched scan over the endpoint subset.
+
+        Event-aware scoring (opt-in via ``event_keys`` + ``event_pattern_id``):
+        when both are supplied, each edge's potential is additionally
+        weighted by ``(1 + ||event_polygon[event_key]||)`` from the event
+        pattern's per-event geometry. This breaks the score-collapse where
+        multiple distinct events between the same ``(from, to)`` node pair
+        would otherwise produce identical scores (delta_distance and
+        pair_count both depend only on the node pair). The ``+ 1`` keeps
+        normal events (event_norm = 0 at population centroid) at parity
+        with the node-pair-only score; anomalous events boost above. When
+        either argument is omitted scoring reduces to the legacy
+        node-pair-only formula — preserving backward compat for existing
+        single-motif callers (``score_motif``, ``find_high_potential_motifs``).
 
         A zero edge_potential (identical-delta endpoints) is semantically
         distinct from underflow — it collapses the motif score to exactly 0.0
@@ -4088,16 +4106,42 @@ class GDSNavigator:
             raise GDSNavigationError(
                 "_score_motif_from_edges requires a non-empty edges list.",
             )
+        if event_keys is not None and len(event_keys) != len(edges):
+            raise GDSNavigationError(
+                f"event_keys length {len(event_keys)} does not match edges "
+                f"length {len(edges)} — invariant violation.",
+            )
         endpoint_keys: set[str] = set()
         for (u, v) in edges:
             endpoint_keys.add(u)
             endpoint_keys.add(v)
         version = self._resolve_version(pattern_id)
         delta_map = self._batch_read_deltas(pattern_id, version, endpoint_keys)
+
+        event_factors: list[float] | None = None
+        if event_keys is not None and event_pattern_id is not None:
+            event_version = self._resolve_version(event_pattern_id)
+            event_delta_map = self._batch_read_deltas(
+                event_pattern_id, event_version, set(event_keys),
+            )
+            event_factors = []
+            for ek in event_keys:
+                ed = event_delta_map.get(ek)
+                if ed is None:
+                    # Event polygon missing — neutral factor (no boost,
+                    # no penalty). Keeps ranking stable when event-pattern
+                    # geometry is partial.
+                    event_factors.append(1.0)
+                else:
+                    event_factors.append(1.0 + float(np.linalg.norm(ed)))
+
         graph_pid = self._resolve_motif_graph_pid(pattern_id)
         adj = self._storage.get_adjacency(graph_pid)
         pair_counts = adj.pair_counts()
-        result = self._lean_score_motif(edges, delta_map, pair_counts)
+        result = self._lean_score_motif(
+            edges, delta_map, pair_counts,
+            event_factors=event_factors,
+        )
         if result is None:
             # _lean_score_motif returned None — at least one endpoint is absent from the batched delta read.
             missing = next(
@@ -4351,8 +4395,15 @@ class GDSNavigator:
         edges: list[tuple[str, str]],
         delta_map: dict[str, np.ndarray],
         pair_counts: dict[tuple[str, str], int],
+        *,
+        event_factors: list[float] | None = None,
     ) -> dict[str, Any] | None:
         """Product of edge_potential scores using only the pre-fetched caches.
+
+        ``event_factors`` (optional, length must equal ``edges`` when provided):
+        per-edge multiplicative boost from event-pattern geometry — see
+        ``_score_motif_from_edges`` docstring for semantics. Surfaced in the
+        per-edge breakdown when supplied.
 
         Returns ``None`` when any endpoint is missing from ``delta_map``
         (skipped from the ranking).
@@ -4361,7 +4412,7 @@ class GDSNavigator:
         product = 1.0
         log_score = 0.0
         saw_zero = False
-        for (u, v) in edges:
+        for i, (u, v) in enumerate(edges):
             if u not in delta_map or v not in delta_map:
                 return None
             distance = float(np.linalg.norm(delta_map[u] - delta_map[v]))
@@ -4370,14 +4421,20 @@ class GDSNavigator:
             else:
                 cnt = pair_counts.get((u, v), 0) + pair_counts.get((v, u), 0)
             effective = max(1, min(cnt, self._EDGE_POTENTIAL_PAIR_CAP))
-            edge_score = distance * (1.0 / effective)
-            breakdown.append({
+            event_factor = (
+                event_factors[i] if event_factors is not None else 1.0
+            )
+            edge_score = distance * (1.0 / effective) * event_factor
+            entry: dict[str, Any] = {
                 "edge": (u, v),
                 "edge_potential": round(edge_score, 6),
                 "delta_distance": round(distance, 4),
                 "pair_tx_count": cnt,
                 "effective_weight": round(1.0 / effective, 6),
-            })
+            }
+            if event_factors is not None:
+                entry["event_factor"] = round(event_factor, 6)
+            breakdown.append(entry)
             if edge_score == 0.0:
                 saw_zero = True
             else:
@@ -13154,6 +13211,7 @@ class GDSNavigator:
         seed_keys: list[str] | None = None,
         max_results: int = 100,
         score: bool = False,
+        time_window_hours: float | None = None,
     ) -> dict[str, Any]:
         """Match motifs declaratively via per-hop ``HopPredicate``s.
 
@@ -13162,23 +13220,64 @@ class GDSNavigator:
         amount / temporal / direction / edge-dim constraints; the navigator
         walks the edge table looking for matching chains.
 
-        Bounded MVP — supports ``amount_min`` / ``amount_max`` /
+        Supports ``amount_min`` / ``amount_max`` /
         ``time_delta_max_hours`` / ``direction`` (``forward`` / ``reverse``
-        / ``any``) / ``edge_dim_predicates``. ``amount_ratio_to_prev`` and
-        ``require_anomalous_entity`` ship in a follow-up release.
-        """
-        from hypertopos.engine.hop_predicate import enumerate_motifs_by_hops
+        / ``any``) / ``amount_ratio_to_prev`` (decreasing-chain ratio in
+        ``(0, 1.0]``; rejects edge unless
+        ``current_amount / prev_hop_amount <= ratio``; must be ``None`` on
+        ``hops[0]``) / ``edge_dim_predicates``.
 
-        if not hops:
-            raise GDSNavigationError("hops must be non-empty")
-        if not 1 <= len(hops) <= 6:
-            raise GDSNavigationError(
-                f"hop count must be 1..6; got {len(hops)}",
-            )
+        ``time_window_hours`` (optional, default ``None``): global
+        total-chain-span cap, measured from the first hop's edge
+        timestamp. When set, every hop after the first must satisfy
+        ``abs(current_edge_ts - first_edge_ts) <= time_window_hours``.
+        Independent of per-hop ``time_delta_max_hours``; both apply when
+        both are set. Must be strictly positive when not ``None``.
+
+        ``score`` (optional, default ``False``): when ``True``, score each
+        motif as the product of event-aware ``edge_potential`` across its
+        edges. The scoring kernel resolves the anchor-companion pattern
+        whose ``entity_line`` covers the edge endpoints
+        (``_resolve_anchor_pattern_for_scoring``) and combines its
+        per-entity geometry with the event pattern's per-event polygon
+        norms — formula
+        ``delta_distance × (1/effective_pair_count) × (1 + event_norm)``
+        per edge. The event-norm factor breaks ties between motifs that
+        share a node sequence but use different transactions (without it,
+        all such motifs would collapse to identical scores). Each scored
+        motif gains ``score``, ``score_breakdown`` (per-edge entries
+        carry ``edge_potential``, ``delta_distance``, ``pair_tx_count``,
+        ``effective_weight``, ``event_factor``), and
+        ``anchor_pattern_id`` fields together; output is sorted descending
+        on score with unscored motifs (endpoint missing from anchor
+        geometry) at the tail. Raises ``GDSNavigationError`` when no
+        anchor companion is configured for ``pattern_id``.
+
+        ``require_anomalous_entity`` (per-hop bool, default ``False``):
+        when ``True`` on hop ``i``, the destination entity (``nodes[i+1]``
+        of the resulting motif) must satisfy ``is_anomaly=True`` in the
+        resolved anchor companion pattern's geometry. Multiple hops may
+        set this independently; constraints AND across hops. Filter runs
+        after BFS, before scoring — saves scoring work on motifs that
+        get dropped. ``max_results`` applies AFTER the filter, so a
+        restrictive filter can return fewer than ``max_results`` motifs.
+        Seed (``nodes[0]``) is never checked — pre-filter ``seed_keys``
+        upfront to cover it. Raises ``GDSNavigationError`` when no
+        anchor companion is configured.
+        """
+        from hypertopos.engine.hop_predicate import (
+            enumerate_motifs_by_hops,
+            validate_hops,
+        )
+
         if max_results < 1:
             raise GDSNavigationError(
                 f"max_results must be >= 1; got {max_results}",
             )
+        try:
+            validate_hops(hops, time_window_hours=time_window_hours)
+        except ValueError as exc:
+            raise GDSNavigationError(str(exc)) from exc
 
         sphere = self._storage.read_sphere()
         if pattern_id not in sphere.patterns:
@@ -13242,37 +13341,138 @@ class GDSNavigator:
                 seed_keys=seed_keys,
                 max_results=max_results,
                 edge_features=edge_features,
+                time_window_hours=time_window_hours,
             )
         except ValueError as exc:
             raise GDSNavigationError(str(exc)) from exc
 
+        # F4 require_anomalous_entity — drop motifs where any flagged
+        # hop's destination is not anomalous in the anchor companion.
+        # Filter runs after BFS, before scoring — saves scoring work on
+        # motifs that will be dropped, and `n_results` reflects the
+        # post-filter count. `max_results` applies AFTER this filter; if
+        # the filter is restrictive the call returns fewer than
+        # max_results motifs.
+        require_flags = [
+            bool(getattr(h, "require_anomalous_entity", False))
+            for h in hops
+        ]
+        if instances and any(require_flags):
+            anchor_pid_for_filter = (
+                self._resolve_anchor_pattern_for_scoring(pattern_id)
+            )
+            if (
+                anchor_pid_for_filter is None
+                or anchor_pid_for_filter == pattern_id
+            ):
+                raise GDSNavigationError(
+                    f"require_anomalous_entity requires an anchor "
+                    f"pattern whose entity_line covers edge endpoints "
+                    f"of {pattern_id!r}; none found.",
+                )
+            flagged_hop_indices = [
+                i for i, f in enumerate(require_flags) if f
+            ]
+            candidate_keys: set[str] = set()
+            for inst in instances:
+                for i in flagged_hop_indices:
+                    candidate_keys.add(inst["nodes"][i + 1])
+            anchor_version = self._resolve_version(anchor_pid_for_filter)
+            geo = self._storage.read_geometry(
+                anchor_pid_for_filter, anchor_version,
+                point_keys=list(candidate_keys),
+                columns=["primary_key", "is_anomaly"],
+            )
+            if "is_anomaly" not in geo.column_names:
+                raise GDSNavigationError(
+                    f"anchor pattern {anchor_pid_for_filter!r} has no "
+                    f"is_anomaly column — calibration must run first",
+                )
+            is_anomaly_map: dict[str, bool] = {
+                geo["primary_key"][i].as_py(): bool(
+                    geo["is_anomaly"][i].as_py(),
+                )
+                for i in range(geo.num_rows)
+            }
+            filtered: list[dict[str, Any]] = []
+            for inst in instances:
+                if all(
+                    is_anomaly_map.get(inst["nodes"][i + 1], False)
+                    for i in flagged_hop_indices
+                ):
+                    filtered.append(inst)
+            instances = filtered
+
         # Scoring uses _score_motif_from_edges which requires anchor-pattern
         # geometry (entity-level polygons). Event patterns store
         # per-transaction polygons keyed by event_key, so motif edges
-        # (account, account) do not map back to event-pattern geometry.
-        # Score is silently skipped when pattern_type == "event"; future
-        # work wires up the anchor-companion lookup for event-
-        # pattern scoring.
-        if score and instances and pattern.pattern_type != "event":
+        # (account, account) must use the anchor pattern's per-entity
+        # geometry instead. _resolve_anchor_pattern_for_scoring picks the
+        # anchor whose entity_line covers the edge endpoints.
+        if score and instances:
+            anchor_pid = self._resolve_anchor_pattern_for_scoring(pattern_id)
+            if anchor_pid is None or anchor_pid == pattern_id:
+                raise GDSNavigationError(
+                    f"score=True requires an anchor pattern whose "
+                    f"entity_line covers edge endpoints of {pattern_id!r}; "
+                    f"none found. Declare an anchor pattern in the "
+                    f"sphere config.",
+                )
+            # Hoist BOTH delta reads out of the per-motif loop:
+            #   * anchor pattern (per-account geometry, ~500k rows)
+            #   * event pattern (per-transaction polygons, ~5M rows on AML)
+            # Union all motifs' endpoints / event_keys once and pay a
+            # single Lance scan per pattern. Without this, each motif
+            # pays its own pair of reads, multiplying I/O linearly with
+            # max_results — measured 3.5× warm regression vs baseline
+            # before this hoist; with both reads hoisted F5's
+            # event-aware scoring fits within the perf gate.
+            all_anchor_keys: set[str] = set()
+            all_event_keys: set[str] = set()
+            for inst in instances:
+                for node in inst["nodes"]:
+                    all_anchor_keys.add(node)
+                all_event_keys.update(inst["edges"])
+            anchor_version = self._resolve_version(anchor_pid)
+            anchor_delta_map = self._batch_read_deltas(
+                anchor_pid, anchor_version, all_anchor_keys,
+            )
+            event_version = self._resolve_version(pattern_id)
+            event_delta_map = self._batch_read_deltas(
+                pattern_id, event_version, all_event_keys,
+            )
+            graph_pid = self._resolve_motif_graph_pid(anchor_pid)
+            anchor_adj = self._storage.get_adjacency(graph_pid)
+            pair_counts = anchor_adj.pair_counts()
+
             scored: list[dict[str, Any]] = []
             for inst in instances:
                 edge_pairs = [
                     (inst["nodes"][i], inst["nodes"][i + 1])
                     for i in range(len(inst["edges"]))
                 ]
-                try:
-                    breakdown = self._score_motif_from_edges(
-                        edges=edge_pairs, pattern_id=pattern_id,
+                event_factors_for_motif: list[float] = []
+                for ek in inst["edges"]:
+                    ed = event_delta_map.get(ek)
+                    event_factors_for_motif.append(
+                        1.0 if ed is None
+                        else 1.0 + float(np.linalg.norm(ed)),
                     )
-                    inst_with_score = dict(inst)
-                    inst_with_score["score"] = breakdown.get("score", 0.0)
-                    inst_with_score["score_breakdown"] = breakdown.get(
-                        "breakdown", [],
-                    )
-                    scored.append(inst_with_score)
-                except GDSNavigationError:
-                    # Anchor companion not addressable — keep instance unscored.
+                score_result = self._lean_score_motif(
+                    edge_pairs, anchor_delta_map, pair_counts,
+                    event_factors=event_factors_for_motif,
+                )
+                if score_result is None:
+                    # Endpoint missing in anchor geometry — silent skip.
                     scored.append(dict(inst))
+                    continue
+                inst_with_score = dict(inst)
+                inst_with_score["score"] = score_result.get("score", 0.0)
+                inst_with_score["score_breakdown"] = score_result.get(
+                    "breakdown", [],
+                )
+                inst_with_score["anchor_pattern_id"] = anchor_pid
+                scored.append(inst_with_score)
             scored.sort(key=lambda m: -m.get("score", 0.0))
             instances = scored
 

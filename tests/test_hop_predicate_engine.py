@@ -234,11 +234,11 @@ def test_empty_hops_raises():
         enumerate_motifs_by_hops(out_map, in_map, hops=[], seed_keys=["A"])
 
 
-def test_hop_count_above_six_raises():
+def test_hop_count_above_eight_raises():
     out_map, in_map = _maps_from_rows([("A", "B", "ek1", 0.0, 100.0)])
-    with pytest.raises(ValueError, match="hop count must be 1..6"):
+    with pytest.raises(ValueError, match="hop count must be 1..8"):
         enumerate_motifs_by_hops(
-            out_map, in_map, hops=[HopPredicate()] * 7, seed_keys=["A"],
+            out_map, in_map, hops=[HopPredicate()] * 9, seed_keys=["A"],
         )
 
 
@@ -367,3 +367,220 @@ def test_direction_any_window_uses_absolute_delta():
     )
     # |1000 - 500| = 500s > 360s → reject.
     assert motifs_tight == []
+
+
+# ─────────────────────────────────────────────────────────────────────
+# HopPredicate.amount_ratio_to_prev — decreasing-chain semantic
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_amount_ratio_to_prev_decreasing_chain():
+    out_map, in_map = _maps_from_rows([
+        ("A", "B", "e1", 0.0,   1000.0),
+        ("B", "C", "e2", 100.0,  500.0),
+        ("C", "D", "e3", 200.0,  200.0),
+    ])
+    motifs = enumerate_motifs_by_hops(
+        out_map, in_map,
+        hops=[
+            HopPredicate(),
+            HopPredicate(amount_ratio_to_prev=0.6),
+            HopPredicate(amount_ratio_to_prev=0.6),
+        ],
+        seed_keys=["A"],
+        max_results=10,
+    )
+    assert len(motifs) == 1
+    assert motifs[0]["nodes"] == ["A", "B", "C", "D"]
+
+
+def test_amount_ratio_to_prev_rejects_when_ratio_exceeded():
+    out_map, in_map = _maps_from_rows([
+        ("A", "B", "e1", 0.0,   1000.0),
+        ("B", "C", "e2", 100.0,  700.0),
+    ])
+    motifs = enumerate_motifs_by_hops(
+        out_map, in_map,
+        hops=[HopPredicate(), HopPredicate(amount_ratio_to_prev=0.5)],
+        seed_keys=["A"],
+        max_results=10,
+    )
+    assert motifs == []
+
+
+def test_amount_ratio_to_prev_zero_prev_skipped():
+    out_map, in_map = _maps_from_rows([
+        ("A", "B", "e1", 0.0,   0.0),
+        ("B", "C", "e2", 100.0, 500.0),
+    ])
+    motifs = enumerate_motifs_by_hops(
+        out_map, in_map,
+        hops=[HopPredicate(), HopPredicate(amount_ratio_to_prev=0.5)],
+        seed_keys=["A"],
+        max_results=10,
+    )
+    assert motifs == []
+
+
+def test_amount_ratio_to_prev_negative_current_skipped():
+    out_map, in_map = _maps_from_rows([
+        ("A", "B", "e1", 0.0,   100.0),
+        ("B", "C", "e2", 100.0, -50.0),
+    ])
+    motifs = enumerate_motifs_by_hops(
+        out_map, in_map,
+        hops=[HopPredicate(), HopPredicate(amount_ratio_to_prev=0.5)],
+        seed_keys=["A"],
+        max_results=10,
+    )
+    assert motifs == []
+
+
+def test_amount_ratio_to_prev_hop0_must_be_none():
+    with pytest.raises(ValueError, match=r"hops\[0\]\.amount_ratio_to_prev"):
+        enumerate_motifs_by_hops(
+            {}, {},
+            hops=[HopPredicate(amount_ratio_to_prev=0.5)],
+            seed_keys=["X"],
+            max_results=10,
+        )
+
+
+@pytest.mark.parametrize("ratio,ok", [
+    (0.0, False),
+    (-0.1, False),
+    (1.5, False),
+    (10.0, False),
+    (0.5, True),
+    (1.0, True),
+    (0.001, True),
+])
+def test_amount_ratio_to_prev_must_be_in_unit_interval(ratio, ok):
+    hops = [HopPredicate(), HopPredicate(amount_ratio_to_prev=ratio)]
+    if ok:
+        motifs = enumerate_motifs_by_hops(
+            {}, {}, hops=hops, seed_keys=["X"], max_results=1,
+        )
+        assert motifs == []
+    else:
+        with pytest.raises(ValueError, match="amount_ratio_to_prev"):
+            enumerate_motifs_by_hops(
+                {}, {}, hops=hops, seed_keys=["X"], max_results=1,
+            )
+
+
+def test_amount_ratio_to_prev_with_direction_reverse():
+    """In reverse traversal, 'prev' is traversal-prev (later-in-time edge).
+    Ratio compares current against the last hop in the walk sequence."""
+    out_map, in_map = _maps_from_rows([
+        ("B", "A", "e_ba", 200.0, 500.0),   # traversal hop[0]: B→A (incoming to A) at ts=200
+        ("C", "B", "e_cb", 100.0, 100.0),   # traversal hop[1]: C→B (incoming to B) at ts=100
+    ])
+    motifs = enumerate_motifs_by_hops(
+        out_map, in_map,
+        hops=[
+            HopPredicate(direction="reverse"),
+            HopPredicate(direction="reverse", amount_ratio_to_prev=0.5),
+        ],
+        seed_keys=["A"],
+        max_results=10,
+    )
+    # Walk: start at A, hop[0] reverse -> finds incoming edge B→A (amount 500, ts=200),
+    # hop[1] reverse from B -> finds incoming edge C→B (amount 100, ts=100).
+    # Reverse direction enforces strict-decreasing ts: 100 < 200 → OK.
+    # ratio = 100/500 = 0.2 ≤ 0.5 → match.
+    assert len(motifs) == 1
+    assert motifs[0]["nodes"] == ["A", "B", "C"]
+
+
+# ─────────────────────────────────────────────────────────────────────
+# BFS-by-level replacement: lifted hop cap + global time-window
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_seven_hops_enumerates():
+    """k=7 chain previously rejected by the k<=6 cap; BFS lift permits."""
+    rows = [
+        (chr(ord('A') + i), chr(ord('A') + i + 1), f"e{i}", float(i * 100), 100.0)
+        for i in range(7)
+    ]
+    out_map, in_map = _maps_from_rows(rows)
+    motifs = enumerate_motifs_by_hops(
+        out_map, in_map, hops=[HopPredicate()] * 7, seed_keys=["A"], max_results=10,
+    )
+    assert len(motifs) == 1
+    assert motifs[0]["nodes"] == list("ABCDEFGH")
+
+
+def test_eight_hops_enumerates():
+    rows = [
+        (chr(ord('A') + i), chr(ord('A') + i + 1), f"e{i}", float(i * 100), 100.0)
+        for i in range(8)
+    ]
+    out_map, in_map = _maps_from_rows(rows)
+    motifs = enumerate_motifs_by_hops(
+        out_map, in_map, hops=[HopPredicate()] * 8, seed_keys=["A"], max_results=10,
+    )
+    assert len(motifs) == 1
+    assert motifs[0]["nodes"] == list("ABCDEFGHI")
+
+
+def test_nine_hops_rejected():
+    with pytest.raises(ValueError, match="hop count must be 1..8"):
+        enumerate_motifs_by_hops(
+            {}, {}, hops=[HopPredicate()] * 9, seed_keys=["A"], max_results=1,
+        )
+
+
+def test_time_window_hours_global_cap():
+    """3-hop chain spanning 30 hours total — per-hop time_delta_max_hours
+    can pass each hop, but global time_window_hours=24 must reject the
+    chain because total span exceeds 24h."""
+    rows = [
+        ("A", "B", "e1",   0.0,     100.0),
+        ("B", "C", "e2", 36000.0,   100.0),  # +10h from A→B
+        ("C", "D", "e3", 108000.0,  100.0),  # +20h more, total 30h
+    ]
+    out_map, in_map = _maps_from_rows(rows)
+    # Without global cap: per-hop windows pass.
+    motifs_no_cap = enumerate_motifs_by_hops(
+        out_map, in_map,
+        hops=[HopPredicate(),
+              HopPredicate(time_delta_max_hours=24.0),
+              HopPredicate(time_delta_max_hours=24.0)],
+        seed_keys=["A"], max_results=10,
+    )
+    assert len(motifs_no_cap) == 1
+    # With global cap of 24h: rejected (total 30h span).
+    motifs_capped = enumerate_motifs_by_hops(
+        out_map, in_map,
+        hops=[HopPredicate(),
+              HopPredicate(time_delta_max_hours=24.0),
+              HopPredicate(time_delta_max_hours=24.0)],
+        seed_keys=["A"], max_results=10,
+        time_window_hours=24.0,
+    )
+    assert motifs_capped == []
+
+
+def test_time_window_hours_default_none_no_cap():
+    rows = [("A", "B", "e1", 0.0, 100.0), ("B", "C", "e2", 1e9, 100.0)]
+    out_map, in_map = _maps_from_rows(rows)
+    motifs = enumerate_motifs_by_hops(
+        out_map, in_map, hops=[HopPredicate(), HopPredicate()],
+        seed_keys=["A"], max_results=10,
+    )
+    assert len(motifs) == 1
+
+
+def test_time_window_hours_must_be_positive():
+    with pytest.raises(ValueError, match="time_window_hours must be positive"):
+        enumerate_motifs_by_hops(
+            {}, {}, hops=[HopPredicate(), HopPredicate()],
+            seed_keys=["A"], max_results=1, time_window_hours=0.0,
+        )
+    with pytest.raises(ValueError, match="time_window_hours must be positive"):
+        enumerate_motifs_by_hops(
+            {}, {}, hops=[HopPredicate(), HopPredicate()],
+            seed_keys=["A"], max_results=1, time_window_hours=-1.0,
+        )

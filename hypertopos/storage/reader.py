@@ -201,6 +201,20 @@ class GDSReader:
             for ed in raw.get("event_dimensions", [])
         ]
 
+        from hypertopos.model.sphere import EdgeDimAggregationsRef
+        eda_raw = raw.get("edge_dim_aggregations")
+        edge_dim_aggregations = (
+            EdgeDimAggregationsRef(
+                from_event_pattern=eda_raw["from"],
+                dims=(
+                    tuple(eda_raw["dims"])
+                    if eda_raw.get("dims") is not None
+                    else None
+                ),
+            )
+            if eda_raw else None
+        )
+
         return Pattern(
             pattern_id=raw["pattern_id"],
             entity_type=raw["entity_type"],
@@ -257,6 +271,7 @@ class GDSReader:
             dim_percentiles=raw.get("dim_percentiles"),
             timestamp_col=raw.get("timestamp_col"),
             dimension_kinds=raw.get("dimension_kinds"),
+            edge_dim_aggregations=edge_dim_aggregations,
         )
 
     def _parse_alias(self, raw: dict[str, Any]) -> Alias:

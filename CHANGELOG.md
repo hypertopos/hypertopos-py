@@ -7,6 +7,137 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-05-01
+
+### Fixed
+- `find_motif_by_hops` `score=True` now functional on event patterns. The
+  scoring branch was previously dead code (gated on
+  `pattern_type != "event"`, but the function rejects non-event patterns
+  upstream), so passing `score=True` had no observable effect since the
+  declarative motif API shipped. Scoring now resolves the event pattern's
+  anchor companion via `_resolve_anchor_pattern_for_scoring` and uses the
+  anchor pattern's per-entity geometry (entity-level deltas) rather than
+  the event pattern's per-transaction polygons. Each scored motif carries
+  a new `anchor_pattern_id` provenance field. Raises `GDSNavigationError`
+  when no anchor companion is configured for the event pattern; per-motif
+  scoring failures (endpoint missing in anchor geometry) leave the motif
+  unscored without breaking the call. Output ordering: descending on
+  score, unscored motifs at tail.
+- Motif scoring kernel (`_score_motif_from_edges`, `_lean_score_motif`)
+  now event-aware via opt-in `event_keys` + `event_pattern_id` arguments.
+  Previously `edge_potential = delta_distance × (1/effective_pair_count)`
+  depended only on the node pair, so multiple distinct transactions
+  between the same `(from, to)` accounts produced identical motif scores
+  — turning ranked `find_motif_by_hops(score=True)` output into "5–10
+  distinct ranks with the rest as ties" whenever motifs shared a node
+  sequence. With the new arguments the kernel batch-reads the event
+  pattern's per-event polygons and multiplies each edge's potential by
+  `(1 + ||event_polygon[event_key]||)`; events sitting at the population
+  centroid (norm 0) keep the legacy score, anomalous events boost above.
+  Per-edge `score_breakdown` carries a new `event_factor` field when
+  event-aware. Backward compatible: legacy callers (`score_motif`,
+  `find_high_potential_motifs`, any external caller of
+  `_score_motif_from_edges` without event_keys) see unchanged scores.
+  `find_motif_by_hops` passes both arguments automatically and hoists
+  both anchor and event delta reads out of the per-motif loop (one
+  batched scan per pattern across the union of all motifs, vs.
+  per-motif reads pre-hoist) so the per-call I/O cost stays O(1) in
+  motif count.
+- `Pattern.dim_labels` and `Pattern.delta_dim()` now include aggregated
+  edge-dim names from `edge_dim_aggregations` so callers don't see a
+  stale 33-element view of a 37-element delta. Previously the property
+  returned only `relations + event_dimensions + prop_columns` — but the
+  builder appends `(source_dim)_mean` and `(source_dim)_max` columns to
+  the polygon delta when an anchor pattern declares
+  `edge_dim_aggregations: { from: <event>, dims: [...] }`. The mismatch
+  produced two visible failure classes on patterns with aggregations
+  declared:
+    - `anomaly_summary` raised `operands could not be broadcast together
+      with shapes (33,) (37,) (33,)` because `dim_sq_totals` was sized
+      from `len(pattern.dim_labels)` (33) but cluster delta vectors had
+      length 37 (33 base + 4 aggregated).
+    - `find_clusters.dim_profile`, `find_anomalies.anomaly_dimensions`,
+      `explain_anomaly` top-dim labels, `contrast_populations`
+      effect-size labels and other label-resolving paths returned
+      `dim_35` / `dim_36` placeholders for the aggregated dims instead
+      of the build-time names (`find_motif_structuring_mean`,
+      `pair_edge_count_max`, etc.).
+  Both classes are resolved by the model property fix; the aggregated
+  name convention follows `f"{source_dim}_{agg}"` for each
+  `agg ∈ AGGREGATE_NAMES = ("mean", "max")` in
+  `engine/edge_features.py`. `parse_edge_dim_aggregations` now requires
+  `dims` to be a non-empty list — the previous `dims=None` shorthand
+  ("aggregate every applicable dim") was a latent build-vs-runtime
+  inconsistency: builder appended columns from the source event
+  pattern, but the runtime model had no record of which columns. Users
+  must now declare dims explicitly. Backward compatible for spheres
+  with explicit `dims:` on disk (AML HI-small etc.); spheres that
+  somehow built with `dims=None` fail loudly at re-load and need a
+  rebuild with explicit declaration. Closes the F1.d follow-up
+  (human-readable aggregated-dim labels) and the F6 stress-test
+  wildcard for the broadcast regression.
+
+### Changed
+- `find_motif_by_hops` engine: replaced the recursive DFS walk with an
+  iterative BFS-by-level enumerator. Lifts the per-call hop count cap
+  from 6 to 8 (matches the `chain_k` motif vocabulary). Adds an optional
+  `time_window_hours: float | None` top-level parameter for total-
+  chain-span cap (independent semantic from per-hop
+  `time_delta_max_hours`; both apply when both are set). API surface
+  preserved: same enumeration output shape, all existing tests pass.
+  Cites the Paranjape-Benson-Leskovec delta-temporal motif algorithm as
+  prior art for sliding-window enumeration; the implementation is a
+  pragmatic level-synchronous BFS (PBL counts fixed-template motifs
+  without per-edge predicates, which does not fit the enumerate-with-
+  arbitrary-predicates use case).
+
+### Added
+- `HopPredicate.require_anomalous_entity: bool` — new per-hop predicate
+  field for the declarative motif API (closes the X1 predicate set
+  alongside `amount_ratio_to_prev`). When `True` on hop `i`, the
+  destination entity (`nodes[i+1]` of the resulting motif) must satisfy
+  `is_anomaly=True` in the resolved anchor companion pattern's geometry.
+  Multiple hops can set this independently; constraints AND across hops.
+  Filter runs at the navigator layer after BFS enumeration but before
+  scoring (saves scoring work on motifs that get dropped). The seed
+  (`nodes[0]`) is never checked — pre-filter `seed_keys` upfront if seed
+  coverage is needed. `max_results` applies AFTER the filter, so a
+  restrictive filter can return fewer than `max_results` motifs. Raises
+  `GDSNavigationError` when no anchor companion is configured for the
+  queried event pattern, or when the anchor pattern has no `is_anomaly`
+  column (calibration must run first). Default `False` is a no-op,
+  preserving prior behavior. Reuses the same anchor-companion lookup
+  wired by F5; no sphere format change, no rebuild required.
+- `HopPredicate.amount_ratio_to_prev: float | None` — new per-hop predicate
+  field for the declarative motif API. When set on hop `i ≥ 1`, the engine
+  rejects a candidate edge unless `current_amount / prev_hop_amount ≤
+  ratio`. Bounds `0 < ratio ≤ 1.0` enforced at validation; `hops[0]` must
+  leave the field None (no previous amount). Edges where either amount is
+  ≤ 0 are silently skipped, matching the existing `find_motif_structuring`
+  convention. Use case: declarative structuring / layering chain detection
+  without baking absolute amount thresholds (`amount_min` / `amount_max`).
+- Anchor-pattern aggregation of edge-derived dimensions (S1 extension).
+  An anchor pattern can declare `edge_dim_aggregations: { from: <event_pid>, dims: [...] }`
+  in its YAML stanza; the builder reads the event pattern's edge_features
+  sidecar and bakes per-anchor-entity `_mean` and `_max` aggregates of
+  the named source dims into the anchor polygon's `shape_snapshot`.
+  Aggregation handles two anchor regimes — `single` (anchor PK matches
+  edge `from_key` OR `to_key`, account-style) and `pair` (anchor PK
+  encoded as `<from>__<to>`, composite-pair-style); chain anchors
+  raise `NotImplementedError` and ship in 0.6.2. New
+  `EdgeDimAggregationsConfig` builder dataclass, `EdgeDimAggregationsRef`
+  runtime dataclass on `Pattern`, and
+  `engine.edge_features.aggregate_edge_dims_for_anchor` engine entry
+  point. Builder switches to a two-phase build (event patterns first,
+  anchor patterns second) when any pattern declares
+  `edge_dim_aggregations` so the sidecar dependency holds without a
+  topo sort. New aggregated dims surface automatically in every
+  existing anchor-pattern primitive (`find_anomalies`,
+  `explain_anomaly`, `find_clusters`, `find_calibration_influencers`,
+  `decompose_drift`) via the `dimension_kinds` source-of-truth — no
+  new tools, no MCP API change. Sphere format stays at 2.4; spheres
+  without the new YAML block are byte-identical.
+
 ## [0.6.0] — 2026-04-30
 
 ### Theme

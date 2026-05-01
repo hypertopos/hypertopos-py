@@ -106,6 +106,7 @@ class TestMotifScoring:
             edges: list[tuple[str, str]],
             delta_map: dict,
             pair_counts: dict,
+            **_kwargs,
         ) -> dict | None:
             breakdown: list[dict] = []
             product = 1.0

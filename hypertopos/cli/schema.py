@@ -126,6 +126,7 @@ class PatternConfig:
     semantic_dim: dict | None = None  # {"columns": [...], "n_components": int}
     # --- Edge-derived dimensions ---
     edge_dimensions: list | None = None  # list[str | dict] from YAML — parsed lazily
+    edge_dim_aggregations: dict | None = None  # {"from": <event_pid>, "dims": [...]} — parsed lazily
 
 
 @dataclass
@@ -592,6 +593,7 @@ def _parse_one_pattern(
         metric_properties=metric_props,
         semantic_dim=semantic_dim,
         edge_dimensions=spec.get("edge_dimensions"),
+        edge_dim_aggregations=spec.get("edge_dim_aggregations"),
     )
 
 

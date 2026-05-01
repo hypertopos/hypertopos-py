@@ -71,6 +71,12 @@ class EventDimDef:
     display_name: str | None = None
 
 
+@dataclass(frozen=True)
+class EdgeDimAggregationsRef:
+    from_event_pattern: str
+    dims: tuple[str, ...] | None = None
+
+
 @dataclass
 class Pattern:
     pattern_id: str
@@ -99,23 +105,47 @@ class Pattern:
     dim_percentiles: dict[str, dict[str, float]] | None = None
     timestamp_col: str | None = None
     dimension_kinds: list[str] | None = None
+    edge_dim_aggregations: "EdgeDimAggregationsRef | None" = None
 
     def delta_dim(self) -> int:
-        return len(self.relations) + len(self.event_dimensions) + len(self.prop_columns)
+        base = (
+            len(self.relations)
+            + len(self.event_dimensions)
+            + len(self.prop_columns)
+        )
+        return base + len(self._edge_dim_aggregation_names())
 
     @property
     def theta_norm(self) -> float:
         """L2 norm of the anomaly threshold vector."""
         return float(np.linalg.norm(self.theta))
 
+    def _edge_dim_aggregation_names(self) -> list[str]:
+        """Human-readable names for edge_dim_aggregations dims, in build order.
+
+        For each source dim in ``edge_dim_aggregations.dims``, produces
+        ``{dim}_mean`` and ``{dim}_max`` entries (matching the
+        ``AGGREGATE_NAMES`` tuple in ``engine/edge_features.py``). Returns
+        an empty list when the pattern has no aggregations declared.
+        """
+        agg = self.edge_dim_aggregations
+        if agg is None or not agg.dims:
+            return []
+        names: list[str] = []
+        for d in agg.dims:
+            names.append(f"{d}_mean")
+            names.append(f"{d}_max")
+        return names
+
     @property
     def dim_labels(self) -> list[str]:
-        """Human-readable dimension labels: relation display_names + event dims + prop_columns."""
+        """Human-readable dimension labels: relations + event dims + props + aggregated edge dims."""
         labels = [r.display_name if r.display_name else r.line_id for r in self.relations]
         labels.extend(
             ed.display_name or ed.column for ed in self.event_dimensions
         )
         labels.extend(self.prop_columns)
+        labels.extend(self._edge_dim_aggregation_names())
         return labels
 
     @property
@@ -578,10 +608,9 @@ class HopPredicate:
 
     Used by ``GDSNavigator.find_motif_by_hops`` to describe a custom motif
     as a list of per-hop predicates instead of a closed-vocabulary
-    ``motif_type``. The bounded MVP (0.6.0) supports ``amount_min`` /
-    ``amount_max`` / ``time_delta_max_hours`` / ``direction`` /
-    ``edge_dim_predicates``; ``amount_ratio_to_prev`` and
-    ``require_anomalous_entity`` ship in a follow-up release.
+    ``motif_type``. Supports ``amount_min`` / ``amount_max`` /
+    ``time_delta_max_hours`` / ``amount_ratio_to_prev`` / ``direction`` /
+    ``edge_dim_predicates`` / ``require_anomalous_entity``.
     """
 
     amount_min: float | None = None
@@ -595,3 +624,20 @@ class HopPredicate:
     edge_dim_predicates: dict[str, tuple[str, float]] = field(
         default_factory=dict,
     )
+    # ``amount_ratio_to_prev``: when set on hop i ≥ 1, rejects a candidate
+    # edge unless ``current_amount / prev_hop_amount ≤ ratio``. Bounds
+    # (0, 1] enforced at validation; hops[0] must leave None (no prev).
+    # Edges where either amount is ≤ 0 are silently skipped (matches
+    # existing find_motif_structuring convention). Decreasing-chain
+    # semantic for structuring / layering enumeration without baking
+    # absolute thresholds.
+    amount_ratio_to_prev: float | None = None
+    # ``require_anomalous_entity``: when True on hop i, the destination
+    # entity (``nodes[i+1]`` of the resulting motif) must satisfy
+    # ``is_anomaly=True`` in the resolved anchor companion pattern's
+    # geometry. Filter applied at navigator level after BFS, before
+    # scoring. Multiple hops may set this independently; constraints
+    # AND across hops. Seed (``nodes[0]``) is never checked — pre-filter
+    # ``seed_keys`` upfront when needed. ``max_results`` applies AFTER
+    # the filter.
+    require_anomalous_entity: bool = False

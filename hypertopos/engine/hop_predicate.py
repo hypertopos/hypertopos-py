@@ -1,14 +1,28 @@
 """Declarative motif enumeration via per-hop predicates.
 
 Walks the existing in-memory ``AdjacencyIndex`` (cached at storage level
-so repeat calls are O(1) per node lookup, no 5M-edge dict rebuild).
-For each candidate seed (single-seed list or all unique ``from_key``s),
-applies ``hops[0]`` predicates to find hop-0 candidates, then walks
-forward through hops applying temporal window, amount, direction and
-optional edge-dim predicates.
+so repeat calls are O(1) per node lookup, no full edge-table dict
+rebuild). For each candidate seed (single-seed list or all unique
+``from_key``s), iterates BFS-by-level: at each hop level, every partial
+chain in the frontier is extended by one edge subject to the hop's
+predicates (amount window, direction-aware temporal monotonicity,
+per-hop ``time_delta_max_hours``, optional ``amount_ratio_to_prev``,
+optional global ``time_window_hours`` chain-span cap, optional
+``edge_dim_predicates``).
 
-Bounded MVP — ``amount_ratio_to_prev`` and ``require_anomalous_entity``
-are NOT supported in this module; full PBL vectorisation lands in a follow-up release.
+Design note: this is a pragmatic level-synchronous BFS enumerator, not
+the Paranjape-Benson-Leskovec delta-temporal motif state machine. PBL
+counts fixed-template motifs (k=2, k=3) on temporal edge streams
+without per-edge predicates; this enumerator targets k=1..8 chains
+with arbitrary HopPredicate constraints, which is a different surface.
+PBL is cited as prior art for sliding-window enumeration; the
+``time_window_hours`` parameter expresses the analogous total-span cap
+without adopting the paper's algorithm.
+
+``require_anomalous_entity`` is enforced at the navigator layer
+post-BFS — see ``GDSNavigator.find_motif_by_hops``. The engine here is
+not aware of anchor-pattern anomaly status; the navigator filters
+motifs by destination ``is_anomaly`` after this enumerator returns.
 """
 from __future__ import annotations
 
@@ -18,6 +32,12 @@ import pyarrow as pa  # noqa: TC002 — pyarrow.Table is exposed in signatures
 
 _VALID_DIRECTIONS: frozenset[str] = frozenset({"forward", "reverse", "any"})
 _VALID_OPERATORS: frozenset[str] = frozenset({"<", "<=", ">", ">=", "=="})
+
+# Cap on intermediate frontier size relative to ``max_results`` — keeps
+# enough survivors alive so the final hop produces ``max_results``
+# results with high probability, without exponential blow-up on dense
+# graphs.
+_FRONTIER_SLACK_FACTOR = 4
 
 
 def _evaluate_predicate(value: float, op: str, threshold: float) -> bool:
@@ -139,34 +159,42 @@ def _candidates(
     return [*fwd, *rev]
 
 
-def enumerate_motifs_by_hops(
-    out_map: dict[str, list[tuple[str, float, float, str]]],
-    in_map: dict[str, list[tuple[str, float, float, str]]],
+def validate_hops(
     hops: list[Any],
     *,
-    seed_keys: list[str] | None = None,
-    max_results: int = 100,
-    edge_features: pa.Table | None = None,
-) -> list[dict[str, Any]]:
-    """Enumerate motif instances matching the per-hop predicate list.
+    time_window_hours: float | None = None,
+) -> None:
+    """Pure-input validation of a per-hop predicate list.
 
-    ``out_map`` / ``in_map`` are AdjacencyIndex._out / _in style dicts —
-    pre-sorted by timestamp ascending. Built once per pattern at storage
-    level; reused across calls.
+    Extracted so callers (navigator early-return paths, MCP tool layer)
+    can validate predicates BEFORE any sphere-state-dependent early-return
+    fires — closes the silent-accept failure class on edge-table-less
+    spheres.
 
-    Returns motif dicts with ``nodes``, ``edges``, ``timestamps``,
-    ``amounts``, ``dim_values_per_hop`` (only when edge_dim_predicates
-    were used). Stops at ``max_results``.
+    ``time_window_hours`` is the optional global chain-span cap; when
+    not None it must be strictly positive.
+
+    Raises ``ValueError`` on any rule violation.
     """
     if not hops:
         raise ValueError("hops must be non-empty")
-    if not 1 <= len(hops) <= 6:
-        raise ValueError(f"hop count must be 1..6; got {len(hops)}")
+    if not 1 <= len(hops) <= 8:
+        raise ValueError(f"hop count must be 1..8; got {len(hops)}")
+    if time_window_hours is not None and time_window_hours <= 0:
+        raise ValueError(
+            f"time_window_hours must be positive; got {time_window_hours!r}",
+        )
     if hops[0].time_delta_max_hours is not None:
         raise ValueError(
             "hops[0].time_delta_max_hours must be None — first hop has no "
             "previous timestamp to compare against; place the time-window "
             "constraint on hops[1..] instead",
+        )
+    if hops[0].amount_ratio_to_prev is not None:
+        raise ValueError(
+            "hops[0].amount_ratio_to_prev must be None — first hop has no "
+            "previous amount to compare against; place the ratio constraint "
+            "on hops[1..] instead",
         )
     for i, hp in enumerate(hops):
         if hp.direction not in _VALID_DIRECTIONS:
@@ -182,12 +210,158 @@ def enumerate_motifs_by_hops(
                 f"hops[{i}].time_delta_max_hours must be positive; "
                 f"got {hp.time_delta_max_hours!r}",
             )
+        if hp.amount_ratio_to_prev is not None:
+            if not (0 < hp.amount_ratio_to_prev <= 1.0):
+                raise ValueError(
+                    f"hops[{i}].amount_ratio_to_prev must be in (0, 1]; "
+                    f"got {hp.amount_ratio_to_prev!r}",
+                )
         for dim, (op, _v) in hp.edge_dim_predicates.items():
             if op not in _VALID_OPERATORS:
                 raise ValueError(
                     f"hops[{i}].edge_dim_predicates[{dim!r}] operator must "
                     f"be one of {sorted(_VALID_OPERATORS)}; got {op!r}",
                 )
+
+
+def _expand_one_level(
+    state: list[dict[str, Any]],
+    out_map: dict[str, list[tuple[str, float, float, str]]],
+    in_map: dict[str, list[tuple[str, float, float, str]]],
+    hp: Any,
+    hop_idx: int,
+    feature_lookup: _FeatureLookup | None,
+    requested_dims: set[str],
+    time_window_hours: float | None,
+    max_results: int,
+) -> list[dict[str, Any]]:
+    """Extend every partial chain in ``state`` by one hop.
+
+    Returns the new frontier. Predicate evaluation order matches the
+    previous DFS implementation so backward-compat is preserved.
+    """
+    next_state: list[dict[str, Any]] = []
+    frontier_cap = max(max_results * _FRONTIER_SLACK_FACTOR, max_results)
+    window_seconds = (
+        time_window_hours * 3600.0 if time_window_hours is not None else None
+    )
+
+    for chain in state:
+        prev_nodes: list[str] = chain["nodes"]
+        prev_edges: list[str] = chain["edges"]
+        prev_ts: list[float] = chain["ts"]
+        prev_amts: list[float] = chain["amts"]
+        prev_dims: list[dict[str, float]] | None = chain["dims"]
+
+        last_node = prev_nodes[-1]
+        cands = _candidates(out_map, in_map, last_node, hp.direction)
+        # Local refs avoid attribute lookups inside the per-edge loop.
+        amount_min = hp.amount_min
+        amount_max = hp.amount_max
+        time_delta_max_hours = hp.time_delta_max_hours
+        amount_ratio_to_prev = hp.amount_ratio_to_prev
+        direction = hp.direction
+        edge_dim_predicates = hp.edge_dim_predicates
+
+        for (nxt, ts, amt, ek) in cands:
+            if nxt in prev_nodes:
+                continue
+            if not _passes_amount(amt, amount_min, amount_max):
+                continue
+            # Inter-hop predicates (only fire from hop_idx >= 1).
+            if hop_idx > 0 and prev_ts:
+                last_ts = prev_ts[-1]
+                # Direction-aware temporal monotonicity:
+                #   forward → strict-increasing time
+                #   reverse → strict-decreasing time (predecessor edges
+                #             precede current edge in causal order)
+                #   any     → no monotonic constraint
+                if direction == "forward" and ts <= last_ts:
+                    continue
+                if direction == "reverse" and ts >= last_ts:
+                    continue
+                if time_delta_max_hours is not None:
+                    delta = abs(ts - last_ts)
+                    if delta > time_delta_max_hours * 3600.0:
+                        continue
+                if amount_ratio_to_prev is not None:
+                    prev_amt = prev_amts[-1]
+                    if prev_amt <= 0 or amt <= 0:
+                        continue
+                    if amt / prev_amt > amount_ratio_to_prev:
+                        continue
+            # Global chain-span cap — independent of per-hop windows.
+            # Compares current edge ts to the chain's first hop ts.
+            if window_seconds is not None and prev_ts:
+                if abs(ts - prev_ts[0]) > window_seconds:
+                    continue
+            if not _passes_edge_dim(
+                ek, edge_dim_predicates, feature_lookup,
+            ):
+                continue
+
+            row_dims = (
+                feature_lookup.values_at(ek) if feature_lookup is not None else {}
+            )
+            new_chain: dict[str, Any] = {
+                "nodes": [*prev_nodes, nxt],
+                "edges": [*prev_edges, ek],
+                "ts": [*prev_ts, ts],
+                "amts": [*prev_amts, amt],
+                "dims": (
+                    [*prev_dims, row_dims] if prev_dims is not None else None
+                ),
+            }
+            next_state.append(new_chain)
+            if len(next_state) >= frontier_cap:
+                return next_state
+
+    return next_state
+
+
+def _state_to_motif(
+    chain: dict[str, Any],
+    requested_dims: set[str],
+) -> dict[str, Any]:
+    inst: dict[str, Any] = {
+        "nodes": list(chain["nodes"]),
+        "edges": list(chain["edges"]),
+        "timestamps": list(chain["ts"]),
+        "amounts": list(chain["amts"]),
+    }
+    if requested_dims:
+        inst["dim_values_per_hop"] = list(chain["dims"] or [])
+    return inst
+
+
+def enumerate_motifs_by_hops(
+    out_map: dict[str, list[tuple[str, float, float, str]]],
+    in_map: dict[str, list[tuple[str, float, float, str]]],
+    hops: list[Any],
+    *,
+    seed_keys: list[str] | None = None,
+    max_results: int = 100,
+    edge_features: pa.Table | None = None,
+    time_window_hours: float | None = None,
+) -> list[dict[str, Any]]:
+    """Enumerate motif instances matching the per-hop predicate list.
+
+    ``out_map`` / ``in_map`` are AdjacencyIndex._out / _in style dicts —
+    pre-sorted by timestamp ascending. Built once per pattern at storage
+    level; reused across calls.
+
+    ``time_window_hours`` is an optional total-chain-span cap. When set,
+    every chain instance must satisfy
+    ``abs(current_edge_ts - first_edge_ts) <= time_window_hours * 3600``
+    on every hop after the first. This is independent of the per-hop
+    ``time_delta_max_hours`` constraint (consecutive-hop window) — both
+    apply when both are set.
+
+    Returns motif dicts with ``nodes``, ``edges``, ``timestamps``,
+    ``amounts``, ``dim_values_per_hop`` (only when edge_dim_predicates
+    were used). Stops at ``max_results``.
+    """
+    validate_hops(hops, time_window_hours=time_window_hours)
 
     requested_dims: set[str] = set()
     for hp in hops:
@@ -211,75 +385,32 @@ def enumerate_motifs_by_hops(
         seed_keys if seed_keys is not None else sorted(out_map.keys())
     )
 
-    results: list[dict[str, Any]] = []
+    # Initial frontier: one trivial partial chain per seed (no edges yet).
+    state: list[dict[str, Any]] = [
+        {
+            "nodes": [s],
+            "edges": [],
+            "ts": [],
+            "amts": [],
+            "dims": [] if requested_dims else None,
+        }
+        for s in candidate_seeds
+    ]
 
-    def _walk(
-        prev_nodes: list[str],
-        prev_edges: list[str],
-        prev_ts: list[float],
-        prev_amts: list[float],
-        prev_dim_values: list[dict[str, float]],
-        hop_idx: int,
-    ) -> None:
-        if len(results) >= max_results:
-            return
-        if hop_idx == len(hops):
-            inst: dict[str, Any] = {
-                "nodes": list(prev_nodes),
-                "edges": list(prev_edges),
-                "timestamps": list(prev_ts),
-                "amounts": list(prev_amts),
-            }
-            if requested_dims:
-                inst["dim_values_per_hop"] = list(prev_dim_values)
-            results.append(inst)
-            return
-
-        hp = hops[hop_idx]
-        current = prev_nodes[-1]
-        cands = _candidates(out_map, in_map, current, hp.direction)
-        for (nxt, ts, amt, ek) in cands:
-            if nxt in prev_nodes:
-                continue
-            if not _passes_amount(amt, hp.amount_min, hp.amount_max):
-                continue
-            if hop_idx > 0 and prev_ts:
-                # Direction-aware temporal monotonicity:
-                #   forward → strict-increasing time
-                #   reverse → strict-decreasing time (predecessor edges
-                #             precede current edge in causal order)
-                #   any     → no monotonic constraint
-                last_ts = prev_ts[-1]
-                if hp.direction == "forward" and ts <= last_ts:
-                    continue
-                if hp.direction == "reverse" and ts >= last_ts:
-                    continue
-                if hp.time_delta_max_hours is not None:
-                    delta = abs(ts - last_ts)
-                    if delta > hp.time_delta_max_hours * 3600.0:
-                        continue
-            if not _passes_edge_dim(
-                ek, hp.edge_dim_predicates, feature_lookup,
-            ):
-                continue
-
-            row_dims = (
-                feature_lookup.values_at(ek) if feature_lookup is not None else {}
-            )
-            _walk(
-                [*prev_nodes, nxt],
-                [*prev_edges, ek],
-                [*prev_ts, ts],
-                [*prev_amts, amt],
-                [*prev_dim_values, row_dims] if requested_dims else prev_dim_values,
-                hop_idx + 1,
-            )
-            if len(results) >= max_results:
-                return
-
-    for seed in candidate_seeds:
-        _walk([seed], [], [], [], [], 0)
-        if len(results) >= max_results:
+    # Apply each hop level-synchronously. Empty frontier short-circuits.
+    for hop_idx in range(len(hops)):
+        if not state:
             break
+        state = _expand_one_level(
+            state,
+            out_map,
+            in_map,
+            hops[hop_idx],
+            hop_idx,
+            feature_lookup,
+            requested_dims,
+            time_window_hours,
+            max_results,
+        )
 
-    return results
+    return [_state_to_motif(c, requested_dims) for c in state[:max_results]]

@@ -30,7 +30,7 @@ The core package is split into a few layers:
 - **Builder**: transforms source data into a complete sphere
 - **CLI**: builds and inspects spheres from the command line
 
-The `hypertopos-mcp` package sits on top of this core library and exposes the same capabilities to agents via 67 MCP tools.
+The `hypertopos-mcp` package sits on top of this core library and exposes the same capabilities to agents via 80 MCP tools.
 
 The split is deliberate:
 
@@ -175,7 +175,7 @@ graph LR
     ST --> E["Engine\ngeometry, delta,\nclustering, DTW"]
     E --> N["Navigator\nπ1–π12, detect_*"]
     N --> PS["PassiveScanner\nmulti-source\nbatch screening"]
-    N --> MCP["MCP Server\n72 tools\nstdio transport"]
+    N --> MCP["MCP Server\n80 tools\nstdio transport"]
     MCP --> Agent["AI Agent"]
     CT["CalibrationTracker\nonline drift\nWelford stats"] -.-> E
     M["Manifest\nMVCC version pin"] -.-> ST

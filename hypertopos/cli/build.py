@@ -70,6 +70,8 @@ def run_build(
         )
         print(f"Built: {out_path}")
     except Exception as exc:
+        import traceback
+        traceback.print_exc(file=sys.stderr)
         print(f"error: build failed: {exc}", file=sys.stderr)
         sys.exit(1)
 
@@ -530,6 +532,13 @@ def _add_pattern(
             pat_cfg.edge_dimensions, pattern_type=pat_cfg.type,
         )
 
+    _edge_dim_agg_cfg = None
+    if pat_cfg.edge_dim_aggregations:
+        from hypertopos.builder.mapping import parse_edge_dim_aggregations
+        _edge_dim_agg_cfg = parse_edge_dim_aggregations(
+            pat_cfg.edge_dim_aggregations, pattern_type=pat_cfg.type,
+        )
+
     builder.add_pattern(  # type: ignore[union-attr]
         pid,
         pattern_type=pat_cfg.type,
@@ -547,6 +556,7 @@ def _add_pattern(
         metric_properties=pat_cfg.metric_properties,
         semantic_dim=pat_cfg.semantic_dim,
         edge_dimensions=_edge_dims_cfg,
+        edge_dim_aggregations=_edge_dim_agg_cfg,
     )
 
     # Event dimensions

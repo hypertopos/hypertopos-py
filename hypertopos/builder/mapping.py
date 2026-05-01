@@ -123,6 +123,70 @@ def parse_edge_dimensions(
     return EdgeDimensionsConfig(dims=out)
 
 
+@dataclass(frozen=True)
+class EdgeDimAggregationsConfig:
+    from_event_pattern: str
+    dims: tuple[str, ...] | None = None
+
+
+def parse_edge_dim_aggregations(
+    raw: Any, *, pattern_type: str,
+) -> EdgeDimAggregationsConfig:
+    if pattern_type != "anchor":
+        raise ValueError(
+            f"edge_dim_aggregations are only supported on anchor patterns; "
+            f"got pattern_type={pattern_type!r}",
+        )
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"edge_dim_aggregations must be a YAML mapping; "
+            f"got {type(raw).__name__}",
+        )
+    src = raw.get("from")
+    if not src or not isinstance(src, str):
+        raise ValueError(
+            "edge_dim_aggregations must specify 'from: <event_pattern_id>'",
+        )
+    raw_dims = raw.get("dims")
+    if raw_dims is None:
+        # The previous "dims = None means aggregate every applicable
+        # source edge dim" shorthand was a latent build-vs-runtime
+        # inconsistency: the builder resolved `dims=None` to the source
+        # event pattern's `avail` list and appended N columns to the
+        # polygon delta on disk, but the runtime Pattern model retained
+        # `dims=None`, so `Pattern.dim_labels` and `Pattern.delta_dim()`
+        # had no record of the appended columns — every label-resolving
+        # call (`anomaly_summary`, `find_clusters.dim_profile`,
+        # `find_anomalies.anomaly_dimensions`, etc.) would fall back to
+        # 33-element views of 37-element deltas and either crash with a
+        # broadcast error or surface placeholder `dim_<idx>` labels.
+        # Forcing explicit declaration keeps the build-time and
+        # runtime-time views aligned without a sphere format bump.
+        raise ValueError(
+            "edge_dim_aggregations.dims must be a non-empty list of "
+            "source edge dim names; the previous 'omit dims to "
+            "aggregate everything' shorthand was a latent "
+            "build-vs-runtime inconsistency and has been removed",
+        )
+    if not isinstance(raw_dims, list):
+        raise ValueError(
+            f"edge_dim_aggregations.dims must be a list; "
+            f"got {type(raw_dims).__name__}",
+        )
+    if not raw_dims:
+        raise ValueError(
+            "edge_dim_aggregations.dims must be a non-empty list",
+        )
+    for d in raw_dims:
+        if d not in EDGE_DIM_KINDS:
+            raise ValueError(
+                f"unknown edge dimension: {d!r}; "
+                f"valid: {sorted(EDGE_DIM_KINDS)}",
+            )
+    dims = tuple(raw_dims)
+    return EdgeDimAggregationsConfig(from_event_pattern=src, dims=dims)
+
+
 @dataclass
 class RelationMapping:
     line_id: str
@@ -151,6 +215,7 @@ class PatternMapping:
     anomaly_percentile: float = 95.0
     tracked_properties: list[str] = field(default_factory=list)
     edge_dimensions: "EdgeDimensionsConfig | None" = None
+    edge_dim_aggregations: "EdgeDimAggregationsConfig | None" = None
 
 
 @dataclass
@@ -245,6 +310,12 @@ def _parse_patterns(
             if edge_dims_raw is not None
             else None
         )
+        eda_raw = spec.get("edge_dim_aggregations")
+        edge_dim_aggregations = (
+            parse_edge_dim_aggregations(eda_raw, pattern_type=pattern_type)
+            if eda_raw is not None
+            else None
+        )
         result[pattern_id] = PatternMapping(
             pattern_type=pattern_type,
             entity_line=str(entity_line),
@@ -252,6 +323,7 @@ def _parse_patterns(
             anomaly_percentile=float(spec.get("anomaly_percentile", 95.0)),
             tracked_properties=list(spec.get("tracked_properties") or []),
             edge_dimensions=edge_dimensions,
+            edge_dim_aggregations=edge_dim_aggregations,
         )
     return result
 

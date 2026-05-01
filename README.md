@@ -8,7 +8,7 @@
 [![PyArrow](https://img.shields.io/badge/format-PyArrow-red.svg)](https://arrow.apache.org/docs/python/)
 [![Lance](https://img.shields.io/badge/storage-Lance-blueviolet.svg)](https://github.com/lance-format/lance)
 [![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io)
-[![Version](https://img.shields.io/badge/version-0.6.0-%235500FF.svg)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.6.1-%235500FF.svg)](pyproject.toml)
 
 hypertopos is not a database, and not a machine learning model. It is a layer that turns relational data into a coordinate system where every entity gets a position derived from its relationships and the population around it.
 
@@ -64,7 +64,10 @@ Each capability below emerges from treating entities as points in a shared, popu
 | Hidden-influencer matrix | `find_calibration_influencers` — 4-cell classification (`hidden` / `distorter` / `standard_anomaly` / `normal`) via exact leave-one-out impact on calibration | SHAP / counterfactual: explain a prediction, not the coordinate system itself | `0.6.0` |
 | Cross-pattern temporal lead-lag | `find_lead_lag(pattern_a, pattern_b)` — cross-correlates differenced population-centroid drift; peak lag, Bonferroni-adjusted significance, per-dim FDR matrix | Granger causality on raw metrics — not on population-relative geometry | `0.6.0` |
 | Anomaly by absence | `find_density_gaps` — joint-density gaps under independence null with BH-corrected q-values; surfaces under-populated cells in named delta-space ranges | Outlier detection finds extremes; gap detection finds *missing* combinations | `0.6.0` |
-| Declarative motif API | `find_motif_by_hops(pattern_id, hops, *, seed_keys)` — caller passes per-hop `HopPredicate`s (amount / time-delta / direction / edge-dim filters); navigator walks chains of length 1..6 | Closed-vocab motif registry — no escape hatch for ad-hoc structural shapes | `0.6.0` |
+| Declarative motif API | `find_motif_by_hops(pattern_id, hops, *, seed_keys)` — caller passes per-hop `HopPredicate`s (amount / time-delta / direction / edge-dim filters); navigator walks chains of length 1..8 with optional total-span cap (`time_window_hours`) | Closed-vocab motif registry — no escape hatch for ad-hoc structural shapes | `0.6.0` |
+| Anchor-pattern aggregation of edge-derived dims | Anchor patterns declare `edge_dim_aggregations:` to bake per-edge sidecar signals (`pair_edge_count`, `find_motif_structuring`, …) into per-anchor `_mean` / `_max` columns; surfaces in every anchor primitive (`find_anomalies`, `explain_anomaly`, `find_clusters`) | Hand-rolled SQL roll-up + manual feature engineering | `0.6.1` |
+| Richer hop predicates | `HopPredicate.amount_ratio_to_prev` (decreasing-chain ratio) and `require_anomalous_entity` (filter chains routing through calibrated-anomalous nodes) extend the declarative motif API | Closed-vocab motif library has fixed amount thresholds and no anomaly-routing filter | `0.6.1` |
+| Event-aware motif scoring | `find_motif_by_hops(score=True)` ranks motifs by the product of event-aware `edge_potential` across edges (uses both the anchor companion's per-entity geometry and the event pattern's per-transaction polygons); distinct transactions between the same accounts produce distinct scores | Pure node-pair scoring collapses ranks when motifs share a node sequence | `0.6.1` |
 
 ### What changes in practice
 
@@ -83,6 +86,8 @@ The same problems look different when graph, time, and statistics are unified:
 | Root-cause an anomaly | Manual chain: explain → counterparties → contagion → hub check, 4+ tool calls | `trace_root_cause(entity)` — single call returns bounded DAG of evidence |
 | Detect relationship layering | Custom rule engine or manual rare-pair SQL queries | `edge_potential(A, B)` — per-edge score combining endpoint distance and pair rarity |
 | Match AML typology patterns | Graph DB subgraph queries + separate risk scoring | `find_motif(type="structuring", …)` — structural pattern + geometric rarity product |
+| Match ad-hoc structural chains | Custom subgraph queries per shape, no built-in scoring | `find_motif_by_hops(hops=[HopPredicate(...)])` — declarative per-hop predicates (amount, time, direction, edge-dim, ratio-to-prev, anomaly filter) with event-aware geometric scoring on the same call |
+| Account-level transaction layering recall | Hand-rolled SQL roll-ups of per-edge signals into account features | `edge_dim_aggregations:` on the anchor pattern bakes per-edge structuring / pair-recurrence / chain-depth signals into anchor geometry — read off `find_anomalies` like any other dim |
 | Direction of behavioural drift | Drift magnitude alone — no toward/away-from-centre signal | `attract_drift` returns `drift_direction ∈ {normalizing, deteriorating, neutral}` |
 
 ## Benchmarks

@@ -150,6 +150,110 @@ def compute_find_motif_structuring(
     return pa.array(out, type=pa.float32())
 
 
+AGGREGATE_NAMES: tuple[str, ...] = ("mean", "max")
+
+
+def aggregate_kind(source_kind: str, agg: str) -> str:
+    if agg == "mean":
+        return "gaussian"
+    if agg == "max":
+        return "bernoulli" if source_kind == "bernoulli" else "gaussian"
+    raise ValueError(f"unknown aggregate: {agg!r}")
+
+
+def aggregate_edge_dims_for_anchor(
+    *,
+    anchor_keys: list[str],
+    edges: pa.Table,
+    sidecar: pa.Table,
+    dims: list[str],
+    anchor_kind: str,
+    pair_separator: str = "→",
+) -> pa.Table:
+    if anchor_kind == "chain":
+        raise NotImplementedError(
+            "anchor_kind='chain' aggregation ships in 0.6.2 — chain "
+            "membership lookup is not yet exposed at the polygon-build site",
+        )
+    if anchor_kind not in ("single", "pair"):
+        raise ValueError(
+            f"anchor_kind must be one of 'single' / 'pair' / 'chain'; "
+            f"got {anchor_kind!r}",
+        )
+    for d in dims:
+        if d not in EDGE_DIM_KINDS:
+            raise ValueError(
+                f"unknown edge dimension: {d!r}; "
+                f"valid: {sorted(EDGE_DIM_KINDS)}",
+            )
+        if d not in sidecar.column_names:
+            raise ValueError(
+                f"edge dimension {d!r} not present in sidecar; "
+                f"available: {sorted(set(sidecar.column_names) - {'event_key'})}",
+            )
+
+    n_anchors = len(anchor_keys)
+    out_cols: dict[str, pa.Array] = {
+        "primary_key": pa.array(anchor_keys, type=pa.string()),
+    }
+
+    if edges.num_rows == 0 or sidecar.num_rows == 0:
+        for d in dims:
+            for agg in AGGREGATE_NAMES:
+                out_cols[f"{d}_{agg}"] = pa.array(
+                    np.zeros(n_anchors, dtype=np.float32),
+                )
+        return pa.table(out_cols)
+
+    joined = edges.join(sidecar, keys="event_key")
+
+    if anchor_kind == "single":
+        from_pk_arr = joined["from_key"].combine_chunks()
+        to_pk_arr   = joined["to_key"].combine_chunks()
+        anchor_pk_arr = pa.concat_arrays([from_pk_arr, to_pk_arr])
+        dim_arrays: dict[str, pa.Array] = {}
+        for d in dims:
+            v = joined[d].combine_chunks()
+            dim_arrays[d] = pa.concat_arrays([v, v])
+    else:
+        from_pks = joined["from_key"].combine_chunks().to_pylist()
+        to_pks   = joined["to_key"].combine_chunks().to_pylist()
+        anchor_pk_arr = pa.array(
+            [
+                f"{f}{pair_separator}{t}"
+                for f, t in zip(from_pks, to_pks, strict=False)
+            ],
+            type=pa.string(),
+        )
+        dim_arrays = {
+            d: joined[d].combine_chunks() for d in dims
+        }
+
+    base = pa.table({"primary_key": anchor_pk_arr, **dim_arrays})
+    aggs: list[tuple[str, str]] = []
+    for d in dims:
+        aggs.append((d, "mean"))
+        aggs.append((d, "max"))
+    grouped = base.group_by("primary_key").aggregate(aggs)
+    pk_to_idx = {
+        pk: i for i, pk in enumerate(grouped["primary_key"].to_pylist())
+    }
+
+    for d in dims:
+        for agg in AGGREGATE_NAMES:
+            col_name = f"{d}_{agg}"
+            grouped_col = f"{d}_{agg}"
+            buf = np.zeros(n_anchors, dtype=np.float32)
+            for i, pk in enumerate(anchor_keys):
+                gi = pk_to_idx.get(pk)
+                if gi is not None:
+                    val = grouped[grouped_col][gi].as_py()
+                    if val is not None and not (val != val):
+                        buf[i] = float(val)
+            out_cols[col_name] = pa.array(buf)
+    return pa.table(out_cols)
+
+
 def compute_all_edge_dims(
     edges: pa.Table, config: dict[str, dict[str, Any]],
 ) -> pa.Table:

@@ -340,7 +340,7 @@ names in user-supplied `dim_pairs`.
 | `parse_edge_dimensions(raw_list, *, pattern_type)` | Parse + validate the YAML list of dim entries (bare strings or single-key dicts). Raises `ValueError` on anchor pattern, `min_position < 3`, `cv_threshold` outside `(0, 1]`, `min_count < 2`, non-positive `amt1_min` / `amt2_max` / `time_window_hours`, negative `burst_seconds`, duplicate or unknown dim names, malformed entries |
 | `EdgeDimAggregationsConfig(from_event_pattern: str, dims: tuple[str, ...])` | Parsed `edge_dim_aggregations:` block on an anchor pattern — frozen dataclass attached to `PatternMapping.edge_dim_aggregations`. `dims` is a non-empty tuple of source dim names |
 | `parse_edge_dim_aggregations(raw_dict, *, pattern_type)` | Parse + validate the YAML mapping. Raises `ValueError` on event pattern, missing `from`, missing or empty `dims` (non-empty list required), non-list `dims`, or unknown dim name |
-| `aggregate_edge_dims_for_anchor(*, anchor_keys, edges, sidecar, dims, anchor_kind)` | Aggregate per-edge sidecar dim values up to per-anchor `_mean` / `_max` columns. `anchor_kind` ∈ `{single, pair}`; `chain` raises `NotImplementedError`. Returns a `pa.Table` keyed by `primary_key` |
+| `aggregate_edge_dims_for_anchor(*, anchor_keys, edges, sidecar, dims, anchor_kind, pair_separator, chain_events)` | Aggregate per-edge sidecar dim values up to per-anchor `_mean` / `_max` columns. `anchor_kind` ∈ `{single, pair, chain}`. For chain regime, pass `chain_events: list[str]` of comma-joined event_keys per anchor (one per `anchor_keys` entry); `edges` arg is ignored. Returns a `pa.Table` keyed by `primary_key` |
 
 ### Calibration History (GDSReader)
 

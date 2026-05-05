@@ -497,6 +497,7 @@ class GDSBuilder:
         self._composite_lines: list = []  # CompositeLineSpec list
         self._graph_features: list = []  # GraphFeaturesSpec list
         self._chain_dims: list = []  # (line_id, feature_name, edge_max) tuples
+        self._chain_lines: set[str] = set()  # line_ids registered via add_chain_line
         self._precomputed_dims: list = []  # PrecomputedDimSpec list
         self._aliases: dict[str, _AliasReg] = {}
         self._no_edges: bool = False  # set by CLI --no-edges
@@ -827,6 +828,7 @@ class GDSBuilder:
             for f in features:
                 cols[f] = []
             self.add_line(line_id, pa.table(cols), key_col="primary_key", source_id=line_id, role="anchor")
+            self._chain_lines.add(line_id)
             return self
 
         # Validate chain dict structure
@@ -863,6 +865,7 @@ class GDSBuilder:
 
         table = pa.table(cols)
         self.add_line(line_id, table, key_col="primary_key", source_id=line_id, role="anchor")
+        self._chain_lines.add(line_id)
 
         # Auto-create derived dims using pre-computed arrays (no second loop over chains)
         for f in features:
@@ -1115,6 +1118,7 @@ class GDSBuilder:
                  if cs.line_id == pat.entity_line),
                 None,
             )
+            chain_events_col: list[str] | None = None
             if pat.entity_line in src_lines:
                 anchor_kind = "single"
                 pair_separator = "→"
@@ -1127,17 +1131,27 @@ class GDSBuilder:
                         f"Pattern {pat.pattern_id!r}: edge_dim_aggregations "
                         f"on a composite anchor with k="
                         f"{len(composite_match.key_cols)} keys ships in "
-                        f"0.7.0; only k=2 (pair) is supported in 0.6.1",
+                        f"0.7.0; only k=2 (pair) is supported",
                     )
+            elif pat.entity_line in self._chain_lines:
+                # Chain regime — entity_line registered as chain via chain_lines: block.
+                # event_line consistency was validated at parse time (cli/schema.py).
+                # Zero-chain extraction is caught earlier at _validate() with a
+                # chain-specific message; by the time we reach the dispatch the
+                # entity_table is guaranteed to have rows AND a chain_events column
+                # populated by `add_chain_line`.
+                anchor_kind = "chain"
+                pair_separator = "→"  # unused in chain regime
+                chain_events_col = entity_table["chain_events"].to_pylist()
             else:
                 raise NotImplementedError(
                     f"Pattern {pat.pattern_id!r}: edge_dim_aggregations "
                     f"could not resolve anchor regime — entity_line "
                     f"{pat.entity_line!r} is neither a relation of the "
                     f"source event pattern {cfg.from_event_pattern!r} "
-                    f"(single-key regime) nor a registered composite_line "
-                    f"(pair regime). Chain-anchor aggregation ships in "
-                    f"0.6.2; other regimes are not supported.",
+                    f"(single-key regime), nor a registered composite_line "
+                    f"(pair regime), nor a registered chain_line. "
+                    f"Supported regimes: single, pair, chain.",
                 )
 
             primary_keys = entity_table["primary_key"].to_pylist()
@@ -1148,6 +1162,7 @@ class GDSBuilder:
                 dims=agg_dims,
                 anchor_kind=anchor_kind,
                 pair_separator=pair_separator,
+                chain_events=chain_events_col,
             )
             n_cols = len(agg_dims) * len(AGGREGATE_NAMES)
             edge_dim_agg_matrix = np.zeros((n, n_cols), dtype=np.float32)
@@ -4063,6 +4078,7 @@ class GDSBuilder:
                  if cs.line_id == pat.entity_line),
                 None,
             )
+            chain_events_col: list[str] | None = None
             if pat.entity_line in src_lines:
                 anchor_kind = "single"
                 pair_separator = "→"
@@ -4075,17 +4091,27 @@ class GDSBuilder:
                         f"Pattern {pat.pattern_id!r}: edge_dim_aggregations "
                         f"on a composite anchor with k="
                         f"{len(composite_match.key_cols)} keys ships in "
-                        f"0.7.0; only k=2 (pair) is supported in 0.6.1",
+                        f"0.7.0; only k=2 (pair) is supported",
                     )
+            elif pat.entity_line in self._chain_lines:
+                # Chain regime — entity_line registered as chain via chain_lines: block.
+                # event_line consistency was validated at parse time (cli/schema.py).
+                # Zero-chain extraction is caught earlier at _validate() with a
+                # chain-specific message; by the time we reach the dispatch the
+                # entity_table is guaranteed to have rows AND a chain_events column
+                # populated by `add_chain_line`.
+                anchor_kind = "chain"
+                pair_separator = "→"  # unused in chain regime
+                chain_events_col = entity_table["chain_events"].to_pylist()
             else:
                 raise NotImplementedError(
                     f"Pattern {pat.pattern_id!r}: edge_dim_aggregations "
                     f"could not resolve anchor regime — entity_line "
                     f"{pat.entity_line!r} is neither a relation of the "
                     f"source event pattern {cfg.from_event_pattern!r} "
-                    f"(single-key regime) nor a registered composite_line "
-                    f"(pair regime). Chain-anchor aggregation ships in "
-                    f"0.6.2; other regimes are not supported.",
+                    f"(single-key regime), nor a registered composite_line "
+                    f"(pair regime), nor a registered chain_line. "
+                    f"Supported regimes: single, pair, chain.",
                 )
 
             primary_keys = entity_table["primary_key"].to_pylist()
@@ -4096,6 +4122,7 @@ class GDSBuilder:
                 dims=agg_dims,
                 anchor_kind=anchor_kind,
                 pair_separator=pair_separator,
+                chain_events=chain_events_col,
             )
             n_cols = len(agg_dims) * len(AGGREGATE_NAMES)
             edge_dim_agg_matrix = np.zeros((n, n_cols), dtype=np.float32)
@@ -5666,6 +5693,26 @@ class GDSBuilder:
                 and not pat.event_dimensions
                 and not pat.tracked_properties
             ):
+                # Chain anchor with zero extracted chains lands here because
+                # `_resolve_chain_dims` had no `_chain_dims` tuples to inject
+                # (the empty-chains short-circuit in `add_chain_line` returns
+                # before populating them). The generic "declare at least one
+                # relation..." message is misleading for chains because the
+                # user did declare features — chain extraction just produced
+                # nothing.
+                if pat.entity_line in self._chain_lines:
+                    raise ValueError(
+                        f"Pattern '{pat_id}': chain extraction returned 0 "
+                        f"chains for line '{pat.entity_line}'; the auto-"
+                        f"injected chain feature relations are therefore "
+                        f"empty and the pattern has no geometry to compute. "
+                        f"Either adjust chain seed criteria in "
+                        f"chain_lines.{pat.entity_line!r} (lower "
+                        f"seed_percentile_*, increase max_hops range) so "
+                        f"extraction yields chains, or remove the chain_line "
+                        f"declaration if no chains are expected for this "
+                        f"sphere."
+                    )
                 raise ValueError(
                     f"Pattern '{pat_id}' has no dimensions: declare at least one "
                     f"relation, event dimension, derived dimension, or "

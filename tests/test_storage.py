@@ -256,10 +256,8 @@ def test_build_temporal_index(tmp_path):
 
     lance_path = tmp_path / "temporal" / "test_pattern" / "data.lance"
     ds = lance.dataset(str(lance_path))
-    indices = ds.list_indices()
-    pk_indices = [
-        idx for idx in indices if isinstance(idx, dict) and "primary_key" in idx.get("fields", [])
-    ]
+    indices = ds.describe_indices()
+    pk_indices = [idx for idx in indices if "primary_key" in idx.field_names]
     assert len(pk_indices) == 1, f"Expected 1 BTREE index on primary_key, got: {indices}"
 
 
@@ -1460,8 +1458,8 @@ class TestLanceGeometry:
         writer.write_lance_geometry(geo_table, geo_dir)
 
         ds = lance.dataset(str(geo_dir / "data.lance"))
-        indices = ds.list_indices()
-        assert any(idx["fields"] == ["delta"] for idx in indices), (
+        indices = ds.describe_indices()
+        assert any("delta" in idx.field_names for idx in indices), (
             f"No vector index on delta. Indices: {indices}"
         )
 
@@ -1498,8 +1496,8 @@ class TestLanceGeometry:
         writer.write_lance_geometry(geo_table, geo_dir)
 
         ds = lance.dataset(str(geo_dir / "data.lance"))
-        indices = ds.list_indices()
-        indexed_fields = {idx["fields"][0] for idx in indices if len(idx["fields"]) == 1}
+        indices = ds.describe_indices()
+        indexed_fields = {f for idx in indices for f in idx.field_names}
         assert "delta_norm" in indexed_fields, f"No index on delta_norm. Fields: {indexed_fields}"
         assert "is_anomaly" in indexed_fields, f"No index on is_anomaly. Fields: {indexed_fields}"
         assert "delta_rank_pct" in indexed_fields, (
@@ -1540,8 +1538,8 @@ class TestLanceGeometry:
         writer.write_lance_geometry(geo_table, geo_dir)
 
         ds = lance.dataset(str(geo_dir / "data.lance"))
-        indices = ds.list_indices()
-        indexed_fields = {idx["fields"][0] for idx in indices if len(idx["fields"]) == 1}
+        indices = ds.describe_indices()
+        indexed_fields = {f for idx in indices for f in idx.field_names}
         assert "entity_keys" in indexed_fields, (
             f"No LABEL_LIST index on entity_keys. Fields: {indexed_fields}"
         )  # noqa: E501
@@ -2936,18 +2934,30 @@ class TestAppendGeometry:
         lance_dir.mkdir(parents=True)
         lance.write_dataset(table, str(lance_dir / "data.lance"))
 
-        # Simulate index existing and covering all rows: patch list_indices to
-        # return a fake IVF-PQ index with num_indexed_rows == n_rows
+        # Simulate index existing and covering all rows: patch describe_indices to
+        # return a fake IVF-PQ index with num_rows_indexed == n_rows
+        import types
+
         ds = lance.dataset(str(lance_dir / "data.lance"))
         n_rows = ds.count_rows()
 
-        def _fake_list_indices() -> list[dict]:
-            return [{"fields": ["delta"], "num_indexed_rows": n_rows}]
+        def _fake_describe_indices() -> list:
+            return [
+                types.SimpleNamespace(
+                    name="delta_idx",
+                    type_url="/lance.table.IvfPqIndexDetails",
+                    fields=[0],
+                    field_names=["delta"],
+                    num_rows_indexed=n_rows,
+                    num_segments=1,
+                    total_size_bytes=100,
+                )
+            ]
 
         monkeypatch.setattr(
             ds.__class__,
-            "list_indices",
-            lambda self: _fake_list_indices(),
+            "describe_indices",
+            lambda self: _fake_describe_indices(),
         )
 
         result = writer._maybe_reindex_geometry("pat", threshold=0.1, version=1)
@@ -2974,13 +2984,8 @@ class TestAppendGeometry:
         assert result is True
         # Verify the index was created
         ds = lance.dataset(str(lance_dir / "data.lance"))
-        indices = ds.list_indices()
-        vector_indices = [
-            idx
-            for idx in indices
-            if "delta"
-            in (idx.get("fields", []) if isinstance(idx, dict) else getattr(idx, "fields", []))  # noqa: E501
-        ]
+        indices = ds.describe_indices()
+        vector_indices = [idx for idx in indices if "delta" in idx.field_names]
         assert len(vector_indices) > 0, f"Expected IVF-PQ index, got: {indices}"
 
     def test_append_geometry_triggers_reindex_for_large_dataset(self, tmp_path):
@@ -3008,9 +3013,7 @@ class TestAppendGeometry:
         # Verify no index yet
         ds_before = lance.dataset(str(lance_dir / "data.lance"))
         assert not any(
-            "delta"
-            in (idx.get("fields", []) if isinstance(idx, dict) else getattr(idx, "fields", []))  # noqa: E501
-            for idx in ds_before.list_indices()
+            "delta" in idx.field_names for idx in ds_before.describe_indices()
         ), "Expected no index before append_geometry"
 
         # Append extra rows — this should trigger reindex (100% unindexed)
@@ -3022,13 +3025,8 @@ class TestAppendGeometry:
         assert ds_after.count_rows() == n_initial + n_extra
 
         # Verify index now exists on delta
-        indices = ds_after.list_indices()
-        vector_indices = [
-            idx
-            for idx in indices
-            if "delta"
-            in (idx.get("fields", []) if isinstance(idx, dict) else getattr(idx, "fields", []))  # noqa: E501
-        ]
+        indices = ds_after.describe_indices()
+        vector_indices = [idx for idx in indices if "delta" in idx.field_names]
         assert len(vector_indices) > 0, f"Expected IVF-PQ index after append, got: {indices}"
 
         # Verify ANN search works

@@ -183,6 +183,7 @@ class ChainLineConfig:
     bidirectional: bool = True
     anomaly_percentile: float = 95.0
     description: str | None = None
+    edge_dim_aggregations: dict | None = None
 
 
 @dataclass
@@ -263,7 +264,7 @@ def parse_config(yaml_path: str | Path) -> SphereConfig:
     temporal = _parse_temporal(raw.get("temporal") or [], all_patterns)
     aliases = _parse_aliases(raw.get("aliases") or {}, all_patterns)
 
-    return SphereConfig(
+    cfg = SphereConfig(
         sphere_id=str(sphere_id),
         version=yaml_version,
         name=raw.get("name"),
@@ -276,6 +277,56 @@ def parse_config(yaml_path: str | Path) -> SphereConfig:
         chain_lines=chain_lines,
         temporal=temporal,
     )
+
+    # ── Cross-block validation: chain_lines.edge_dim_aggregations ──
+    # If a chain_line declares edge_dim_aggregations, the source event
+    # pattern's edge_table.event_line must match this chain_line.event_line;
+    # otherwise event_keys cannot match in the engine join.
+    for cl_id, cl_cfg in cfg.chain_lines.items():
+        eda = cl_cfg.edge_dim_aggregations
+        if eda is None:
+            continue
+        if not isinstance(eda, dict):
+            raise ValueError(
+                f"chain_lines.{cl_id}.edge_dim_aggregations must be a "
+                f"YAML mapping; got {type(eda).__name__}",
+            )
+        src_pid = eda.get("from")
+        if not src_pid or not isinstance(src_pid, str):
+            raise ValueError(
+                f"chain_lines.{cl_id}.edge_dim_aggregations must specify "
+                f"'from: <event_pattern_id>'",
+            )
+        src_pat_cfg = cfg.patterns.get(src_pid)
+        if src_pat_cfg is None:
+            raise ValueError(
+                f"chain_lines.{cl_id}.edge_dim_aggregations.from="
+                f"{src_pid!r} must reference a registered event pattern",
+            )
+        if getattr(src_pat_cfg, "type", None) != "event":
+            raise ValueError(
+                f"chain_lines.{cl_id}.edge_dim_aggregations.from="
+                f"{src_pid!r} must be an event pattern; got "
+                f"type={getattr(src_pat_cfg, 'type', None)!r}",
+            )
+        # Resolve the source event pattern's edge_table.event_line.
+        src_edge_table = getattr(src_pat_cfg, "edge_table", None)
+        if src_edge_table is not None and hasattr(src_edge_table, "event_line"):
+            src_event_line = src_edge_table.event_line
+        elif isinstance(src_edge_table, dict):
+            src_event_line = src_edge_table.get("event_line", src_pat_cfg.entity_line)
+        else:
+            src_event_line = src_pat_cfg.entity_line
+        if cl_cfg.event_line != src_event_line:
+            raise ValueError(
+                f"chain_lines.{cl_id}.event_line="
+                f"{cl_cfg.event_line!r} must match "
+                f"edge_dim_aggregations.from={src_pid!r}'s event pattern "
+                f"event_line={src_event_line!r}; otherwise event_keys "
+                f"cannot match in the join",
+            )
+
+    return cfg
 
 
 # ── sources ──────────────────────────────────────────────────────────
@@ -896,5 +947,6 @@ def _parse_chain_lines(
             bidirectional=bool(spec.get("bidirectional", True)),
             anomaly_percentile=float(spec.get("anomaly_percentile", 95.0)),
             description=spec.get("description"),
+            edge_dim_aggregations=spec.get("edge_dim_aggregations"),
         )
     return result

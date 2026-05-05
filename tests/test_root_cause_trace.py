@@ -20,7 +20,7 @@ from hypertopos.storage._schemas import EDGE_TABLE_SCHEMA
 
 
 def _empty_adjacency() -> AdjacencyIndex:
-    return AdjacencyIndex(_out={}, _in={}, _nodes=set(), _edge_count=0)
+    return AdjacencyIndex._empty()
 
 
 def _empty_edges_table() -> pa.Table:

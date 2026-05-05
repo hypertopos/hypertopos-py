@@ -117,19 +117,6 @@ def test_aggregate_kind_mapping():
     assert aggregate_kind("bernoulli", "max") == "bernoulli"
 
 
-def test_aggregate_chain_kind_raises_not_implemented():
-    edges = _edges([("e1", "A", "B")])
-    side  = _sidecar([("e1", 2.0, 0.0)])
-    with pytest.raises(NotImplementedError, match="0.6.2"):
-        aggregate_edge_dims_for_anchor(
-            anchor_keys=["chain1"],
-            edges=edges,
-            sidecar=side,
-            dims=["pair_edge_count"],
-            anchor_kind="chain",
-        )
-
-
 def test_aggregate_unknown_dim_raises():
     edges = _edges([("e1", "A", "B")])
     side  = _sidecar([("e1", 2.0, 0.0)])
@@ -192,3 +179,125 @@ def test_aggregate_empty_edges_returns_zeros():
     )
     assert out["pair_edge_count_mean"].to_pylist() == [0.0, 0.0]
     assert out["pair_edge_count_max"].to_pylist() == [0.0, 0.0]
+
+
+def test_aggregate_chain_kind_with_chain_events_works():
+    """Chain regime aggregates dim values per chain via explosion+groupby."""
+    sidecar = pa.table({
+        "event_key": ["evt1", "evt2", "evt3", "evt4", "evt5"],
+        "find_motif_structuring": pa.array(
+            [1.0, 0.0, 1.0, 0.0, 1.0], type=pa.float32(),
+        ),
+    })
+    edges = pa.table({
+        "event_key": pa.array([], type=pa.string()),
+        "from_key": pa.array([], type=pa.string()),
+        "to_key":   pa.array([], type=pa.string()),
+    })
+
+    result = aggregate_edge_dims_for_anchor(
+        anchor_keys=["chain_a", "chain_b", "chain_c"],
+        edges=edges,
+        sidecar=sidecar,
+        dims=["find_motif_structuring"],
+        anchor_kind="chain",
+        chain_events=["evt1,evt2,evt3", "evt2,evt4", "evt5"],
+    )
+
+    pks = result["primary_key"].to_pylist()
+    means = result["find_motif_structuring_mean"].to_numpy()
+    maxs  = result["find_motif_structuring_max"].to_numpy()
+    assert pks == ["chain_a", "chain_b", "chain_c"]
+    assert means == pytest.approx([2.0 / 3.0, 0.0, 1.0], abs=1e-6)
+    assert maxs  == pytest.approx([1.0, 0.0, 1.0], abs=1e-6)
+
+
+def test_aggregate_chain_kind_requires_chain_events_arg():
+    """Engine raises when chain regime is requested without chain_events list."""
+    sidecar = pa.table({
+        "event_key": ["evt1"],
+        "find_motif_structuring": pa.array([1.0], type=pa.float32()),
+    })
+    edges = pa.table({
+        "event_key": pa.array([], type=pa.string()),
+        "from_key": pa.array([], type=pa.string()),
+        "to_key":   pa.array([], type=pa.string()),
+    })
+    with pytest.raises(ValueError, match="chain regime requires chain_events"):
+        aggregate_edge_dims_for_anchor(
+            anchor_keys=["chain_a"],
+            edges=edges,
+            sidecar=sidecar,
+            dims=["find_motif_structuring"],
+            anchor_kind="chain",
+            chain_events=None,
+        )
+
+
+def test_aggregate_chain_kind_chain_events_length_mismatch():
+    """Engine raises when len(chain_events) != len(anchor_keys)."""
+    sidecar = pa.table({
+        "event_key": ["evt1"],
+        "find_motif_structuring": pa.array([1.0], type=pa.float32()),
+    })
+    edges = pa.table({
+        "event_key": pa.array([], type=pa.string()),
+        "from_key": pa.array([], type=pa.string()),
+        "to_key":   pa.array([], type=pa.string()),
+    })
+    with pytest.raises(ValueError, match="must match"):
+        aggregate_edge_dims_for_anchor(
+            anchor_keys=["chain_a", "chain_b"],
+            edges=edges,
+            sidecar=sidecar,
+            dims=["find_motif_structuring"],
+            anchor_kind="chain",
+            chain_events=["evt1"],
+        )
+
+
+def test_aggregate_chain_kind_empty_chain_events_string_returns_zero():
+    """Per-chain empty chain_events string defaults to 0.0 aggregates."""
+    sidecar = pa.table({
+        "event_key": ["evt1", "evt2"],
+        "find_motif_structuring": pa.array([1.0, 1.0], type=pa.float32()),
+    })
+    edges = pa.table({
+        "event_key": pa.array([], type=pa.string()),
+        "from_key": pa.array([], type=pa.string()),
+        "to_key":   pa.array([], type=pa.string()),
+    })
+    result = aggregate_edge_dims_for_anchor(
+        anchor_keys=["chain_with_edges", "chain_empty"],
+        edges=edges,
+        sidecar=sidecar,
+        dims=["find_motif_structuring"],
+        anchor_kind="chain",
+        chain_events=["evt1,evt2", ""],
+    )
+    means = result["find_motif_structuring_mean"].to_numpy()
+    maxs  = result["find_motif_structuring_max"].to_numpy()
+    assert means == pytest.approx([1.0, 0.0])
+    assert maxs  == pytest.approx([1.0, 0.0])
+
+
+def test_aggregate_chain_kind_unknown_event_keys_skipped():
+    """Chain event_keys not in sidecar contribute nothing to aggregates."""
+    sidecar = pa.table({
+        "event_key": ["evt1", "evt2"],
+        "find_motif_structuring": pa.array([1.0, 1.0], type=pa.float32()),
+    })
+    edges = pa.table({
+        "event_key": pa.array([], type=pa.string()),
+        "from_key": pa.array([], type=pa.string()),
+        "to_key":   pa.array([], type=pa.string()),
+    })
+    result = aggregate_edge_dims_for_anchor(
+        anchor_keys=["chain_with_unknown"],
+        edges=edges,
+        sidecar=sidecar,
+        dims=["find_motif_structuring"],
+        anchor_kind="chain",
+        chain_events=["evt1,evt_missing,evt2"],
+    )
+    assert result["find_motif_structuring_mean"][0].as_py() == pytest.approx(1.0)

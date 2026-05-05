@@ -25,7 +25,7 @@ def _mock_edges_table(pairs: list[tuple[str, str]]) -> pa.Table:
 def _make_adjacency(pairs: list[tuple[str, str]]):
     from hypertopos.engine.adjacency import AdjacencyIndex
     if not pairs:
-        return AdjacencyIndex(_out={}, _in={}, _nodes=set(), _edge_count=0)
+        return AdjacencyIndex._empty()
     return AdjacencyIndex.from_edge_lists(
         from_keys=[p[0] for p in pairs],
         to_keys=[p[1] for p in pairs],

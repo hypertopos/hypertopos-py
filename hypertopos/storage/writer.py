@@ -392,23 +392,14 @@ class GDSWriter:
         has_vector_index = False
         indexed_rows: int = n_rows  # optimistic default when index exists
         with suppress(Exception):
-            indices = ds.list_indices()
+            indices = ds.describe_indices()
             for idx in indices:
-                fields = (
-                    idx.get("fields", []) if isinstance(idx, dict)
-                    else getattr(idx, "fields", [])
-                )
-                if "delta" in fields:
+                # field_names is the list of column names this index covers
+                if "delta" in idx.field_names:
                     has_vector_index = True
-                    # Try to read num_indexed_rows if Lance exposes it
-                    num_indexed = (
-                        idx.get("num_indexed_rows")
-                        if isinstance(idx, dict)
-                        else getattr(idx, "num_indexed_rows", None)
-                    )
-                    if num_indexed is not None:
-                        indexed_rows = int(num_indexed)
-                    break
+                    if idx.num_rows_indexed is not None:
+                        indexed_rows = int(idx.num_rows_indexed)
+                    break  # delta vector index found, no need to keep scanning
 
         unindexed = n_rows if not has_vector_index else max(0, n_rows - indexed_rows)
 

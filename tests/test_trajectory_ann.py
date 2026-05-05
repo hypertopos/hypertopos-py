@@ -208,10 +208,12 @@ def test_build_trajectory_uses_ivf_flat(fixture_sphere_path: Path) -> None:
         pytest.skip("Too few entities for index creation")
     traj_path = fixture_sphere_path / "_gds_meta" / "trajectory" / f"{pattern_id}.lance"
     ds = _lance.dataset(str(traj_path))
-    indices = ds.list_indices()
+    indices = ds.describe_indices()
     assert len(indices) > 0
     idx = indices[0]
-    assert idx["type"] == "IVF_FLAT", f"Expected IVF_FLAT, got {idx['type']}"
+    assert "IvfFlat" in idx.type_url or "IVF_FLAT" in idx.type_url, (
+        f"Expected IVF_FLAT index, got type_url: {idx.type_url}"
+    )
 
 
 def test_trajectory_vectorized_correctness(

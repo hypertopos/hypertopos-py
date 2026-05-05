@@ -460,9 +460,9 @@ def test_builder_geometry_has_ann_index_when_large(tmp_path):
     geo_path = str(tmp_path / "gds_large" / "geometry" / "gl_entry_pattern" / "v=1" / "data.lance")
     ds = lance.dataset(geo_path)
 
-    # Lance stores index metadata accessible via ds.list_indices()
-    indices = ds.list_indices()
-    index_names = [idx["name"] if isinstance(idx, dict) else idx.name for idx in indices]
+    # Lance stores index metadata accessible via ds.describe_indices()
+    indices = ds.describe_indices()
+    index_names = [idx.name for idx in indices]
     vector_indices = [
         n
         for n in index_names

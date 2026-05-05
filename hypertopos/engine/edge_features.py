@@ -169,17 +169,24 @@ def aggregate_edge_dims_for_anchor(
     dims: list[str],
     anchor_kind: str,
     pair_separator: str = "→",
+    chain_events: list[str] | None = None,
 ) -> pa.Table:
-    if anchor_kind == "chain":
-        raise NotImplementedError(
-            "anchor_kind='chain' aggregation ships in 0.6.2 — chain "
-            "membership lookup is not yet exposed at the polygon-build site",
-        )
-    if anchor_kind not in ("single", "pair"):
+    if anchor_kind not in ("single", "pair", "chain"):
         raise ValueError(
             f"anchor_kind must be one of 'single' / 'pair' / 'chain'; "
             f"got {anchor_kind!r}",
         )
+    if anchor_kind == "chain":
+        if chain_events is None:
+            raise ValueError(
+                "chain regime requires chain_events="
+                "list[str] of comma-joined event_keys per anchor",
+            )
+        if len(chain_events) != len(anchor_keys):
+            raise ValueError(
+                f"len(chain_events)={len(chain_events)} must match "
+                f"len(anchor_keys)={len(anchor_keys)}",
+            )
     for d in dims:
         if d not in EDGE_DIM_KINDS:
             raise ValueError(
@@ -197,12 +204,57 @@ def aggregate_edge_dims_for_anchor(
         "primary_key": pa.array(anchor_keys, type=pa.string()),
     }
 
-    if edges.num_rows == 0 or sidecar.num_rows == 0:
+    if (anchor_kind != "chain" and edges.num_rows == 0) or sidecar.num_rows == 0:
         for d in dims:
             for agg in AGGREGATE_NAMES:
                 out_cols[f"{d}_{agg}"] = pa.array(
                     np.zeros(n_anchors, dtype=np.float32),
                 )
+        return pa.table(out_cols)
+
+    if anchor_kind == "chain":
+        chain_id_flat: list[str] = []
+        event_key_flat: list[str] = []
+        for cid, evs_str in zip(anchor_keys, chain_events, strict=True):
+            if not evs_str:
+                continue
+            evs = evs_str.split(",")
+            chain_id_flat.extend([cid] * len(evs))
+            event_key_flat.extend(evs)
+
+        if not chain_id_flat:
+            for d in dims:
+                for agg in AGGREGATE_NAMES:
+                    out_cols[f"{d}_{agg}"] = pa.array(
+                        np.zeros(n_anchors, dtype=np.float32),
+                    )
+            return pa.table(out_cols)
+
+        exploded = pa.table({
+            "primary_key": pa.array(chain_id_flat, type=pa.string()),
+            "event_key":   pa.array(event_key_flat, type=pa.string()),
+        })
+        joined = exploded.join(sidecar, keys="event_key")
+        aggs: list[tuple[str, str]] = []
+        for d in dims:
+            aggs.append((d, "mean"))
+            aggs.append((d, "max"))
+        grouped = joined.group_by("primary_key").aggregate(aggs)
+        pk_to_idx = {
+            pk: i for i, pk in enumerate(grouped["primary_key"].to_pylist())
+        }
+        for d in dims:
+            for agg in AGGREGATE_NAMES:
+                col_name = f"{d}_{agg}"
+                grouped_col = f"{d}_{agg}"
+                buf = np.zeros(n_anchors, dtype=np.float32)
+                for i, pk in enumerate(anchor_keys):
+                    gi = pk_to_idx.get(pk)
+                    if gi is not None:
+                        val = grouped[grouped_col][gi].as_py()
+                        if val is not None and not (val != val):
+                            buf[i] = float(val)
+                out_cols[col_name] = pa.array(buf)
         return pa.table(out_cols)
 
     joined = edges.join(sidecar, keys="event_key")
@@ -230,7 +282,7 @@ def aggregate_edge_dims_for_anchor(
         }
 
     base = pa.table({"primary_key": anchor_pk_arr, **dim_arrays})
-    aggs: list[tuple[str, str]] = []
+    aggs = []
     for d in dims:
         aggs.append((d, "mean"))
         aggs.append((d, "max"))

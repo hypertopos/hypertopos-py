@@ -735,11 +735,11 @@ class TestAddChainLine:
         assert tbl["chain_keys"][0].as_py() == "A,B"
 
     def test_empty_chains(self, tmp_path):
-        """Empty chain list creates empty line — build raises on missing dimensions."""
+        """Empty chain list creates empty line — build raises with chain-aware diagnostic."""
         builder = GDSBuilder("test", str(tmp_path / "sphere"))
         builder.add_chain_line("chains", [])
         builder.add_pattern("p", "anchor", "chains", relations=[])
-        with pytest.raises(ValueError, match="non-empty|no dimensions"):
+        with pytest.raises(ValueError, match="chain extraction returned 0 chains"):
             builder.build()
 
     def test_missing_chain_keys_raises(self, tmp_path):

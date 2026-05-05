@@ -215,8 +215,8 @@ def test_write_points_creates_inverted_index(tmp_path):
     lance_path = tmp_path / "points" / "items" / "v=1" / "data.lance"
     assert lance_path.exists()
     ds = lance.dataset(str(lance_path))
-    indices = ds.list_indices()
-    index_names = [(idx["name"] if isinstance(idx, dict) else idx.name) for idx in indices]
+    indices = ds.describe_indices()
+    index_names = [idx.name for idx in indices]
     # At least one INVERTED index should exist on the 'name' or 'status' column
     assert any(
         "name" in str(n).lower() or "status" in str(n).lower() or "inverted" in str(n).lower()
@@ -259,11 +259,9 @@ def _get_inverted_columns(lance_path) -> set[str]:
 
     ds = lance.dataset(str(lance_path))
     result = set()
-    for idx in ds.list_indices():
-        idx_type = idx.get("type", "") if isinstance(idx, dict) else getattr(idx, "index_type", "")
-        fields = idx.get("fields", []) if isinstance(idx, dict) else getattr(idx, "columns", [])
-        if "inverted" in str(idx_type).lower() or "inverted" in str(idx).lower():
-            for f in fields:
+    for idx in ds.describe_indices():
+        if "InvertedIndex" in idx.type_url or "inverted" in idx.type_url.lower():
+            for f in idx.field_names:
                 result.add(f)
     return result
 

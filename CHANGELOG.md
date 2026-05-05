@@ -7,6 +7,63 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.2] — 2026-05-05
+
+### Added
+- Chain-anchor `edge_dim_aggregations:` regime — third `anchor_kind`
+  alongside `single` (account-style) and `pair` (k=2 composite). Chain
+  anchor patterns auto-emitted from `chain_lines:` config can declare
+  `edge_dim_aggregations: { from: <event_pid>, dims: [...] }` directly
+  in the `chain_lines.<id>:` block; the builder forwards it to the
+  auto-emitted `<id>_pattern`. Aggregation reads the source event
+  pattern's edge_features sidecar and bakes per-chain `<source_dim>_mean`
+  and `<source_dim>_max` columns into the chain anchor polygon's
+  `shape_snapshot`. New `_chain_lines: set[str]` registry on `GDSBuilder`
+  for regime detection. `aggregate_edge_dims_for_anchor` gains a
+  `chain_events: list[str] | None` keyword for the chain regime
+  (comma-joined event_keys per anchor; engine performs explosion + join
+  + groupby). Cross-block parse-time validation enforces
+  `chain_lines.<id>.event_line == src_pat.edge_table.event_line`;
+  zero-extracted-chains with declared aggregations raise loudly at
+  build dispatch. Sphere format stays at 2.4 — `chain_events` property
+  column on the chain anchor line is the existing membership source.
+  Aggregated dims surface automatically in every existing anchor-pattern
+  primitive (`find_anomalies`, `explain_anomaly`, `find_clusters`,
+  `find_calibration_influencers`, `decompose_drift`) via
+  `dimension_kinds` source-of-truth — no new tools, no MCP API change.
+
+### Added
+- `AdjacencyIndex.neighbors_out_window` and
+  `AdjacencyIndex.neighbors_in_window` — column-selective neighbor
+  accessors. Return a per-column dict (`{col: list[Any]}`) for any subset
+  of `("to_key" / "from_key", "timestamp", "amount", "event_key")` with
+  an optional `ts_min` window predicate applied at the pyarrow C++ layer
+  before materialization. Useful for callers that need only key + timestamp
+  without paying the cost of materializing `amount` / `event_key`.
+- `AdjacencyIndex.distinct_neighbors_out`,
+  `AdjacencyIndex.distinct_neighbors_in`, and
+  `AdjacencyIndex.max_amount_out_excl_self` — O(1) public accessors over
+  precomputed per-`from_key` aggregates (distinct-out-neighbor count,
+  distinct-in-neighbor count, max-amount-excluding-self). Self-loop
+  semantics preserved; null amounts skipped.
+
+### Fixed
+- Cold-call latency on motif enumeration tools (`find_high_potential_motifs`,
+  `score_motif`, `find_motif_by_hops`) reduced across `bipartite_burst`,
+  `fan_out`, `fan_in`, and `cycle_2` motif types. No public API change.
+- `AdjacencyIndex.pair_counts()` first-call cost on hub-graph workloads
+  reduced. The aggregate is now precomputed at adjacency build time and
+  surfaced in O(1) on first call. Self-loop semantics preserved
+  (`pair_counts` includes self-pairs; distinct counts skip them).
+
+### Changed
+- `AdjacencyIndex` cold load path is faster on edge-table-backed
+  patterns; motif tools' first-call latency drops materially. No format
+  bump, no persisted artifact, no public API change — every public method
+  (`neighbors_out`, `neighbors_in`, `degree_out`, `degree_in`, `all_nodes`,
+  `all_edges`, `node_count`, `edge_count`, `pair_counts`) preserves its
+  signature and observable behavior.
+
 ## [0.6.1] — 2026-05-01
 
 ### Fixed

@@ -623,7 +623,7 @@ def _nav_with_mocked_pipeline(
             event_keys=[f"e{i}" for i in range(len(edges_rows))],
         )
     else:
-        adj = AdjacencyIndex(_out={}, _in={}, _nodes=set(), _edge_count=0)
+        adj = AdjacencyIndex.from_edge_lists([], [], [], [], [])
     nav._storage.get_adjacency = MagicMock(return_value=adj)
 
     # Build delta_map and pair_counts so _lean_score_motif reproduces the given

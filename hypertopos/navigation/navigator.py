@@ -4609,52 +4609,38 @@ class GDSNavigator:
         if motif_type == "fan_out":
             return [
                 s for s in all_seeds_set
-                if s in adj._out
-                and len({t for (t, *_r) in adj._out[s] if t != s}) >= effective_min_k
+                if adj.distinct_neighbors_out(s) >= effective_min_k
             ]
         if motif_type == "fan_in":
             return [
                 s for s in all_seeds_set
-                if s in adj._in
-                and len({f for (f, *_r) in adj._in[s] if f != s}) >= effective_min_k
+                if adj.distinct_neighbors_in(s) >= effective_min_k
             ]
         if motif_type == "split_recombine":
             if direction == "forward":
                 return [
                     s for s in all_seeds_set
-                    if s in adj._out
-                    and len({t for (t, *_r) in adj._out[s] if t != s}) >= effective_min_k
+                    if adj.distinct_neighbors_out(s) >= effective_min_k
                 ]
             return [
                 s for s in all_seeds_set
-                if s in adj._in
-                and len({f for (f, *_r) in adj._in[s] if f != s}) >= effective_min_k
+                if adj.distinct_neighbors_in(s) >= effective_min_k
             ]
         if motif_type == "bipartite_burst":
             return [
                 s for s in all_seeds_set
-                if (
-                    s in adj._out
-                    and len({t for (t, *_r) in adj._out[s] if t != s}) >= min_m
-                ) or (
-                    s in adj._in
-                    and len({f for (f, *_r) in adj._in[s] if f != s}) >= effective_min_k
-                )
+                if adj.distinct_neighbors_out(s) >= min_m
+                or adj.distinct_neighbors_in(s) >= effective_min_k
             ]
         if motif_type == "structuring":
             return [
                 s for s in all_seeds_set
-                if s in adj._out
-                and any(
-                    amt is not None and amt >= amt1_min and t != s
-                    for (t, _ts, amt, _ek) in adj._out[s]
-                )
+                if adj.max_amount_out_excl_self(s) >= amt1_min
             ]
         if motif_type == "chain_k":
             return [
                 s for s in all_seeds_set
-                if s in adj._out
-                and any(t != s for (t, *_r) in adj._out[s])
+                if adj.distinct_neighbors_out(s) > 0
             ]
         return [s for s in all_seeds if s in adj._out]
 
@@ -4665,12 +4651,14 @@ class GDSNavigator:
         window_sec: float,
         min_k: int,
     ) -> list[dict[str, Any]]:
-        edges = adj.neighbors_out(seed)
-        if not edges:
+        nbr = adj.neighbors_out_window(seed)
+        timestamps = nbr["timestamp"]
+        if not timestamps:
             return []
-        max_ts = max(ts for (_, ts, *_r) in edges)
+        to_keys = nbr["to_key"]
+        max_ts = max(timestamps)
         recent = [
-            (t, ts) for (t, ts, *_r) in edges
+            (t, ts) for t, ts in zip(to_keys, timestamps, strict=True)
             if t != seed and ts >= max_ts - window_sec
         ]
         unique = sorted({t for (t, _) in recent})
@@ -4691,12 +4679,14 @@ class GDSNavigator:
         min_k: int,
     ) -> list[dict[str, Any]]:
         """Mirror of _enum_fan_out_via_adj: seed = sink, collect distinct sources."""
-        edges = adj.neighbors_in(seed)
-        if not edges:
+        nbr = adj.neighbors_in_window(seed)
+        timestamps = nbr["timestamp"]
+        if not timestamps:
             return []
-        max_ts = max(ts for (_, ts, *_r) in edges)
+        from_keys = nbr["from_key"]
+        max_ts = max(timestamps)
         recent = [
-            (f, ts) for (f, ts, *_r) in edges
+            (f, ts) for f, ts in zip(from_keys, timestamps, strict=True)
             if f != seed and ts >= max_ts - window_sec
         ]
         unique = sorted({f for (f, _) in recent})
@@ -4821,27 +4811,36 @@ class GDSNavigator:
         only qualify on one side skip the other side entirely, eliminating the
         fruitless `_try_source` fallback that dominated Phase 1 cProfile output.
 
-        Nested helpers (_try_source_inner / _try_sink_inner) receive pre-fetched
-        edge lists so no second adj lookup is needed.  Inner logic is unchanged
-        from the original _try_source / _try_sink — small-set-first intersection
-        ordering is preserved.
+        Nested helpers (_try_source_inner / _try_sink_inner) receive the
+        per-column dict windows produced by `neighbors_out_window` /
+        `neighbors_in_window` so no second adj lookup is needed.  Inner logic
+        iterates `zip(keys, timestamps)` instead of unpacking 4-tuples — the
+        `amount` and `event_key` columns are not consumed at this layer and
+        skipping their materialization is the C1 win.  Small-set-first
+        intersection ordering is preserved.
         """
 
         def _try_source_inner(
             seed_: str,
-            out_edges_: list,
+            out_window_: dict[str, list[Any]],
         ) -> dict[str, Any] | None:
-            max_ts = max(ts for (_n, ts, *_r) in out_edges_)
+            timestamps = out_window_["timestamp"]
+            if not timestamps:
+                return None
+            to_keys = out_window_["to_key"]
+            max_ts = max(timestamps)
             sinks = sorted({
-                d for (d, ts, *_r) in out_edges_
+                d for d, ts in zip(to_keys, timestamps, strict=True)
                 if d != seed_ and ts >= max_ts - window_sec
             })
             if len(sinks) < min_m:
                 return None
             sources_per_sink: dict[str, set[str]] = {}
+            window_min = max_ts - window_sec
             for d in sinks:
-                for (f, ts, *_r) in adj.neighbors_in(d):
-                    if f == d or ts < max_ts - window_sec:
+                nbr = adj.neighbors_in_window(d, ts_min=window_min, columns=("from_key",))
+                for f in nbr["from_key"]:
+                    if f == d:
                         continue
                     sources_per_sink.setdefault(d, set()).add(f)
             sinks = [d for d in sinks if d in sources_per_sink]
@@ -4878,19 +4877,25 @@ class GDSNavigator:
 
         def _try_sink_inner(
             seed_: str,
-            in_edges_: list,
+            in_window_: dict[str, list[Any]],
         ) -> dict[str, Any] | None:
-            max_ts = max(ts for (_n, ts, *_r) in in_edges_)
+            timestamps = in_window_["timestamp"]
+            if not timestamps:
+                return None
+            from_keys = in_window_["from_key"]
+            max_ts = max(timestamps)
             sources = sorted({
-                f for (f, ts, *_r) in in_edges_
+                f for f, ts in zip(from_keys, timestamps, strict=True)
                 if f != seed_ and ts >= max_ts - window_sec
             })
             if len(sources) < min_k:
                 return None
             sinks_per_source: dict[str, set[str]] = {}
+            window_min = max_ts - window_sec
             for s in sources:
-                for (d, ts, *_r) in adj.neighbors_out(s):
-                    if d == s or ts < max_ts - window_sec:
+                nbr = adj.neighbors_out_window(s, ts_min=window_min, columns=("to_key",))
+                for d in nbr["to_key"]:
+                    if d == s:
                         continue
                     sinks_per_source.setdefault(s, set()).add(d)
             sources = [s for s in sources if s in sinks_per_source]
@@ -4925,19 +4930,21 @@ class GDSNavigator:
                 "edges": edges,
             }
 
-        out_edges = adj.neighbors_out(seed)
-        in_edges = adj.neighbors_in(seed)
-        if not out_edges and not in_edges:
+        out_window = adj.neighbors_out_window(seed)
+        in_window = adj.neighbors_in_window(seed)
+        out_to_keys = out_window["to_key"]
+        in_from_keys = in_window["from_key"]
+        if not out_to_keys and not in_from_keys:
             return []
 
-        distinct_out = len({t for (t, *_r) in out_edges if t != seed})
-        distinct_in = len({f for (f, *_r) in in_edges if f != seed})
+        distinct_out = len({t for t in out_to_keys if t != seed})
+        distinct_in = len({f for f in in_from_keys if f != seed})
 
         candidates: list = []
         if distinct_out >= min_m:
-            candidates.append(lambda: _try_source_inner(seed, out_edges))
+            candidates.append(lambda: _try_source_inner(seed, out_window))
         if distinct_in >= min_k:
-            candidates.append(lambda: _try_sink_inner(seed, in_edges))
+            candidates.append(lambda: _try_sink_inner(seed, in_window))
 
         for fn in candidates:
             hit = fn()
@@ -4951,16 +4958,16 @@ class GDSNavigator:
         adj: "AdjacencyIndex",
         window_sec: float,
     ) -> list[dict[str, Any]]:
-        out_edges = adj.neighbors_out(seed)
-        in_edges = adj.neighbors_in(seed)
-        if not out_edges or not in_edges:
+        out_nbr = adj.neighbors_out_window(seed)
+        in_nbr = adj.neighbors_in_window(seed)
+        if not out_nbr["timestamp"] or not in_nbr["timestamp"]:
             return []
         out_by_cp: dict[str, list[float]] = defaultdict(list)
-        for (t, ts, *_r) in out_edges:
+        for t, ts in zip(out_nbr["to_key"], out_nbr["timestamp"], strict=True):
             if t != seed:
                 out_by_cp[t].append(ts)
         in_by_cp: dict[str, list[float]] = defaultdict(list)
-        for (f, ts, *_r) in in_edges:
+        for f, ts in zip(in_nbr["from_key"], in_nbr["timestamp"], strict=True):
             if f != seed:
                 in_by_cp[f].append(ts)
         results: list[dict[str, Any]] = []
@@ -13179,7 +13186,7 @@ class GDSNavigator:
             frontier = next_frontier
 
         if not edge_tables:
-            return AdjacencyIndex(_out={}, _in={}, _nodes=set(), _edge_count=0)
+            return AdjacencyIndex._empty()
 
         combined = pa.concat_tables(edge_tables)
         # Forward + reverse reads of overlapping subgraphs surface the same

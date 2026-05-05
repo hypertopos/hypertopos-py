@@ -924,6 +924,14 @@ def _add_chain_line(
         chains=chain_dicts,
         features=cl_cfg.features,
     )
+    # Parse edge_dim_aggregations dict (if any) into EdgeDimAggregationsConfig.
+    # Cross-block event_line consistency was validated at parse_config time.
+    eda_cfg = None
+    if cl_cfg.edge_dim_aggregations is not None:
+        from hypertopos.builder.mapping import parse_edge_dim_aggregations
+        eda_cfg = parse_edge_dim_aggregations(
+            cl_cfg.edge_dim_aggregations, pattern_type="anchor",
+        )
     # Auto-create pattern for chain line
     builder.add_pattern(  # type: ignore[union-attr]
         f"{cl_id}_pattern",
@@ -932,6 +940,7 @@ def _add_chain_line(
         relations=[],
         anomaly_percentile=cl_cfg.anomaly_percentile,
         description=cl_cfg.description,
+        edge_dim_aggregations=eda_cfg,
     )
 
 

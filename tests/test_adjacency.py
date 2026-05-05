@@ -67,13 +67,14 @@ def test_pair_counts_matches_defaultdict_baseline():
     }
 
 
-def test_pair_counts_lazy_and_cached():
+def test_pair_counts_eagerly_populated_and_cached():
     idx = AdjacencyIndex.from_edge_lists(
         from_keys=["A", "A"], to_keys=["B", "C"],
         timestamps=[1.0, 2.0], amounts=[10.0, 20.0],
         event_keys=["e1", "e2"],
     )
-    assert idx._pair_counts is None
+    # _pair_counts eagerly populated by _from_table — must not be None after construction
+    assert idx._pair_counts is not None
     first = idx.pair_counts()
     assert idx._pair_counts is first
     second = idx.pair_counts()
@@ -81,7 +82,7 @@ def test_pair_counts_lazy_and_cached():
 
 
 def test_pair_counts_empty_adjacency():
-    idx = AdjacencyIndex(_out={}, _in={}, _nodes=set(), _edge_count=0)
+    idx = AdjacencyIndex.from_edge_lists([], [], [], [], [])
     assert idx.pair_counts() == {}
 
 

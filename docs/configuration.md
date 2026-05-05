@@ -734,6 +734,25 @@ Automatically creates an anchor line + pattern (`{line_id}_pattern`).
 | `bidirectional` | bool | `true` | Follow edges in both directions. |
 | `anomaly_percentile` | float | `95.0` | Theta for the auto-created chain pattern. |
 | `description` | string | `null` | Description for chain line + pattern. |
+| `edge_dim_aggregations` | dict | `null` | Aggregate per-edge sidecar dims of an event pattern up to per-chain `_mean` / `_max` columns baked into the chain anchor polygon. `from: <event_pid>` is required and must reference an event pattern that declares `edge_dimensions:` and whose `edge_table.event_line` matches this `chain_lines.<id>.event_line` (validated at parse time). `dims: [...]` is required — non-empty list of source dim names from the referenced sidecar. The chain anchor pattern's polygon shape grows by `2 * len(dims)` columns; downstream primitives (`find_anomalies`, `explain_anomaly`, `find_clusters`) surface the new dims transparently. |
+
+**Example with edge-dim aggregation on chain anchor:**
+
+```yaml
+chain_lines:
+  tx_chains:
+    event_line: transactions
+    from_col: from_account
+    to_col: to_account
+    features: [hop_count, is_cyclic, time_span_hours]
+    edge_dim_aggregations:
+      from: tx_pattern                    # event pattern declaring edge_dimensions
+      dims: [find_motif_structuring, position_in_chain]
+```
+
+The chain anchor `tx_chains_pattern` then exposes `find_motif_structuring_mean`,
+`find_motif_structuring_max`, `position_in_chain_mean`, `position_in_chain_max`
+in `find_anomalies` response and `Pattern.dim_labels`.
 
 ---
 

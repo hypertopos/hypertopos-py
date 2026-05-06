@@ -372,6 +372,7 @@ class PatternBuildResult:
     dimension_kinds: list[str] | None = None
     dim_block_names: list[str] = field(default_factory=list)
     dim_block_stats: dict[str, Any] | None = None
+    edge_dim_thresholds: dict[str, float] | None = None
 
 
 @dataclass
@@ -505,6 +506,26 @@ class GDSBuilder:
         # _write_calibration_epoch_for_pattern. Each thread writes a distinct
         # pattern_id key, so plain assignment is safe under ThreadPoolExecutor.
         self._calibration_state: dict[str, dict] = {}
+        # Per-pattern edge_dim_aggregations thresholds populated during the
+        # population-stats dispatch when the anchor pattern declares
+        # `edge_dim_aggregations:`. Keyed by anchor pattern_id, value is the
+        # per-source-dim threshold (population p95 by default; user override
+        # path planned). Persisted into the calibration epoch JSON so
+        # `compare_calibrations` can surface threshold drift across epochs.
+        self._edge_dim_thresholds: dict[str, dict[str, float]] = {}
+
+    def _resolve_and_persist_edge_dim_thresholds(
+        self,
+        pattern_id: str,
+        sidecar: pa.Table,
+        dims: list[str],
+        user_overrides: dict[str, float] | None = None,
+    ) -> dict[str, float]:
+        from hypertopos.engine.edge_features import _resolve_count_above_thresholds
+
+        resolved = _resolve_count_above_thresholds(sidecar, dims, user_overrides)
+        self._edge_dim_thresholds[pattern_id] = resolved
+        return resolved
 
     def add_line(
         self,
@@ -1119,20 +1140,41 @@ class GDSBuilder:
                 None,
             )
             chain_events_col: list[str] | None = None
+            composite_key_cols: list[str] | None = None
             if pat.entity_line in src_lines:
                 anchor_kind = "single"
                 pair_separator = "→"
             elif composite_match is not None:
-                if len(composite_match.key_cols) == 2:
-                    anchor_kind = "pair"
-                    pair_separator = composite_match.separator
-                else:
-                    raise NotImplementedError(
-                        f"Pattern {pat.pattern_id!r}: edge_dim_aggregations "
-                        f"on a composite anchor with k="
-                        f"{len(composite_match.key_cols)} keys ships in "
-                        f"0.7.0; only k=2 (pair) is supported",
-                    )
+                anchor_kind = "pair"
+                pair_separator = composite_match.separator
+                composite_key_cols = list(composite_match.key_cols)
+                # Convention: first two key_cols positionally map to the
+                # source event_pattern's edge_table endpoints (renamed in
+                # _extract_edge_table to from_key / to_key). Reject k>=3
+                # composite anchors that violate this — silent mismatch
+                # would produce all-zero aggregates because the anchor PK
+                # built from event_table.{key_cols[0],key_cols[1],...} would
+                # not match the engine's PK constructed from
+                # edges.{from_key, to_key, key_cols[2:]}.
+                if len(composite_key_cols) > 2 and src_pat.edge_table is not None:
+                    expected_from = src_pat.edge_table.from_col
+                    expected_to = src_pat.edge_table.to_col
+                    if (
+                        composite_key_cols[0] != expected_from
+                        or composite_key_cols[1] != expected_to
+                    ):
+                        raise ValueError(
+                            f"Pattern {pat.pattern_id!r}: composite_line "
+                            f"{composite_match.line_id!r} declares "
+                            f"key_cols={composite_key_cols!r} but "
+                            f"edge_dim_aggregations on a k>=3 composite "
+                            f"anchor requires key_cols[0:2] to positionally "
+                            f"match the source event pattern "
+                            f"{cfg.from_event_pattern!r} edge_table endpoints "
+                            f"(from_col={expected_from!r}, "
+                            f"to_col={expected_to!r}). Property columns "
+                            f"key_cols[2:] can be any event_table column.",
+                        )
             elif pat.entity_line in self._chain_lines:
                 # Chain regime — entity_line registered as chain via chain_lines: block.
                 # event_line consistency was validated at parse time (cli/schema.py).
@@ -1150,11 +1192,17 @@ class GDSBuilder:
                     f"{pat.entity_line!r} is neither a relation of the "
                     f"source event pattern {cfg.from_event_pattern!r} "
                     f"(single-key regime), nor a registered composite_line "
-                    f"(pair regime), nor a registered chain_line. "
+                    f"(pair / k>2 regime), nor a registered chain_line. "
                     f"Supported regimes: single, pair, chain.",
                 )
 
             primary_keys = entity_table["primary_key"].to_pylist()
+            edge_dim_thresholds_resolved = (
+                self._resolve_and_persist_edge_dim_thresholds(
+                    pat.pattern_id, sidecar_tbl, agg_dims,
+                )
+            )
+            aggregates_per_dim = cfg.aggregates_per_dim
             extra = aggregate_edge_dims_for_anchor(
                 anchor_keys=primary_keys,
                 edges=src_edges,
@@ -1163,13 +1211,17 @@ class GDSBuilder:
                 anchor_kind=anchor_kind,
                 pair_separator=pair_separator,
                 chain_events=chain_events_col,
+                key_cols=composite_key_cols,
+                event_table=self._lines[src_pat.entity_line].table,
+                thresholds=edge_dim_thresholds_resolved,
+                aggregates_per_dim=aggregates_per_dim,
             )
-            n_cols = len(agg_dims) * len(AGGREGATE_NAMES)
+            n_cols = sum(len(aggregates_per_dim[d]) for d in agg_dims)
             edge_dim_agg_matrix = np.zeros((n, n_cols), dtype=np.float32)
             col_idx = 0
             for d in agg_dims:
                 src_kind = EDGE_DIM_KINDS[d]
-                for agg in AGGREGATE_NAMES:
+                for agg in aggregates_per_dim[d]:
                     edge_dim_agg_matrix[:, col_idx] = (
                         extra[f"{d}_{agg}"].to_numpy()
                     )
@@ -2515,6 +2567,10 @@ class GDSBuilder:
                     "dims": (
                         list(eda.dims) if eda.dims is not None else None
                     ),
+                    "aggregates_per_dim": {
+                        d: list(aggs)
+                        for d, aggs in eda.aggregates_per_dim.items()
+                    },
                 }
             # Calibration epoch metadata (populated by _build_and_write)
             cal_state = self._calibration_state.get(pat_id, {})
@@ -3206,6 +3262,7 @@ class GDSBuilder:
             edge_max=edge_max_arr,
             computed_at=now,
             last_calibrated_at=now,
+            edge_dim_thresholds=self._edge_dim_thresholds.get(pat.pattern_id),
         )
         write_calibration_history_epoch(
             self.output_path, fit, last_k=last_k,
@@ -4079,20 +4136,41 @@ class GDSBuilder:
                 None,
             )
             chain_events_col: list[str] | None = None
+            composite_key_cols: list[str] | None = None
             if pat.entity_line in src_lines:
                 anchor_kind = "single"
                 pair_separator = "→"
             elif composite_match is not None:
-                if len(composite_match.key_cols) == 2:
-                    anchor_kind = "pair"
-                    pair_separator = composite_match.separator
-                else:
-                    raise NotImplementedError(
-                        f"Pattern {pat.pattern_id!r}: edge_dim_aggregations "
-                        f"on a composite anchor with k="
-                        f"{len(composite_match.key_cols)} keys ships in "
-                        f"0.7.0; only k=2 (pair) is supported",
-                    )
+                anchor_kind = "pair"
+                pair_separator = composite_match.separator
+                composite_key_cols = list(composite_match.key_cols)
+                # Convention: first two key_cols positionally map to the
+                # source event_pattern's edge_table endpoints (renamed in
+                # _extract_edge_table to from_key / to_key). Reject k>=3
+                # composite anchors that violate this — silent mismatch
+                # would produce all-zero aggregates because the anchor PK
+                # built from event_table.{key_cols[0],key_cols[1],...} would
+                # not match the engine's PK constructed from
+                # edges.{from_key, to_key, key_cols[2:]}.
+                if len(composite_key_cols) > 2 and src_pat.edge_table is not None:
+                    expected_from = src_pat.edge_table.from_col
+                    expected_to = src_pat.edge_table.to_col
+                    if (
+                        composite_key_cols[0] != expected_from
+                        or composite_key_cols[1] != expected_to
+                    ):
+                        raise ValueError(
+                            f"Pattern {pat.pattern_id!r}: composite_line "
+                            f"{composite_match.line_id!r} declares "
+                            f"key_cols={composite_key_cols!r} but "
+                            f"edge_dim_aggregations on a k>=3 composite "
+                            f"anchor requires key_cols[0:2] to positionally "
+                            f"match the source event pattern "
+                            f"{cfg.from_event_pattern!r} edge_table endpoints "
+                            f"(from_col={expected_from!r}, "
+                            f"to_col={expected_to!r}). Property columns "
+                            f"key_cols[2:] can be any event_table column.",
+                        )
             elif pat.entity_line in self._chain_lines:
                 # Chain regime — entity_line registered as chain via chain_lines: block.
                 # event_line consistency was validated at parse time (cli/schema.py).
@@ -4110,11 +4188,17 @@ class GDSBuilder:
                     f"{pat.entity_line!r} is neither a relation of the "
                     f"source event pattern {cfg.from_event_pattern!r} "
                     f"(single-key regime), nor a registered composite_line "
-                    f"(pair regime), nor a registered chain_line. "
+                    f"(pair / k>2 regime), nor a registered chain_line. "
                     f"Supported regimes: single, pair, chain.",
                 )
 
             primary_keys = entity_table["primary_key"].to_pylist()
+            edge_dim_thresholds_resolved = (
+                self._resolve_and_persist_edge_dim_thresholds(
+                    pat.pattern_id, sidecar_tbl, agg_dims,
+                )
+            )
+            aggregates_per_dim = cfg.aggregates_per_dim
             extra = aggregate_edge_dims_for_anchor(
                 anchor_keys=primary_keys,
                 edges=src_edges,
@@ -4123,13 +4207,17 @@ class GDSBuilder:
                 anchor_kind=anchor_kind,
                 pair_separator=pair_separator,
                 chain_events=chain_events_col,
+                key_cols=composite_key_cols,
+                event_table=self._lines[src_pat.entity_line].table,
+                thresholds=edge_dim_thresholds_resolved,
+                aggregates_per_dim=aggregates_per_dim,
             )
-            n_cols = len(agg_dims) * len(AGGREGATE_NAMES)
+            n_cols = sum(len(aggregates_per_dim[d]) for d in agg_dims)
             edge_dim_agg_matrix = np.zeros((n, n_cols), dtype=np.float32)
             col_idx = 0
             for d in agg_dims:
                 src_kind = EDGE_DIM_KINDS[d]
-                for agg in AGGREGATE_NAMES:
+                for agg in aggregates_per_dim[d]:
                     edge_dim_agg_matrix[:, col_idx] = (
                         extra[f"{d}_{agg}"].to_numpy()
                     )

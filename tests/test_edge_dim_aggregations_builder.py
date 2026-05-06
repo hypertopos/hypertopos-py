@@ -118,12 +118,14 @@ def test_account_pattern_with_aggregations_extends_dimension_kinds(
     pat = sphere_w.patterns["account_pattern"]
     new_kinds = pat.dimension_kinds or []
 
-    # 1 source dim × 2 aggs = 2 new kinds appended at the tail.
-    # pair_edge_count source kind is poisson; aggregates map to gaussian via
-    # aggregate_kind() (CLT for _mean, Gumbel-ish for _max — both better
-    # approximated by gaussian than the source kind).
-    assert len(new_kinds) == base_dim + 2
-    assert new_kinds[-2:] == ["gaussian", "gaussian"]
+    # 1 source dim × 5 aggs (mean / max / std / p95 / count_above_threshold)
+    # = 5 new kinds appended at the tail. pair_edge_count source kind is
+    # poisson; mean/max/std/p95 map to gaussian; count_above_threshold maps
+    # to poisson (count of edges above the per-dim threshold).
+    assert len(new_kinds) == base_dim + 5
+    assert new_kinds[-5:] == [
+        "gaussian", "gaussian", "gaussian", "gaussian", "poisson",
+    ]
 
 
 def test_account_pattern_aggregations_baked_into_geometry_delta(
@@ -371,3 +373,259 @@ def test_pair_anchor_aggregations_nonzero(tmp_path: Path):
         f"pair regime aggregates appear all-zero on (A→B) — separator "
         f"plumbing likely broken; delta tail was {last_two_a_b}"
     )
+
+
+def test_edge_dim_thresholds_persisted_into_calibration_history(
+    tmp_path: Path,
+):
+    """End-to-end: anchor pattern with `edge_dim_aggregations:` writes
+    per-source-dim `_count_above_threshold` cutoffs into the calibration
+    epoch JSON alongside mu/sigma/theta. Builds a tiny sphere, then reads
+    `_gds_meta/calibration_history/account_pattern/v=1.json` directly off
+    disk to confirm the field is populated and the persisted value matches
+    what `_resolve_count_above_thresholds` would compute on the same sidecar.
+    Closes the build → write → read wiring gap that round-trip serializer
+    tests cannot catch."""
+    out = tmp_path / "gds_persist"
+    _make_sphere(out, with_aggregations=True).build()
+
+    epoch_path = (
+        out / "_gds_meta" / "calibration_history" / "account_pattern"
+        / "v=1.json"
+    )
+    assert epoch_path.exists(), (
+        f"calibration epoch JSON missing at {epoch_path}"
+    )
+    blob = json.loads(epoch_path.read_text())
+
+    assert "edge_dim_thresholds" in blob, (
+        "edge_dim_thresholds key missing from epoch JSON — builder did not "
+        "persist thresholds even though pattern declares edge_dim_aggregations:"
+    )
+    thr = blob["edge_dim_thresholds"]
+    assert thr is not None
+    assert "pair_edge_count" in thr, (
+        f"expected pair_edge_count in thresholds, got keys: {list(thr)}"
+    )
+    # Population p95 of pair_edge_count over the 6-edge sidecar — counts are
+    # small (each pair has 1-3 edges), so threshold is finite and >= 0.
+    pec_thr = thr["pair_edge_count"]
+    assert isinstance(pec_thr, (int, float))
+    assert pec_thr >= 0.0
+    # NaN/Inf guard: threshold MUST be finite — degenerate sidecars are
+    # mapped to 0.0 by `_resolve_count_above_thresholds`.
+    import math
+    assert math.isfinite(pec_thr)
+
+
+def test_edge_dim_thresholds_absent_when_pattern_has_no_aggregations(
+    tmp_path: Path,
+):
+    """Anchor patterns built without `edge_dim_aggregations:` must NOT carry
+    `edge_dim_thresholds` in their calibration epoch JSON — `None` after
+    deserialization, omitted on disk by the serializer."""
+    out = tmp_path / "gds_no_agg"
+    _make_sphere(out, with_aggregations=False).build()
+
+    epoch_path = (
+        out / "_gds_meta" / "calibration_history" / "account_pattern"
+        / "v=1.json"
+    )
+    assert epoch_path.exists()
+    blob = json.loads(epoch_path.read_text())
+    # Either key absent OR explicitly null — both shapes deserialize as None.
+    assert blob.get("edge_dim_thresholds") is None
+
+
+def _make_sphere_with_per_dim_aggregates(
+    out_root: Path,
+    *,
+    aggregates_per_dim: dict[str, tuple[str, ...]],
+) -> GDSBuilder:
+    """Variant of `_make_sphere(with_aggregations=True)` that drives the
+    per-dim aggregate-subset selector via `aggregates_per_dim`."""
+    b = GDSBuilder("test_aggsel", str(out_root))
+    b.add_line(
+        "accounts",
+        [
+            {"acct_id": "A", "name": "alpha"},
+            {"acct_id": "B", "name": "beta"},
+            {"acct_id": "C", "name": "gamma"},
+            {"acct_id": "D", "name": "delta"},
+        ],
+        key_col="acct_id", source_id="t",
+    )
+    b.add_line(
+        "transactions",
+        [
+            {"tx_id": "ek1", "from_acct": "A", "to_acct": "B",
+             "ts": 0.0,    "amount": 20000.0},
+            {"tx_id": "ek2", "from_acct": "B", "to_acct": "C",
+             "ts": 100.0,  "amount": 5000.0},
+            {"tx_id": "ek3", "from_acct": "C", "to_acct": "D",
+             "ts": 200.0,  "amount": 5000.0},
+            {"tx_id": "ek4", "from_acct": "A", "to_acct": "B",
+             "ts": 1000.0, "amount": 1000.0},
+        ],
+        key_col="tx_id", source_id="t",
+    )
+
+    edge_dims = EdgeDimensionsConfig(dims={
+        "pair_edge_count": {},
+        "find_motif_structuring": {
+            "time_window_hours": 1.0,
+            "amt1_min": 10000.0,
+            "amt2_max": 10000.0,
+        },
+    })
+
+    b.add_pattern(
+        "tx_pattern",
+        pattern_type="event",
+        entity_line="transactions",
+        relations=[
+            RelationSpec(
+                "accounts", fk_col="from_acct", direction="in", required=True,
+            ),
+        ],
+        edge_table=EdgeTableConfig(
+            from_col="from_acct", to_col="to_acct",
+            timestamp_col="ts", amount_col="amount",
+        ),
+        edge_dimensions=edge_dims,
+    )
+
+    b.add_pattern(
+        "account_pattern",
+        pattern_type="anchor",
+        entity_line="accounts",
+        relations=[],
+        edge_dim_aggregations=EdgeDimAggregationsConfig(
+            from_event_pattern="tx_pattern",
+            dims=tuple(aggregates_per_dim.keys()),
+            aggregates_per_dim=aggregates_per_dim,
+        ),
+    )
+    # Anchor needs at least one base dimension before aggregates can extend it.
+    b.add_derived_dimension(
+        anchor_line="accounts",
+        event_line="transactions",
+        anchor_fk="from_acct",
+        metric="count",
+        metric_col=None,
+        dimension_name="tx_out_count",
+        edge_max="auto",
+    )
+    return b
+
+
+def test_per_dim_subset_emits_only_selected_aggregate_columns(tmp_path: Path):
+    """`aggregates_per_dim` drives polygon-dim count: source dims × user-
+    selected aggregates produces exactly that many extra columns, instead
+    of source-dims × 5. Closes the polygon-dim balloon for narrow-intent
+    users."""
+    out = tmp_path / "gds_subset"
+    _make_sphere_with_per_dim_aggregates(
+        out,
+        aggregates_per_dim={
+            "pair_edge_count": ("count_above_threshold",),
+            "find_motif_structuring": ("mean", "max"),
+        },
+    ).build()
+
+    sphere = GDSReader(str(out)).read_sphere()
+    pat = sphere.patterns["account_pattern"]
+    kinds = pat.dimension_kinds or []
+    # 1 derived (tx_out_count) + (1 + 2) per-dim aggregates = 4 dims
+    assert len(kinds) == 4, (
+        f"expected 4 polygon dims (1 derived + 3 selected aggregates), "
+        f"got {len(kinds)}"
+    )
+    labels = pat.dim_labels
+    assert labels[-3:] == [
+        "pair_edge_count_count_above_threshold",
+        "find_motif_structuring_mean",
+        "find_motif_structuring_max",
+    ]
+
+
+def test_per_dim_subset_round_trips_through_sphere_json(tmp_path: Path):
+    """The per-dim selector survives the build → sphere.json → reader path,
+    so `Pattern.dim_labels` reconstructs the same shape after a cold read."""
+    out = tmp_path / "gds_roundtrip"
+    _make_sphere_with_per_dim_aggregates(
+        out,
+        aggregates_per_dim={
+            "pair_edge_count": ("count_above_threshold",),
+            "find_motif_structuring": ("mean", "max", "p95"),
+        },
+    ).build()
+
+    sj = json.loads(
+        (out / "_gds_meta" / "sphere.json").read_text(),
+    )
+    eda_node = sj["patterns"]["account_pattern"]["edge_dim_aggregations"]
+    assert eda_node["aggregates_per_dim"] == {
+        "pair_edge_count": ["count_above_threshold"],
+        "find_motif_structuring": ["mean", "max", "p95"],
+    }
+
+    sphere = GDSReader(str(out)).read_sphere()
+    pat = sphere.patterns["account_pattern"]
+    assert pat.edge_dim_aggregations is not None
+    assert pat.edge_dim_aggregations.aggregates_per_dim == {
+        "pair_edge_count": ("count_above_threshold",),
+        "find_motif_structuring": ("mean", "max", "p95"),
+    }
+
+
+def test_per_dim_subset_flips_schema_hash_vs_all_five(tmp_path: Path):
+    """Central design claim: changing the per-dim selector changes
+    `dimension_kinds` length, which changes the calibration `schema_hash`,
+    which in turn auto-wipes `calibration_history` on the next build —
+    no separate persistence-layer wiping logic needed. Two builds with
+    different selectors must produce different `schema_hash` values."""
+    out_full = tmp_path / "gds_full"
+    _make_sphere_with_per_dim_aggregates(
+        out_full,
+        aggregates_per_dim={
+            "pair_edge_count": ("mean", "max", "std", "p95",
+                                "count_above_threshold"),
+            "find_motif_structuring": ("mean", "max", "std", "p95",
+                                        "count_above_threshold"),
+        },
+    ).build()
+
+    out_subset = tmp_path / "gds_subset"
+    _make_sphere_with_per_dim_aggregates(
+        out_subset,
+        aggregates_per_dim={
+            "pair_edge_count": ("count_above_threshold",),
+            "find_motif_structuring": ("mean", "max"),
+        },
+    ).build()
+
+    sj_full = json.loads(
+        (out_full / "_gds_meta" / "sphere.json").read_text(),
+    )
+    sj_subset = json.loads(
+        (out_subset / "_gds_meta" / "sphere.json").read_text(),
+    )
+    hash_full = sj_full["patterns"]["account_pattern"]["schema_hash"]
+    hash_subset = sj_subset["patterns"]["account_pattern"]["schema_hash"]
+    assert hash_full != hash_subset, (
+        f"schema_hash MUST flip when the per-dim selector subset "
+        f"changes — auto-wipe of calibration_history depends on this. "
+        f"Both builds produced {hash_full!r}"
+    )
+
+    # Sanity: dimension_kinds length reflects the selector difference.
+    kinds_full = (
+        sj_full["patterns"]["account_pattern"].get("dimension_kinds") or []
+    )
+    kinds_subset = (
+        sj_subset["patterns"]["account_pattern"].get("dimension_kinds") or []
+    )
+    # full: 1 derived + 2 dims × 5 aggs = 11; subset: 1 derived + 1 + 2 = 4
+    assert len(kinds_full) == 11
+    assert len(kinds_subset) == 4

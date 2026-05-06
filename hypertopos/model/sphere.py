@@ -75,6 +75,20 @@ class EventDimDef:
 class EdgeDimAggregationsRef:
     from_event_pattern: str
     dims: tuple[str, ...] | None = None
+    aggregates_per_dim: dict[str, tuple[str, ...]] | None = None
+
+    def __post_init__(self) -> None:
+        # Materialise the all-five canonical default when the constructor
+        # was called without an explicit per-dim subset (older sphere.json
+        # on disk, direct test construction). One single point of truth
+        # for the default — the reader and the model both rely on this
+        # rather than each carrying its own back-compat fallback.
+        if self.aggregates_per_dim is None and self.dims:
+            from hypertopos.engine.edge_features import AGGREGATE_NAMES
+            object.__setattr__(
+                self, "aggregates_per_dim",
+                {d: tuple(AGGREGATE_NAMES) for d in self.dims},
+            )
 
 
 @dataclass
@@ -123,18 +137,23 @@ class Pattern:
     def _edge_dim_aggregation_names(self) -> list[str]:
         """Human-readable names for edge_dim_aggregations dims, in build order.
 
-        For each source dim in ``edge_dim_aggregations.dims``, produces
-        ``{dim}_mean`` and ``{dim}_max`` entries (matching the
-        ``AGGREGATE_NAMES`` tuple in ``engine/edge_features.py``). Returns
-        an empty list when the pattern has no aggregations declared.
+        For each source dim in ``edge_dim_aggregations.dims`` (insertion order),
+        emits one entry per aggregate the dim selected via
+        ``aggregates_per_dim`` — typically a subset of the canonical
+        ``AGGREGATE_NAMES`` tuple. Returns an empty list when the pattern has
+        no aggregations declared.
         """
         agg = self.edge_dim_aggregations
         if agg is None or not agg.dims:
             return []
+        # `aggregates_per_dim` is always populated by `__post_init__`
+        # when `dims` is non-empty — single source of truth for the
+        # all-five canonical default.
+        per_dim = agg.aggregates_per_dim or {}
         names: list[str] = []
         for d in agg.dims:
-            names.append(f"{d}_mean")
-            names.append(f"{d}_max")
+            for agg_name in per_dim.get(d, ()):
+                names.append(f"{d}_{agg_name}")
         return names
 
     @property
@@ -373,6 +392,7 @@ class CalibrationFit:
     edge_max: np.ndarray | None
     computed_at: datetime
     last_calibrated_at: datetime
+    edge_dim_thresholds: dict[str, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -417,6 +437,7 @@ class CalibrationDriftReport:
     overall_drift_rms: float
     top_drifted: list[DimensionDrift]
     per_dimension: list[DimensionDrift] | None
+    edge_dim_threshold_drift: dict[str, dict[str, float]] | None = None
 
 
 @dataclass(frozen=True)

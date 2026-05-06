@@ -203,17 +203,27 @@ class GDSReader:
 
         from hypertopos.model.sphere import EdgeDimAggregationsRef
         eda_raw = raw.get("edge_dim_aggregations")
-        edge_dim_aggregations = (
-            EdgeDimAggregationsRef(
-                from_event_pattern=eda_raw["from"],
-                dims=(
-                    tuple(eda_raw["dims"])
-                    if eda_raw.get("dims") is not None
-                    else None
-                ),
+        if eda_raw:
+            eda_dims = (
+                tuple(eda_raw["dims"])
+                if eda_raw.get("dims") is not None
+                else None
             )
-            if eda_raw else None
-        )
+            apd_raw = eda_raw.get("aggregates_per_dim")
+            apd_parsed = (
+                {d: tuple(aggs) for d, aggs in apd_raw.items()}
+                if apd_raw is not None else None
+            )
+            # `EdgeDimAggregationsRef.__post_init__` materialises the
+            # all-five canonical default when `apd_parsed` is None (older
+            # sphere.json on disk without the explicit subset selector).
+            edge_dim_aggregations = EdgeDimAggregationsRef(
+                from_event_pattern=eda_raw["from"],
+                dims=eda_dims,
+                aggregates_per_dim=apd_parsed,
+            )
+        else:
+            edge_dim_aggregations = None
 
         return Pattern(
             pattern_id=raw["pattern_id"],

@@ -207,6 +207,70 @@ def test_calibration_fit_round_trip_with_optionals_none():
     assert restored.dimension_kinds is None
     assert restored.dim_percentiles is None
     assert restored.group_stats is None
+    assert restored.edge_dim_thresholds is None
+
+
+def test_calibration_fit_round_trip_with_edge_dim_thresholds():
+    """edge_dim_thresholds round-trips serialize → JSON → deserialize cleanly."""
+    from hypertopos.model.sphere import CalibrationFit
+    from hypertopos.storage.calibration_history import deserialize_fit, serialize_fit
+
+    original = CalibrationFit(
+        pattern_id="account_pattern",
+        calibration_epoch=2,
+        schema_version=1,
+        schema_hash="c" * 64,
+        mu=np.array([0.1], dtype=np.float32),
+        sigma_diag=np.array([0.05], dtype=np.float32),
+        theta=np.array([3.0], dtype=np.float32),
+        population_size=100,
+        dimension_weights=None,
+        dimension_kinds=None,
+        dim_percentiles=None,
+        group_stats=None,
+        gmm_components=None,
+        edge_max=None,
+        computed_at=datetime(2026, 5, 5, 12, 0, 0, tzinfo=timezone.utc),
+        last_calibrated_at=datetime(2026, 5, 5, 12, 0, 0, tzinfo=timezone.utc),
+        edge_dim_thresholds={
+            "pair_edge_count": 7.5,
+            "find_motif_structuring": 0.92,
+        },
+    )
+    restored = deserialize_fit(json.loads(json.dumps(serialize_fit(original))))
+    assert restored.edge_dim_thresholds == {
+        "pair_edge_count": 7.5,
+        "find_motif_structuring": 0.92,
+    }
+
+
+def test_calibration_fit_legacy_blob_without_edge_dim_thresholds_is_none():
+    """Older epochs serialized without an `edge_dim_thresholds` key deserialize
+    cleanly with `edge_dim_thresholds=None` — backward-compat with epochs from
+    earlier releases that predate the field."""
+    from hypertopos.storage.calibration_history import deserialize_fit
+
+    legacy_blob = {
+        "pattern_id": "p",
+        "calibration_epoch": 1,
+        "schema_version": 1,
+        "schema_hash": "d" * 64,
+        "mu": [0.1],
+        "sigma_diag": [0.05],
+        "theta": [3.0],
+        "population_size": 100,
+        "dimension_weights": None,
+        "dimension_kinds": None,
+        "dim_percentiles": None,
+        "group_stats": None,
+        "gmm_components": None,
+        "edge_max": None,
+        "computed_at": "2026-04-27T12:00:00+00:00",
+        "last_calibrated_at": "2026-04-27T12:00:00+00:00",
+        # NB: no `edge_dim_thresholds` key — older sphere on disk.
+    }
+    restored = deserialize_fit(legacy_blob)
+    assert restored.edge_dim_thresholds is None
     assert restored.gmm_components is None
     assert restored.edge_max is None
 

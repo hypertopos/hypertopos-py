@@ -165,8 +165,8 @@ def test_chain_anchor_aggregations_extends_dimension_kinds(tmp_path: Path):
     pat_without = sphere_without.patterns["tx_chains_pattern"]
     kinds_with = pat_with.dimension_kinds or []
     kinds_without = pat_without.dimension_kinds or []
-    # 1 source dim × 2 aggs (mean + max) = 2 new entries appended at the tail.
-    assert len(kinds_with) == len(kinds_without) + 2
+    # 1 source dim × 5 aggs (mean/max/std/p95/count_above_threshold) = 5 new.
+    assert len(kinds_with) == len(kinds_without) + 5
 
 
 # ---------------------------------------------------------------------------
@@ -198,8 +198,8 @@ def test_chain_anchor_aggregations_baked_into_geometry_delta(tmp_path: Path):
     delta_len_without = len(geo_without["delta"][0].as_py())
     assert delta_len_with == len(pat_with.dimension_kinds or [])
     assert delta_len_without == len(pat_without.dimension_kinds or [])
-    # And with-aggregations is exactly 2 longer than without.
-    assert delta_len_with == delta_len_without + 2
+    # And with-aggregations is exactly 5 longer than without (1 dim × 5 aggs).
+    assert delta_len_with == delta_len_without + 5
 
 
 # ---------------------------------------------------------------------------

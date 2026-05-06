@@ -1,3 +1,7 @@
+# Copyright (C) 2026 Karol Kędzia
+# Licensed under the Business Source License 1.1 (the "License");
+# you may not use this file except in compliance with the License.
+# See LICENSE.md in the repository root for full terms.
 """Declarative motif enumeration via per-hop predicates.
 
 Walks the existing in-memory ``AdjacencyIndex`` (cached at storage level

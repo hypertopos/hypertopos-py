@@ -36,25 +36,79 @@ class ChainResult(list):
 
 
 def parse_timestamps_to_epoch(ts_list: list) -> list[float]:
-    """Convert a list of mixed-type timestamps to epoch seconds."""
+    """Convert a list of mixed-type timestamps to epoch seconds.
+
+    Vectorised through pyarrow whenever the inferred type is one of:
+    timestamp, integer, floating, or string (parsed via `pc.strptime` over
+    a small set of canonical formats). Falls back to per-row Python only
+    when none of the formats match — rare in practice.
+    """
     if not ts_list:
         return []
-    sample = ts_list[0]
-    if hasattr(sample, "timestamp"):
-        try:
-            import pyarrow as pa
-            import pyarrow.compute as pc
-            arr = pa.array(ts_list)
-            if pa.types.is_timestamp(arr.type):
-                epoch_us = pc.cast(arr, pa.int64())
-                unit = arr.type.unit
-                divisors = {"s": 1.0, "ms": 1e3, "us": 1e6, "ns": 1e9}
-                d = divisors.get(unit, 1e6)
-                return (epoch_us.to_numpy(zero_copy_only=False).astype(np.float64) / d).tolist()
-        except Exception:
-            pass
-    elif isinstance(sample, (int, float)):
-        return [float(t) for t in ts_list]
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    try:
+        arr = pa.array(ts_list)
+    except Exception:
+        arr = None
+
+    if arr is not None:
+        if pa.types.is_timestamp(arr.type):
+            epoch_int = pc.cast(arr, pa.int64())
+            unit = arr.type.unit
+            divisors = {"s": 1.0, "ms": 1e3, "us": 1e6, "ns": 1e9}
+            d = divisors.get(unit, 1e6)
+            return (
+                epoch_int.to_numpy(zero_copy_only=False).astype(np.float64)
+                / d
+            ).tolist()
+        if pa.types.is_floating(arr.type) or pa.types.is_integer(arr.type):
+            return pc.cast(
+                arr, pa.float64(),
+            ).to_numpy(zero_copy_only=False).tolist()
+        if pa.types.is_string(arr.type):
+            # Try canonical strptime formats; each runs C-native over the
+            # whole array, no per-row Python.
+            for fmt in (
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%dT%H:%M:%S.%f",
+                "%Y-%m-%dT%H:%M:%S.%fZ",
+                "%Y-%m-%d",
+                "%Y/%m/%d %H:%M:%S",
+                "%Y/%m/%d",
+            ):
+                try:
+                    parsed = pc.strptime(arr, format=fmt, unit="us")
+                except Exception:
+                    continue
+                if pc.sum(pc.is_null(parsed)).as_py() == 0:
+                    epoch_int = pc.cast(parsed, pa.int64())
+                    return (
+                        epoch_int.to_numpy(zero_copy_only=False)
+                        .astype(np.float64) / 1e6
+                    ).tolist()
+            # If no format matched all rows, try replacing '/' → '-' once.
+            try:
+                normalised = pc.replace_substring(arr, "/", "-")
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                    try:
+                        parsed = pc.strptime(
+                            normalised, format=fmt, unit="us",
+                        )
+                    except Exception:
+                        continue
+                    if pc.sum(pc.is_null(parsed)).as_py() == 0:
+                        epoch_int = pc.cast(parsed, pa.int64())
+                        return (
+                            epoch_int.to_numpy(zero_copy_only=False)
+                            .astype(np.float64) / 1e6
+                        ).tolist()
+            except Exception:
+                pass
+
+    # Per-row Python fallback — only hits exotic / mixed inputs.
     result = []
     for t in ts_list:
         if hasattr(t, "timestamp"):

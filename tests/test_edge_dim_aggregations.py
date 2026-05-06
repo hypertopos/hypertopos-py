@@ -103,16 +103,23 @@ def test_pattern_dim_labels_extends_with_aggregated_dim_names():
         ),
     )
     labels = pat.dim_labels
-    assert len(labels) == 6, (
-        f"2 relations + 0 event + 0 prop + 4 aggregated = 6, got {len(labels)}"
+    # 2 relations + 0 event + 0 prop + 2 source dims × 5 aggregates = 12
+    assert len(labels) == 12, (
+        f"2 relations + 0 event + 0 prop + 10 aggregated = 12, got {len(labels)}"
     )
-    assert labels[-4:] == [
+    assert labels[-10:] == [
         "pair_edge_count_mean",
         "pair_edge_count_max",
+        "pair_edge_count_std",
+        "pair_edge_count_p95",
+        "pair_edge_count_count_above_threshold",
         "find_motif_structuring_mean",
         "find_motif_structuring_max",
+        "find_motif_structuring_std",
+        "find_motif_structuring_p95",
+        "find_motif_structuring_count_above_threshold",
     ]
-    assert pat.delta_dim() == 6
+    assert pat.delta_dim() == 12
 
 
 def test_pattern_dim_labels_no_aggregations_unchanged():
@@ -171,3 +178,163 @@ def test_pattern_dim_labels_aggregations_with_empty_dims():
     )
     assert pat.dim_labels == ["_d_tx_out_count"]
     assert pat.delta_dim() == 1
+
+
+# --- per-dim aggregate selector (mapping form) ---
+
+
+def test_parse_aggregations_list_form_expands_to_all_five_per_dim():
+    """Form A — list of dim names — materialises to all five canonical
+    aggregates per dim. Back-compat with the historical YAML shape that
+    predates the per-dim subset selector."""
+    from hypertopos.engine.edge_features import AGGREGATE_NAMES
+
+    cfg = parse_edge_dim_aggregations(
+        {
+            "from": "tx_pattern",
+            "dims": ["pair_edge_count", "find_motif_structuring"],
+        },
+        pattern_type="anchor",
+    )
+    assert cfg.dims == ("pair_edge_count", "find_motif_structuring")
+    assert cfg.aggregates_per_dim == {
+        "pair_edge_count": tuple(AGGREGATE_NAMES),
+        "find_motif_structuring": tuple(AGGREGATE_NAMES),
+    }
+
+
+def test_parse_aggregations_mapping_form_per_dim_subset():
+    """Form B — mapping with per-dim agg subsets — preserves keys in YAML
+    order (drives polygon-dim layout) and aggregate values in canonical
+    AGGREGATE_NAMES order regardless of user-list order."""
+    cfg = parse_edge_dim_aggregations(
+        {
+            "from": "tx_pattern",
+            "dims": {
+                "pair_edge_count": ["count_above_threshold"],
+                "find_motif_structuring": ["max", "mean"],   # reversed user input
+            },
+        },
+        pattern_type="anchor",
+    )
+    assert cfg.dims == ("pair_edge_count", "find_motif_structuring")
+    # user wrote [max, mean] but canonical order materialises as (mean, max)
+    assert cfg.aggregates_per_dim == {
+        "pair_edge_count": ("count_above_threshold",),
+        "find_motif_structuring": ("mean", "max"),
+    }
+
+
+def test_parse_aggregations_canonical_order_insensitive_to_user_input():
+    """Schema-hash stability check: two YAML shapes that differ only in the
+    user-supplied aggregate order produce identical aggregates_per_dim, so
+    `dimension_kinds` and `schema_hash` do not flip between cosmetic edits."""
+    cfg_a = parse_edge_dim_aggregations(
+        {
+            "from": "tx_pattern",
+            "dims": {"pair_edge_count": ["mean", "p95", "max"]},
+        },
+        pattern_type="anchor",
+    )
+    cfg_b = parse_edge_dim_aggregations(
+        {
+            "from": "tx_pattern",
+            "dims": {"pair_edge_count": ["max", "mean", "p95"]},
+        },
+        pattern_type="anchor",
+    )
+    assert cfg_a.aggregates_per_dim == cfg_b.aggregates_per_dim
+
+
+def test_parse_aggregations_unknown_agg_name_raises():
+    with pytest.raises(ValueError, match="unknown aggregate 'median'"):
+        parse_edge_dim_aggregations(
+            {
+                "from": "tx_pattern",
+                "dims": {"pair_edge_count": ["mean", "median"]},
+            },
+            pattern_type="anchor",
+        )
+
+
+def test_parse_aggregations_empty_per_dim_list_raises():
+    with pytest.raises(ValueError, match="non-empty"):
+        parse_edge_dim_aggregations(
+            {
+                "from": "tx_pattern",
+                "dims": {"pair_edge_count": []},
+            },
+            pattern_type="anchor",
+        )
+
+
+def test_parse_aggregations_empty_mapping_raises():
+    with pytest.raises(ValueError, match="non-empty"):
+        parse_edge_dim_aggregations(
+            {"from": "tx_pattern", "dims": {}},
+            pattern_type="anchor",
+        )
+
+
+def test_parse_aggregations_unknown_dim_in_mapping_raises():
+    with pytest.raises(ValueError, match="unknown edge dimension"):
+        parse_edge_dim_aggregations(
+            {
+                "from": "tx_pattern",
+                "dims": {"definitely_not_a_dim": ["mean"]},
+            },
+            pattern_type="anchor",
+        )
+
+
+def test_parse_aggregations_per_dim_value_must_be_list():
+    with pytest.raises(ValueError, match="must be a list of"):
+        parse_edge_dim_aggregations(
+            {
+                "from": "tx_pattern",
+                "dims": {"pair_edge_count": "mean"},
+            },
+            pattern_type="anchor",
+        )
+
+
+def test_parse_aggregations_dims_neither_list_nor_mapping_raises():
+    with pytest.raises(ValueError, match="must be a list or mapping"):
+        parse_edge_dim_aggregations(
+            {"from": "tx_pattern", "dims": 7},
+            pattern_type="anchor",
+        )
+
+
+def test_edge_dim_aggregations_config_post_init_materialises_default():
+    """Direct constructor without `aggregates_per_dim` materialises the
+    all-five canonical default at __post_init__ time, so engine-level
+    dispatch never sees an empty mapping. Locks the contract that
+    `EdgeDimAggregationsConfig(from_event_pattern=..., dims=...)` works
+    for direct callers (tests, downstream pipelines)."""
+    from hypertopos.engine.edge_features import AGGREGATE_NAMES
+
+    cfg = EdgeDimAggregationsConfig(
+        from_event_pattern="tx_pattern",
+        dims=("pair_edge_count", "find_motif_structuring"),
+    )
+    assert cfg.aggregates_per_dim == {
+        "pair_edge_count": tuple(AGGREGATE_NAMES),
+        "find_motif_structuring": tuple(AGGREGATE_NAMES),
+    }
+
+
+def test_edge_dim_aggregations_ref_post_init_materialises_default():
+    """The runtime model `EdgeDimAggregationsRef` (built by the reader)
+    materialises the same default in `__post_init__`, so direct
+    construction and reader paths converge to one source of truth."""
+    from hypertopos.engine.edge_features import AGGREGATE_NAMES
+    from hypertopos.model.sphere import EdgeDimAggregationsRef
+
+    ref = EdgeDimAggregationsRef(
+        from_event_pattern="tx_pattern",
+        dims=("pair_edge_count",),
+    )
+    assert ref.aggregates_per_dim == {
+        "pair_edge_count": tuple(AGGREGATE_NAMES),
+    }

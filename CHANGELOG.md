@@ -7,6 +7,69 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.3] — 2026-05-06
+
+### Changed
+- Build-time compute paths for `edge_dim_aggregations:` and the edge feature
+  catalog (`compute_pair_edge_count`, `compute_time_since_pair_last_edge`,
+  `compute_pair_amount_zscore`, `parse_timestamps_to_epoch`) optimised —
+  pure-Python per-row loops replaced with vectorised pyarrow / numpy
+  paths. The `_p95` aggregate now returns the exact 95-th percentile
+  element (previously a t-digest sketch approximation).
+
+### Added
+- `aggregates:` per-source-dim subset selector on `edge_dim_aggregations:`.
+  Source dims can now declare which aggregates to emit (`mean` / `max` /
+  `std` / `p95` / `count_above_threshold`) instead of always emitting all
+  five. The existing `dims: [a, b]` list form continues to expand to all
+  five aggregates per dim; the new mapping form
+  `dims: {a: [count_above_threshold], b: [mean, max]}` selects subsets.
+  Polygon-dim layout follows source-dim insertion order × canonical
+  aggregate order, so reordering the user-supplied aggregate list does
+  not flip `schema_hash`. Spheres rebuilt with subset selectors carry an
+  `aggregates_per_dim` block under each pattern's `edge_dim_aggregations:`
+  in `sphere.json`; pre-selector spheres keep emitting the full five-tuple
+  on read.
+- Per-source-dim `_count_above_threshold` thresholds are now persisted into
+  the calibration epoch JSON under `_gds_meta/calibration_history/<pid>/v={N}.json`
+  alongside `mu` / `sigma` / `theta`. Each calibration epoch carries the
+  thresholds used during its build, so re-builds are deterministic and
+  multi-epoch comparisons see threshold drift. `compare_calibrations`
+  output gains a new `edge_dim_threshold_drift` field — a per-source-dim
+  `{from, to, delta}` map populated when both compared epochs declared
+  `edge_dim_aggregations:`. Legacy epochs (built before this release)
+  deserialize with `edge_dim_thresholds=None` and silently omit the
+  drift block.
+- `edge_dim_aggregations:` on composite anchors with `len(key_cols) > 2`
+  (tripartite and beyond). The previous k=2 (pair) restriction is lifted —
+  composite anchors registered via `composite_lines:` with three or more
+  key columns now compose with `edge_dim_aggregations:` the same way k=2
+  composite anchors did. The anchor primary key is constructed positionally
+  from `key_cols` joined by the `composite_lines.<id>.separator`, matching
+  the convention used to register the composite line itself. Aggregated
+  per-anchor `<source_dim>_mean` / `<source_dim>_max` columns surface in
+  every existing anchor-pattern primitive (`find_anomalies`,
+  `explain_anomaly`, `find_clusters`, `find_calibration_influencers`,
+  `decompose_drift`) via the same `dimension_kinds` source-of-truth as the
+  earlier `single` / `pair` / `chain` regimes. No new tools, no MCP API
+  change, no sphere format bump.
+- Three new aggregates on `edge_dim_aggregations:` — `_std`
+  (per-anchor standard deviation of the source dim across the anchor's
+  edges), `_p95` (95th percentile, tail-mass tracker without `_max`'s
+  extreme-outlier sensitivity), and `_count_above_threshold` (number
+  of edges where the source dim crosses a per-dim threshold). Extend
+  the prior `_mean` / `_max` set on every anchor regime (single, pair,
+  k>2, chain). Surface automatically alongside `_mean` / `_max` on
+  every anchor primitive (`find_anomalies`, `explain_anomaly`,
+  `find_clusters`, `find_calibration_influencers`, `decompose_drift`).
+  Per-dim threshold for `_count_above_threshold` defaults to the
+  population p95 of the source dim; user can override by passing a
+  `thresholds` dict keyed by source dim name. `_std` adds variance
+  signal that `_mean` / `_max` don't capture; `_p95` separates
+  tail-mass from extreme outliers; `_count_above_threshold` flags
+  anchors with anomalous concentration of high-value edges. No new
+  YAML keywords, no new tools, no sphere format bump.
+
 ## [0.6.2] — 2026-05-05
 
 ### Added

@@ -472,6 +472,29 @@ def _compute_calibration_drift(
     ranked = sorted(per_dim, key=lambda d: abs(d.mu_delta_normalized), reverse=True)
     top_drifted = ranked[: min(top_n, D)]
 
+    # Edge-dim threshold drift — surface per-source-dim p95 threshold change
+    # across epochs when the anchor pattern declared `edge_dim_aggregations:`.
+    # Both fits' thresholds are populated by the builder at calibration write
+    # time; missing on either side means that epoch did not declare aggregations.
+    threshold_drift: dict[str, dict[str, float]] | None = None
+    thr_from = fit_from.edge_dim_thresholds
+    thr_to = fit_to.edge_dim_thresholds
+    if thr_from is not None and thr_to is not None:
+        all_dims = sorted(set(thr_from) | set(thr_to))
+        threshold_drift = {}
+        for d in all_dims:
+            tf = thr_from.get(d)
+            tt = thr_to.get(d)
+            if tf is None or tt is None:
+                continue
+            threshold_drift[d] = {
+                "from": float(tf),
+                "to": float(tt),
+                "delta": float(tt - tf),
+            }
+        if not threshold_drift:
+            threshold_drift = None
+
     return CalibrationDriftReport(
         pattern_id=fit_from.pattern_id,
         v_from=fit_from.calibration_epoch,
@@ -482,6 +505,7 @@ def _compute_calibration_drift(
         overall_drift_rms=overall_drift_rms,
         top_drifted=top_drifted,
         per_dimension=per_dim if verbose else None,
+        edge_dim_threshold_drift=threshold_drift,
     )
 
 

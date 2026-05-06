@@ -8,7 +8,7 @@
 [![PyArrow](https://img.shields.io/badge/format-PyArrow-red.svg)](https://arrow.apache.org/docs/python/)
 [![Lance](https://img.shields.io/badge/storage-Lance-blueviolet.svg)](https://github.com/lance-format/lance)
 [![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io)
-[![Version](https://img.shields.io/badge/version-0.6.2-%235500FF.svg)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.6.3-%235500FF.svg)](pyproject.toml)
 
 hypertopos is not a database, and not a machine learning model. It is a layer that turns relational data into a coordinate system where every entity gets a position derived from its relationships and the population around it.
 
@@ -69,6 +69,7 @@ Each capability below emerges from treating entities as points in a shared, popu
 | Richer hop predicates | `HopPredicate.amount_ratio_to_prev` (decreasing-chain ratio) and `require_anomalous_entity` (filter chains routing through calibrated-anomalous nodes) extend the declarative motif API | Closed-vocab motif library has fixed amount thresholds and no anomaly-routing filter | `0.6.1` |
 | Event-aware motif scoring | `find_motif_by_hops(score=True)` ranks motifs by the product of event-aware `edge_potential` across edges (uses both the anchor companion's per-entity geometry and the event pattern's per-transaction polygons); distinct transactions between the same accounts produce distinct scores | Pure node-pair scoring collapses ranks when motifs share a node sequence | `0.6.1` |
 | Chain-anchor aggregation | Chain anchor patterns auto-emitted from `chain_lines:` declare `edge_dim_aggregations:` to bake per-event sidecar signals into per-chain `_mean` / `_max` columns; closes the third `anchor_kind` after `single` and `pair` | Per-chain manual aggregation outside the geometry, or no chain-level edge-dim summary at all | `0.6.2` |
+| Expanded `edge_dim_aggregations:` surface | Three additional canonical aggregates per source dim (`_std`, `_p95`, `_count_above_threshold` with population p95 cutoff persisted in calibration epoch JSON); k>2 composite anchor support (tripartite and beyond); per-source-dim subset selector — `dims:` accepts list (sugar = all five aggregates) or mapping `{dim: [agg, …]}` (per-dim subset); cross-epoch `edge_dim_threshold_drift` surface on `compare_calibrations` | Manual rebuild + re-engineering whenever the aggregate vocabulary or the per-anchor breadth changes | `0.6.3` |
 
 ### What changes in practice
 

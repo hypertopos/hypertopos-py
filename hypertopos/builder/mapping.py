@@ -126,12 +126,28 @@ def parse_edge_dimensions(
 @dataclass(frozen=True)
 class EdgeDimAggregationsConfig:
     from_event_pattern: str
-    dims: tuple[str, ...] | None = None
+    dims: tuple[str, ...]
+    aggregates_per_dim: dict[str, tuple[str, ...]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Direct constructor callers (tests, downstream pipelines) frequently
+        # pass `dims=` only and omit `aggregates_per_dim`. Materialise the
+        # all-five canonical default so the engine-level dispatch always
+        # receives a fully populated per-dim mapping — same back-compat
+        # contract the YAML list form provides.
+        if not self.aggregates_per_dim:
+            from hypertopos.engine.edge_features import AGGREGATE_NAMES
+            object.__setattr__(
+                self, "aggregates_per_dim",
+                {d: tuple(AGGREGATE_NAMES) for d in self.dims},
+            )
 
 
 def parse_edge_dim_aggregations(
     raw: Any, *, pattern_type: str,
 ) -> EdgeDimAggregationsConfig:
+    from hypertopos.engine.edge_features import AGGREGATE_NAMES
+
     if pattern_type != "anchor":
         raise ValueError(
             f"edge_dim_aggregations are only supported on anchor patterns; "
@@ -155,36 +171,83 @@ def parse_edge_dim_aggregations(
         # event pattern's `avail` list and appended N columns to the
         # polygon delta on disk, but the runtime Pattern model retained
         # `dims=None`, so `Pattern.dim_labels` and `Pattern.delta_dim()`
-        # had no record of the appended columns — every label-resolving
-        # call (`anomaly_summary`, `find_clusters.dim_profile`,
-        # `find_anomalies.anomaly_dimensions`, etc.) would fall back to
-        # 33-element views of 37-element deltas and either crash with a
-        # broadcast error or surface placeholder `dim_<idx>` labels.
-        # Forcing explicit declaration keeps the build-time and
-        # runtime-time views aligned without a sphere format bump.
+        # had no record of the appended columns. Forcing explicit
+        # declaration keeps the build-time and runtime-time views aligned.
         raise ValueError(
-            "edge_dim_aggregations.dims must be a non-empty list of "
-            "source edge dim names; the previous 'omit dims to "
-            "aggregate everything' shorthand was a latent "
-            "build-vs-runtime inconsistency and has been removed",
+            "edge_dim_aggregations.dims must be a non-empty list or "
+            "mapping of source edge dim names",
         )
-    if not isinstance(raw_dims, list):
+    aggregates_per_dim: dict[str, tuple[str, ...]]
+    if isinstance(raw_dims, list):
+        # Form A — list sugar: every dim emits all five canonical aggregates.
+        if not raw_dims:
+            raise ValueError(
+                "edge_dim_aggregations.dims must be a non-empty list",
+            )
+        for d in raw_dims:
+            if not isinstance(d, str):
+                raise ValueError(
+                    f"edge_dim_aggregations.dims entries must be strings; "
+                    f"got {type(d).__name__}",
+                )
+            if d not in EDGE_DIM_KINDS:
+                raise ValueError(
+                    f"unknown edge dimension: {d!r}; "
+                    f"valid: {sorted(EDGE_DIM_KINDS)}",
+                )
+        dims = tuple(raw_dims)
+        aggregates_per_dim = {d: tuple(AGGREGATE_NAMES) for d in dims}
+    elif isinstance(raw_dims, dict):
+        # Form B — mapping: each source dim declares its own subset.
+        if not raw_dims:
+            raise ValueError(
+                "edge_dim_aggregations.dims mapping must be non-empty",
+            )
+        aggregates_per_dim = {}
+        for d, agg_list in raw_dims.items():
+            if not isinstance(d, str):
+                raise ValueError(
+                    f"edge_dim_aggregations.dims keys must be strings; "
+                    f"got {type(d).__name__}",
+                )
+            if d not in EDGE_DIM_KINDS:
+                raise ValueError(
+                    f"unknown edge dimension: {d!r}; "
+                    f"valid: {sorted(EDGE_DIM_KINDS)}",
+                )
+            if not isinstance(agg_list, list):
+                raise ValueError(
+                    f"edge_dim_aggregations.dims[{d!r}] must be a list of "
+                    f"aggregate names; got {type(agg_list).__name__}",
+                )
+            if not agg_list:
+                raise ValueError(
+                    f"edge_dim_aggregations.dims[{d!r}] must be a non-empty "
+                    f"list of aggregate names",
+                )
+            for agg in agg_list:
+                if agg not in AGGREGATE_NAMES:
+                    raise ValueError(
+                        f"unknown aggregate {agg!r} for dim {d!r}; "
+                        f"valid: {list(AGGREGATE_NAMES)}",
+                    )
+            # Canonical-order materialisation: filter AGGREGATE_NAMES by user
+            # selection so polygon-dim layout is insensitive to YAML order.
+            user_set = set(agg_list)
+            aggregates_per_dim[d] = tuple(
+                a for a in AGGREGATE_NAMES if a in user_set
+            )
+        dims = tuple(raw_dims.keys())
+    else:
         raise ValueError(
-            f"edge_dim_aggregations.dims must be a list; "
+            f"edge_dim_aggregations.dims must be a list or mapping; "
             f"got {type(raw_dims).__name__}",
         )
-    if not raw_dims:
-        raise ValueError(
-            "edge_dim_aggregations.dims must be a non-empty list",
-        )
-    for d in raw_dims:
-        if d not in EDGE_DIM_KINDS:
-            raise ValueError(
-                f"unknown edge dimension: {d!r}; "
-                f"valid: {sorted(EDGE_DIM_KINDS)}",
-            )
-    dims = tuple(raw_dims)
-    return EdgeDimAggregationsConfig(from_event_pattern=src, dims=dims)
+    return EdgeDimAggregationsConfig(
+        from_event_pattern=src,
+        dims=dims,
+        aggregates_per_dim=aggregates_per_dim,
+    )
 
 
 @dataclass

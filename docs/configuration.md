@@ -734,9 +734,9 @@ Automatically creates an anchor line + pattern (`{line_id}_pattern`).
 | `bidirectional` | bool | `true` | Follow edges in both directions. |
 | `anomaly_percentile` | float | `95.0` | Theta for the auto-created chain pattern. |
 | `description` | string | `null` | Description for chain line + pattern. |
-| `edge_dim_aggregations` | dict | `null` | Aggregate per-edge sidecar dims of an event pattern up to per-chain `_mean` / `_max` columns baked into the chain anchor polygon. `from: <event_pid>` is required and must reference an event pattern that declares `edge_dimensions:` and whose `edge_table.event_line` matches this `chain_lines.<id>.event_line` (validated at parse time). `dims: [...]` is required — non-empty list of source dim names from the referenced sidecar. The chain anchor pattern's polygon shape grows by `2 * len(dims)` columns; downstream primitives (`find_anomalies`, `explain_anomaly`, `find_clusters`) surface the new dims transparently. |
+| `edge_dim_aggregations` | dict | `null` | Aggregate per-edge sidecar dims of an event pattern up to per-chain aggregated columns baked into the chain anchor polygon. `from: <event_pid>` is required and must reference an event pattern that declares `edge_dimensions:` and whose `edge_table.event_line` matches this `chain_lines.<id>.event_line` (validated at parse time). `dims:` is required and accepts either a list of source dim names (each dim emits all five canonical aggregates: `mean` / `max` / `std` / `p95` / `count_above_threshold`) or a mapping `{dim: [agg, …]}` for an explicit per-dim subset. The chain anchor pattern's polygon shape grows by the total number of selected aggregates; downstream primitives (`find_anomalies`, `explain_anomaly`, `find_clusters`) surface the new dims transparently. |
 
-**Example with edge-dim aggregation on chain anchor:**
+**Example with edge-dim aggregation on chain anchor (list form — all five aggregates per dim):**
 
 ```yaml
 chain_lines:
@@ -750,9 +750,32 @@ chain_lines:
       dims: [find_motif_structuring, position_in_chain]
 ```
 
-The chain anchor `tx_chains_pattern` then exposes `find_motif_structuring_mean`,
-`find_motif_structuring_max`, `position_in_chain_mean`, `position_in_chain_max`
+The chain anchor `tx_chains_pattern` then exposes
+`find_motif_structuring_mean` / `_max` / `_std` / `_p95` /
+`_count_above_threshold` and the same five suffixes for `position_in_chain`
 in `find_anomalies` response and `Pattern.dim_labels`.
+
+**Example with per-dim subset (mapping form) — pick only the aggregates you need:**
+
+```yaml
+chain_lines:
+  tx_chains:
+    event_line: transactions
+    from_col: from_account
+    to_col: to_account
+    features: [hop_count]
+    edge_dim_aggregations:
+      from: tx_pattern
+      dims:
+        find_motif_structuring: [mean, count_above_threshold]
+        position_in_chain: [max]
+```
+
+The chain anchor exposes only `find_motif_structuring_mean`,
+`find_motif_structuring_count_above_threshold`, and `position_in_chain_max`
+— three aggregated columns instead of ten. Reordering the user-supplied
+aggregate list does not affect polygon-dim layout (canonical `AGGREGATE_NAMES`
+order applies per dim) or `schema_hash`.
 
 ---
 

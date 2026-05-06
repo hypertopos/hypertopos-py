@@ -216,8 +216,10 @@ Only one version per line or pattern is in `production` at any time.
 that re-fits a pattern writes one such file containing a frozen
 `CalibrationFit` (population statistics `mu/sigma_diag/theta`, plus
 ancillary fit-time fields like `dimension_weights`, `dim_percentiles`,
-`group_stats`, `gmm_components`, `edge_max`). The file is immutable for the
-lifetime of the epoch.
+`group_stats`, `gmm_components`, `edge_max`, and `edge_dim_thresholds` —
+per-source-dim `_count_above_threshold` cutoffs persisted only when the
+anchor pattern declares `edge_dim_aggregations:`, otherwise omitted). The
+file is immutable for the lifetime of the epoch.
 
 `sphere.json` adds three fields starting at format_version `2.4`:
 

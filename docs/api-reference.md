@@ -338,9 +338,9 @@ names in user-supplied `dim_pairs`.
 |--------|-------------|
 | `EdgeDimensionsConfig(dims: dict[str, dict])` | Parsed `edge_dimensions:` block — frozen dataclass attached to `PatternMapping.edge_dimensions` |
 | `parse_edge_dimensions(raw_list, *, pattern_type)` | Parse + validate the YAML list of dim entries (bare strings or single-key dicts). Raises `ValueError` on anchor pattern, `min_position < 3`, `cv_threshold` outside `(0, 1]`, `min_count < 2`, non-positive `amt1_min` / `amt2_max` / `time_window_hours`, negative `burst_seconds`, duplicate or unknown dim names, malformed entries |
-| `EdgeDimAggregationsConfig(from_event_pattern: str, dims: tuple[str, ...])` | Parsed `edge_dim_aggregations:` block on an anchor pattern — frozen dataclass attached to `PatternMapping.edge_dim_aggregations`. `dims` is a non-empty tuple of source dim names |
-| `parse_edge_dim_aggregations(raw_dict, *, pattern_type)` | Parse + validate the YAML mapping. Raises `ValueError` on event pattern, missing `from`, missing or empty `dims` (non-empty list required), non-list `dims`, or unknown dim name |
-| `aggregate_edge_dims_for_anchor(*, anchor_keys, edges, sidecar, dims, anchor_kind, pair_separator, chain_events)` | Aggregate per-edge sidecar dim values up to per-anchor `_mean` / `_max` columns. `anchor_kind` ∈ `{single, pair, chain}`. For chain regime, pass `chain_events: list[str]` of comma-joined event_keys per anchor (one per `anchor_keys` entry); `edges` arg is ignored. Returns a `pa.Table` keyed by `primary_key` |
+| `EdgeDimAggregationsConfig(from_event_pattern: str, dims: tuple[str, ...], aggregates_per_dim: dict[str, tuple[str, ...]])` | Parsed `edge_dim_aggregations:` block on an anchor pattern — frozen dataclass attached to `PatternMapping.edge_dim_aggregations`. `dims` is a non-empty tuple of source dim names; `aggregates_per_dim` maps each source dim to the canonical-ordered subset of `AGGREGATE_NAMES` it emits. Direct constructor calls without `aggregates_per_dim` default to all five canonical aggregates per dim |
+| `parse_edge_dim_aggregations(raw_dict, *, pattern_type)` | Parse + validate the YAML mapping. Accepts two `dims:` shapes — Form A (list of dim names → all five aggregates per dim) and Form B (mapping `{dim: [agg, ...]}` → explicit per-dim subset). Raises `ValueError` on event pattern, missing `from`, missing/empty `dims`, neither-list-nor-mapping `dims`, empty per-dim agg list, or unknown dim/aggregate name |
+| `aggregate_edge_dims_for_anchor(*, anchor_keys, edges, sidecar, dims, anchor_kind, pair_separator, chain_events, key_cols, event_table, thresholds, aggregates_per_dim)` | Aggregate per-edge sidecar dim values up to per-anchor columns. For each source dim in `dims`, emits the aggregates listed in `aggregates_per_dim[dim]` (defaults to all five canonical names: `mean` / `max` / `std` / `p95` / `count_above_threshold`). `anchor_kind` ∈ `{single, pair, chain}`. For chain regime, pass `chain_events: list[str]` of comma-joined event_keys per anchor (one per `anchor_keys` entry); `edges` arg is ignored. `key_cols` carries composite anchor PK columns when k>2. `thresholds` overrides per-dim `_count_above_threshold` cutoffs (default = population p95 of each source dim from the sidecar). Returns a `pa.Table` keyed by `primary_key` with one column per `<dim>_<agg>` selected |
 
 ### Calibration History (GDSReader)
 
@@ -380,7 +380,11 @@ comparable). `CalibrationNotFoundError` bubbles from missing versions.
 
 Fields: `pattern_id`, `v_from`, `v_to`, `schema_hash`,
 `population_size_from`, `population_size_to`, `overall_drift_rms`,
-`top_drifted: list[DimensionDrift]`, `per_dimension: list[DimensionDrift] | None`.
+`top_drifted: list[DimensionDrift]`, `per_dimension: list[DimensionDrift] | None`,
+`edge_dim_threshold_drift: dict[str, dict[str, float]] | None` —
+per-source-dim `{from, to, delta}` of the `_count_above_threshold` cutoff
+when both compared epochs declared `edge_dim_aggregations:` on the anchor
+pattern; `None` when at least one epoch lacks the aggregations block.
 
 #### `DimensionDrift` (dataclass, frozen)
 

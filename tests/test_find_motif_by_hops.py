@@ -44,6 +44,117 @@ def test_returns_dict_with_motifs_block(aml_nav):
     assert out["pattern_id"] == "tx_pattern"
 
 
+def test_anomaly_seed_filter_prunes_frontier(aml_nav):
+    """anomaly_seed_filter=True must intersect the BFS frontier with
+    the anomaly subset of the resolved anchor companion. Verifies the
+    seed_filter_summary diagnostics surface the prune count."""
+    out = aml_nav.find_motif_by_hops(
+        "tx_pattern",
+        hops=[HopPredicate()],
+        anomaly_seed_filter=True,
+        max_results=5,
+    )
+    assert "seed_filter_summary" in out
+    summary = out["seed_filter_summary"]
+    assert summary["requested"] is None
+    assert summary["anomaly"] > 0
+    assert summary["filtered"] > 0
+    assert summary["filtered"] <= summary["anomaly"]
+    # Verify the Lance filter actually filtered — anomaly count must be
+    # a proper SUBSET of all anchor entities, not the full population.
+    # AML HI-small has ~5 % anomaly rate on account_pattern, so anomaly
+    # count must be well under the total row count. If the
+    # `is_anomaly = true` filter silently failed open (Lance returning
+    # all rows), summary["anomaly"] would equal the full anchor row
+    # count and this assertion would catch it.
+    total_anchor_rows = aml_nav._storage.read_geometry(
+        "account_pattern",
+        aml_nav._resolve_version("account_pattern"),
+        columns=["primary_key"],
+    ).num_rows
+    assert summary["anomaly"] < total_anchor_rows * 0.5, (
+        f"anomaly subset {summary['anomaly']} not meaningfully smaller "
+        f"than total {total_anchor_rows} — filter may have failed open"
+    )
+
+
+def test_anomaly_seed_filter_intersects_explicit_seeds(aml_nav):
+    """When seed_keys is provided AND anomaly_seed_filter=True, result
+    is the intersection — both an explicit seed list and the anomaly
+    subset must contain the key."""
+    geo = aml_nav._storage.read_geometry(
+        "account_pattern",
+        aml_nav._resolve_version("account_pattern"),
+        columns=["primary_key"],
+    )
+    seeds = geo["primary_key"][:50].to_pylist()
+    out = aml_nav.find_motif_by_hops(
+        "tx_pattern",
+        hops=[HopPredicate()],
+        seed_keys=seeds,
+        anomaly_seed_filter=True,
+        max_results=5,
+    )
+    summary = out["seed_filter_summary"]
+    assert summary["requested"] == 50
+    assert summary["filtered"] <= 50
+    assert summary["filtered"] <= summary["anomaly"]
+
+
+def test_anomaly_seed_filter_omitted_no_summary(aml_nav):
+    """seed_filter_summary key must be ABSENT when anomaly_seed_filter
+    is False (default), preserving prior return shape."""
+    out = aml_nav.find_motif_by_hops(
+        "tx_pattern",
+        hops=[HopPredicate()],
+        max_results=3,
+    )
+    assert "seed_filter_summary" not in out
+
+
+def test_large_seed_list_does_not_trigger_full_edge_read(aml_nav):
+    """Regression test: a 1000+ seed_keys query must not re-read the
+    edge table per call.
+
+    Prior to dropping the per-call scoped adjacency build, this case ran
+    the full edge table read on every call (~58s on AML HI-small). After
+    routing through the cached global AdjacencyIndex with seed-frontier
+    filter in BFS, warm calls amortise to BFS-only cost. Asserts a very
+    lenient wall-clock budget (5s) that catches a regression to the
+    scoped path without being flaky on slow CI machines.
+    """
+    import time
+
+    # Fetch 1000 anchor primary_keys from account_pattern as seeds.
+    # Module-scope nav fixture means the adjacency cache is warm by the
+    # time this test runs (ordering-independent — all tests share it).
+    geo = aml_nav._storage.read_geometry(
+        "account_pattern",
+        aml_nav._resolve_version("account_pattern"),
+        columns=["primary_key"],
+    )
+    seeds = geo["primary_key"][:1000].to_pylist()
+
+    # First call may pay cold adjacency cost (~28s on this sphere); not
+    # asserted. Second call must be warm and fast.
+    aml_nav.find_motif_by_hops(
+        "tx_pattern", hops=[HopPredicate()],
+        seed_keys=seeds, max_results=10,
+    )
+    t0 = time.perf_counter()
+    out = aml_nav.find_motif_by_hops(
+        "tx_pattern", hops=[HopPredicate()],
+        seed_keys=seeds, max_results=10,
+    )
+    elapsed = time.perf_counter() - t0
+    assert isinstance(out, dict)
+    assert "n_results" in out
+    assert elapsed < 5.0, (
+        f"warm-cache call with 1000 seed_keys took {elapsed:.2f}s — "
+        f"regression toward per-call edge-table read suspected"
+    )
+
+
 def test_anchor_pattern_raises(aml_nav):
     with pytest.raises(Exception, match="event pattern"):
         aml_nav.find_motif_by_hops(

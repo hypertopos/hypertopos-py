@@ -8,7 +8,7 @@
 [![PyArrow](https://img.shields.io/badge/format-PyArrow-red.svg)](https://arrow.apache.org/docs/python/)
 [![Lance](https://img.shields.io/badge/storage-Lance-blueviolet.svg)](https://github.com/lance-format/lance)
 [![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io)
-[![Version](https://img.shields.io/badge/version-0.6.3-%235500FF.svg)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.6.4-%235500FF.svg)](pyproject.toml)
 
 hypertopos is not a database, and not a machine learning model. It is a layer that turns relational data into a coordinate system where every entity gets a position derived from its relationships and the population around it.
 
@@ -70,6 +70,8 @@ Each capability below emerges from treating entities as points in a shared, popu
 | Event-aware motif scoring | `find_motif_by_hops(score=True)` ranks motifs by the product of event-aware `edge_potential` across edges (uses both the anchor companion's per-entity geometry and the event pattern's per-transaction polygons); distinct transactions between the same accounts produce distinct scores | Pure node-pair scoring collapses ranks when motifs share a node sequence | `0.6.1` |
 | Chain-anchor aggregation | Chain anchor patterns auto-emitted from `chain_lines:` declare `edge_dim_aggregations:` to bake per-event sidecar signals into per-chain `_mean` / `_max` columns; closes the third `anchor_kind` after `single` and `pair` | Per-chain manual aggregation outside the geometry, or no chain-level edge-dim summary at all | `0.6.2` |
 | Expanded `edge_dim_aggregations:` surface | Three additional canonical aggregates per source dim (`_std`, `_p95`, `_count_above_threshold` with population p95 cutoff persisted in calibration epoch JSON); k>2 composite anchor support (tripartite and beyond); per-source-dim subset selector — `dims:` accepts list (sugar = all five aggregates) or mapping `{dim: [agg, …]}` (per-dim subset); cross-epoch `edge_dim_threshold_drift` surface on `compare_calibrations` | Manual rebuild + re-engineering whenever the aggregate vocabulary or the per-anchor breadth changes | `0.6.3` |
+| Chain-coherent investigative loop | Four primitives compose into a complete chain investigation: `find_chains_with_coherent_anomaly` (population sweep — chains where consecutive entity-anchor positions are individually anomalous on the same dominant delta dim), `anomaly_propagation_in_chain` (per-chain hop-by-hop trace), `classify_chain_typology` (five-axis label: shape / peak_position / position_in_chain / extension_signals / dominant_top_dim), `extend_chain` (boundary-extension suggester via the chain reverse index) | Manual SQL over chain pattern + ad-hoc Python scoring + no per-chain typology label | `0.6.4` |
+| Anomaly-anchored seed prune for motifs | `find_motif_by_hops(anomaly_seed_filter=True)` intersects the BFS starting frontier with the anomaly subset of the resolved anchor companion (replaces "all keys" frontier when `seed_keys=None`, intersects with explicit list otherwise); result dict carries `seed_filter_summary` (`{requested, anomaly, filtered}`) | Manual pre-filter on every call, no built-in convergence on anomaly-anchored seeds | `0.6.4` |
 
 ### What changes in practice
 

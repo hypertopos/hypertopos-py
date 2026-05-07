@@ -376,7 +376,12 @@ def _parallel_bfs(
             )
 
         # Post-merge dedup via frozenset — ensures correctness even when
-        # per-worker dedup caps (_DEDUP_CAP) are hit.
+        # per-worker dedup caps (_DEDUP_CAP) are hit. Each worker assigned
+        # chain_ids starting from its local len(chains)=0, so the merged
+        # set has 1 .. n_workers collisions per id; reassign chain_id from
+        # the global dedup index to restore primary_key uniqueness in the
+        # downstream points table.
+        import dataclasses
         seen: set[frozenset] = set()
         deduped: list[Chain] = []
         pre_dedup = len(chains)
@@ -384,13 +389,44 @@ def _parallel_bfs(
             sig = frozenset(c.event_keys)
             if sig not in seen:
                 seen.add(sig)
-                deduped.append(c)
+                deduped.append(
+                    dataclasses.replace(
+                        c, chain_id=f"CHAIN-{len(deduped):06d}",
+                    ),
+                )
                 if len(deduped) >= max_chains:
                     break
         if pre_dedup - len(deduped) > pre_dedup * 0.1:
             warnings.warn(
                 f"Chain dedup removed {pre_dedup - len(deduped)} duplicates "
                 f"({(pre_dedup - len(deduped)) / pre_dedup:.0%}) across workers.", stacklevel=2
+            )
+
+        # Safety net: post-dedup chain_ids MUST be unique. Earlier
+        # parallel-pool merge collision (each worker restarting its
+        # local len(chains) counter at 0) silently produced
+        # ~75% colliding ids on AML HI-small. Reassignment from global
+        # dedup index restores uniqueness — assert that here so any
+        # future regression in the merge logic fails loudly at build
+        # time instead of silently corrupting the chain pattern points
+        # table.
+        chain_ids = [c.chain_id for c in deduped]
+        if len(set(chain_ids)) != len(chain_ids):
+            from collections import Counter
+            collisions = {
+                cid: count for cid, count in Counter(chain_ids).items()
+                if count > 1
+            }
+            raise RuntimeError(
+                f"chain extraction (or external import) produced "
+                f"{len(collisions)} colliding chain_ids across "
+                f"{len(chain_ids)} chains ({sum(collisions.values())} "
+                f"total colliding rows). primary_key uniqueness must "
+                f"be guaranteed for the chain pattern points table — "
+                f"either fix the parallel-worker id reassignment path "
+                f"or, if the chains came from external import, ensure "
+                f"upstream id uniqueness. First few collisions: "
+                f"{list(collisions.items())[:5]}",
             )
         return deduped
     finally:

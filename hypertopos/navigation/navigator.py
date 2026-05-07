@@ -1085,8 +1085,8 @@ class GDSNavigator:
             line_ver = self._manifest.line_version(entity_line_id) if entity_line_id else None
             if not (entity_line_id and line_ver is not None):
                 raise GDSNavigationError(
-                    f"property_filters requires an entity line — "
-                    f"event patterns don't have entity properties"
+                    "property_filters requires an entity line — "
+                    "event patterns don't have entity properties"
                 )
             read_cols = list(property_filters.keys())
             if rank_by_property and rank_by_property not in read_cols:
@@ -4616,7 +4616,7 @@ class GDSNavigator:
 
     @staticmethod
     def _active_seeds_for_motif(
-        adj: "AdjacencyIndex",
+        adj: AdjacencyIndex,
         all_seeds: list[str],
         motif_type: str,
         effective_min_k: int,
@@ -4671,7 +4671,7 @@ class GDSNavigator:
     @staticmethod
     def _enum_fan_out_via_adj(
         seed: str,
-        adj: "AdjacencyIndex",
+        adj: AdjacencyIndex,
         window_sec: float,
         min_k: int,
     ) -> list[dict[str, Any]]:
@@ -4698,7 +4698,7 @@ class GDSNavigator:
     @staticmethod
     def _enum_fan_in_via_adj(
         seed: str,
-        adj: "AdjacencyIndex",
+        adj: AdjacencyIndex,
         window_sec: float,
         min_k: int,
     ) -> list[dict[str, Any]]:
@@ -4726,7 +4726,7 @@ class GDSNavigator:
     @staticmethod
     def _enum_split_recombine_via_adj(
         seed: str,
-        adj: "AdjacencyIndex",
+        adj: AdjacencyIndex,
         window_sec: float,
         min_k: int,
         direction: str = "forward",
@@ -4823,7 +4823,7 @@ class GDSNavigator:
     @staticmethod
     def _enum_bipartite_burst_via_adj(
         seed: str,
-        adj: "AdjacencyIndex",
+        adj: AdjacencyIndex,
         window_sec: float,
         min_k: int,
         min_m: int,
@@ -4979,7 +4979,7 @@ class GDSNavigator:
     @staticmethod
     def _enum_cycle_2_via_adj(
         seed: str,
-        adj: "AdjacencyIndex",
+        adj: AdjacencyIndex,
         window_sec: float,
     ) -> list[dict[str, Any]]:
         out_nbr = adj.neighbors_out_window(seed)
@@ -5010,7 +5010,7 @@ class GDSNavigator:
     @staticmethod
     def _enum_cycle_3_via_adj(
         seed: str,
-        adj: "AdjacencyIndex",
+        adj: AdjacencyIndex,
         window_sec: float,
         max_triads: int = 50,
     ) -> list[dict[str, Any]]:
@@ -5065,7 +5065,7 @@ class GDSNavigator:
     @staticmethod
     def _enum_structuring_via_adj(
         seed: str,
-        adj: "AdjacencyIndex",
+        adj: AdjacencyIndex,
         window_sec: float,
         amt1_min: float,
         amt2_max: float,
@@ -5124,7 +5124,7 @@ class GDSNavigator:
     @staticmethod
     def _enum_chain_k_via_adj(
         seed: str,
-        adj: "AdjacencyIndex",
+        adj: AdjacencyIndex,
         window_sec: float,
         k: int,
         max_frontier: int = 1000,
@@ -6030,7 +6030,6 @@ class GDSNavigator:
         if fdr_alpha is not None and len(results) > 0:
             from hypertopos.engine.fdr import (
                 benjamini_hochberg,
-                empirical_p_values_from_rank,
             )
             N = len(results)
             # p-value from hub_score ranking: rank 1 (highest) → lowest p
@@ -9215,6 +9214,932 @@ class GDSNavigator:
                 "total": len(chains),
                 "anomalous": anomalous,
             },
+        }
+
+    def find_chains_with_coherent_anomaly(
+        self,
+        pattern_id: str,
+        *,
+        anchor_pattern_id: str,
+        min_hops: int = 3,
+        max_results: int = 100,
+    ) -> dict[str, Any]:
+        """Find chains where ≥min_hops consecutive entity-anchor positions
+        are individually anomalous AND share the same dominant delta dim.
+
+        Targets the "coherent anomaly cascade" signal: chains hopping
+        through entities individually flagged for the same structural
+        reason (e.g. AML structuring chains routed through accounts that
+        all show high pass-through ratio or fan-asymmetry).
+
+        Distinct from find_anomalies(chain_pattern), which scores chains
+        on chain-level features (hop_count, amount_decay, time_span);
+        this primitive scores chain composition, not chain shape.
+
+        Args:
+            pattern_id: chain anchor pattern id (built from chain_lines:).
+            anchor_pattern_id: entity anchor pattern whose primary_keys
+                match the chain hops (e.g. account_pattern when chains
+                hop through accounts).
+            min_hops: strict consecutive run length; must be >= 2.
+            max_results: cap on returned runs.
+
+        Returns dict with chains list (each entry: chain_id,
+        run_start_idx, run_length, top_dim, run_keys, max_delta_norm)
+        and diagnostics (n_chains_total, n_anomaly_entities, elapsed_ms).
+
+        Sorting: (run_length DESC, max_delta_norm DESC).
+        """
+        import time as _time
+        t0 = _time.perf_counter()
+
+        if min_hops < 2:
+            raise ValueError(
+                f"min_hops must be >= 2 (coherence undefined for single "
+                f"hop); got {min_hops}",
+            )
+        if max_results < 0:
+            raise ValueError(f"max_results must be >= 0; got {max_results}")
+
+        sphere = self._storage.read_sphere()
+        if pattern_id not in sphere.patterns:
+            raise GDSNavigationError(f"pattern not found: {pattern_id!r}")
+        if anchor_pattern_id not in sphere.patterns:
+            raise GDSNavigationError(
+                f"anchor pattern not found: {anchor_pattern_id!r}",
+            )
+
+        chain_pat = sphere.patterns[pattern_id]
+        if chain_pat.pattern_type != "anchor":
+            raise GDSNavigationError(
+                f"pattern_id must be a chain anchor pattern; got "
+                f"pattern_type={chain_pat.pattern_type!r} for "
+                f"{pattern_id!r}",
+            )
+
+        anchor_pat = sphere.patterns[anchor_pattern_id]
+        if anchor_pat.pattern_type != "anchor":
+            raise GDSNavigationError(
+                f"anchor_pattern_id must be an anchor pattern; got "
+                f"pattern_type={anchor_pat.pattern_type!r} for "
+                f"{anchor_pattern_id!r}",
+            )
+
+        chain_line_id = sphere.entity_line(pattern_id)
+        if chain_line_id is None:
+            raise GDSNavigationError(
+                f"chain anchor pattern {pattern_id!r} has no entity_line",
+            )
+        chain_line_ver = self._manifest.line_version(chain_line_id) or 1
+        pts = self._storage.read_points(
+            chain_line_id, chain_line_ver,
+            columns=["primary_key", "chain_keys"],
+        )
+        if "chain_keys" not in pts.schema.names:
+            raise GDSNavigationError(
+                f"line {chain_line_id!r} has no chain_keys column — "
+                f"pattern {pattern_id!r} is not a chain pattern",
+            )
+
+        # n_chains_total = non-empty chain entries (the actual sweep
+        # surface). Computed once here so both the early-return paths
+        # and the main sweep share the same semantic.
+        chain_keys_strs_all = pts["chain_keys"].to_pylist()
+        n_chains_total = sum(1 for ck in chain_keys_strs_all if ck)
+
+        anchor_version = self._resolve_version(anchor_pattern_id)
+        try:
+            anchor_geo = self._storage.read_geometry(
+                anchor_pattern_id, anchor_version,
+                columns=["primary_key", "is_anomaly", "delta", "delta_norm"],
+            )
+        except (KeyError, ValueError) as exc:
+            raise GDSNavigationError(
+                f"anchor pattern {anchor_pattern_id!r} cannot serve "
+                f"is_anomaly / delta — calibration must run first",
+            ) from exc
+
+        if anchor_geo.num_rows == 0:
+            return {
+                "pattern_id": pattern_id,
+                "anchor_pattern_id": anchor_pattern_id,
+                "n_results": 0,
+                "chains": [],
+                "diagnostics": {
+                    "n_chains_total": n_chains_total,
+                    "n_anomaly_entities": 0,
+                    "elapsed_ms": round(
+                        (_time.perf_counter() - t0) * 1000.0, 2,
+                    ),
+                },
+            }
+
+        pks_arr = anchor_geo["primary_key"].to_pylist()
+        is_anom_arr = np.asarray(
+            anchor_geo["is_anomaly"].to_pylist(), dtype=bool,
+        )
+        delta_norm_arr = anchor_geo["delta_norm"].to_pylist()
+        delta_2d = delta_matrix_from_arrow(anchor_geo)
+        n_dims = delta_2d.shape[1]
+
+        dim_labels = (
+            list(anchor_pat.dim_labels)
+            if anchor_pat.dim_labels else
+            [f"dim_{i}" for i in range(n_dims)]
+        )
+
+        sigma = getattr(anchor_pat, "sigma", None)
+        if sigma is not None:
+            sigma_arr = np.asarray(sigma, dtype=np.float32)
+            if sigma_arr.shape[0] != n_dims:
+                sigma_safe = np.ones(n_dims, dtype=np.float32)
+            else:
+                sigma_safe = np.where(sigma_arr > 1e-12, sigma_arr, 1.0)
+        else:
+            sigma_safe = np.ones(n_dims, dtype=np.float32)
+
+        anom_idxs = np.flatnonzero(is_anom_arr)
+        if anom_idxs.size == 0:
+            return {
+                "pattern_id": pattern_id,
+                "anchor_pattern_id": anchor_pattern_id,
+                "n_results": 0,
+                "chains": [],
+                "diagnostics": {
+                    "n_chains_total": n_chains_total,
+                    "n_anomaly_entities": 0,
+                    "elapsed_ms": round(
+                        (_time.perf_counter() - t0) * 1000.0, 2,
+                    ),
+                },
+            }
+
+        anomaly_delta = delta_2d[anom_idxs]
+        normalized = np.abs(anomaly_delta) / sigma_safe[None, :]
+        top_idxs = np.argmax(normalized, axis=1)
+        anomaly_top_dim: dict[str, str] = {}
+        pk_to_norm: dict[str, float] = {}
+        for j, i in enumerate(anom_idxs):
+            pk = pks_arr[i]
+            anomaly_top_dim[pk] = dim_labels[int(top_idxs[j])]
+            n_val = delta_norm_arr[i]
+            pk_to_norm[pk] = float(n_val) if n_val is not None else 0.0
+
+        chain_pks = pts["primary_key"].to_pylist()
+        chain_keys_strs = chain_keys_strs_all
+
+        runs: list[dict[str, Any]] = []
+        for chain_pk, ck in zip(chain_pks, chain_keys_strs, strict=False):
+            if not ck:
+                continue
+            keys = ck.split(",")
+            n = len(keys)
+            best_len = 0
+            best_start = 0
+            best_dim: str | None = None
+            i = 0
+            while i < n:
+                td = anomaly_top_dim.get(keys[i])
+                if td is None:
+                    i += 1
+                    continue
+                j = i + 1
+                while j < n and anomaly_top_dim.get(keys[j]) == td:
+                    j += 1
+                run_len = j - i
+                if run_len > best_len:
+                    best_len = run_len
+                    best_start = i
+                    best_dim = td
+                i = j
+            if best_len >= min_hops and max_results > 0:
+                run_keys = keys[best_start:best_start + best_len]
+                max_norm = max(
+                    (pk_to_norm.get(k, 0.0) for k in run_keys),
+                    default=0.0,
+                )
+                runs.append({
+                    "chain_id": chain_pk,
+                    "run_start_idx": best_start,
+                    "run_length": best_len,
+                    "top_dim": best_dim,
+                    "run_keys": run_keys,
+                    "max_delta_norm": round(max_norm, 4),
+                })
+
+        runs.sort(
+            key=lambda r: (r["run_length"], r["max_delta_norm"]),
+            reverse=True,
+        )
+        runs = runs[:max_results]
+
+        elapsed_ms = (_time.perf_counter() - t0) * 1000.0
+        return {
+            "pattern_id": pattern_id,
+            "anchor_pattern_id": anchor_pattern_id,
+            "n_results": len(runs),
+            "chains": runs,
+            "diagnostics": {
+                "n_chains_total": n_chains_total,
+                "n_anomaly_entities": int(anom_idxs.size),
+                "elapsed_ms": round(elapsed_ms, 2),
+            },
+        }
+
+    def anomaly_propagation_in_chain(
+        self,
+        chain_id: str,
+        pattern_id: str,
+        *,
+        anchor_pattern_id: str,
+    ) -> dict[str, Any]:
+        """Per-hop anomaly progression for a single chain.
+
+        Inspector primitive complementary to
+        `find_chains_with_coherent_anomaly`: the latter sweeps the
+        population of chains; this primitive takes one chain_id and
+        returns its hop-by-hop anomaly trace — for each entity in the
+        chain's keys sequence, returns is_anomaly + delta_norm + top
+        dominant dim (sigma-normalised argmax over delta) +
+        delta_rank_pct.
+
+        Use case: after a population sweep flags a chain as having a
+        coherent anomaly run, drill into that chain's full hop
+        progression to see how the anomaly accumulates and where it
+        breaks.
+
+        Args:
+            chain_id: primary_key of the chain in the chain anchor pattern.
+            pattern_id: chain anchor pattern id (built from chain_lines:).
+            anchor_pattern_id: entity anchor pattern whose primary_keys
+                match the chain hops.
+
+        Returns dict with hops[] (per-hop progression) and summary stats
+        (n_hops, n_anomalous, max_run_length_same_top_dim,
+        dominant_top_dim). On ties for dominant_top_dim,
+        ``Counter.most_common`` returns the dim that first appeared in
+        chain order (Python 3.7+ insertion-ordered dict guarantee), not
+        the lexicographically smallest.
+
+        Raises GDSNavigationError when chain_id is not found, pattern_id
+        is not a chain anchor, anchor_pattern_id is not an anchor, or
+        the anchor lacks calibration.
+        """
+        import time as _time
+        from collections import Counter
+        t0 = _time.perf_counter()
+
+        sphere = self._storage.read_sphere()
+        if pattern_id not in sphere.patterns:
+            raise GDSNavigationError(f"pattern not found: {pattern_id!r}")
+        if anchor_pattern_id not in sphere.patterns:
+            raise GDSNavigationError(
+                f"anchor pattern not found: {anchor_pattern_id!r}",
+            )
+
+        chain_pat = sphere.patterns[pattern_id]
+        if chain_pat.pattern_type != "anchor":
+            raise GDSNavigationError(
+                f"pattern_id must be a chain anchor pattern; got "
+                f"pattern_type={chain_pat.pattern_type!r} for "
+                f"{pattern_id!r}",
+            )
+
+        anchor_pat = sphere.patterns[anchor_pattern_id]
+        if anchor_pat.pattern_type != "anchor":
+            raise GDSNavigationError(
+                f"anchor_pattern_id must be an anchor pattern; got "
+                f"pattern_type={anchor_pat.pattern_type!r} for "
+                f"{anchor_pattern_id!r}",
+            )
+
+        chain_line_id = sphere.entity_line(pattern_id)
+        if chain_line_id is None:
+            raise GDSNavigationError(
+                f"chain anchor pattern {pattern_id!r} has no entity_line",
+            )
+        chain_line_ver = self._manifest.line_version(chain_line_id) or 1
+
+        pts = self._storage.read_points(
+            chain_line_id, chain_line_ver,
+            columns=["primary_key", "chain_keys"],
+            primary_key=chain_id,
+        )
+        if pts.num_rows == 0:
+            raise GDSNavigationError(
+                f"chain not found: {chain_id!r} in pattern {pattern_id!r}",
+            )
+        if "chain_keys" not in pts.schema.names:
+            raise GDSNavigationError(
+                f"line {chain_line_id!r} has no chain_keys column — "
+                f"pattern {pattern_id!r} is not a chain pattern",
+            )
+        # Defend against a builder-side chain_id collision: multiple chain
+        # rows with identical primary_key but distinct chain_keys. Until the
+        # extractor guarantees uniqueness, a duplicate is ambiguous and we
+        # cannot pick the "correct" chain — raise rather than silently
+        # return one variant's hops.
+        if pts.num_rows > 1:
+            distinct_keys = sorted({
+                str(pts["chain_keys"][i].as_py())
+                for i in range(pts.num_rows)
+                if pts["chain_keys"][i].as_py()
+            })
+            raise GDSNavigationError(
+                f"ambiguous chain_id {chain_id!r} in pattern "
+                f"{pattern_id!r}: {pts.num_rows} rows share this id with "
+                f"{len(distinct_keys)} distinct chain_keys variants. "
+                f"Chain extraction prior to the parallel-worker id "
+                f"collision fix produced colliding chain_ids; rebuild "
+                f"this sphere's chain pattern to restore primary_key "
+                f"uniqueness, then retry the inspector.",
+            )
+        ck = pts["chain_keys"][0].as_py()
+        if not ck:
+            return {
+                "chain_id": chain_id,
+                "pattern_id": pattern_id,
+                "anchor_pattern_id": anchor_pattern_id,
+                "hops": [],
+                "summary": {
+                    "n_hops": 0,
+                    "n_anomalous": 0,
+                    "max_run_length_same_top_dim": 0,
+                    "dominant_top_dim": None,
+                },
+                "elapsed_ms": round(
+                    (_time.perf_counter() - t0) * 1000.0, 2,
+                ),
+            }
+        keys = ck.split(",")
+
+        anchor_version = self._resolve_version(anchor_pattern_id)
+        try:
+            anchor_geo = self._storage.read_geometry(
+                anchor_pattern_id, anchor_version,
+                columns=["primary_key", "is_anomaly", "delta",
+                         "delta_norm", "delta_rank_pct"],
+                point_keys=keys,
+            )
+        except (KeyError, ValueError) as exc:
+            raise GDSNavigationError(
+                f"anchor pattern {anchor_pattern_id!r} cannot serve "
+                f"is_anomaly / delta — calibration must run first",
+            ) from exc
+
+        entity_info: dict[str, dict[str, Any]] = {}
+        if anchor_geo.num_rows > 0:
+            pks_arr = anchor_geo["primary_key"].to_pylist()
+            is_anom_arr = anchor_geo["is_anomaly"].to_pylist()
+            dn_arr = anchor_geo["delta_norm"].to_pylist()
+            drp_arr = anchor_geo["delta_rank_pct"].to_pylist()
+            delta_2d = delta_matrix_from_arrow(anchor_geo)
+            n_dims = delta_2d.shape[1]
+
+            dim_labels = (
+                list(anchor_pat.dim_labels)
+                if anchor_pat.dim_labels else
+                [f"dim_{i}" for i in range(n_dims)]
+            )
+
+            sigma = getattr(anchor_pat, "sigma", None)
+            if sigma is not None:
+                sigma_arr = np.asarray(sigma, dtype=np.float32)
+                if sigma_arr.shape[0] != n_dims:
+                    sigma_safe = np.ones(n_dims, dtype=np.float32)
+                else:
+                    sigma_safe = np.where(
+                        sigma_arr > 1e-12, sigma_arr, 1.0,
+                    )
+            else:
+                sigma_safe = np.ones(n_dims, dtype=np.float32)
+
+            normalized = np.abs(delta_2d) / sigma_safe[None, :]
+            top_idxs = np.argmax(normalized, axis=1)
+
+            for i, pk in enumerate(pks_arr):
+                is_anom = bool(is_anom_arr[i])
+                top_dim = (
+                    dim_labels[int(top_idxs[i])] if is_anom else None
+                )
+                entity_info[pk] = {
+                    "is_anomaly": is_anom,
+                    "delta_norm": (
+                        round(float(dn_arr[i]), 4)
+                        if dn_arr[i] is not None else 0.0
+                    ),
+                    "top_dim": top_dim,
+                    "delta_rank_pct": (
+                        round(float(drp_arr[i]), 2)
+                        if drp_arr[i] is not None else None
+                    ),
+                }
+
+        hops: list[dict[str, Any]] = []
+        for i, key in enumerate(keys):
+            info = entity_info.get(key)
+            if info is None:
+                hops.append({
+                    "hop_idx": i,
+                    "primary_key": key,
+                    "is_anomaly": False,
+                    "delta_norm": 0.0,
+                    "top_dim": None,
+                    "delta_rank_pct": None,
+                })
+            else:
+                hops.append({"hop_idx": i, "primary_key": key, **info})
+
+        n_anomalous = sum(1 for h in hops if h["is_anomaly"])
+        max_run = 0
+        cur_run = 0
+        cur_dim: str | None = None
+        for h in hops:
+            if (
+                h["is_anomaly"] and h["top_dim"] is not None
+                and h["top_dim"] == cur_dim
+            ):
+                cur_run += 1
+            elif h["is_anomaly"]:
+                cur_dim = h["top_dim"]
+                cur_run = 1
+            else:
+                cur_dim = None
+                cur_run = 0
+            if cur_run > max_run:
+                max_run = cur_run
+
+        dim_counter: Counter[str] = Counter(
+            h["top_dim"] for h in hops
+            if h["is_anomaly"] and h["top_dim"] is not None
+        )
+        dominant = dim_counter.most_common(1)[0][0] if dim_counter else None
+
+        return {
+            "chain_id": chain_id,
+            "pattern_id": pattern_id,
+            "anchor_pattern_id": anchor_pattern_id,
+            "hops": hops,
+            "summary": {
+                "n_hops": len(hops),
+                "n_anomalous": n_anomalous,
+                "max_run_length_same_top_dim": max_run,
+                "dominant_top_dim": dominant,
+            },
+            "elapsed_ms": round(
+                (_time.perf_counter() - t0) * 1000.0, 2,
+            ),
+        }
+
+    def classify_chain_typology(
+        self,
+        chain_id: str,
+        pattern_id: str,
+        *,
+        anchor_pattern_id: str,
+    ) -> dict[str, Any]:
+        """Five-dimensional typology classification for a single chain.
+
+        Wraps `anomaly_propagation_in_chain` and applies classification
+        rules over the per-hop trace to label the chain along five
+        operational axes:
+
+          - shape: monotone-rising / monotone-falling / peak-in-middle /
+            peak-at-start / peak-at-end / flat / no-anomalous-run
+          - peak_position: at-start / early / middle / late / at-end /
+            single-hop / no-run
+          - position_in_chain: leading / transit / terminal / full-chain /
+            no-run
+          - extension_signals: backward (pre-run rank in elevated band) /
+            forward (next-hop rank in elevated band)
+          - dominant_top_dim across the entire chain
+
+        Run band buckets ("low" / "median" / "elevated" /
+        "borderline-anomalous") are the same as
+        `find_chains_with_coherent_anomaly`'s breakpoint analysis.
+        """
+        import time as _time
+        t0 = _time.perf_counter()
+
+        trace = self.anomaly_propagation_in_chain(
+            chain_id, pattern_id, anchor_pattern_id=anchor_pattern_id,
+        )
+        hops = trace["hops"]
+        n_hops = len(hops)
+
+        # Identify the longest same-top-dim run (matches the C1 sweep).
+        run_start: int | None = None
+        run_length = 0
+        run_top_dim: str | None = None
+        cur_dim: str | None = None
+        cur_start = 0
+        cur_len = 0
+        for i, h in enumerate(hops):
+            td = h["top_dim"] if h["is_anomaly"] else None
+            if td is not None and td == cur_dim:
+                cur_len += 1
+            elif td is not None:
+                cur_dim = td
+                cur_start = i
+                cur_len = 1
+            else:
+                cur_dim = None
+                cur_len = 0
+            if cur_len > run_length:
+                run_length = cur_len
+                run_start = cur_start
+                run_top_dim = cur_dim
+
+        if run_start is None or run_length == 0:
+            return {
+                "chain_id": chain_id,
+                "pattern_id": pattern_id,
+                "anchor_pattern_id": anchor_pattern_id,
+                "typology": {
+                    "shape": "no-anomalous-run",
+                    "peak_position": "no-run",
+                    "position_in_chain": "no-run",
+                    "extension_signals": {"backward": False, "forward": False},
+                    "pre_run_rank_bucket": "no-pre-run",
+                    "breakpoint_rank_bucket": "no-breakpoint",
+                    "dominant_top_dim": trace["summary"]["dominant_top_dim"],
+                    "run_length": 0,
+                    "run_start_idx": None,
+                    "run_top_dim": None,
+                },
+                "elapsed_ms": round(
+                    (_time.perf_counter() - t0) * 1000.0, 2,
+                ),
+            }
+
+        run_end_excl = run_start + run_length
+        run_deltas = [h["delta_norm"] for h in hops[run_start:run_end_excl]]
+
+        # Shape classification.
+        if len(run_deltas) < 2:
+            shape = "single-hop"
+        else:
+            diffs = [run_deltas[i + 1] - run_deltas[i] for i in range(len(run_deltas) - 1)]
+            n_up = sum(1 for d in diffs if d > 0.5)
+            n_down = sum(1 for d in diffs if d < -0.5)
+            if n_up == 0 and n_down == 0:
+                shape = "flat"
+            elif n_down == 0 and n_up > 0:
+                shape = "monotone-rising"
+            elif n_up == 0 and n_down > 0:
+                shape = "monotone-falling"
+            else:
+                peak_local = run_deltas.index(max(run_deltas))
+                if 0 < peak_local < len(run_deltas) - 1:
+                    shape = "peak-in-middle"
+                elif peak_local == 0:
+                    shape = "peak-at-start"
+                else:
+                    shape = "peak-at-end"
+
+        # Peak position bucket within the run.
+        if run_deltas:
+            peak_local = run_deltas.index(max(run_deltas))
+            n = len(run_deltas)
+            if n == 1:
+                peak_position = "single-hop"
+            elif peak_local == 0:
+                peak_position = "at-start"
+            elif peak_local == n - 1:
+                peak_position = "at-end"
+            elif peak_local < n / 3:
+                peak_position = "early"
+            elif peak_local > 2 * n / 3:
+                peak_position = "late"
+            else:
+                peak_position = "middle"
+        else:
+            peak_position = "no-run"
+
+        # Position class.
+        is_at_start = run_start == 0
+        is_terminal = run_end_excl >= n_hops
+        if is_at_start and is_terminal:
+            position_in_chain = "full-chain"
+        elif is_at_start:
+            position_in_chain = "leading"
+        elif is_terminal:
+            position_in_chain = "terminal"
+        else:
+            position_in_chain = "transit"
+
+        def _bucket(rank: float | None) -> str:
+            if rank is None:
+                return "no-rank"
+            if rank >= 95:
+                return "borderline-anomalous"
+            if rank >= 80:
+                return "elevated"
+            if rank >= 50:
+                return "median"
+            return "low"
+
+        pre_run_rank = (
+            hops[run_start - 1].get("delta_rank_pct")
+            if run_start > 0 else None
+        )
+        breakpoint_rank = (
+            hops[run_end_excl].get("delta_rank_pct")
+            if run_end_excl < n_hops else None
+        )
+        pre_run_bucket = (
+            _bucket(pre_run_rank) if run_start > 0 else "no-pre-run"
+        )
+        breakpoint_bucket = (
+            _bucket(breakpoint_rank)
+            if run_end_excl < n_hops else "no-breakpoint"
+        )
+        backward_signal = pre_run_bucket in ("elevated", "borderline-anomalous")
+        forward_signal = breakpoint_bucket in (
+            "elevated", "borderline-anomalous",
+        )
+
+        return {
+            "chain_id": chain_id,
+            "pattern_id": pattern_id,
+            "anchor_pattern_id": anchor_pattern_id,
+            "typology": {
+                "shape": shape,
+                "peak_position": peak_position,
+                "position_in_chain": position_in_chain,
+                "extension_signals": {
+                    "backward": backward_signal,
+                    "forward": forward_signal,
+                },
+                "pre_run_rank_bucket": pre_run_bucket,
+                "breakpoint_rank_bucket": breakpoint_bucket,
+                "dominant_top_dim": trace["summary"]["dominant_top_dim"],
+                "run_length": run_length,
+                "run_start_idx": run_start,
+                "run_top_dim": run_top_dim,
+            },
+            "elapsed_ms": round(
+                (_time.perf_counter() - t0) * 1000.0, 2,
+            ),
+        }
+
+    def extend_chain(
+        self,
+        chain_id: str,
+        pattern_id: str,
+        *,
+        anchor_pattern_id: str,
+        direction: str = "forward",
+        max_results: int = 20,
+    ) -> dict[str, Any]:
+        """Suggest candidate extension entities at the boundary of a
+        chain's anomalous run.
+
+        Forward: at the run's end, find entities that follow the
+        boundary entity in OTHER chains in the same chain pattern, and
+        rank them by their own anchor anomaly status. These are
+        candidates for extending the investigation forward into the
+        laundering ring.
+
+        Backward: same logic at the run's start, returning entities
+        that PRECEDE the boundary entity in other chains.
+
+        Returns dict with `boundary_key`, `boundary_position`
+        (start/end of run within original chain), `candidates[]`
+        (entity_key, is_anomaly, delta_norm, delta_rank_pct,
+        source_chain_id), and `summary` (`n_candidates`,
+        `n_anomalous_candidates`, `n_unique_keys`).
+        """
+        import time as _time
+        from collections import defaultdict
+        t0 = _time.perf_counter()
+
+        if direction not in ("forward", "backward"):
+            raise ValueError(
+                f"direction must be 'forward' or 'backward'; "
+                f"got {direction!r}",
+            )
+        if max_results < 0:
+            raise ValueError(f"max_results must be >= 0; got {max_results}")
+
+        trace = self.anomaly_propagation_in_chain(
+            chain_id, pattern_id, anchor_pattern_id=anchor_pattern_id,
+        )
+        hops = trace["hops"]
+        n_hops = len(hops)
+
+        # Locate boundary: end of the longest anomalous-same-top-dim run
+        # for forward, start for backward.
+        run_start: int | None = None
+        run_end_excl = 0
+        cur_dim: str | None = None
+        cur_start = 0
+        cur_len = 0
+        best_len = 0
+        for i, h in enumerate(hops):
+            td = h["top_dim"] if h["is_anomaly"] else None
+            if td is not None and td == cur_dim:
+                cur_len += 1
+            elif td is not None:
+                cur_dim = td
+                cur_start = i
+                cur_len = 1
+            else:
+                cur_dim = None
+                cur_len = 0
+            if cur_len > best_len:
+                best_len = cur_len
+                run_start = cur_start
+                run_end_excl = i + 1
+
+        if run_start is None or best_len == 0:
+            return {
+                "chain_id": chain_id,
+                "pattern_id": pattern_id,
+                "anchor_pattern_id": anchor_pattern_id,
+                "direction": direction,
+                "boundary_key": None,
+                "boundary_position": None,
+                "candidates": [],
+                "summary": {
+                    "n_candidates": 0,
+                    "n_anomalous_candidates": 0,
+                    "n_unique_keys": 0,
+                },
+                "elapsed_ms": round(
+                    (_time.perf_counter() - t0) * 1000.0, 2,
+                ),
+            }
+
+        if direction == "forward":
+            boundary_idx = run_end_excl - 1
+            boundary_key = hops[boundary_idx]["primary_key"]
+            boundary_position = "run-end"
+        else:
+            boundary_idx = run_start
+            boundary_key = hops[boundary_idx]["primary_key"]
+            boundary_position = "run-start"
+
+        # Use the chain reverse index to find OTHER chains containing
+        # the boundary key. Then walk those chains to extract the
+        # candidate "next-after-boundary" or "prev-before-boundary"
+        # entity keys.
+        sphere = self._storage.read_sphere()
+        chain_line_id = sphere.entity_line(pattern_id)
+        chain_line_ver = self._manifest.line_version(chain_line_id) or 1
+
+        # Read full chain points (filtered to chains containing
+        # boundary_key via the existing reverse index).
+        rev_idx = self._get_chain_reverse_index(chain_line_id, chain_line_ver)
+        chain_pks_with_boundary = rev_idx.get(boundary_key, [])
+        if not chain_pks_with_boundary:
+            return {
+                "chain_id": chain_id,
+                "pattern_id": pattern_id,
+                "anchor_pattern_id": anchor_pattern_id,
+                "direction": direction,
+                "boundary_key": boundary_key,
+                "boundary_position": boundary_position,
+                "candidates": [],
+                "summary": {
+                    "n_candidates": 0,
+                    "n_anomalous_candidates": 0,
+                    "n_unique_keys": 0,
+                },
+                "elapsed_ms": round(
+                    (_time.perf_counter() - t0) * 1000.0, 2,
+                ),
+            }
+
+        # Targeted batch read of the chains containing the boundary key.
+        # The reverse index narrowed us to a small subset; reading the
+        # full points table just to filter in Python materialises all
+        # 290 k+ string columns and dominates wall-clock at ~700 ms warm.
+        # read_points_batch uses BTREE-pushed equality scans, sub-100 ms.
+        pts = self._storage.read_points_batch(
+            chain_line_id, chain_line_ver,
+            primary_keys=sorted(set(chain_pks_with_boundary)),
+            columns=["primary_key", "chain_keys"],
+        )
+        all_pks = pts["primary_key"].to_pylist()
+        all_cks = pts["chain_keys"].to_pylist()
+
+        # Collect candidate entity keys per source chain.
+        candidate_to_sources: dict[str, list[str]] = defaultdict(list)
+        for pk, ck in zip(all_pks, all_cks, strict=False):
+            if pk == chain_id or not ck:
+                continue
+            keys = ck.split(",")
+            for j, k in enumerate(keys):
+                if k != boundary_key:
+                    continue
+                if direction == "forward" and j + 1 < len(keys):
+                    candidate_to_sources[keys[j + 1]].append(pk)
+                elif direction == "backward" and j > 0:
+                    candidate_to_sources[keys[j - 1]].append(pk)
+
+        if not candidate_to_sources:
+            return {
+                "chain_id": chain_id,
+                "pattern_id": pattern_id,
+                "anchor_pattern_id": anchor_pattern_id,
+                "direction": direction,
+                "boundary_key": boundary_key,
+                "boundary_position": boundary_position,
+                "candidates": [],
+                "summary": {
+                    "n_candidates": 0,
+                    "n_anomalous_candidates": 0,
+                    "n_unique_keys": 0,
+                },
+                "elapsed_ms": round(
+                    (_time.perf_counter() - t0) * 1000.0, 2,
+                ),
+            }
+
+        # Look up anchor anomaly + delta_norm + delta_rank_pct for
+        # candidate keys.
+        candidate_keys = list(candidate_to_sources.keys())
+        anchor_version = self._resolve_version(anchor_pattern_id)
+        try:
+            anchor_geo = self._storage.read_geometry(
+                anchor_pattern_id, anchor_version,
+                columns=["primary_key", "is_anomaly", "delta_norm",
+                         "delta_rank_pct"],
+                point_keys=candidate_keys,
+            )
+        except (KeyError, ValueError) as exc:
+            raise GDSNavigationError(
+                f"anchor pattern {anchor_pattern_id!r} cannot serve "
+                f"is_anomaly / delta — calibration must run first",
+            ) from exc
+
+        info_by_key: dict[str, dict[str, Any]] = {}
+        if anchor_geo.num_rows > 0:
+            for i, pk in enumerate(anchor_geo["primary_key"].to_pylist()):
+                info_by_key[pk] = {
+                    "is_anomaly": bool(
+                        anchor_geo["is_anomaly"][i].as_py(),
+                    ),
+                    "delta_norm": (
+                        round(float(anchor_geo["delta_norm"][i].as_py()), 4)
+                        if anchor_geo["delta_norm"][i].as_py() is not None
+                        else 0.0
+                    ),
+                    "delta_rank_pct": (
+                        round(
+                            float(
+                                anchor_geo["delta_rank_pct"][i].as_py()
+                            ), 2,
+                        )
+                        if anchor_geo["delta_rank_pct"][i].as_py() is not None
+                        else None
+                    ),
+                }
+
+        candidates: list[dict[str, Any]] = []
+        for k, sources in candidate_to_sources.items():
+            info = info_by_key.get(k, {
+                "is_anomaly": False,
+                "delta_norm": 0.0,
+                "delta_rank_pct": None,
+            })
+            candidates.append({
+                "entity_key": k,
+                "is_anomaly": info["is_anomaly"],
+                "delta_norm": info["delta_norm"],
+                "delta_rank_pct": info["delta_rank_pct"],
+                "n_source_chains": len(sources),
+                "source_chain_ids": sources[:5],
+            })
+
+        candidates.sort(
+            key=lambda c: (
+                c["is_anomaly"],
+                c["delta_norm"],
+                c["n_source_chains"],
+            ),
+            reverse=True,
+        )
+        candidates = candidates[:max_results]
+
+        n_anom = sum(1 for c in candidates if c["is_anomaly"])
+        return {
+            "chain_id": chain_id,
+            "pattern_id": pattern_id,
+            "anchor_pattern_id": anchor_pattern_id,
+            "direction": direction,
+            "boundary_key": boundary_key,
+            "boundary_position": boundary_position,
+            "candidates": candidates,
+            "summary": {
+                "n_candidates": len(candidates),
+                "n_anomalous_candidates": n_anom,
+                "n_unique_keys": len(candidate_to_sources),
+            },
+            "elapsed_ms": round(
+                (_time.perf_counter() - t0) * 1000.0, 2,
+            ),
         }
 
     # ── Edge table: geometric path finding & lazy chains ──────
@@ -12612,7 +13537,7 @@ class GDSNavigator:
         T_b = sorted(set(ts_b_unique))
         T_common = sorted(set(T_a) & set(T_b))
         N = len(T_common)
-        if N < min_epochs:
+        if min_epochs > N:
             raise ValueError(
                 f"find_lead_lag: intersection of pattern timestamps has only "
                 f"N={N} epochs; need >= {min_epochs}. If patterns use different "
@@ -13157,83 +14082,6 @@ class GDSNavigator:
             "n_pairs_tested": len(pair_local),
         }
 
-    def _build_scoped_adjacency_for_motif(
-        self,
-        pattern_id: str,
-        hops: list[Any],
-        seed_keys: list[str],
-    ) -> Any:
-        """Build a partial AdjacencyIndex covering only the BFS frontier
-        reachable from ``seed_keys`` within ``len(hops)`` levels.
-
-        Uses Lance BTREE-pushdown reads (``from_keys=`` / ``to_keys=`` IN
-        filters) to fetch only the edges actually visited.  On a 5 M-tx
-        edge table seeded by one anchor entity, this typically reads tens
-        to low hundreds of rows instead of the full table.
-        """
-        import pyarrow as pa
-        from hypertopos.engine.adjacency import AdjacencyIndex
-
-        needs_forward = any(
-            getattr(h, "direction", "forward") in ("forward", "any") for h in hops
-        )
-        needs_reverse = any(
-            getattr(h, "direction", "forward") in ("reverse", "any") for h in hops
-        )
-        if not (needs_forward or needs_reverse):
-            needs_forward = True
-
-        visited: set[str] = set(seed_keys)
-        frontier: set[str] = set(seed_keys)
-        edge_tables: list[pa.Table] = []
-
-        for _ in range(len(hops)):
-            if not frontier:
-                break
-            new_keys: set[str] = set()
-            if needs_forward:
-                t = self._storage.read_edges(
-                    pattern_id, from_keys=list(frontier),
-                )
-                if t.num_rows > 0:
-                    edge_tables.append(t)
-                    new_keys.update(t["to_key"].to_pylist())
-            if needs_reverse:
-                t = self._storage.read_edges(
-                    pattern_id, to_keys=list(frontier),
-                )
-                if t.num_rows > 0:
-                    edge_tables.append(t)
-                    new_keys.update(t["from_key"].to_pylist())
-            next_frontier = new_keys - visited
-            visited |= new_keys
-            frontier = next_frontier
-
-        if not edge_tables:
-            return AdjacencyIndex._empty()
-
-        combined = pa.concat_tables(edge_tables)
-        # Forward + reverse reads of overlapping subgraphs surface the same
-        # transaction twice; dedup on event_key before handing to from_edge_lists.
-        if combined.num_rows > 0 and "event_key" in combined.column_names:
-            seen: set[str] = set()
-            keep: list[int] = []
-            eks = combined["event_key"].to_pylist()
-            for i, ek in enumerate(eks):
-                if ek not in seen:
-                    seen.add(ek)
-                    keep.append(i)
-            if len(keep) < combined.num_rows:
-                combined = combined.take(keep)
-
-        return AdjacencyIndex.from_edge_lists(
-            combined["from_key"].to_pylist(),
-            combined["to_key"].to_pylist(),
-            combined["timestamp"].to_pylist(),
-            combined["amount"].to_pylist(),
-            combined["event_key"].to_pylist(),
-        )
-
     def find_motif_by_hops(
         self,
         pattern_id: str,
@@ -13243,6 +14091,7 @@ class GDSNavigator:
         max_results: int = 100,
         score: bool = False,
         time_window_hours: float | None = None,
+        anomaly_seed_filter: bool = False,
     ) -> dict[str, Any]:
         """Match motifs declaratively via per-hop ``HopPredicate``s.
 
@@ -13295,6 +14144,20 @@ class GDSNavigator:
         Seed (``nodes[0]``) is never checked — pre-filter ``seed_keys``
         upfront to cover it. Raises ``GDSNavigationError`` when no
         anchor companion is configured.
+
+        ``anomaly_seed_filter`` (default ``False``): pre-filter the BFS
+        starting frontier to entities with ``is_anomaly=True`` in the
+        resolved anchor companion pattern. When ``seed_keys=None``,
+        replaces the implicit "all keys" frontier with the anomaly
+        subset; when ``seed_keys=<list>`` is provided, intersects the
+        list with the anomaly subset. On large populations (e.g. 515 k
+        anchor entities with ~ 5 % anomaly rate) this collapses the BFS
+        traversal to ~ 1/20 of the work, typically 5–15 × wall-clock
+        improvement on population-sweep motif queries. Raises
+        ``GDSNavigationError`` when the resolved anchor pattern has no
+        ``is_anomaly`` column (calibration must run first). The result
+        dict gains ``seed_filter_summary`` (``{requested, anomaly,
+        filtered}``) so the caller can verify the prune.
         """
         from hypertopos.engine.hop_predicate import (
             enumerate_motifs_by_hops,
@@ -13323,30 +14186,71 @@ class GDSNavigator:
                 f"{pattern_id!r}",
             )
 
-        # When seed_keys are provided, build a scoped AdjacencyIndex via
-        # Lance BTREE-pushdown reads expanding the BFS frontier hop-by-hop.
-        # On large edge tables (multi-million rows) this avoids the cold-cache
-        # full-table to_pylist() rebuild that AdjacencyIndex.from_lance pays
-        # on the first global call — for a 2-hop seeded query on AML HI-small
-        # (5 M tx, ~22 outgoing edges per seed) the scoped build reads ~70
-        # edges vs. 5 M.  The unseeded path keeps the cached global index.
-        if seed_keys:
-            adj = self._build_scoped_adjacency_for_motif(
-                pattern_id, hops, seed_keys,
+        # anomaly_seed_filter pre-prune: collapse the BFS starting
+        # frontier to anomaly entities of the resolved anchor companion.
+        # Either replaces the implicit "all keys" frontier (when
+        # seed_keys=None) or intersects with an explicit caller-supplied
+        # list. Captured for the diagnostics block.
+        seed_filter_summary: dict[str, Any] | None = None
+        if anomaly_seed_filter:
+            anchor_pid = (
+                self._resolve_anchor_pattern_for_scoring(pattern_id)
             )
-        else:
-            # AdjacencyIndex is built once per pattern at storage level
-            # (cached inside GDSReader._adjacency_cache).  Subsequent calls
-            # reuse it; cold first call on a multi-million-edge table can
-            # take tens of seconds — that is the price of full enumeration.
-            adj = self._storage.get_adjacency(pattern_id)
+            if anchor_pid is None or anchor_pid == pattern_id:
+                raise GDSNavigationError(
+                    f"anomaly_seed_filter requires an anchor companion "
+                    f"pattern whose entity_line covers edge endpoints "
+                    f"of {pattern_id!r}; none found.",
+                )
+            anchor_version = self._resolve_version(anchor_pid)
+            try:
+                anom_geo = self._storage.read_geometry(
+                    anchor_pid, anchor_version,
+                    columns=["primary_key", "is_anomaly"],
+                    filter="is_anomaly = true",
+                )
+            except (KeyError, ValueError) as exc:
+                raise GDSNavigationError(
+                    f"anchor pattern {anchor_pid!r} cannot serve "
+                    f"is_anomaly — calibration must run first",
+                ) from exc
+            anom_keys = anom_geo["primary_key"].to_pylist()
+            anom_set = set(anom_keys)
+            requested = (
+                len(seed_keys) if seed_keys is not None else None
+            )
+            if seed_keys is None:
+                # sorted() — list(set) ordering is nondeterministic across
+                # processes (PYTHONHASHSEED randomises string hashing) and
+                # would produce different BFS visit orders → different
+                # max_results trims across runs.
+                filtered_seeds = sorted(anom_set)
+            else:
+                filtered_seeds = [k for k in seed_keys if k in anom_set]
+            seed_filter_summary = {
+                "requested": requested,
+                "anomaly": len(anom_set),
+                "filtered": len(filtered_seeds),
+            }
+            seed_keys = filtered_seeds
+
+        # AdjacencyIndex is built once per pattern at storage level
+        # (cached inside GDSReader._adjacency_cache). The cold first call
+        # on a multi-million-edge table pays the full O(E) build; warm
+        # calls amortise to BFS-only cost. The BFS uses seed_keys to
+        # filter the starting frontier when provided, so the global
+        # adjacency works correctly for both seeded and unseeded queries.
+        adj = self._storage.get_adjacency(pattern_id)
         if adj is None or not adj._out:
-            return {
+            empty: dict[str, Any] = {
                 "pattern_id": pattern_id,
                 "n_results": 0,
                 "motifs": [],
                 "reason": "pattern has no edge table",
             }
+            if seed_filter_summary is not None:
+                empty["seed_filter_summary"] = seed_filter_summary
+            return empty
 
         # edge_features sidecar — only loaded when at least one hop
         # references edge_dim_predicates.
@@ -13507,9 +14411,12 @@ class GDSNavigator:
             scored.sort(key=lambda m: -m.get("score", 0.0))
             instances = scored
 
-        return {
+        result: dict[str, Any] = {
             "pattern_id": pattern_id,
             "n_results": len(instances),
             "motifs": instances,
         }
+        if seed_filter_summary is not None:
+            result["seed_filter_summary"] = seed_filter_summary
+        return result
 

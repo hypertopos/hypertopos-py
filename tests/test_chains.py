@@ -25,6 +25,38 @@ class TestExtractChains:
         assert chains[0].hop_count == 2
         assert chains[0].is_cyclic is False
 
+    def test_chain_ids_unique_across_workers(self):
+        """Regression — multi-worker extraction must produce unique
+        chain_ids in the merged output. Previously each worker's local
+        len(chains) counter restarted from 0 and merged chains had
+        repeated primary_keys (~ n_workers-fold duplication), breaking
+        downstream point-table reads keyed by chain_id."""
+        # Build a graph dense enough to span multiple workers and produce
+        # several chains per seed. ProcessPoolExecutor activates when
+        # there are enough seeds to chunk; a 50-seed fan-out scenario
+        # reliably triggers the parallel path on a multi-CPU host.
+        from_keys: list[str] = []
+        to_keys: list[str] = []
+        event_pks: list[str] = []
+        for seed_idx in range(50):
+            seed = f"SEED-{seed_idx}"
+            for hop in range(5):
+                from_keys.append(seed if hop == 0 else f"M-{seed_idx}-{hop - 1}")
+                to_keys.append(f"M-{seed_idx}-{hop}")
+                event_pks.append(f"TX-{seed_idx}-{hop}")
+        chains = extract_chains(
+            from_keys=from_keys,
+            to_keys=to_keys,
+            event_pks=event_pks,
+            min_hops=2,
+            max_hops=10,
+        )
+        ids = [c.chain_id for c in chains]
+        assert len(ids) == len(set(ids)), (
+            f"chain_ids are not unique: {len(ids) - len(set(ids))} "
+            f"duplicates in {len(ids)} chains"
+        )
+
     def test_cycle_detection(self):
         """A→B→C→A extracted with is_cyclic=True."""
         chains = extract_chains(

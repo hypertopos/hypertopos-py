@@ -9172,6 +9172,15 @@ class GDSNavigator:
                 "summary": {"total": 0, "anomalous": 0},
             }
 
+        # Cyclic / self-revisiting chains insert the entity primary_key
+        # multiple times into chain_keys (e.g. a chain A->B->A->C contains
+        # A twice). The reverse index therefore lists the same chain_id
+        # twice for entity A. Per-chain dedup is provided by the geometry
+        # table being keyed by chain_id (one row per chain), so the loop
+        # below appends each chain at most once regardless of how many
+        # times the entity revisits it. set(chain_pks) here is the
+        # O(1) membership filter for the loop below — the dedup itself
+        # is a geometry-storage invariant.
         chain_pk_set = set(chain_pks)
 
         # Read geometry with anomaly columns, push-down filter via point_keys

@@ -7,6 +7,14 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.5] — 2026-05-08
+
+### Added
+- Chain anchor pattern's per-chain feature surface gains two new derived columns: `cross_bank_count` (number of distinct banks the chain transits across all from_bank / to_bank pairs — textbook AML jurisdictional layering indicator) and `amount_monotone_decreasing` (boolean, true when amounts strictly decrease at every hop — textbook structuring pattern). Both flow into the chain anchor pattern's polygon delta and surface in `find_anomalies` / chain-coherent loop tools / `classify_chain_typology` `dominant_top_dim`. Populated automatically when the source event line declares `from_bank` / `to_bank` columns (or `source_bank` / `destination_bank`); chains built without bank columns carry `cross_bank_count = 0` (additive, no breakage). Effect is gated on next chain pattern rebuild — existing spheres carry the prior feature set until rebuild.
+
+### Fixed
+- `extract_chains` post-merge dedup gains a strict-prefix subsumption pass: chains whose entity sequence is a strict ordered prefix of another chain's entity sequence are dropped (the longer chain traverses every entity the shorter one does plus more, so the shorter is investigatively redundant). Effect is gated on next chain pattern rebuild — existing spheres carry the prior chain count until rebuild. Chain-coherent loop tools see slightly fewer redundant chain entries on rebuilt spheres.
+
 ## [0.6.4] — 2026-05-07
 
 ### Fixed

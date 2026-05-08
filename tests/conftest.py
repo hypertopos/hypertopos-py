@@ -11,19 +11,30 @@ import lance
 import pytest
 
 FIXTURES_PATH = Path(__file__).parent / "fixtures" / "gds" / "sales_sphere"
+SYNTHETIC_CHAIN_FIXTURES_PATH = (
+    Path(__file__).parent / "fixtures" / "gds" / "synthetic_chain_sphere"
+)
 
 
 @pytest.fixture(scope="session", autouse=True)
 def ensure_fixtures() -> None:
     """Generate test fixtures once per session if they don't exist."""
     sphere_json = FIXTURES_PATH / "sphere.json"
-    if sphere_json.exists():
-        return
-    fixture_script = Path(__file__).parent / "fixtures" / "generate_fixtures.py"
-    subprocess.run(
-        [sys.executable, str(fixture_script)],
-        check=True,
-    )
+    if not sphere_json.exists():
+        fixture_script = Path(__file__).parent / "fixtures" / "generate_fixtures.py"
+        subprocess.run(
+            [sys.executable, str(fixture_script)],
+            check=True,
+        )
+    synthetic_sphere_json = SYNTHETIC_CHAIN_FIXTURES_PATH / "_gds_meta" / "sphere.json"
+    if not synthetic_sphere_json.exists():
+        synthetic_script = (
+            Path(__file__).parent / "fixtures" / "synthetic_chain_sphere.py"
+        )
+        subprocess.run(
+            [sys.executable, str(synthetic_script)],
+            check=True,
+        )
 
 
 @pytest.fixture

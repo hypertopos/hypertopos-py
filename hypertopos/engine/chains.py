@@ -137,6 +137,41 @@ class Chain:
     categories: list[str]  # per-hop categorical values (e.g. currency, type)
     amounts: list[float]   # per-hop numeric values
     amount_decay: float    # last_amount / first_amount (0 if first=0)
+    # Per-hop bank pair (from_bank, to_bank). Empty when bank data is
+    # not available at extraction time. Populated by callers passing
+    # `event_banks=[(from_bank, to_bank), ...]` to extract_chains.
+    banks: list[tuple[str, str]] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        # Mutable default safe via post_init.
+        if self.banks is None:
+            self.banks = []
+
+    def cross_bank_count(self) -> int:
+        """Number of distinct banks the chain transits (across all
+        from_bank / to_bank values per hop). High counts flag
+        jurisdictional layering — textbook AML indicator."""
+        if not self.banks:
+            return 0
+        seen: set = set()
+        for fb, tb in self.banks:
+            seen.add(fb)
+            seen.add(tb)
+        return len(seen)
+
+    def amount_monotone_decreasing(self) -> bool:
+        """True iff amounts strictly decrease at every hop AND the
+        chain is not cyclic. Textbook structuring pattern — funds
+        split into smaller amounts at each layering step. Cyclic
+        chains can also produce strictly decreasing amounts (e.g.
+        decay round-trip) but those are not structuring; gate on
+        is_cyclic to keep the flag meaning specific to layering."""
+        if self.is_cyclic or len(self.amounts) < 2:
+            return False
+        return all(
+            self.amounts[i + 1] < self.amounts[i]
+            for i in range(len(self.amounts) - 1)
+        )
 
     def to_dict(self) -> dict:
         amt_std = float(np.std(self.amounts)) if self.amounts else 0.0
@@ -157,6 +192,10 @@ class Chain:
             "amount_max": max(self.amounts) if self.amounts else 0.0,
             "amount_min": min(self.amounts) if self.amounts else 0.0,
             "n_unique_keys": len(set(self.keys)),
+            "cross_bank_count": self.cross_bank_count(),
+            "amount_monotone_decreasing": (
+                self.amount_monotone_decreasing()
+            ),
         }
 
 
@@ -174,6 +213,7 @@ def extract_chains(
     max_chains: int = 100_000,
     seed_nodes: list[str] | None = None,
     bidirectional: bool = False,
+    event_banks: list[tuple[str, str]] | None = None,
 ) -> list[Chain]:
     """Extract transaction chains via temporal BFS.
 
@@ -195,6 +235,11 @@ def extract_chains(
         bidirectional: If True, each edge A→B also creates a reverse edge
             B→A in the adjacency graph. Useful for undirected relationship
             analysis (e.g. communication networks). Default False.
+        event_banks: Optional list of (from_bank, to_bank) per event,
+            same length as from_keys. When provided, the resulting
+            chains carry per-hop bank pairs in `Chain.banks`, enabling
+            `cross_bank_count` derivation (textbook AML jurisdictional
+            layering indicator). Defaults to None (no bank tracking).
 
     Returns:
         List of Chain objects sorted by hop_count descending.
@@ -218,6 +263,8 @@ def extract_chains(
                 categories = [categories[i] for i in indices]
             if amounts:
                 amounts = [amounts[i] for i in indices]
+            if event_banks:
+                event_banks = [event_banks[i] for i in indices]
             n = max_events
 
     # Build adjacency using integer IDs for speed (string→int mapping)
@@ -300,10 +347,15 @@ def extract_chains(
             n_workers,
         )
 
-    # Translate int IDs back to string keys
+    # Translate int IDs back to string keys. Capture raw event indices
+    # BEFORE event_keys translation so per-event bank lookup works on
+    # the integer indices.
     for chain in chains:
+        raw_event_indices = chain.event_keys  # still ints at this stage
         chain.keys = [_id_to_key[k] for k in chain.keys]
-        chain.event_keys = [event_pks[i] for i in chain.event_keys]
+        chain.event_keys = [event_pks[i] for i in raw_event_indices]
+        if event_banks is not None:
+            chain.banks = [event_banks[i] for i in raw_event_indices]
 
     # Sort by hop_count descending
     chains.sort(key=lambda c: c.hop_count, reverse=True)
@@ -375,31 +427,34 @@ def _parallel_bfs(
                 window_secs, has_ts, per_seed_budget, max_chains,
             )
 
-        # Post-merge dedup via frozenset — ensures correctness even when
-        # per-worker dedup caps (_DEDUP_CAP) are hit. Each worker assigned
-        # chain_ids starting from its local len(chains)=0, so the merged
-        # set has 1 .. n_workers collisions per id; reassign chain_id from
-        # the global dedup index to restore primary_key uniqueness in the
-        # downstream points table.
-        import dataclasses
+        # Post-merge dedup pass 1: frozenset(event_keys) — collapses
+        # permutation duplicates (different traversal orders visiting
+        # the same edge set). Required across the parallel pool's
+        # per-worker dedup caps.
+        # Pass 2: strict ordered prefix subsumption. Refactored into
+        # a separate testable function — see _dedup_strict_prefixes.
+        # Empirical observation on AML HI-small: ~ 0.59 % of chains
+        # are strict-prefix-subsumed (1 721 of 290 784); low-rate but
+        # non-zero, so worth removing as investigative noise.
         seen: set[frozenset] = set()
-        deduped: list[Chain] = []
+        unique_chains: list[Chain] = []
         pre_dedup = len(chains)
         for c in chains:
             sig = frozenset(c.event_keys)
             if sig not in seen:
                 seen.add(sig)
-                deduped.append(
-                    dataclasses.replace(
-                        c, chain_id=f"CHAIN-{len(deduped):06d}",
-                    ),
-                )
-                if len(deduped) >= max_chains:
-                    break
+                unique_chains.append(c)
+
+        deduped, prefix_dedup_removed = _dedup_strict_prefixes(
+            unique_chains, max_chains=max_chains,
+        )
+
         if pre_dedup - len(deduped) > pre_dedup * 0.1:
             warnings.warn(
-                f"Chain dedup removed {pre_dedup - len(deduped)} duplicates "
-                f"({(pre_dedup - len(deduped)) / pre_dedup:.0%}) across workers.", stacklevel=2
+                f"Chain dedup removed {pre_dedup - len(deduped)} "
+                f"duplicates ({(pre_dedup - len(deduped)) / pre_dedup:.0%}) "
+                f"across workers — {prefix_dedup_removed} via sub-chain "
+                f"prefix subsumption.", stacklevel=2,
             )
 
         # Safety net: post-dedup chain_ids MUST be unique. Earlier
@@ -529,6 +584,64 @@ def _bfs_seed_batch(
             break
 
     return chains
+
+
+def _dedup_strict_prefixes(
+    chains: list[Chain],
+    *,
+    max_chains: int = 100_000,
+) -> tuple[list[Chain], int]:
+    """Drop chains whose entity-key sequence (`keys`) is a strict
+    ordered prefix of another chain's `keys`, then reassign
+    chain_ids from the surviving order.
+
+    Strict prefix means chain X.keys equals chain Y.keys[:len(X)]
+    AND len(X) < len(Y). Y traverses every entity X traverses plus
+    more — investigatively redundant since chain-coherent loop tools
+    key off entity sequence, not event sequence.
+
+    Why entity sequence (`keys`) not event sequence (`event_keys`):
+    two chains may visit the same entity path through different
+    transactions (e.g. parallel edges between the same accounts).
+    Entity-path is what investigators reason about and what `chain_keys`
+    in the points table stores; event_keys is the underlying tx
+    sequence persisted only in chain features. The investigatively-
+    redundant cleanup operates on the entity basis.
+
+    Algorithm: sort longest-first, register every proper prefix in
+    a hash set per chain. A shorter chain whose entity path matches
+    one of the registered prefixes is subsumed. O(N x L_avg) work.
+
+    Note: this changes chain_id ordering relative to raw extraction
+    order — surviving chains carry sequential CHAIN-NNNNNN ids
+    reflecting post-dedup order, with the longest chains assigned
+    first. Chain_ids are opaque per architecture; downstream code
+    must not rely on extraction-order semantics.
+    """
+    import dataclasses
+
+    # Stable sort longest-first so prefixes get registered before any
+    # shorter chain reaches the dedup check.
+    sorted_chains = sorted(chains, key=lambda c: -len(c.keys))
+
+    extended_prefixes: set[tuple] = set()
+    deduped: list[Chain] = []
+    removed = 0
+    for c in sorted_chains:
+        ek = tuple(c.keys)
+        if ek in extended_prefixes:
+            removed += 1
+            continue
+        deduped.append(
+            dataclasses.replace(
+                c, chain_id=f"CHAIN-{len(deduped):06d}",
+            ),
+        )
+        if len(deduped) >= max_chains:
+            break
+        for k in range(1, len(ek)):
+            extended_prefixes.add(ek[:k])
+    return deduped, removed
 
 
 def _emit_chain(

@@ -7283,6 +7283,81 @@ def test_find_chains_for_entity_no_chain_keys_column():
         nav.find_chains_for_entity("ACCT-001", "chain_pattern")
 
 
+def test_find_chains_for_entity_cyclic_chain_dedup():
+    """Cyclic chain (A->B->A->C) lists entity A twice in chain_keys, so
+    the reverse index lists CH-CYCLE twice for entity A. Per-chain dedup
+    is provided by the geometry table being keyed by chain_id (one row
+    per chain), so the chain surfaces in the API contract exactly once.
+    Locks the API contract; per-chain dedup itself is a geometry-storage
+    invariant.
+    """
+    chain_keys_map = {
+        "CH-CYCLE": "ACCT-001,ACCT-002,ACCT-001,ACCT-003",
+        "CH-NORMAL": "ACCT-001,ACCT-004",
+    }
+    geometry_rows = [
+        {
+            "primary_key": "CH-CYCLE",
+            "is_anomaly": True,
+            "delta_norm": 5.5,
+            "delta_rank_pct": 92.0,
+        },
+        {
+            "primary_key": "CH-NORMAL",
+            "is_anomaly": False,
+            "delta_norm": 1.2,
+            "delta_rank_pct": 25.0,
+        },
+    ]
+    storage = _ChainMockStorage(chain_keys_map, geometry_rows)
+    nav = GDSNavigator(
+        engine=_MockEngine(),
+        storage=storage,
+        manifest=_ChainMockManifest(),
+        contract=Contract("m-001", []),
+    )
+
+    result = nav.find_chains_for_entity("ACCT-001", "chain_pattern")
+
+    chain_ids = [c["chain_id"] for c in result["chains"]]
+    assert chain_ids == ["CH-CYCLE", "CH-NORMAL"]
+    assert chain_ids.count("CH-CYCLE") == 1
+    assert result["summary"]["total"] == 2
+    assert result["summary"]["anomalous"] == 1
+
+
+def test_find_chains_for_entity_self_loop_dedup():
+    """Pure self-loop A->A lists entity A twice in a single chain. Reverse
+    index lists CH-SELF twice for entity A; geometry-storage uniqueness
+    plus the chain_pk_set membership filter combine so the API contract
+    surfaces the chain once with summary.total == 1.
+    """
+    chain_keys_map = {
+        "CH-SELF": "ACCT-001,ACCT-001",
+    }
+    geometry_rows = [
+        {
+            "primary_key": "CH-SELF",
+            "is_anomaly": False,
+            "delta_norm": 0.7,
+            "delta_rank_pct": 12.0,
+        },
+    ]
+    storage = _ChainMockStorage(chain_keys_map, geometry_rows)
+    nav = GDSNavigator(
+        engine=_MockEngine(),
+        storage=storage,
+        manifest=_ChainMockManifest(),
+        contract=Contract("m-001", []),
+    )
+
+    result = nav.find_chains_for_entity("ACCT-001", "chain_pattern")
+
+    assert len(result["chains"]) == 1
+    assert result["chains"][0]["chain_id"] == "CH-SELF"
+    assert result["summary"]["total"] == 1
+
+
 class TestLineProfile:
     """Tests for GDSNavigator.line_profile — direct points-table profiling."""
 

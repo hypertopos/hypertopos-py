@@ -838,10 +838,18 @@ class GDSBuilder:
             line_id: Name for the chain line.
             chains: List of chain dicts (from Chain.to_dict()).
             features: Which chain features become dimensions.
-                Default: hop_count, is_cyclic, n_distinct_categories, amount_decay.
+                Default: hop_count, is_cyclic, n_distinct_categories,
+                amount_decay, cross_bank_count, amount_monotone_decreasing.
+                The latter two are AML-oriented (jurisdictional layering
+                + structuring pattern) and default to 0 / False on
+                event lines without bank data — additive, no breakage.
         """
         if features is None:
-            features = ["hop_count", "is_cyclic", "n_distinct_categories", "amount_decay"]
+            features = [
+                "hop_count", "is_cyclic", "n_distinct_categories",
+                "amount_decay", "cross_bank_count",
+                "amount_monotone_decreasing",
+            ]
 
         if not chains:
             # Empty chains → empty line

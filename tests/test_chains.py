@@ -12,6 +12,97 @@ from hypertopos.engine.chains import extract_chains
 
 
 class TestExtractChains:
+    def test_cross_bank_count_zero_when_banks_unset(self):
+        """When event_banks is not passed, chains carry empty banks
+        list and cross_bank_count returns 0."""
+        chains = extract_chains(
+            from_keys=["A", "B"],
+            to_keys=["B", "C"],
+            event_pks=["TX-1", "TX-2"],
+            min_hops=2,
+        )
+        assert len(chains) == 1
+        assert chains[0].banks == []
+        assert chains[0].cross_bank_count() == 0
+
+    def test_cross_bank_count_counts_distinct_banks(self):
+        """When event_banks is passed, cross_bank_count counts
+        distinct bank ids across all from_bank / to_bank pairs."""
+        chains = extract_chains(
+            from_keys=["A", "B", "C"],
+            to_keys=["B", "C", "D"],
+            event_pks=["TX-1", "TX-2", "TX-3"],
+            event_banks=[
+                ("BANK1", "BANK2"),
+                ("BANK2", "BANK3"),
+                ("BANK3", "BANK1"),
+            ],
+            min_hops=3,
+        )
+        # Chain A→B→C→D traversing 3 distinct banks (BANK1/2/3)
+        relevant = [c for c in chains if c.keys == ["A", "B", "C", "D"]]
+        assert relevant
+        c = relevant[0]
+        assert len(c.banks) == 3
+        assert c.cross_bank_count() == 3
+
+    def test_amount_monotone_decreasing_true(self):
+        """Strictly decreasing amounts → True."""
+        chains = extract_chains(
+            from_keys=["A", "B", "C"],
+            to_keys=["B", "C", "D"],
+            event_pks=["TX-1", "TX-2", "TX-3"],
+            amounts=[1000.0, 500.0, 200.0],
+            min_hops=3,
+        )
+        relevant = [c for c in chains if c.keys == ["A", "B", "C", "D"]]
+        assert relevant
+        assert relevant[0].amount_monotone_decreasing() is True
+
+    def test_amount_monotone_decreasing_false_on_increase(self):
+        """Any non-decreasing pair → False."""
+        chains = extract_chains(
+            from_keys=["A", "B", "C"],
+            to_keys=["B", "C", "D"],
+            event_pks=["TX-1", "TX-2", "TX-3"],
+            amounts=[1000.0, 500.0, 800.0],  # increase at last hop
+            min_hops=3,
+        )
+        relevant = [c for c in chains if c.keys == ["A", "B", "C", "D"]]
+        assert relevant
+        assert relevant[0].amount_monotone_decreasing() is False
+
+    def test_amount_monotone_decreasing_false_on_equal(self):
+        """Equal amounts at any hop are not strictly decreasing → False."""
+        chains = extract_chains(
+            from_keys=["A", "B", "C"],
+            to_keys=["B", "C", "D"],
+            event_pks=["TX-1", "TX-2", "TX-3"],
+            amounts=[1000.0, 1000.0, 500.0],
+            min_hops=3,
+        )
+        relevant = [c for c in chains if c.keys == ["A", "B", "C", "D"]]
+        assert relevant
+        assert relevant[0].amount_monotone_decreasing() is False
+
+    def test_to_dict_includes_new_features(self):
+        """Chain.to_dict() exposes cross_bank_count and
+        amount_monotone_decreasing — these get baked into polygon
+        delta via the chain anchor pattern build."""
+        chains = extract_chains(
+            from_keys=["A", "B"],
+            to_keys=["B", "C"],
+            event_pks=["TX-1", "TX-2"],
+            amounts=[1000.0, 500.0],
+            event_banks=[("BANK1", "BANK2"), ("BANK2", "BANK3")],
+            min_hops=2,
+        )
+        d = chains[0].to_dict()
+        assert "cross_bank_count" in d
+        assert "amount_monotone_decreasing" in d
+        assert d["cross_bank_count"] == 3
+        assert d["amount_monotone_decreasing"] is True
+
     def test_simple_chain(self):
         """A→B→C extracted as 2-hop chain."""
         chains = extract_chains(
@@ -24,6 +115,112 @@ class TestExtractChains:
         assert chains[0].keys == ["A", "B", "C"]
         assert chains[0].hop_count == 2
         assert chains[0].is_cyclic is False
+
+    def test_dedup_strict_prefixes_removes_subsumed_chain(self):
+        """Direct test of the prefix dedup helper. Chain X with
+        event_keys [E1,E2] is a strict prefix of chain Y with
+        event_keys [E1,E2,E3] — Y carries every hop of X plus more,
+        so X is redundant and should be dropped."""
+        from hypertopos.engine.chains import Chain, _dedup_strict_prefixes
+
+        x = Chain(
+            chain_id="CHAIN-X",
+            keys=["A", "B", "C"],
+            event_keys=["E1", "E2"],
+            hop_count=2,
+            is_cyclic=False,
+            time_span_hours=0.0,
+            categories=[],
+            amounts=[],
+            amount_decay=0.0,
+        )
+        y = Chain(
+            chain_id="CHAIN-Y",
+            keys=["A", "B", "C", "D"],
+            event_keys=["E1", "E2", "E3"],
+            hop_count=3,
+            is_cyclic=False,
+            time_span_hours=0.0,
+            categories=[],
+            amounts=[],
+            amount_decay=0.0,
+        )
+        deduped, removed = _dedup_strict_prefixes([x, y])
+        assert len(deduped) == 1
+        assert removed == 1
+        # The longer chain Y survives; chain_id reassigned to CHAIN-000000
+        assert deduped[0].keys == ["A", "B", "C", "D"]
+        assert deduped[0].event_keys == ["E1", "E2", "E3"]
+        assert deduped[0].chain_id == "CHAIN-000000"
+
+    def test_dedup_strict_prefixes_keeps_diverging_tails(self):
+        """Two chains sharing a common prefix but diverging in their
+        tails (different events at the divergence point) are siblings,
+        not in a prefix relationship — both must survive."""
+        from hypertopos.engine.chains import Chain, _dedup_strict_prefixes
+
+        x = Chain(
+            chain_id="CHAIN-X",
+            keys=["A", "B", "C", "D"],
+            event_keys=["E1", "E2", "E3"],
+            hop_count=3,
+            is_cyclic=False,
+            time_span_hours=0.0,
+            categories=[],
+            amounts=[],
+            amount_decay=0.0,
+        )
+        y = Chain(
+            chain_id="CHAIN-Y",
+            keys=["A", "B", "C", "E"],
+            event_keys=["E1", "E2", "E4"],
+            hop_count=3,
+            is_cyclic=False,
+            time_span_hours=0.0,
+            categories=[],
+            amounts=[],
+            amount_decay=0.0,
+        )
+        deduped, removed = _dedup_strict_prefixes([x, y])
+        assert len(deduped) == 2
+        assert removed == 0
+
+    def test_dedup_strict_prefixes_handles_empty(self):
+        from hypertopos.engine.chains import _dedup_strict_prefixes
+
+        deduped, removed = _dedup_strict_prefixes([])
+        assert deduped == []
+        assert removed == 0
+
+    def test_subchain_prefix_dedup_does_not_drop_siblings_from_extract(self):
+        """Integration check: when extract_chains produces multiple
+        chains starting from different seeds (A and B), BFS produces
+        sibling chains that share suffixes but differ in starting
+        node — these are NOT in a strict prefix relationship and must
+        all survive. Concretely: from edges A→B, B→C, C→D, C→E the
+        BFS emits chains starting from A AND B, with branches at C.
+        None is a strict prefix of another (different leading event)."""
+        chains = extract_chains(
+            from_keys=["A", "B", "C", "C"],
+            to_keys=["B", "C", "D", "E"],
+            event_pks=["TX-1", "TX-2", "TX-3", "TX-4"],
+            min_hops=2,
+            max_hops=10,
+        )
+        # No two chains may have entity-key sequences in a strict-prefix
+        # relationship (would mean dedup over-aggressively kept a
+        # redundant chain or under-aggressively missed dropping one).
+        key_seqs = [tuple(c.keys) for c in chains]
+        for i, seq_i in enumerate(key_seqs):
+            for j, seq_j in enumerate(key_seqs):
+                if i == j:
+                    continue
+                if (len(seq_i) < len(seq_j)
+                        and seq_j[:len(seq_i)] == seq_i):
+                    raise AssertionError(
+                        f"chain {i} {seq_i} is a strict prefix of "
+                        f"chain {j} {seq_j} — dedup missed it",
+                    )
 
     def test_chain_ids_unique_across_workers(self):
         """Regression — multi-worker extraction must produce unique

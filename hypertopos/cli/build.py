@@ -804,6 +804,22 @@ def _add_chain_line(
                 needed_cols.append(amt_col)
                 break
 
+        # Bank columns for cross_bank_count chain feature. Optional —
+        # only populated when both from_bank and to_bank are present
+        # in the event table (typical for AML / financial spheres).
+        from_bank_col = None
+        to_bank_col = None
+        for fcol, tcol in (
+            ("from_bank", "to_bank"),
+            ("source_bank", "destination_bank"),
+        ):
+            if (fcol in event_table.schema.names
+                    and tcol in event_table.schema.names):
+                from_bank_col, to_bank_col = fcol, tcol
+                needed_cols.append(from_bank_col)
+                needed_cols.append(to_bank_col)
+                break
+
         # Single to_pydict — one pass instead of 6 separate to_pylist calls
         bulk = event_table.select(list(set(needed_cols))).to_pydict()
         from_keys = bulk[cl_cfg.from_col]
@@ -829,6 +845,17 @@ def _add_chain_line(
             amounts = amt_filled.to_pylist()
         else:
             amounts = [0.0] * n
+
+        # Bank pairs per event — pass through to extract_chains so the
+        # resulting chains carry per-hop bank pairs in Chain.banks,
+        # enabling cross_bank_count feature derivation.
+        event_banks: list[tuple[str, str]] | None = None
+        if from_bank_col and to_bank_col:
+            from_banks = bulk.get(from_bank_col, [""] * n)
+            to_banks = bulk.get(to_bank_col, [""] * n)
+            event_banks = list(zip(
+                from_banks, to_banks, strict=False,
+            ))
 
         # Seed selection — Arrow groupby instead of Python loop
         # Fan-out: count distinct targets per source
@@ -907,6 +934,7 @@ def _add_chain_line(
             seed_nodes=seed_keys,
             max_chains=cl_cfg.max_chains,
             bidirectional=cl_cfg.bidirectional,
+            event_banks=event_banks,
         )
 
         # Save to cache

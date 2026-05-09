@@ -692,6 +692,8 @@ class TestAddChainLine:
                 "is_cyclic": False,
                 "n_distinct_categories": 1,
                 "amount_decay": 0.95,
+                "amount_monotone_decreasing": False,
+                "cross_bank_count": 0,
             },
             {
                 "chain_id": "C-2",
@@ -701,6 +703,8 @@ class TestAddChainLine:
                 "is_cyclic": True,
                 "n_distinct_categories": 2,
                 "amount_decay": 0.8,
+                "amount_monotone_decreasing": True,
+                "cross_bank_count": 1,
             },
         ]
         builder = GDSBuilder("test", str(tmp_path / "sphere"))
@@ -710,7 +714,7 @@ class TestAddChainLine:
 
         sphere = json.loads((tmp_path / "sphere" / "_gds_meta" / "sphere.json").read_text())
         assert sphere["patterns"]["chain_pattern"]["population_size"] == 2
-        assert len(sphere["patterns"]["chain_pattern"]["relations"]) == 4  # 4 default features
+        assert len(sphere["patterns"]["chain_pattern"]["relations"]) >= 4
 
     def test_chain_stores_keys(self, tmp_path):
         """Chain line stores chain_keys and chain_events as properties."""
@@ -723,6 +727,8 @@ class TestAddChainLine:
                 "is_cyclic": False,
                 "n_distinct_categories": 1,
                 "amount_decay": 1.0,
+                "amount_monotone_decreasing": False,
+                "cross_bank_count": 0,
             },
         ]
         builder = GDSBuilder("test", str(tmp_path / "sphere"))

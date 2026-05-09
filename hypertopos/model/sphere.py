@@ -393,6 +393,7 @@ class CalibrationFit:
     computed_at: datetime
     last_calibrated_at: datetime
     edge_dim_thresholds: dict[str, float] | None = None
+    theta_sensitivity: dict[str, dict[str, float]] | None = None
 
 
 @dataclass(frozen=True)
@@ -438,6 +439,41 @@ class CalibrationDriftReport:
     top_drifted: list[DimensionDrift]
     per_dimension: list[DimensionDrift] | None
     edge_dim_threshold_drift: dict[str, dict[str, float]] | None = None
+
+
+@dataclass(frozen=True)
+class ThetaSensitivityReport:
+    """Calibration-quality diagnostic for one pattern at one epoch.
+
+    Surfaces the populated `theta_sensitivity` field on `CalibrationFit`
+    plus its derived structure (stable band + cliffs). `pattern_id`,
+    `calibration_epoch`, and `population_size` carry the identity of
+    the underlying calibration so agents can correlate the diagnostic
+    with the pattern's other fields.
+
+    `theta_sensitivity` mirrors the dict on `CalibrationFit`. Each
+    `p<percentile>` entry has `theta_mean`, `theta_std`,
+    `anomaly_count_mean`, `anomaly_count_std`, `anomaly_rate`. The
+    `theta_std` / `anomaly_count_std` fields are 0.0 when the field
+    was populated via the cheap build-time path (default).
+
+    `stable_band` and `cliffs` are derived from
+    `theta_sensitivity` by `derive_stable_band_and_cliffs` using
+    `theta_mean` ratios (NOT anomaly_count ratios — those are
+    mechanically determined by percentile arithmetic and carry no
+    distribution shape signal). Within the band the threshold scales
+    smoothly with percentile choice; across a cliff the threshold
+    jumps by 50 % or more, signalling a heavy-tail region.
+    """
+
+    pattern_id: str
+    calibration_epoch: int
+    population_size: int
+    theta_sensitivity: dict[str, dict[str, float]]
+    stable_band: dict[str, object]
+    cliffs: list[dict[str, object]]
+    n_cliffs: int
+    stable_band_length: int
 
 
 @dataclass(frozen=True)

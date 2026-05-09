@@ -350,6 +350,7 @@ class PopulationStats:
     theta_per_dim: np.ndarray | None = None
     dim_block_names: list[str] = field(default_factory=list)
     dim_block_stats: dict[str, Any] | None = None
+    theta_sensitivity: dict[str, dict[str, float]] | None = None
 
 
 @dataclass
@@ -373,6 +374,7 @@ class PatternBuildResult:
     dim_block_names: list[str] = field(default_factory=list)
     dim_block_stats: dict[str, Any] | None = None
     edge_dim_thresholds: dict[str, float] | None = None
+    theta_sensitivity: dict[str, dict[str, float]] | None = None
 
 
 @dataclass
@@ -1732,6 +1734,13 @@ class GDSBuilder:
         # 6. Compute conformal p-values (reuse sorted_norms from step 5)
         conformal_p = compute_conformal_p(delta_norms, sorted_norms=sorted_norms)
 
+        # 6b. Theta sensitivity surface — calibration-quality diagnostic.
+        # Glues onto the same sorted_norms (no new sort, O(P) per pattern).
+        from hypertopos.builder._theta_sensitivity import (
+            compute_theta_sensitivity_from_sorted,
+        )
+        theta_sensitivity = compute_theta_sensitivity_from_sorted(sorted_norms)
+
         # 7. Compute is_anomaly (per-cluster if GMM, per-group if grouped, else global)
         #    When Bregman norms are available, use sum(theta_per_dim) as the
         #    anomaly threshold instead of the L2 theta_norm of the uniform theta.
@@ -1779,6 +1788,7 @@ class GDSBuilder:
             theta_per_dim=theta_per_dim_arr,
             dim_block_names=dim_block_names,
             dim_block_stats=dim_block_stats if dim_block_stats else None,
+            theta_sensitivity=theta_sensitivity,
         )
 
     def _build_geometry_slice(
@@ -3006,6 +3016,7 @@ class GDSBuilder:
                 dimension_kinds=ps.dimension_kinds,
                 dim_block_names=ps.dim_block_names,
                 dim_block_stats=ps.dim_block_stats,
+                theta_sensitivity=ps.theta_sensitivity,
             )
             self._write_calibration_epoch_for_pattern(pat, pbr)
             return pat_id, pbr
@@ -3271,6 +3282,7 @@ class GDSBuilder:
             computed_at=now,
             last_calibrated_at=now,
             edge_dim_thresholds=self._edge_dim_thresholds.get(pat.pattern_id),
+            theta_sensitivity=pbr.theta_sensitivity,
         )
         write_calibration_history_epoch(
             self.output_path, fit, last_k=last_k,
@@ -3882,6 +3894,7 @@ class GDSBuilder:
             dimension_kinds=ps.dimension_kinds,
             dim_block_names=ps.dim_block_names,
             dim_block_stats=ps.dim_block_stats,
+            theta_sensitivity=ps.theta_sensitivity,
         )
 
     def _build_shape_chunk(
@@ -4657,6 +4670,9 @@ class GDSBuilder:
                     "amount_max": float(_pc.max(edge_table["amount"]).as_py()),
                 })
 
+        from hypertopos.builder._theta_sensitivity import (
+            compute_theta_sensitivity_from_sorted,
+        )
         return pat_id, PatternBuildResult(
             mu=mu, sigma=sigma, theta=theta,
             population_size=n,
@@ -4670,6 +4686,7 @@ class GDSBuilder:
                 pat.entity_line,
             ),
             dimension_kinds=dimension_kinds,
+            theta_sensitivity=compute_theta_sensitivity_from_sorted(sorted_norms),
         )
 
     @staticmethod

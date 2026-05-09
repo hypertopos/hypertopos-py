@@ -8,7 +8,7 @@
 [![PyArrow](https://img.shields.io/badge/format-PyArrow-red.svg)](https://arrow.apache.org/docs/python/)
 [![Lance](https://img.shields.io/badge/storage-Lance-blueviolet.svg)](https://github.com/lance-format/lance)
 [![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io)
-[![Version](https://img.shields.io/badge/version-0.6.5-%235500FF.svg)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.6.6-%235500FF.svg)](pyproject.toml)
 
 hypertopos is not a database, and not a machine learning model. It is a layer that turns relational data into a coordinate system where every entity gets a position derived from its relationships and the population around it.
 
@@ -74,6 +74,7 @@ Each capability below emerges from treating entities as points in a shared, popu
 | Anomaly-anchored seed prune for motifs | `find_motif_by_hops(anomaly_seed_filter=True)` intersects the BFS starting frontier with the anomaly subset of the resolved anchor companion (replaces "all keys" frontier when `seed_keys=None`, intersects with explicit list otherwise); result dict carries `seed_filter_summary` (`{requested, anomaly, filtered}`) | Manual pre-filter on every call, no built-in convergence on anomaly-anchored seeds | `0.6.4` |
 | Cross-bank and structuring chain features | Chain anchor patterns gain two derived columns — `cross_bank_count` (distinct banks the chain transits, textbook jurisdictional layering signal) and `amount_monotone_decreasing` (boolean, true when amounts strictly decrease at every hop, textbook structuring pattern). Auto-populated when the event line declares `from_bank` / `to_bank` columns; surfaces in `find_anomalies(<chain_pattern>)`, the chain-coherent loop, and `classify_chain_typology` `dominant_top_dim`. Effect gated on next chain pattern rebuild | Hand-rolled per-chain rollup post-extraction, no chain-level structuring detector | `0.6.5` |
 | Strict-prefix chain subsumption | `extract_chains` post-merge dedup gains a strict ordered prefix pass — chains whose entity sequence is a strict prefix of another chain's are dropped, since the longer chain investigates every entity the shorter one does plus more | Three near-duplicate chain rows in the points table for what is effectively one investigative finding | `0.6.5` |
+| Theta sensitivity diagnostic | Calibration epochs gain a `theta_sensitivity` field — per-percentile sweep of the anomaly threshold at p90..p99 with `theta_mean`, `anomaly_count_mean`, and `anomaly_rate` per percentile. New `theta_sensitivity(pattern_id)` MCP tool plus `sphere_overview` summary block surface a stable band (longest contiguous range where adjacent-pair theta ratio stays below 1.30) and cliff list (boundaries where the ratio is 1.50 or higher, signalling heavy-tail regions). Lets investigators see at a glance whether the chosen `anomaly_percentile` sits in a smooth zone or near a recalibration cliff. Glues onto the builder's existing population sort — zero new I/O cost in the build path | Manual percentile sweep + custom analytics to characterise threshold sensitivity per pattern | `0.6.6` |
 
 ### What changes in practice
 

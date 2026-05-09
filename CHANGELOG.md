@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.6] — 2026-05-09
+
+### Added
+- `GDSNavigator.sphere_overview()` per-pattern entry gains an optional `theta_sensitivity_summary` block when the pattern's latest calibration epoch has a populated `theta_sensitivity` field. The block carries `stable_band_from`, `stable_band_to`, `stable_band_length`, `n_cliffs`, and `theta_at_p95` so an agent reading the population overview sees at a glance whether the production threshold sits in a smooth region or near a heavy-tail jump. Calibration epochs from older builds that lack the underlying field continue to render `sphere_overview` entries as before — the block is silently skipped. Cost: one calibration-history JSON read plus an O(P=10) derivation per pattern, sub-millisecond per call.
+- `GDSNavigator.theta_sensitivity(pattern_id, version=None)` — new navigator method surfacing the calibration-quality diagnostic. Reads the populated `theta_sensitivity` field on the resolved `CalibrationFit` and returns a `ThetaSensitivityReport` with the per-percentile sweep plus derived `stable_band` (`from`, `to`, `length`) and `cliffs[]` (`from`, `to`, `ratio`). Resolves the latest epoch on disk by default; `version=N` selects an explicit historical epoch. Raises `ValueError` when the calibration epoch lacks the diagnostic field. Companion to the existing `compare_calibrations` and `decompose_drift` calibration-history surfaces.
+- Calibration epoch JSON gains a `theta_sensitivity` field — per-percentile sweep over the population's `delta_norm` distribution at p90..p99. For each percentile reports `theta_mean` (the threshold value at that percentile), `anomaly_count_mean` (entities at or above that threshold), and `anomaly_rate`. Lets investigators inspect how stable the chosen `anomaly_percentile` is to perturbation: contiguous percentiles where adjacent-pair anomaly_count ratios stay below ~1.30 form the safe recalibration zone; ratios at or above ~1.50 mark cliffs where moving the threshold changes population materially. Populated automatically at build time on every pattern; field is `None` on calibration epochs from prior builds and surfaces on the next pattern rebuild. Reads back via `read_calibration_fit` on `CalibrationFit.theta_sensitivity`.
+
 ## [0.6.5] — 2026-05-08
 
 ### Added

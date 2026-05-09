@@ -6128,6 +6128,12 @@ class _MockStorageOverview(_MockStorage):
             return int(sum(1 for n in self._norms if n >= threshold))
         return len(self._norms)
 
+    def list_calibration_versions(self, pattern_id):
+        # No calibration history in this mock — sphere_overview's
+        # theta_sensitivity_summary helper sees this as 'no epochs on
+        # disk' and silently skips the field.
+        return []
+
     def read_sphere(self):
         from hypertopos.model.sphere import Pattern, RelationDef
 

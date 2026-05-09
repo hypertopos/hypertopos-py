@@ -6986,8 +6986,61 @@ class GDSNavigator:
                 if temporal_path.exists():
                     entry["has_temporal"] = True
 
+            # theta_sensitivity_summary — compact diagnostic from latest
+            # calibration epoch's populated theta_sensitivity field.
+            # Skipped silently for pre-T2 spheres (no field on disk).
+            ts_summary = self._build_theta_sensitivity_summary(pid)
+            if ts_summary is not None:
+                entry["theta_sensitivity_summary"] = ts_summary
+
             results.append(entry)
         return results
+
+    def _build_theta_sensitivity_summary(self, pattern_id: str) -> dict | None:
+        """Compact theta_sensitivity diagnostic for sphere_overview.
+
+        Returns None when the calibration epoch lacks the diagnostic field
+        (pre-T2 sphere) or when no calibration epochs exist on disk.
+        Otherwise returns a small dict with stable_band shape, cliff count,
+        and the production p95 theta value for at-a-glance inspection.
+
+        Cost: one JSON read of calibration_history v=latest (~few KB) plus
+        an O(P=10) derivation. Sub-millisecond per pattern.
+        """
+        from hypertopos.builder._theta_sensitivity import (
+            derive_stable_band_and_cliffs,
+        )
+        from hypertopos.storage.calibration_history import (
+            CalibrationNotFoundError,
+        )
+
+        try:
+            versions = self._storage.list_calibration_versions(pattern_id)
+            if not versions:
+                return None
+            fit = self._storage.read_calibration_fit(
+                pattern_id, version=versions[-1],
+            )
+        except (CalibrationNotFoundError, FileNotFoundError):
+            # Race between list_versions and read_fit (GC trimmed the
+            # version between the two calls), or the file vanished.
+            # Other exceptions propagate so reviewers see them.
+            return None
+
+        if fit.theta_sensitivity is None:
+            return None
+
+        derived = derive_stable_band_and_cliffs(fit.theta_sensitivity)
+        p95 = fit.theta_sensitivity.get("p95")
+        return {
+            "stable_band_from": derived["stable_band"]["from"],
+            "stable_band_to": derived["stable_band"]["to"],
+            "stable_band_length": derived["stable_band_length"],
+            "n_cliffs": derived["n_cliffs"],
+            "theta_at_p95": (
+                round(float(p95["theta_mean"]), 4) if p95 else None
+            ),
+        }
 
     def temporal_quality_summary(
         self,
@@ -12940,6 +12993,67 @@ class GDSNavigator:
             )
 
         return _compute_calibration_drift(fit_from, fit_to, top_n=top_n, verbose=verbose)
+
+    def theta_sensitivity(
+        self,
+        pattern_id: str,
+        version: int | None = None,
+    ) -> "ThetaSensitivityReport":
+        """Calibration-quality diagnostic surfacing `theta_sensitivity` for one
+        pattern epoch.
+
+        Reads the populated `theta_sensitivity` field on `CalibrationFit` and
+        derives `stable_band` + `cliffs` so agents see which `anomaly_percentile`
+        recalibration moves are safe and which destabilise the population.
+
+        Args:
+            pattern_id: which pattern to inspect.
+            version: calibration epoch (None → latest on disk).
+
+        Returns:
+            ThetaSensitivityReport with the per-percentile sweep, stable band,
+            and cliff list.
+
+        Raises ValueError when the calibration epoch lacks the
+        `theta_sensitivity` field — pre-T2 spheres need a rebuild before
+        the diagnostic is available. CalibrationNotFoundError bubbles
+        up from missing versions.
+        """
+        from hypertopos.builder._theta_sensitivity import (
+            derive_stable_band_and_cliffs,
+        )
+        from hypertopos.model.sphere import ThetaSensitivityReport
+
+        reader = self._storage
+        if version is None:
+            versions = reader.list_calibration_versions(pattern_id)
+            if not versions:
+                raise ValueError(
+                    f"theta_sensitivity: no calibration epochs on disk for "
+                    f"pattern={pattern_id!r}"
+                )
+            version = versions[-1]
+
+        fit = reader.read_calibration_fit(pattern_id, version=version)
+        if fit.theta_sensitivity is None:
+            raise ValueError(
+                f"theta_sensitivity: calibration epoch v={version} for "
+                f"pattern={pattern_id!r} was built before the diagnostic was "
+                f"wired in. Rebuild the pattern (or the full sphere) to "
+                f"populate the field."
+            )
+
+        derived = derive_stable_band_and_cliffs(fit.theta_sensitivity)
+        return ThetaSensitivityReport(
+            pattern_id=fit.pattern_id,
+            calibration_epoch=fit.calibration_epoch,
+            population_size=fit.population_size,
+            theta_sensitivity=fit.theta_sensitivity,
+            stable_band=derived["stable_band"],
+            cliffs=derived["cliffs"],
+            n_cliffs=derived["n_cliffs"],
+            stable_band_length=derived["stable_band_length"],
+        )
 
     def decompose_drift(
         self,

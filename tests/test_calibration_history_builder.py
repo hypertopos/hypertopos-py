@@ -721,6 +721,123 @@ def test_gmm_components_round_trip_on_built_sphere(tiny_sphere_with_gmm_factory,
     assert len(fit.gmm_components) > 0
 
 
+def test_sphere_overview_surfaces_theta_sensitivity_summary(tiny_sphere_factory, tmp_path):
+    """sphere_overview entry on a built sphere must carry a populated
+    theta_sensitivity_summary block: stable_band_from/to/length, n_cliffs,
+    theta_at_p95. Validates the T4 sphere_overview integration."""
+    from hypertopos.sphere import HyperSphere
+
+    sphere_path = tmp_path / "sphere"
+    pid = tiny_sphere_factory(sphere_path)
+
+    sphere = HyperSphere.open(str(sphere_path))
+    session = sphere.session(agent_id="overview_ts_test")
+    try:
+        nav = session.navigator()
+        entries = nav.sphere_overview()
+        match = next((e for e in entries if e["pattern_id"] == pid), None)
+        assert match is not None
+        assert "theta_sensitivity_summary" in match
+        ts = match["theta_sensitivity_summary"]
+        assert "stable_band_from" in ts
+        assert "stable_band_to" in ts
+        assert "stable_band_length" in ts
+        assert "n_cliffs" in ts
+        assert "theta_at_p95" in ts
+        assert isinstance(ts["stable_band_length"], int)
+        assert isinstance(ts["n_cliffs"], int)
+        assert ts["theta_at_p95"] is None or isinstance(
+            ts["theta_at_p95"], float,
+        )
+    finally:
+        session.close()
+
+
+def test_theta_sensitivity_navigator_method_on_built_sphere(tiny_sphere_factory, tmp_path):
+    """Built sphere → navigator.theta_sensitivity returns a populated
+    ThetaSensitivityReport with derived stable_band + cliffs. End-to-end
+    integration test for the T3 surface."""
+    from hypertopos.model.sphere import ThetaSensitivityReport
+    from hypertopos.sphere import HyperSphere
+
+    sphere_path = tmp_path / "sphere"
+    pid = tiny_sphere_factory(sphere_path)
+
+    sphere = HyperSphere.open(str(sphere_path))
+    session = sphere.session(agent_id="theta_sens_test")
+    try:
+        nav = session.navigator()
+        report = nav.theta_sensitivity(pid)
+        assert isinstance(report, ThetaSensitivityReport)
+        assert report.pattern_id == pid
+        assert report.calibration_epoch == 1
+        assert set(report.theta_sensitivity.keys()) == {f"p{p}" for p in range(90, 100)}
+        assert isinstance(report.stable_band, dict)
+        assert "from" in report.stable_band
+        assert "to" in report.stable_band
+        assert "length" in report.stable_band
+        assert isinstance(report.cliffs, list)
+        assert report.n_cliffs == len(report.cliffs)
+        assert report.stable_band_length == report.stable_band["length"]
+    finally:
+        session.close()
+
+
+def test_theta_sensitivity_navigator_raises_on_missing_pattern(tiny_sphere_factory, tmp_path):
+    """Pattern that doesn't exist on disk → ValueError ('no calibration
+    epochs on disk')."""
+    from hypertopos.sphere import HyperSphere
+
+    sphere_path = tmp_path / "sphere"
+    tiny_sphere_factory(sphere_path)
+
+    sphere = HyperSphere.open(str(sphere_path))
+    session = sphere.session(agent_id="theta_sens_missing")
+    try:
+        nav = session.navigator()
+        with pytest.raises(ValueError, match="no calibration epochs"):
+            nav.theta_sensitivity("nonexistent_pattern")
+    finally:
+        session.close()
+
+
+def test_theta_sensitivity_round_trip_on_built_sphere(tiny_sphere_factory, tmp_path):
+    """Builder must populate `theta_sensitivity` on every CalibrationFit
+    (cheap-path glued onto the existing `sorted_norms` for delta_rank_pcts).
+    Field must survive the v=N.json round-trip with all five expected stat
+    fields per percentile."""
+    from hypertopos.storage.reader import GDSReader
+
+    sphere_path = tmp_path / "sphere"
+    pid = tiny_sphere_factory(sphere_path)
+
+    reader = GDSReader(sphere_path)
+    fit = reader.read_calibration_fit(pid)
+    assert fit.theta_sensitivity is not None, (
+        "Builder did not populate theta_sensitivity"
+    )
+    assert isinstance(fit.theta_sensitivity, dict)
+    # Default percentile sweep p90..p99
+    assert set(fit.theta_sensitivity.keys()) == {f"p{p}" for p in range(90, 100)}
+    expected_fields = {
+        "theta_mean", "theta_std",
+        "anomaly_count_mean", "anomaly_count_std",
+        "anomaly_rate",
+    }
+    for p_key, stats in fit.theta_sensitivity.items():
+        assert set(stats.keys()) == expected_fields, f"missing fields at {p_key}"
+    # Cheap path → std fields are 0.0
+    for p in range(90, 100):
+        assert fit.theta_sensitivity[f"p{p}"]["theta_std"] == 0.0
+        assert fit.theta_sensitivity[f"p{p}"]["anomaly_count_std"] == 0.0
+    # anomaly_count is monotonically non-increasing in percentile
+    counts = [
+        fit.theta_sensitivity[f"p{p}"]["anomaly_count_mean"] for p in range(90, 100)
+    ]
+    for i in range(len(counts) - 1):
+        assert counts[i] >= counts[i + 1]
+
+
 def test_compare_calibrations_on_built_sphere(tiny_sphere_factory, tmp_path):
     """Build the same tiny sphere twice — drift between v=1 and v=2 should
     be near-zero (same data, only theta bootstrap noise) and the report

@@ -253,6 +253,8 @@ Chains (both build-time `chain_lines` and runtime `discover_chains`) are sequenc
 - **Cyclic chains** (`is_cyclic=true`) indicate structural loops, not that the same value returned to the origin
 - These properties apply equally to pre-computed `chain_lines` and runtime `discover_chains`
 
+**External chains.** Chains discovered outside hypertopos — SAR typology engines, ERP supply-chain workflows, EHR clinical pathways, customer-journey platforms — can be ingested as anchor lines and navigated with the same primitives. See [External Chains as Anchor Lines](external-chains-as-anchor-line.md) for the schema convention (chain anchor table = `(chain_id, member_keys, ...features)`, with optional `chain_keys` column to unlock the chain-coherent investigative loop).
+
 ## Geometry Vocabulary
 
 | Term | Definition |

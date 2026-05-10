@@ -5863,6 +5863,247 @@ class TestPi5Offset:
         assert total_found == 1
 
 
+class TestPi5DimensionWeights:
+    """π5_attract_anomaly with per-dim runtime weights.
+
+    Fixture customer_pattern: theta=[7.5, 5.0], theta_norm≈9.01,
+    relations=[products(out), stores(in)] → dim_labels=['products','stores'].
+    CUST-001 z-scored delta=[10.0, 5.0], default L2 norm≈11.18 > 9.01 → anomaly.
+    CUST-002 z-scored delta=[1.5, -1.333], norm≈2.01 < 9.01 → normal.
+    """
+
+    def _navigator(self, sphere_path):
+        from hypertopos.engine.geometry import GDSEngine
+        from hypertopos.storage.cache import GDSCache
+        from hypertopos.storage.reader import GDSReader
+
+        reader = GDSReader(base_path=sphere_path)
+        engine = GDSEngine(storage=reader, cache=GDSCache())
+        manifest = Manifest(
+            manifest_id="m-1",
+            agent_id="a-1",
+            snapshot_time=datetime(2024, 1, 1, tzinfo=UTC),
+            status="active",
+            line_versions={"customers": 1, "products": 1},
+            pattern_versions={"customer_pattern": 1},
+        )
+        return GDSNavigator(
+            engine=engine,
+            storage=reader,
+            manifest=manifest,
+            contract=Contract("m-1", ["customer_pattern"]),
+        )
+
+    def test_default_returns_anomaly(self, sphere_path):
+        """Sanity: without weights, CUST-001 is the single anomaly."""
+        nav = self._navigator(sphere_path)
+        polygons, total_found, _, _ = nav.π5_attract_anomaly(
+            "customer_pattern", radius=None, top_n=10
+        )
+        assert total_found == 1
+        assert [p.primary_key for p in polygons] == ["CUST-001"]
+
+    def test_weight_zero_on_dominant_dim_silences_anomaly(self, sphere_path):
+        """products=0.0 → CUST-001 effective delta=[0, 5.0], norm=5 < 9.01 → no anomaly."""
+        nav = self._navigator(sphere_path)
+        polygons, total_found, _, _ = nav.π5_attract_anomaly(
+            "customer_pattern", radius=None, top_n=10,
+            dimension_weights={"products": 0.0},
+        )
+        assert total_found == 0
+        assert polygons == []
+
+    def test_weight_zero_on_secondary_dim_keeps_anomaly(self, sphere_path):
+        """stores=0.0 → CUST-001 effective delta=[10, 0], norm=10 > 9.01 → still anomaly."""
+        nav = self._navigator(sphere_path)
+        polygons, total_found, _, _ = nav.π5_attract_anomaly(
+            "customer_pattern", radius=None, top_n=10,
+            dimension_weights={"stores": 0.0},
+        )
+        assert total_found == 1
+        assert polygons[0].primary_key == "CUST-001"
+        # Weighted norm = 10.0 (only products dim contributes)
+        assert polygons[0].delta_norm == pytest.approx(10.0, abs=1e-3)
+
+    def test_weight_half_can_drop_below_threshold(self, sphere_path):
+        """products=0.5 → CUST-001 effective delta=[5, 5], norm=sqrt(50)≈7.07 < 9.01."""
+        nav = self._navigator(sphere_path)
+        polygons, total_found, _, _ = nav.π5_attract_anomaly(
+            "customer_pattern", radius=None, top_n=10,
+            dimension_weights={"products": 0.5},
+        )
+        assert total_found == 0
+        assert polygons == []
+
+    def test_missing_dim_defaults_to_one(self, sphere_path):
+        """Providing only one dim leaves the other at default weight 1.0."""
+        nav = self._navigator(sphere_path)
+        # Only "products" specified at 1.0 → exactly equivalent to no weights at all.
+        polygons, total_found, _, _ = nav.π5_attract_anomaly(
+            "customer_pattern", radius=None, top_n=10,
+            dimension_weights={"products": 1.0},
+        )
+        assert total_found == 1
+        assert polygons[0].primary_key == "CUST-001"
+        assert polygons[0].delta_norm == pytest.approx(11.18, abs=0.05)
+
+    def test_empty_dict_is_no_op(self, sphere_path):
+        """dimension_weights={} is equivalent to None — no weighting, no path forced."""
+        nav = self._navigator(sphere_path)
+        polygons, total_found, _, _ = nav.π5_attract_anomaly(
+            "customer_pattern", radius=None, top_n=10,
+            dimension_weights={},
+        )
+        # Identical to default-no-weights call.
+        assert total_found == 1
+        assert polygons[0].primary_key == "CUST-001"
+        assert polygons[0].delta_norm == pytest.approx(11.18, abs=0.05)
+
+    def test_unknown_dim_raises(self, sphere_path):
+        nav = self._navigator(sphere_path)
+        with pytest.raises(ValueError, match="unknown dimension 'nonexistent'"):
+            nav.π5_attract_anomaly(
+                "customer_pattern", radius=None, top_n=10,
+                dimension_weights={"nonexistent": 1.0},
+            )
+
+    def test_negative_weight_raises(self, sphere_path):
+        nav = self._navigator(sphere_path)
+        with pytest.raises(ValueError, match="non-negative finite number"):
+            nav.π5_attract_anomaly(
+                "customer_pattern", radius=None, top_n=10,
+                dimension_weights={"products": -0.5},
+            )
+
+    def test_inf_weight_raises(self, sphere_path):
+        nav = self._navigator(sphere_path)
+        with pytest.raises(ValueError, match="non-negative finite number"):
+            nav.π5_attract_anomaly(
+                "customer_pattern", radius=None, top_n=10,
+                dimension_weights={"products": float("inf")},
+            )
+
+    def test_nan_weight_raises(self, sphere_path):
+        nav = self._navigator(sphere_path)
+        with pytest.raises(ValueError, match="non-negative finite number"):
+            nav.π5_attract_anomaly(
+                "customer_pattern", radius=None, top_n=10,
+                dimension_weights={"products": float("nan")},
+            )
+
+    def test_non_numeric_weight_raises(self, sphere_path):
+        nav = self._navigator(sphere_path)
+        with pytest.raises(ValueError, match="must be a number"):
+            nav.π5_attract_anomaly(
+                "customer_pattern", radius=None, top_n=10,
+                dimension_weights={"products": "heavy"},
+            )
+
+    def test_non_dict_raises(self, sphere_path):
+        nav = self._navigator(sphere_path)
+        with pytest.raises(ValueError, match="must be a dict"):
+            nav.π5_attract_anomaly(
+                "customer_pattern", radius=None, top_n=10,
+                dimension_weights=[1.0, 0.5],  # type: ignore[arg-type]
+            )
+
+    def test_bregman_metric_with_weights_raises(self, sphere_path):
+        """π5 itself only allows metric in ('L2','Linf'), so test the helper
+        directly to lock the bregman rejection guard for future surface
+        expansion."""
+        nav = self._navigator(sphere_path)
+        sphere = nav._storage.read_sphere()
+        pattern = sphere.patterns["customer_pattern"]
+        with pytest.raises(ValueError, match="Bregman divergence is precomputed"):
+            GDSNavigator._build_dimension_weight_vector(
+                pattern, {"products": 0.5}, metric="bregman"
+            )
+
+    def test_linf_metric_with_weights(self, sphere_path):
+        """Linf path: weight scales the per-dim |delta| before max."""
+        nav = self._navigator(sphere_path)
+        # Default Linf for CUST-001: max(|10|, |5|) = 10 > 9.01 → anomaly.
+        polygons, total_found, _, _ = nav.π5_attract_anomaly(
+            "customer_pattern", radius=None, top_n=10, metric="Linf",
+            dimension_weights={"products": 0.5},
+        )
+        # Weighted Linf: max(|5|, |5|) = 5 < 9.01 → no anomaly.
+        assert total_found == 0
+        assert polygons == []
+
+    def test_helper_resolves_relation_display_name(self):
+        """Helper accepts BOTH line_id and display_name on a relation, matching
+        Pattern.dim_index dual-resolution semantics."""
+        from hypertopos.model.sphere import Pattern, RelationDef
+
+        pat = Pattern(
+            pattern_id="p_with_alias",
+            entity_type="test",
+            pattern_type="anchor",
+            relations=[
+                RelationDef(line_id="products", direction="out",
+                            required=True, display_name="goods"),
+                RelationDef(line_id="stores", direction="in", required=False),
+            ],
+            mu=np.zeros(2, dtype=np.float32),
+            sigma_diag=np.ones(2, dtype=np.float32),
+            theta=np.array([1.0, 1.0], dtype=np.float32),
+            population_size=10,
+            computed_at=datetime(2024, 1, 1, tzinfo=UTC),
+            version=1,
+            status="production",
+        )
+        # Both forms must resolve to the same index.
+        vec_via_alias = GDSNavigator._build_dimension_weight_vector(
+            pat, {"goods": 0.0}, metric="L2"
+        )
+        vec_via_lineid = GDSNavigator._build_dimension_weight_vector(
+            pat, {"products": 0.0}, metric="L2"
+        )
+        assert vec_via_alias[0] == 0.0 and vec_via_alias[1] == 1.0
+        assert vec_via_lineid[0] == 0.0 and vec_via_lineid[1] == 1.0
+
+    def test_helper_resolves_edge_dim_aggregation_name(self):
+        """Helper falls back to dim_labels for edge-dim aggregation names that
+        Pattern.dim_index does not cover."""
+        from hypertopos.model.sphere import (
+            EdgeDimAggregationsRef,
+            Pattern,
+            RelationDef,
+        )
+
+        pat = Pattern(
+            pattern_id="p_with_edge_agg",
+            entity_type="test",
+            pattern_type="anchor",
+            relations=[
+                RelationDef(line_id="tx", direction="out", required=True),
+            ],
+            mu=np.zeros(6, dtype=np.float32),
+            sigma_diag=np.ones(6, dtype=np.float32),
+            theta=np.array([1.0] * 6, dtype=np.float32),
+            population_size=10,
+            computed_at=datetime(2024, 1, 1, tzinfo=UTC),
+            version=1,
+            status="production",
+            edge_dim_aggregations=EdgeDimAggregationsRef(
+                from_event_pattern="tx_pattern",
+                dims=("amount",),
+            ),
+        )
+        # dim_labels = ["tx", "amount_mean", "amount_std", "amount_p50",
+        #               "amount_p95", "amount_count_above_threshold"]
+        labels = pat.dim_labels
+        assert labels[1] == "amount_mean"
+        # Edge-dim aggregation name resolves via the fallback path.
+        vec = GDSNavigator._build_dimension_weight_vector(
+            pat, {"amount_mean": 0.0, "amount_p95": 0.5}, metric="L2"
+        )
+        assert vec[0] == 1.0       # "tx" (untouched)
+        assert vec[1] == 0.0       # "amount_mean"
+        assert vec[4] == 0.5       # "amount_p95"
+
+
 # ---------- dead_dim_indices ----------
 
 

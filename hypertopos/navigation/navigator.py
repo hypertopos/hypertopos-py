@@ -509,6 +509,28 @@ def _compute_calibration_drift(
     )
 
 
+def _empty_coherent_diagnostics(
+    *,
+    n_chains_total: int,
+    elapsed_ms: float,
+) -> dict[str, Any]:
+    """Diagnostics block returned by ``find_chains_with_coherent_anomaly``
+    on the empty-result early-exit paths. Mirrors the populated shape so
+    that downstream summarisers can read the same keys regardless of
+    whether the population had any anomalous entities."""
+    return {
+        "n_chains_total": n_chains_total,
+        "n_anomaly_entities": 0,
+        "n_runs_total_pre_truncation": 0,
+        "top_dim_counts_full": {},
+        "run_length_distribution_full": {
+            "min": 0, "p50": 0, "p75": 0, "p90": 0, "max": 0, "mean": 0.0,
+        },
+        "all_coherent_chain_ids": set(),
+        "elapsed_ms": elapsed_ms,
+    }
+
+
 class GDSNavigator:
     def __init__(
         self,
@@ -904,6 +926,7 @@ class GDSNavigator:
         select: str = "top_norm",
         metric: str = "L2",
         min_confidence: float = 0.0,
+        dimension_weights: dict[str, float] | None = None,
     ) -> tuple[list[Polygon], int, list[dict] | None, dict | None]:
         """Find the most anomalous polygons in a pattern.
 
@@ -912,6 +935,24 @@ class GDSNavigator:
         when *include_emerging=True* and *offset == 0*), and *meta* is a dict
         with ``total_anomalies_unfiltered`` when *property_filters* is set,
         or ``None`` otherwise.
+
+        ``dimension_weights`` (optional) — per-dimension multipliers applied
+        to the delta vector before computing the rank score. Default ``None``
+        leaves behaviour unchanged. When set, dims missing from the dict
+        default to ``1.0``; explicit ``0.0`` silences a dim. An empty dict
+        ``{}`` is equivalent to ``None`` (no weights). Requires
+        ``metric in ('L2', 'Linf')`` — Bregman divergence is precomputed and
+        cannot be reweighted post-hoc. Forces the in-process scan path
+        (the subprocess fast path relies on Lance's stored ``delta_norm``).
+        Connects Theme E correlation-gate verdicts to runtime ranking
+        (NOISE-classified dim → weight ``0.0``; HEAVY-TAIL dim → ``0.5``).
+
+        Note: when weights are active, only ``delta_norm`` on the returned
+        polygons reflects the weighted rank score. ``delta`` is the raw
+        unweighted vector; ``is_anomaly``, ``bregman_divergence``,
+        ``delta_rank_pct``, and ``emerging[]`` come from storage and reflect
+        the unweighted calibration. The threshold (``theta_norm``) is also
+        unweighted — silencing dims naturally reduces the surviving count.
         """
         if fdr_method not in ("bh", "storey"):
             raise ValueError(
@@ -922,6 +963,11 @@ class GDSNavigator:
         version = self._resolve_version(pattern_id)
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns[pattern_id]
+        weight_vector = (
+            self._build_dimension_weight_vector(pattern, dimension_weights, metric)
+            if dimension_weights
+            else None
+        )
 
         if missing_edge_to:
             if pattern.pattern_type == "event":
@@ -950,7 +996,12 @@ class GDSNavigator:
             )
         except _NAVIGATION_RECOVERABLE_ERRORS:
             _geo_count = 0
-        if _geo_count > 500_000 and rank_by_property is None and metric == "L2":
+        if (
+            _geo_count > 500_000
+            and rank_by_property is None
+            and metric == "L2"
+            and weight_vector is None
+        ):
             from hypertopos.engine.lance_sql_agg import (
                 find_anomalies as _lance_sql_find_anomalies,
             )
@@ -1043,6 +1094,8 @@ class GDSNavigator:
 
         # Vectorized recompute + rank
         delta_matrix = delta_matrix_from_arrow(light)
+        if weight_vector is not None:
+            delta_matrix = delta_matrix * weight_vector
         if metric == "Linf":
             norms = np.max(np.abs(delta_matrix), axis=1).astype(np.float32)
         elif metric == "bregman" and "bregman_divergence" in light.schema.names:
@@ -1260,6 +1313,72 @@ class GDSNavigator:
         )
         meta = {"total_anomalies_unfiltered": total_anomalies_unfiltered} if property_filters else None
         return results, total_found, emerging, meta
+
+    @staticmethod
+    def _build_dimension_weight_vector(
+        pattern: Any,
+        weights: dict[str, float],
+        metric: str,
+    ) -> np.ndarray:
+        """Resolve a ``{dim_name: weight}`` mapping to a per-dim weight vector.
+
+        Accepts the same dim-name vocabulary as ``Pattern.dim_index``
+        (relation ``line_id`` OR ``display_name``; event-dim ``column`` OR
+        ``display_name``; ``prop_columns``) plus aggregated edge-dim names
+        (e.g. ``amount_mean``) which only surface via ``dim_labels``.
+
+        Validates that every supplied dim exists on the pattern and that
+        every weight is a non-negative finite number. Missing dims default
+        to ``1.0``. Raises ``ValueError`` for ``metric='bregman'`` because
+        Bregman divergence is precomputed per-row and cannot be reweighted.
+        """
+        if metric == "bregman":
+            raise ValueError(
+                "dimension_weights requires metric in ('L2', 'Linf'); "
+                "Bregman divergence is precomputed per-row and cannot be "
+                "reweighted post-hoc"
+            )
+        if not isinstance(weights, dict):
+            raise ValueError(
+                f"dimension_weights must be a dict[str, float], got "
+                f"{type(weights).__name__}"
+            )
+        labels = pattern.dim_labels
+        # Edge-dim aggregations live at the tail of dim_labels and are not
+        # resolvable via Pattern.dim_index — build a fallback map for them.
+        edge_agg_names = pattern._edge_dim_aggregation_names()
+        n_non_edge = len(labels) - len(edge_agg_names)
+        edge_agg_to_idx = {
+            name: n_non_edge + i for i, name in enumerate(edge_agg_names)
+        }
+        vec = np.ones(len(labels), dtype=np.float32)
+        for name, raw in weights.items():
+            # Try Pattern.dim_index first — it accepts both line_id and
+            # display_name on relations / event_dimensions, plus prop_columns.
+            try:
+                idx = pattern.dim_index(name)
+            except ValueError:
+                idx = edge_agg_to_idx.get(name)
+                if idx is None:
+                    raise ValueError(
+                        f"dimension_weights: unknown dimension {name!r}. "
+                        f"Valid dims for pattern '{pattern.pattern_id}': "
+                        f"{labels}"
+                    ) from None
+            try:
+                w = float(raw)
+            except (TypeError, ValueError) as e:
+                raise ValueError(
+                    f"dimension_weights[{name!r}] must be a number, got "
+                    f"{raw!r}"
+                ) from e
+            if not np.isfinite(w) or w < 0:
+                raise ValueError(
+                    f"dimension_weights[{name!r}] must be a non-negative "
+                    f"finite number, got {w}"
+                )
+            vec[idx] = w
+        return vec
 
     def _find_emerging(
         self,
@@ -6993,8 +7112,109 @@ class GDSNavigator:
             if ts_summary is not None:
                 entry["theta_sensitivity_summary"] = ts_summary
 
+            # dim_quality_warnings — dead dims (sigma_diag near zero, z-score
+            # undefined) and sparse dims (median zero with rare nonzero,
+            # gaussian assumption wrong). Both are silent build-time failures
+            # of the "trust the space" frame: the dim sits in the delta
+            # vector contributing nothing or contributing wrong signal,
+            # and the investigator has no way to know without scrolling
+            # the calibration log. Surfacing here makes the failure
+            # auditable from sphere_overview.
+            warnings = self._compute_dim_quality_warnings(pattern)
+            if warnings:
+                entry["dim_quality_warnings"] = warnings
+
             results.append(entry)
         return results
+
+    @staticmethod
+    def _compute_dim_quality_warnings(pattern: Any) -> list[dict[str, Any]]:
+        """Surface build-time dim-quality issues that silently break z-score
+        / delta_norm semantics.
+
+        Two classes flagged:
+
+        - **dead_dim**: ``sigma_diag[i] < 1e-10`` — the dim has zero
+          variance across the population, so the z-score `(x - mu) / sigma`
+          is undefined / explodes. The dim contributes nothing meaningful
+          to ``delta_norm`` and silently dilutes any other dim's signal.
+
+        - **sparse_dim**: ``dim_percentiles[d]['p50'] == 0`` AND
+          ``dim_percentiles[d]['p99'] > 0`` — the dim is mostly-zero with
+          rare nonzero values, so the gaussian z-score assumption is
+          wrong (the empirical distribution is point-mass-at-zero plus a
+          tail). Bregman divergence with a poisson / bernoulli kind tag
+          is the correct distance.
+
+        Both are computed from cached pattern state (``sigma_diag``,
+        ``dim_percentiles``) — sub-millisecond, no storage scan.
+        """
+        warnings: list[dict[str, Any]] = []
+        labels = pattern.dim_labels if pattern.dim_labels else []
+
+        # Dead dims — indexed against dim_labels via sigma_diag position.
+        # Threshold chosen well below float32 noise floor (~1.19e-7) so
+        # sigma values that survive at 1e-10 or above are genuine
+        # population spread, not numerical noise. Strict `<` (not `<=`)
+        # is intentional: 1e-10 itself is on the boundary and we
+        # prefer one false negative over one false positive on a
+        # numerically-defined dim.
+        sigma_diag = getattr(pattern, "sigma_diag", None)
+        if sigma_diag is not None:
+            sigma_arr = np.asarray(sigma_diag, dtype=np.float64)
+            for i, s in enumerate(sigma_arr):
+                if s < 1e-10:
+                    label = labels[i] if i < len(labels) else f"dim_{i}"
+                    warnings.append({
+                        "type": "dead_dim",
+                        "dim_label": label,
+                        "reason": (
+                            f"sigma_diag = {float(s):.2e} (below 1e-10 — "
+                            f"zero variance across population)"
+                        ),
+                        "advice": (
+                            "z-score is undefined / explodes; this dim "
+                            "contributes nothing meaningful to delta_norm "
+                            "and silently dilutes other dims' signal. "
+                            "Drop the dim from the pattern, or investigate "
+                            "the data source for missing values / "
+                            "constant column."
+                        ),
+                    })
+
+        # Sparse dims — keyed by dim name, not delta-vector index.
+        # `dim_percentiles` holds {dim_name: {p25, p50, p75, p99, max}}.
+        dim_percentiles = getattr(pattern, "dim_percentiles", None) or {}
+        for dim_name, stats in dim_percentiles.items():
+            p50 = stats.get("p50", 0)
+            p99 = stats.get("p99", 0)
+            if p50 == 0 and p99 > 0:
+                p25 = stats.get("p25", 0)
+                p75 = stats.get("p75", 0)
+                if p75 == 0:
+                    fraction_zero_estimate = ">=0.75"
+                elif p25 == 0:
+                    fraction_zero_estimate = "0.50-0.75"
+                else:
+                    fraction_zero_estimate = "0.25-0.50"
+                warnings.append({
+                    "type": "sparse_dim",
+                    "dim_label": dim_name,
+                    "reason": (
+                        f"median = 0 with p99 = {p99} "
+                        f"(mostly-zero with rare nonzero; approx "
+                        f"fraction zero {fraction_zero_estimate})"
+                    ),
+                    "advice": (
+                        "Gaussian z-score assumption is wrong for this "
+                        "dim. Use Bregman divergence with a "
+                        "poisson / bernoulli kind tag instead, or split "
+                        "into a binary 'is_active' dim + a continuous "
+                        "'value_when_active' dim."
+                    ),
+                })
+
+        return warnings
 
     def _build_theta_sensitivity_summary(self, pattern_id: str) -> dict | None:
         """Compact theta_sensitivity diagnostic for sphere_overview.
@@ -9387,13 +9607,12 @@ class GDSNavigator:
                 "anchor_pattern_id": anchor_pattern_id,
                 "n_results": 0,
                 "chains": [],
-                "diagnostics": {
-                    "n_chains_total": n_chains_total,
-                    "n_anomaly_entities": 0,
-                    "elapsed_ms": round(
+                "diagnostics": _empty_coherent_diagnostics(
+                    n_chains_total=n_chains_total,
+                    elapsed_ms=round(
                         (_time.perf_counter() - t0) * 1000.0, 2,
                     ),
-                },
+                ),
             }
 
         pks_arr = anchor_geo["primary_key"].to_pylist()
@@ -9427,13 +9646,12 @@ class GDSNavigator:
                 "anchor_pattern_id": anchor_pattern_id,
                 "n_results": 0,
                 "chains": [],
-                "diagnostics": {
-                    "n_chains_total": n_chains_total,
-                    "n_anomaly_entities": 0,
-                    "elapsed_ms": round(
+                "diagnostics": _empty_coherent_diagnostics(
+                    n_chains_total=n_chains_total,
+                    elapsed_ms=round(
                         (_time.perf_counter() - t0) * 1000.0, 2,
                     ),
-                },
+                ),
             }
 
         anomaly_delta = delta_2d[anom_idxs]
@@ -9489,6 +9707,36 @@ class GDSNavigator:
                     "max_delta_norm": round(max_norm, 4),
                 })
 
+        # Compute population aggregates BEFORE sorting + truncating runs[]
+        # so that downstream summarisers (e.g. chain_investigation_summary)
+        # see the full distribution, not a top_K slice biased toward long
+        # runs and dominant top_dim labels. The runs[] field stays
+        # truncated for callers that just want the headline list.
+        from collections import Counter as _Counter
+        n_runs_total_pre_truncation = len(runs)
+        top_dim_counts_full: dict[str, int] = dict(
+            _Counter(r["top_dim"] for r in runs if r.get("top_dim"))
+        )
+        if runs:
+            run_lengths_arr = np.fromiter(
+                (int(r["run_length"]) for r in runs),
+                dtype=np.int32, count=len(runs),
+            )
+            run_length_distribution_full: dict[str, float] = {
+                "min": int(run_lengths_arr.min()),
+                "p50": int(np.percentile(run_lengths_arr, 50)),
+                "p75": int(np.percentile(run_lengths_arr, 75)),
+                "p90": int(np.percentile(run_lengths_arr, 90)),
+                "max": int(run_lengths_arr.max()),
+                "mean": round(float(run_lengths_arr.mean()), 2),
+            }
+            all_coherent_chain_ids: set[str] = {r["chain_id"] for r in runs}
+        else:
+            run_length_distribution_full = {
+                "min": 0, "p50": 0, "p75": 0, "p90": 0, "max": 0, "mean": 0.0,
+            }
+            all_coherent_chain_ids = set()
+
         runs.sort(
             key=lambda r: (r["run_length"], r["max_delta_norm"]),
             reverse=True,
@@ -9504,6 +9752,10 @@ class GDSNavigator:
             "diagnostics": {
                 "n_chains_total": n_chains_total,
                 "n_anomaly_entities": int(anom_idxs.size),
+                "n_runs_total_pre_truncation": n_runs_total_pre_truncation,
+                "top_dim_counts_full": top_dim_counts_full,
+                "run_length_distribution_full": run_length_distribution_full,
+                "all_coherent_chain_ids": all_coherent_chain_ids,
                 "elapsed_ms": round(elapsed_ms, 2),
             },
         }
@@ -9945,6 +10197,147 @@ class GDSNavigator:
             ),
         }
 
+    def chain_investigation_summary(
+        self,
+        chain_pattern_id: str,
+        *,
+        anchor_pattern_id: str,
+        min_hops: int = 2,
+        max_runs: int = 10_000,
+    ) -> dict[str, Any]:
+        """Pre-investigation triage for a chain pattern.
+
+        Returns a population-level summary that lets an agent decide
+        whether to commit investigation budget to the chain-coherent loop
+        on this sphere before drilling in. Aggregates from a single
+        ``find_chains_with_coherent_anomaly`` sweep + a chain-pattern
+        geometry scan, so the cost is one coherent-anomaly sweep — what
+        the agent would pay anyway as the first triage step.
+
+        Args:
+            chain_pattern_id: chain anchor pattern id.
+            anchor_pattern_id: entity anchor pattern that supplies the
+                ``is_anomaly`` / ``delta`` columns referenced by chain
+                hops (e.g. ``account_pattern`` when chains hop accounts).
+            min_hops: minimum coherent-run length to count; passed
+                through to ``find_chains_with_coherent_anomaly``.
+            max_runs: cap on coherent runs read for the typology
+                aggregation; defaults large enough to capture the full
+                tail on most spheres.
+
+        Returns dict with: chain_pattern_id, anchor_pattern_id,
+        n_chains_total, n_chains_with_coherent_anomaly_run,
+        coherent_run_rate, n_chains_with_shape_anomaly,
+        shape_anomaly_rate, cross_pattern_overlap (n_both,
+        n_coherent_only, n_shape_only, jaccard),
+        top_dims_in_coherent_runs (top 10 dim labels by run count),
+        run_length_distribution (min, p50, p75, p90, max, mean),
+        recommended_min_hops, elapsed_ms.
+        """
+        import time as _time
+        from collections import Counter
+        t0 = _time.perf_counter()
+
+        if min_hops < 2:
+            raise ValueError(
+                f"min_hops must be >= 2 (coherence undefined for single "
+                f"hop); got {min_hops}",
+            )
+        if max_runs < 0:
+            raise ValueError(f"max_runs must be >= 0; got {max_runs}")
+
+        sphere = self._storage.read_sphere()
+        if chain_pattern_id not in sphere.patterns:
+            raise GDSNavigationError(
+                f"pattern not found: {chain_pattern_id!r}",
+            )
+        if anchor_pattern_id not in sphere.patterns:
+            raise GDSNavigationError(
+                f"anchor pattern not found: {anchor_pattern_id!r}",
+            )
+
+        coh = self.find_chains_with_coherent_anomaly(
+            chain_pattern_id,
+            anchor_pattern_id=anchor_pattern_id,
+            min_hops=min_hops,
+            max_results=max_runs,
+        )
+        diag = coh["diagnostics"]
+        n_chains_total = int(diag["n_chains_total"])
+        # Use pre-truncation aggregates from the underlying sweep so that
+        # callers passing a small max_runs still get the FULL population
+        # distribution. The sweep sorts (run_length DESC, max_delta_norm
+        # DESC) before truncating, so reading aggregates from chains[]
+        # would bias every metric toward long-run / high-delta tails.
+        n_coherent = int(diag["n_runs_total_pre_truncation"])
+        coherent_run_rate = (
+            round(n_coherent / n_chains_total, 6)
+            if n_chains_total > 0 else 0.0
+        )
+        coh_pks: set[str] = set(diag["all_coherent_chain_ids"])
+
+        chain_version = self._resolve_version(chain_pattern_id)
+        try:
+            chain_geo = self._storage.read_geometry(
+                chain_pattern_id, chain_version,
+                columns=["primary_key", "is_anomaly"],
+            )
+        except (KeyError, ValueError):
+            chain_anom_pks: set[str] = set()
+        else:
+            chain_geo_pks = chain_geo["primary_key"].to_pylist()
+            chain_geo_anoms = chain_geo["is_anomaly"].to_pylist()
+            chain_anom_pks = {
+                pk for pk, a in zip(chain_geo_pks, chain_geo_anoms, strict=False)
+                if a
+            }
+
+        n_shape = len(chain_anom_pks)
+        shape_anomaly_rate = (
+            round(n_shape / n_chains_total, 6)
+            if n_chains_total > 0 else 0.0
+        )
+
+        intersect = coh_pks & chain_anom_pks
+        union = coh_pks | chain_anom_pks
+        jaccard = round(len(intersect) / len(union), 6) if union else 0.0
+
+        top_dim_counts: Counter[str] = Counter(diag["top_dim_counts_full"])
+        top_dims = [
+            {"top_dim": d, "count": c}
+            for d, c in top_dim_counts.most_common(10)
+        ]
+
+        run_length_distribution = dict(diag["run_length_distribution_full"])
+        if n_coherent >= 50:
+            recommended_min_hops = max(
+                int(run_length_distribution["p75"]),
+                min_hops,
+            )
+        else:
+            recommended_min_hops = min_hops
+
+        elapsed_ms = round((_time.perf_counter() - t0) * 1000.0, 2)
+        return {
+            "chain_pattern_id": chain_pattern_id,
+            "anchor_pattern_id": anchor_pattern_id,
+            "n_chains_total": n_chains_total,
+            "n_chains_with_coherent_anomaly_run": n_coherent,
+            "coherent_run_rate": coherent_run_rate,
+            "n_chains_with_shape_anomaly": n_shape,
+            "shape_anomaly_rate": shape_anomaly_rate,
+            "cross_pattern_overlap": {
+                "n_both": len(intersect),
+                "n_coherent_only": len(coh_pks - chain_anom_pks),
+                "n_shape_only": len(chain_anom_pks - coh_pks),
+                "jaccard": jaccard,
+            },
+            "top_dims_in_coherent_runs": top_dims,
+            "run_length_distribution": run_length_distribution,
+            "recommended_min_hops": recommended_min_hops,
+            "elapsed_ms": elapsed_ms,
+        }
+
     def extend_chain(
         self,
         chain_id: str,
@@ -10203,6 +10596,533 @@ class GDSNavigator:
                 (_time.perf_counter() - t0) * 1000.0, 2,
             ),
         }
+
+    def investigate_chain(
+        self,
+        chain_id: str,
+        pattern_id: str,
+        *,
+        anchor_pattern_id: str,
+        extension_max_results: int = 20,
+    ) -> dict[str, Any]:
+        """One-shot orchestrator that runs the full R9 investigative loop
+        on a single chain and aggregates the per-step outputs into a
+        single SAR-ready report.
+
+        Composes (in order):
+          1. ``anomaly_propagation_in_chain`` — per-hop progression + run
+             summary
+          2. ``classify_chain_typology`` — five-axis operational tag
+          3. chain-pattern geometry lookup for the chain_id — `is_anomaly`,
+             `delta_norm`, `delta_rank_pct` (one row read; equivalent to
+             asking ``find_anomalies(<chain_pattern>)`` for this chain
+             only)
+          4. ``extend_chain(direction='forward')`` — boundary candidates
+             past the run end
+          5. ``extend_chain(direction='backward')`` — boundary candidates
+             before the run start
+
+        Each step's status is reported individually in the output so a
+        partial failure (e.g. extension lookup raises because the chain
+        has no anomalous run) does not abort the whole investigation.
+
+        ``summary`` derives an investigation strength + recommended
+        action from the trace + typology + shape + extension signals.
+        Strength is a coarse triage signal — the per-step blocks remain
+        the source of truth for any nuanced reading.
+
+        Returns dict with keys: chain_id, pattern_id, anchor_pattern_id,
+        trace, typology, shape_anomaly, extension_forward,
+        extension_backward, summary, elapsed_ms.
+        """
+        import time as _time
+        t0 = _time.perf_counter()
+
+        sphere = self._storage.read_sphere()
+        if pattern_id not in sphere.patterns:
+            raise GDSNavigationError(f"pattern not found: {pattern_id!r}")
+        if anchor_pattern_id not in sphere.patterns:
+            raise GDSNavigationError(
+                f"anchor pattern not found: {anchor_pattern_id!r}",
+            )
+
+        def _safe(call):
+            try:
+                return {"ok": True, "data": call()}
+            except (GDSNavigationError, ValueError, KeyError) as e:
+                return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+        trace_block = _safe(lambda: self.anomaly_propagation_in_chain(
+            chain_id, pattern_id, anchor_pattern_id=anchor_pattern_id,
+        ))
+        typology_block = _safe(lambda: self.classify_chain_typology(
+            chain_id, pattern_id, anchor_pattern_id=anchor_pattern_id,
+        ))
+
+        chain_version = self._resolve_version(pattern_id)
+
+        def _shape_lookup() -> dict[str, Any]:
+            chain_geo = self._storage.read_geometry(
+                pattern_id, chain_version,
+                point_keys=[chain_id],
+                columns=["primary_key", "is_anomaly", "delta_norm",
+                         "delta_rank_pct"],
+            )
+            if chain_geo.num_rows == 0:
+                raise GDSNavigationError(
+                    f"chain_id {chain_id!r} not found in "
+                    f"{pattern_id!r} geometry"
+                )
+            return {
+                "chain_id": chain_id,
+                "is_anomaly": bool(chain_geo["is_anomaly"][0].as_py()),
+                "delta_norm": (
+                    None if chain_geo["delta_norm"][0].as_py() is None
+                    else round(
+                        float(chain_geo["delta_norm"][0].as_py()), 4,
+                    )
+                ),
+                "delta_rank_pct": (
+                    None if chain_geo["delta_rank_pct"][0].as_py() is None
+                    else round(
+                        float(chain_geo["delta_rank_pct"][0].as_py()), 2,
+                    )
+                ),
+            }
+
+        shape_anomaly = _safe(_shape_lookup)
+
+        extension_forward = _safe(lambda: self.extend_chain(
+            chain_id, pattern_id, anchor_pattern_id=anchor_pattern_id,
+            direction="forward", max_results=extension_max_results,
+        ))
+        extension_backward = _safe(lambda: self.extend_chain(
+            chain_id, pattern_id, anchor_pattern_id=anchor_pattern_id,
+            direction="backward", max_results=extension_max_results,
+        ))
+
+        summary = self._derive_investigation_summary(
+            trace_block, typology_block, shape_anomaly,
+            extension_forward, extension_backward,
+        )
+
+        elapsed_ms = round((_time.perf_counter() - t0) * 1000.0, 2)
+        return {
+            "chain_id": chain_id,
+            "pattern_id": pattern_id,
+            "anchor_pattern_id": anchor_pattern_id,
+            "trace": trace_block,
+            "typology": typology_block,
+            "shape_anomaly": shape_anomaly,
+            "extension_forward": extension_forward,
+            "extension_backward": extension_backward,
+            "summary": summary,
+            "elapsed_ms": elapsed_ms,
+        }
+
+    @staticmethod
+    def _derive_investigation_summary(
+        trace_block: dict,
+        typology_block: dict,
+        shape_anomaly: dict,
+        extension_forward: dict,
+        extension_backward: dict,
+    ) -> dict[str, Any]:
+        """Aggregate per-step outcomes into a coarse triage signal.
+
+        Strength scoring — four 0/1 signals (chain-composition focused):
+          - trace.summary.max_run_length_same_top_dim >= 3
+          - typology.position_in_chain in {leading, transit, terminal,
+            full-chain} (i.e. NOT no-run)
+          - extension_forward.summary.n_anomalous_candidates >= 1
+          - extension_backward.summary.n_anomalous_candidates >= 1
+
+        Strength buckets: 3-4 = strong → escalate to SAR;
+        2 = moderate → continue investigation; 0-1 = weak →
+        false-positive candidate.
+
+        ``shape_anomaly`` is intentionally NOT in the score. R9's value
+        proposition is catching what ``find_anomalies(<chain_pattern>)``
+        misses — composition-anomalous-but-shape-normal is the textbook
+        R9 sweet spot. Awarding score for shape agreement would
+        mechanically cap that case at moderate. The shape block stays
+        in the report as evidence (and as a one-line rationale add-on
+        when it agrees) but does not drive the verdict.
+
+        Rationale concatenates the contributing signals as a single
+        SAR-ready paragraph for paste into investigator notes; when the
+        chain shape ALSO flags, that's surfaced as additional evidence.
+        """
+        signals: list[str] = []
+        score = 0
+
+        if trace_block.get("ok"):
+            t = trace_block["data"]
+            run_len = int(t.get("summary", {}).get(
+                "max_run_length_same_top_dim", 0,
+            ))
+            top_dim = t.get("summary", {}).get("dominant_top_dim")
+            if run_len >= 3:
+                score += 1
+                signals.append(
+                    f"Coherent anomaly run of length {run_len} on "
+                    f"`{top_dim}`."
+                )
+
+        if typology_block.get("ok"):
+            ty = typology_block["data"].get("typology", {})
+            position = ty.get("position_in_chain")
+            shape_label = ty.get("shape")
+            if position and position != "no-run":
+                score += 1
+                signals.append(
+                    f"Typology: {shape_label} run in {position} position."
+                )
+
+        if extension_forward.get("ok"):
+            ef = extension_forward["data"].get("summary", {})
+            if int(ef.get("n_anomalous_candidates", 0)) >= 1:
+                score += 1
+                signals.append(
+                    f"Forward extension surfaces "
+                    f"{ef['n_anomalous_candidates']} anomalous "
+                    f"boundary candidate(s)."
+                )
+
+        if extension_backward.get("ok"):
+            eb = extension_backward["data"].get("summary", {})
+            if int(eb.get("n_anomalous_candidates", 0)) >= 1:
+                score += 1
+                signals.append(
+                    f"Backward extension surfaces "
+                    f"{eb['n_anomalous_candidates']} anomalous "
+                    f"boundary candidate(s)."
+                )
+
+        # Shape evidence as rationale add-on only — does NOT contribute
+        # to the score (see docstring).
+        if shape_anomaly.get("ok") and shape_anomaly["data"].get("is_anomaly"):
+            rank = shape_anomaly["data"].get("delta_rank_pct")
+            signals.append(
+                f"Chain-shape anomaly also flags "
+                f"(delta_rank_pct={rank})."
+            )
+
+        if score >= 3:
+            strength = "strong"
+            action = "escalate to SAR"
+        elif score >= 2:
+            strength = "moderate"
+            action = "continue investigation"
+        else:
+            strength = "weak"
+            action = "false-positive candidate"
+
+        rationale = (
+            " ".join(signals) if signals else
+            "No coherent investigative signal across the R9 surfaces."
+        )
+        return {
+            "investigation_strength": strength,
+            "recommended_action": action,
+            "score": score,
+            "rationale": rationale,
+        }
+
+    def generate_sar_rationale(
+        self,
+        chain_id: str,
+        pattern_id: str,
+        *,
+        anchor_pattern_id: str,
+        evidence: dict[str, Any] | None = None,
+        regulatory_template: str = "FinCEN SAR",
+    ) -> dict[str, Any]:
+        """Compose a SAR-ready narrative from R9 evidence on a single chain.
+
+        Template-based composition over the structured per-step output of
+        ``investigate_chain``. When ``evidence`` is None, runs the R9 loop
+        server-side first; when supplied, the dict must match the
+        ``investigate_chain`` return shape (trace + typology + shape_anomaly
+        + extension_forward + extension_backward + summary, each per-step
+        wrapped in ``{ok, data | error}``). Caller-supplied evidence is the
+        cheap path for repeated narrative generation on the same chain.
+
+        The narrative is composed from structured templates — no LLM call.
+        Each paragraph fills placeholders from the corresponding evidence
+        block; failed evidence blocks (``ok: False``) are silently skipped
+        in the narrative but surface in ``evidence_anchors`` as ``null``.
+
+        Returns dict with ``sar_narrative`` (3-5 paragraph string),
+        ``evidence_anchors`` (structured pointers to the source data per
+        narrative claim), ``regulatory_template_hint`` (echoes the input
+        parameter), ``confidence`` (``high`` / ``moderate`` / ``low``
+        derived from investigation_strength + evidence completeness),
+        ``chain_id``, ``pattern_id``, ``anchor_pattern_id``, ``elapsed_ms``.
+
+        Honesty discipline: language is "evidence indicates" / "the
+        per-hop trace shows" — never "confirms". The narrative is a
+        starting point for the investigator's draft, not a final verdict.
+        """
+        import time as _time
+        t0 = _time.perf_counter()
+
+        if evidence is None:
+            evidence = self.investigate_chain(
+                chain_id, pattern_id,
+                anchor_pattern_id=anchor_pattern_id,
+            )
+
+        sphere = self._storage.read_sphere()
+        if pattern_id not in sphere.patterns:
+            raise GDSNavigationError(f"pattern not found: {pattern_id!r}")
+        if anchor_pattern_id not in sphere.patterns:
+            raise GDSNavigationError(
+                f"anchor pattern not found: {anchor_pattern_id!r}",
+            )
+
+        narrative, anchors = self._compose_sar_narrative(
+            chain_id, pattern_id, anchor_pattern_id, evidence,
+        )
+        confidence = self._derive_sar_confidence(evidence)
+
+        elapsed_ms = round((_time.perf_counter() - t0) * 1000.0, 2)
+        return {
+            "chain_id": chain_id,
+            "pattern_id": pattern_id,
+            "anchor_pattern_id": anchor_pattern_id,
+            "sar_narrative": narrative,
+            "evidence_anchors": anchors,
+            "regulatory_template_hint": regulatory_template,
+            "confidence": confidence,
+            "elapsed_ms": elapsed_ms,
+        }
+
+    @staticmethod
+    def _compose_sar_narrative(
+        chain_id: str,
+        pattern_id: str,
+        anchor_pattern_id: str,
+        evidence: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        """Build the paragraph-structured SAR narrative + structured
+        evidence_anchors block from an investigate_chain output dict.
+
+        Returns ``(narrative, anchors)`` where narrative is a
+        newline-separated 3-5 paragraph string and anchors is a dict of
+        structured pointers to the source data per narrative claim
+        (each pointer null when the corresponding R9 surface failed).
+        """
+        paragraphs: list[str] = []
+        anchors: dict[str, Any] = {}
+
+        # P1 — opening + chain identification + typology one-liner.
+        typology_block = evidence.get("typology", {})
+        if typology_block.get("ok"):
+            ty = typology_block["data"].get("typology", {})
+            shape = ty.get("shape", "unspecified")
+            position = ty.get("position_in_chain", "unspecified")
+            run_length = ty.get("run_length", 0)
+            anchors["typology_axes"] = {
+                "shape": shape,
+                "position_in_chain": position,
+                "peak_position": ty.get("peak_position"),
+                "run_length": run_length,
+                "dominant_top_dim": ty.get("dominant_top_dim"),
+            }
+            paragraphs.append(
+                f"Chain {chain_id} in pattern '{pattern_id}' is "
+                f"classified as a {shape} run in {position} position "
+                f"with run length {run_length}, member entities drawn "
+                f"from anchor pattern '{anchor_pattern_id}'."
+            )
+        else:
+            anchors["typology_axes"] = None
+            paragraphs.append(
+                f"Chain {chain_id} in pattern '{pattern_id}' (member "
+                f"entities from '{anchor_pattern_id}'). Typology "
+                f"classification was not available."
+            )
+
+        # P2 — per-hop trace evidence.
+        trace_block = evidence.get("trace", {})
+        if trace_block.get("ok"):
+            t = trace_block["data"]
+            tsum = t.get("summary", {})
+            n_hops = int(tsum.get("n_hops", 0))
+            n_anom = int(tsum.get("n_anomalous", 0))
+            run_len = int(tsum.get("max_run_length_same_top_dim", 0))
+            top_dim = tsum.get("dominant_top_dim", "unspecified")
+            anchors["per_hop_trace"] = {
+                "n_hops": n_hops,
+                "n_anomalous": n_anom,
+                "max_run_length_same_top_dim": run_len,
+                "dominant_top_dim": top_dim,
+            }
+            paragraphs.append(
+                f"The per-hop trace covers {n_hops} member entities; "
+                f"{n_anom} are individually flagged as anomalous on "
+                f"the entity anchor pattern. The longest contiguous "
+                f"run of consecutive members sharing the same dominant "
+                f"delta dimension is {run_len} hop(s) on "
+                f"`{top_dim}` — the operative coherent-cascade signal "
+                f"for this chain."
+            )
+        else:
+            anchors["per_hop_trace"] = None
+
+        # P3 — boundary extension evidence (forward + backward combined).
+        ext_fwd = evidence.get("extension_forward", {})
+        ext_bwd = evidence.get("extension_backward", {})
+        ext_pieces: list[str] = []
+        ext_anchors: dict[str, Any] = {}
+        for direction, block in (("forward", ext_fwd), ("backward", ext_bwd)):
+            if block.get("ok"):
+                d = block["data"]
+                bsum = d.get("summary", {})
+                n_cands = int(bsum.get("n_candidates", 0))
+                n_anom_c = int(bsum.get("n_anomalous_candidates", 0))
+                ext_anchors[direction] = {
+                    "boundary_key": d.get("boundary_key"),
+                    "boundary_position": d.get("boundary_position"),
+                    "n_candidates": n_cands,
+                    "n_anomalous_candidates": n_anom_c,
+                }
+                if n_cands > 0:
+                    ext_pieces.append(
+                        f"the {direction} boundary at "
+                        f"{d.get('boundary_key', '?')} surfaces "
+                        f"{n_cands} extension candidate(s) "
+                        f"({n_anom_c} individually anomalous)"
+                    )
+            else:
+                ext_anchors[direction] = None
+        anchors["boundary_extensions"] = ext_anchors
+        if ext_pieces:
+            paragraphs.append(
+                "Boundary analysis: " + "; ".join(ext_pieces) + "."
+            )
+
+        # P4 — chain-shape corroboration.
+        shape_block = evidence.get("shape_anomaly", {})
+        if shape_block.get("ok"):
+            s = shape_block["data"]
+            is_anom = bool(s.get("is_anomaly"))
+            rank = s.get("delta_rank_pct")
+            anchors["chain_shape_anomaly"] = {
+                "is_anomaly": is_anom,
+                "delta_norm": s.get("delta_norm"),
+                "delta_rank_pct": rank,
+            }
+            if is_anom:
+                paragraphs.append(
+                    f"The chain-level shape (chain-feature delta) is "
+                    f"independently anomalous at delta_rank_pct={rank} "
+                    f"— corroborating evidence that the structural "
+                    f"profile of the chain itself, not only the "
+                    f"composition of its members, deviates from the "
+                    f"chain population."
+                )
+            else:
+                paragraphs.append(
+                    f"The chain-level shape (chain-feature delta) is "
+                    f"NOT independently anomalous "
+                    f"(delta_rank_pct={rank}); the investigative signal "
+                    f"comes from the composition of member entities, "
+                    f"not the chain's own feature profile. This is the "
+                    f"orthogonal-detector regime — chains that "
+                    f"`find_anomalies(<chain_pattern>)` would miss."
+                )
+        else:
+            anchors["chain_shape_anomaly"] = None
+
+        # P5 — strength + recommended action, OR untriaged guard.
+        # Count R9 surfaces that actually returned evaluable evidence.
+        # When ALL fail, the strength/action derived from the empty
+        # summary would render as "weak / false-positive candidate" —
+        # in a SAR context that text reads "we evaluated and found
+        # the chain clear", which is the worst silent-error class.
+        # Replace with an explicit untriaged guard so the investigator
+        # cannot paste "false-positive" on a chain that was never
+        # actually checked.
+        ok_count = sum(
+            1 for k in ("trace", "typology", "shape_anomaly",
+                        "extension_forward", "extension_backward")
+            if evidence.get(k, {}).get("ok")
+        )
+        summary_block = evidence.get("summary")
+        if ok_count == 0:
+            anchors["summary"] = None
+            paragraphs.append(
+                "Investigation could not complete — none of the R9 "
+                "surfaces returned evaluable evidence (see "
+                "`evidence_anchors` for per-step error status). Treat "
+                "this chain as **untriaged**, not as cleared. The "
+                "narrative above is the chain identification only; no "
+                "investigative finding was produced."
+            )
+        else:
+            if not summary_block:
+                anchors["summary"] = None
+                strength = "weak"
+                action = "false-positive candidate"
+                score = 0
+            else:
+                strength = summary_block.get("investigation_strength", "weak")
+                action = summary_block.get(
+                    "recommended_action", "false-positive candidate",
+                )
+                score = int(summary_block.get("score", 0))
+                rationale = summary_block.get("rationale", "")
+                anchors["summary"] = {
+                    "investigation_strength": strength,
+                    "recommended_action": action,
+                    "score": score,
+                    "rationale": rationale,
+                }
+            paragraphs.append(
+                f"Aggregating across the R9 surfaces, the investigation "
+                f"strength is {strength} (composition score {score}/4), "
+                f"recommended action: {action}."
+            )
+
+        narrative = "\n\n".join(paragraphs)
+        return narrative, anchors
+
+    @staticmethod
+    def _derive_sar_confidence(evidence: dict[str, Any]) -> str:
+        """Map investigation_strength + evidence completeness to a
+        coarse confidence band.
+
+        Rules:
+          - strong + 5 R9 surfaces ok               → high
+          - strong + 4 surfaces ok                  → moderate
+          - moderate + 4-5 surfaces ok              → moderate
+          - everything else (weak strength, or
+            strong/moderate with too-few surfaces)  → low
+
+        The strong+4 rule prevents the contradiction "confidence=low,
+        recommended_action='escalate to SAR'" — a chain scoring
+        composition signals at strong but with one R9 surface failing
+        (e.g. extension_backward errored on a chain whose run starts
+        at hop 0 — normal) gets confidence=moderate, not low.
+
+        Evidence completeness: count of per-step blocks where ok=True.
+        """
+        summary = evidence.get("summary", {})
+        strength = summary.get("investigation_strength", "weak")
+        ok_count = sum(
+            1 for k in ("trace", "typology", "shape_anomaly",
+                        "extension_forward", "extension_backward")
+            if evidence.get(k, {}).get("ok")
+        )
+        if strength == "strong" and ok_count == 5:
+            return "high"
+        if strength == "strong" and ok_count == 4:
+            return "moderate"
+        if strength == "moderate" and ok_count >= 4:
+            return "moderate"
+        return "low"
 
     # ── Edge table: geometric path finding & lazy chains ──────
 

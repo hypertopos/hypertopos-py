@@ -91,7 +91,7 @@ def _make_navigator(sphere=None, geo_stats=None, geo_rows=0, geo_anomalies=0):
     storage.read_sphere.return_value = sphere
     storage.read_geometry_stats.return_value = geo_stats
     storage.read_temporal_centroids.return_value = None
-    storage.count_geometry_rows.side_effect = lambda pid, ver, filter=None: (
+    storage.count_geometry_rows.side_effect = lambda pid, filter=None: (
         geo_anomalies if filter is not None else geo_rows
     )
 
@@ -189,7 +189,7 @@ def _make_navigator_for_dqi(
     # theta_norm for the mock pattern is 1.5 (theta=[1.5], 1-dim)
     _theta_norm = 1.5
 
-    def _count_rows(pid, ver, filter=None):
+    def _count_rows(pid, filter=None):
         if filter and "delta_norm <" in filter:
             return degenerate_count
         if filter and "delta_norm >=" in filter:
@@ -720,7 +720,7 @@ def _make_navigator_for_lgs(edges_per_entity, delta_norms=None):
         return iter(edges_table.to_batches())
 
     nav._storage.read_geometry_batched.side_effect = _batched
-    nav._storage.count_geometry_rows.side_effect = lambda pid, ver, filter=None: 0 if filter else n
+    nav._storage.count_geometry_rows.side_effect = lambda pid, filter=None: 0 if filter else n
     return nav
 
 

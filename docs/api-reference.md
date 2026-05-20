@@ -134,8 +134,8 @@ with sphere.session("agent-1") as session:
 | `anomalous_edges(from_key, to_key, pattern_id, top_n=10)` | Find edges between two entities enriched with event-level geometry (delta_norm, is_anomaly). Unlike path tools which score entities (anchor), this scores individual transactions (event geometry) |
 | `edge_potential(from_key, to_key, pattern_id)` | Per-edge geometric anomaly score (distance × 1/pair_count). Complements `delta_norm`. Returns `{score, delta_distance, pair_tx_count, effective_weight, interpretation}` |
 | `attract_edge_potential(pattern_id, top_n, from_key, to_key, min_pair_count)` | Rank all edges by `edge_potential` DESC. Scope to an entity with from/to. |
-| `score_motif(entity_key, motif_type, pattern_id, time_window_hours=None, amt1_min=10000.0, amt2_max=10000.0, min_k=None, k=4, direction="forward", min_m=3)` | Score best structural motif seeded at entity. `motif_type` ∈ {`fan_out`, `fan_in`, `cycle_2`, `cycle_3`, `structuring`, `chain_k`, `split_recombine`, `bipartite_burst`}. Composes `edge_potential` via product across motif edges. Defaults: fan_out/fan_in=168h, cycle_2=24h, cycle_3=72h, structuring=1h, chain_k=168h, split_recombine=168h, bipartite_burst=24h. `amt1_min`/`amt2_max` gate the three hops of a `structuring` motif; `k` sets chain length for `chain_k` (3 ≤ k ≤ 8, default 4); `min_k` overrides the distinct-neighbour (or source-side, for bipartite_burst) cardinality threshold for `fan_out` / `fan_in` / `split_recombine` / `bipartite_burst` (default 3 when `None`, must be ≥ 2); `direction` ("forward" or "backward") picks whether the seed plays the source S or sink D of a `split_recombine` diamond; `min_m` sets the sink-side cardinality of a `bipartite_burst` K_{k,m} subgraph (default 3, must be ≥ 2); each parameter is ignored for motif types it doesn't gate. |
-| `find_high_potential_motifs(pattern_id, motif_type, top_n, time_window_hours, seeds, min_k, amt1_min, amt2_max, k, direction="forward", min_m=3)` | Rank motifs of a given type across the pattern. LRU-cached per (pattern, motif_type, window, amt1_min, amt2_max, k, direction, min_m), cap 8. `cycle_3` deduplicated by canonical ring; `structuring` and `chain_k` deduplicated by canonical path tuple; `split_recombine` deduplicated by `(direction, source, sink, sorted intermediaries)`; `bipartite_burst` deduplicated by `(frozenset sources, frozenset sinks)`. `min_k` applies to `fan_out` / `fan_in` / `split_recombine` / `bipartite_burst` (default 3); `k` applies to `chain_k` (default 4); `direction` applies to `split_recombine`; `min_m` applies to `bipartite_burst`. |
+| `score_motif(entity_key, motif_type, pattern_id, time_window_hours=None, amt1_min=10000.0, amt2_max=10000.0, min_k=None, k=4, direction="forward", min_m=3)` | Score best structural motif seeded at entity. `pattern_id` must be an **anchor** pattern (event-pattern inputs are rejected with a `GDSNavigationError` pointing at the anchor companion). `motif_type` ∈ {`fan_out`, `fan_in`, `cycle_2`, `cycle_3`, `structuring`, `chain_k`, `split_recombine`, `bipartite_burst`}. Composes `edge_potential` via product across motif edges. Defaults: fan_out/fan_in=168h, cycle_2=24h, cycle_3=72h, structuring=1h, chain_k=168h, split_recombine=168h, bipartite_burst=24h. `amt1_min`/`amt2_max` gate the three hops of a `structuring` motif; `k` sets chain length for `chain_k` (3 ≤ k ≤ 8, default 4); `min_k` overrides the distinct-neighbour (or source-side, for bipartite_burst) cardinality threshold for `fan_out` / `fan_in` / `split_recombine` / `bipartite_burst` (default 3 when `None`, must be ≥ 2); `direction` ("forward" or "backward") picks whether the seed plays the source S or sink D of a `split_recombine` diamond; `min_m` sets the sink-side cardinality of a `bipartite_burst` K_{k,m} subgraph (default 3, must be ≥ 2); each parameter is ignored for motif types it doesn't gate. |
+| `find_high_potential_motifs(pattern_id, motif_type, top_n, time_window_hours, seeds, min_k, amt1_min, amt2_max, k, direction="forward", min_m=3)` | Rank motifs of a given type across the pattern. `pattern_id` must be an **anchor** pattern; passing an event pattern raises `GDSNavigationError` (same gate as `score_motif`). LRU-cached per (pattern, motif_type, window, amt1_min, amt2_max, k, direction, min_m), cap 8. `cycle_3` deduplicated by canonical ring; `structuring` and `chain_k` deduplicated by canonical path tuple; `split_recombine` deduplicated by `(direction, source, sink, sorted intermediaries)`; `bipartite_burst` deduplicated by `(frozenset sources, frozenset sinks)`. `min_k` applies to `fan_out` / `fan_in` / `split_recombine` / `bipartite_burst` (default 3); `k` applies to `chain_k` (default 4); `direction` applies to `split_recombine`; `min_m` applies to `bipartite_burst`. |
 | `find_witness_cohort(primary_key, pattern_id, top_n=10, *, config=None, edge_pattern_id=None)` | Rank entities that share the target's witness signature. Investigative peer ranking — NOT edge forecasting. Combines four signals: `exp(-distance/theta)` delta similarity, witness Jaccard overlap, trajectory cosine alignment (optional), and graded anomaly bonus from `delta_rank_pct`. Excludes entities already connected via BTREE edge lookup — this is the function's main contribution over plain ANN. Configure via `WitnessCohortConfig(weights=WitnessCohortWeights(...), candidate_pool, min_witness_overlap, min_score, use_trajectory, bidirectional_check, timestamp_cutoff)`. Returns `WitnessCohortResult` with ranked `CohortMember` items, per-component scores, exclusion counts, and reproducibility metadata |
 | `find_novel_entities(pattern_id, top_n=10, sample_size=5000)` | Rank entities by geometric deviation from neighbor-expected position using edge table adjacency. High `novelty_score` = entity doesn't behave like its neighborhood. Requires a pattern with an edge table. Returns list of dicts with `primary_key`, `novelty_score`, and per-dimension decomposition |
 
@@ -145,12 +145,13 @@ with sphere.session("agent-1") as session:
 
 | Method | Description |
 |--------|-------------|
-| `explain_anomaly(primary_key, pattern_id)` | Structured investigation: severity, witness set, repair set, conformal p-value, reputation, and Bregman contributions returned under `top_dimensions[]` (fields: `dim`, `kind`, `bregman`, `pct_of_total`) |
+| `explain_anomaly(primary_key, pattern_id)` | Structured investigation: severity, witness set, repair set, conformal p-value, reputation, Bregman contributions under `top_dimensions[]` (fields: `dim`, `kind`, `bregman`, `pct_of_total`), and `reliability_flags` (per-polygon triage: `single_dim_driven`, `dominant_dim`, `dominant_dim_share`, `low_confidence_bucket`, `confidence`, `flags`). `dominant_dim` agrees with `top_dimensions[0]["dim"]` for the same polygon |
 | `trace_root_cause(primary_key, pattern_id, max_depth, max_branches)` | Multi-hop root-cause DAG: composes `explain_anomaly` + `find_counterparties` + `contagion_score` + `π7_attract_hub` into one bounded tree. Returns `{root, summary, hop_count, branches_explored, truncated}`. Replaces `explain_anomaly_chain` |
 | `find_similar_entities(primary_key, pattern_id, top_n, dim_mask, metric)` | ANN search for nearest entities in delta-space. `dim_mask`: list of dimension names to restrict distance. `metric`: `"L2"` or `"cosine"`. Returns `SimilarityResult` |
 | `contrast_populations(pattern_id, group_a, group_b)` | Dimension-by-dimension comparison of two entity groups (Cohen's d) |
-| `composite_risk(primary_key, line_id)` | Fisher's method combination of conformal p-values across patterns |
-| `composite_risk_batch(primary_keys, line_id)` | Batch Fisher combination for multiple entities |
+| `composite_risk(primary_key, line_id, *, include_reliability_flags=True)` | Wilson harmonic-mean p-value (HMP) combination of conformal p-values across patterns. Robust under positive dependence between patterns. Returns `combined_p`, `n_patterns`, `per_pattern{}`, and (when `include_reliability_flags=True` and the entity has a direct anchor pattern) `reliability_flags` for the home polygon. `chi2` / `df` fields removed (HMP has no chi-squared statistic) |
+| `composite_risk_batch(primary_keys, line_id, *, include_reliability_flags=False)` | Batch HMP combination for multiple entities. `include_reliability_flags` defaults `False` on the bulk path — every per-entity attachment triggers an extra polygon build, so 200 entities × one build is bounded by opt-in. Investigators who need per-entity reliability metadata in bulk call `composite_risk` individually |
+| `combine_anomaly_pvalues(pattern_id, *, detectors, weights, sample_size, top_n)` | Multi-detector anomaly consensus via HMP across five orthogonal detectors (`delta_norm`, `neighbor_contamination`, `segment_shift`, `trajectory_continuous`, `density_gap`). `density_gap` contributes no per-entity p-value (structurally aggregate — findings describe missing population, not per-entity attribution) so is silently skipped. Returns ranked list of `{primary_key, hmp, p_per_detector, rank, reliability_flags}` ascending by `hmp` — `reliability_flags` is attached post-truncation only |
 | `cross_pattern_profile(primary_key, line_id)` | Anomaly status from all patterns the entity participates in |
 | `find_chains_for_entity(primary_key, pattern_id, top_n)` | Find chains involving a specific entity |
 | `find_neighborhood(primary_key, pattern_id, max_hops)` | BFS through polygon edges to find reachable entities |
@@ -171,6 +172,43 @@ with sphere.session("agent-1") as session:
 | `detect_collective_drift(pattern_id, top_n)` | Clusters of entities drifting in the same geometric direction |
 | `detect_temporal_burst(pattern_id, window_days)` | Entities with bursty event patterns (z-score on rolling windows) |
 | `detect_data_quality_issues(pattern_id)` | Coverage gaps, dead dimensions, theta ceiling proximity |
+
+### Multi-detector consensus (HMP)
+
+Cross-pattern composition (`composite_risk`) and cross-detector
+composition (`combine_anomaly_pvalues`) both combine independent p-values
+via Wilson's harmonic-mean p-value (HMP):
+
+```
+HMP = sum(w_i) / sum(w_i / p_i)
+```
+
+with weights `w_i` defaulting to uniform `1/n` across the inputs that
+fired. The combiner lives in `engine/composition.py` (`harmonic_mean_p`)
+and is paired with a direct null-simulation threshold lookup
+(`hmp_threshold_at_alpha(L, alpha)`, deterministic via fixed seed and
+LRU-cached).
+
+HMP is robust under positive dependence between inputs (Wilson 2019,
+*PNAS*), which is the regime composite anomaly scoring actually faces:
+multiple patterns derived from the same event line share dimensions and
+fire together on the same entity. Fisher's method assumed independence
+and inflated combined significance whenever inputs co-fired.
+
+`combine_anomaly_pvalues` orchestrates five detector adapters from
+`engine/p_value_calibration.py`:
+
+| Detector | Source signal | p-value transform |
+|----------|---------------|-------------------|
+| `delta_norm` | population-relative geometry deviation | `1 − anomaly_confidence` (chi² survival fallback when null) |
+| `neighbor_contamination` | k-neighbour anomaly density | hypergeometric upper-tail |
+| `segment_shift` | categorical-segment anomaly rate | Fisher exact 2×2 back-projected per entity |
+| `trajectory_continuous` | DTW distance vs population-median trajectory (`engine/topology.py`) | ECDF survival |
+| `density_gap` | local density-gap detector findings | structurally aggregate — emits `{}` per entity (findings describe missing population, no per-entity attribution) |
+
+Detectors that fail to produce a value for a given entity are silently
+skipped — HMP is then computed from the remaining detectors. `delta_norm`
+is the always-available primary path.
 
 ### Population Queries
 
@@ -346,8 +384,8 @@ names in user-supplied `dim_pairs`.
 
 | Method | Description |
 |--------|-------------|
-| `read_calibration_fit(pattern_id, version=None)` | Load one calibration epoch as a frozen `CalibrationFit` dataclass. `version=None` resolves to the pattern's current `calibration_epoch` from sphere.json. Raises `CalibrationNotFoundError` if the requested version does not exist on disk (trimmed by GC, or schema bump wiped history). For 2.3 spheres, `version=None` and `version=1` both reconstruct a `CalibrationFit` from the inline sphere.json fields; any `version >= 2` raises `CalibrationNotFoundError`. |
-| `list_calibration_versions(pattern_id)` | Return all available calibration epochs for a pattern, ascending. On a 2.3 sphere returns `[1]`. On a 2.4 sphere returns the integers N present in `_gds_meta/calibration_history/{pattern_id}/v={N}.json`. |
+| `read_calibration_fit(pattern_id, version=None)` | Load one calibration epoch as a frozen `CalibrationFit` dataclass. `version=None` resolves to the pattern's current `calibration_epoch` from sphere.json. Raises `CalibrationNotFoundError` if the requested version does not exist on disk (trimmed by GC, or schema bump wiped history). When `calibration_history/` is absent, `version=None` and `version=1` both reconstruct a `CalibrationFit` from the inline sphere.json fields; any `version >= 2` raises `CalibrationNotFoundError`. |
+| `list_calibration_versions(pattern_id)` | Return all available calibration epochs for a pattern, ascending. Returns the integers `N` present in `_gds_meta/calibration_history/{pattern_id}/v={N}.json`, or `[1]` when the history dir is absent (no past full builder runs). |
 | `read_calibration_history_policy()` | Read the `calibration_history_policy` from sphere.json. Defaults to `{"last_k": 5}` if absent. Raises `ValueError` if `last_k < 1`. |
 
 ### `CalibrationFit` (dataclass, frozen)

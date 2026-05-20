@@ -219,12 +219,16 @@ class GDSEngine:
         for i in range(table.num_rows):
             row = {col: table[col][i].as_py() for col in table.schema.names}
             shape = np.array(row["shape_snapshot"], dtype=np.float32)
+            # Temporal shape_snapshot carries structural dims only; aggregated
+            # edge_dim dims have no temporal history. Slice calibration arrays
+            # to the snapshot width before the broadcast.
+            _w = shape.shape[-1]
             if pattern.cholesky_inv is not None:
-                delta = pattern.cholesky_inv @ (shape - pattern.mu)
+                delta = pattern.cholesky_inv[:_w, :_w] @ (shape - pattern.mu[:_w])
             else:
-                delta = (shape - pattern.mu) / sigma
+                delta = (shape - pattern.mu[:_w]) / sigma[:_w]
             if pattern.dimension_weights is not None:
-                delta = delta * pattern.dimension_weights
+                delta = delta * pattern.dimension_weights[:_w]
             delta_norm = float(np.linalg.norm(delta))
             slices.append(SolidSlice(
                 slice_index=row["slice_index"],
@@ -1197,6 +1201,139 @@ class GDSEngine:
 
 
 _M3_SIGMA_SAFE_FLOOR = 1e-12
+
+
+def _per_dim_anomaly_contributions(
+    delta: np.ndarray,
+    *,
+    dimension_kinds: list[str] | None,
+    sigma: np.ndarray | None,
+    mu: np.ndarray | None,
+    dimension_weights: np.ndarray | None,
+) -> np.ndarray:
+    """Per-dim anomaly contribution vector — matches build_explanation routing.
+
+    When ``dimension_kinds + sigma + mu`` are all available, returns the
+    Bregman divergence per dim (the canonical mixed-family attribution used
+    by ``explain_anomaly.top_dimensions``). Falls back to ``delta**2`` —
+    matches ``GDSEngine.anomaly_dimensions`` and ``witness_set`` — when the
+    calibration trio is missing or shapes mismatch.
+
+    Output is non-negative and same length as ``delta``. Reliability-flag
+    routing and any future per-dim consumer should call this helper so that
+    ``reliability_flags.dominant_dim`` and ``explain_anomaly`` agree on the
+    same polygon.
+    """
+    d = np.asarray(delta, dtype=np.float64)
+    if (
+        dimension_kinds is not None
+        and sigma is not None
+        and mu is not None
+        and len(dimension_kinds) == len(d)
+        and len(sigma) == len(d)
+        and len(mu) == len(d)
+    ):
+        from hypertopos.builder._bregman import bregman_divergence
+        if dimension_weights is not None:
+            w = np.maximum(
+                np.asarray(dimension_weights, dtype=np.float64), 1e-9
+            )
+            d_unw = d / w
+        else:
+            d_unw = d
+        shape = d_unw * np.asarray(sigma, dtype=np.float64) + np.asarray(
+            mu, dtype=np.float64
+        )
+        return bregman_divergence(
+            shape,
+            np.asarray(mu, dtype=np.float64),
+            np.asarray(sigma, dtype=np.float64),
+            dimension_kinds,
+        )
+    return d ** 2
+
+
+def compute_reliability_flags(
+    delta: np.ndarray | list[float],
+    *,
+    pattern: Pattern,
+    anomaly_confidence: float | None = None,
+    dominant_dim_threshold: float = 0.7,
+    confidence_threshold: float = 0.5,
+) -> dict:
+    """Surface per-polygon reliability warnings.
+
+    Two flags fire independently:
+
+    - ``single_dim_driven`` — the dominant dimension contributes more than
+      ``dominant_dim_threshold`` of total anomaly attribution.
+      Investigator action: a single-dim-driven anomaly is more likely to be
+      a data-quality artefact (a saturated counter, an outlier on one
+      property) than a multi-dim fraud signal. Worth a sanity check on the
+      dominant dim before opening a case.
+    - ``low_confidence_bucket`` — ``anomaly_confidence`` is set and below
+      ``confidence_threshold``. ``anomaly_confidence`` is the
+      bootstrap-derived fraction of resamples in which the entity exceeded
+      its (fresh-mu, fresh-sigma, fresh-theta) anomaly threshold; a value
+      well below 0.5 means the anomaly flag is fragile to population
+      resampling and the entity is borderline.
+
+    Takes the raw ``delta`` vector + scalar ``anomaly_confidence`` (matches
+    the ``anomaly_dimensions`` / ``witness_set`` calling convention rather
+    than requiring a full ``Polygon`` — callers that have only Arrow rows
+    skip the ``Polygon`` construction). Returns a dict with both boolean
+    flags, the dominant dim label and share, the sanitised confidence
+    value, and ``flags`` — the list of triggered flag names (subset of
+    ``{"single_dim_driven", "low_confidence_bucket"}``). ``confidence``
+    sanitises ``NaN`` / ``±inf`` to ``None`` per the strict-JSON
+    convention. The dominant-dim attribution routes through the same
+    per-dim contribution primitive (``_per_dim_anomaly_contributions``)
+    that ``explain_anomaly.top_dimensions`` uses, so the two surfaces
+    always pick the same dim for the same polygon.
+    """
+    delta_arr = np.asarray(delta, dtype=np.float64)
+    dim_labels = pattern.dim_labels
+    contributions = _per_dim_anomaly_contributions(
+        delta_arr,
+        dimension_kinds=pattern.dimension_kinds,
+        sigma=pattern.sigma_diag,
+        mu=pattern.mu,
+        dimension_weights=pattern.dimension_weights,
+    )
+    total = float(contributions.sum())
+    if total > 0:
+        dom_idx = int(np.argmax(contributions))
+        dom_share = float(contributions[dom_idx]) / total
+        dom_label = (
+            dim_labels[dom_idx] if 0 <= dom_idx < len(dim_labels) else None
+        )
+    else:
+        dom_idx = -1
+        dom_share = 0.0
+        dom_label = None
+
+    single_dim_driven = bool(dom_share > dominant_dim_threshold)
+
+    if anomaly_confidence is None or not np.isfinite(float(anomaly_confidence)):
+        conf: float | None = None
+    else:
+        conf = float(anomaly_confidence)
+    low_confidence_bucket = bool(conf is not None and conf < confidence_threshold)
+
+    flags: list[str] = []
+    if single_dim_driven:
+        flags.append("single_dim_driven")
+    if low_confidence_bucket:
+        flags.append("low_confidence_bucket")
+
+    return {
+        "single_dim_driven": single_dim_driven,
+        "dominant_dim": dom_label,
+        "dominant_dim_share": round(dom_share, 4),
+        "low_confidence_bucket": low_confidence_bucket,
+        "confidence": None if conf is None else round(conf, 4),
+        "flags": flags,
+    }
 
 
 def _compute_decomposition_vectors(

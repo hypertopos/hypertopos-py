@@ -16,6 +16,7 @@ def _base_yaml() -> dict:
     return {
         "version": "0.1.0",
         "sphere_id": "test",
+        "format_version": "3.0",
         "sources": {"events": {"path": "events.csv"}},
         "lines": {
             "events": {"source": "events", "key": "primary_key", "role": "event"},

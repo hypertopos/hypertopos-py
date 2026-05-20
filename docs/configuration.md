@@ -264,9 +264,10 @@ skill for design guidelines, benchmark results, and worked examples.
 
 **Cross-line bridging:** Lines sharing the same `source` (same source name in YAML)
 are automatically recognized as **sibling lines** at runtime. `composite_risk` and
-`passive_scan` bridge across sibling lines — combining p-values via Fisher's method
-even though each pattern operates on its own entity line. This preserves dimensional
-isolation while enabling multi-pattern composite scoring.
+`passive_scan` bridge across sibling lines — combining p-values via the Wilson
+harmonic-mean p-value (HMP), robust under positive dependence between sibling
+patterns — even though each pattern operates on its own entity line. This preserves
+dimensional isolation while enabling multi-pattern composite scoring.
 
 ```yaml
 lines:
@@ -319,11 +320,12 @@ patterns:
       - time_since_pair_last_edge
       - pair_amount_zscore              #   LOW_VAR pairs only.
       - find_motif_structuring
+      - edge_curvature_frc              #   Forman-Ricci curvature; no params.
     anomaly_percentile: 95             # Theta threshold percentile (default: 95).
     dimension_weights: kurtosis        # "kurtosis" (recommended), "auto", or [0.5, 0.3, ...].
 ```
 
-The five available `edge_dimensions` functions: `pair_edge_count` (Poisson, count of edges between this pair), `position_in_chain` (Poisson, ordinal position in detected chain — `min_position` rejects below 3 at YAML parse), `time_since_pair_last_edge` (Gaussian, seconds since this `(from, to)` pair last had an edge), `pair_amount_zscore` (Gaussian, per-pair amount z-score on LOW_VAR pairs only), `find_motif_structuring` (Bernoulli, 1 if this edge participates in any structuring motif). Values are baked into the event polygon shape via `dimension_kinds` and written as a sidecar Lance dataset at `_gds_meta/edge_features/{pid}/data.lance` for runtime per-edge predicate filtering.
+The six available `edge_dimensions` functions: `pair_edge_count` (Poisson, count of edges between this pair), `position_in_chain` (Poisson, ordinal position in detected chain — `min_position` rejects below 3 at YAML parse), `time_since_pair_last_edge` (Gaussian, seconds since this `(from, to)` pair last had an edge), `pair_amount_zscore` (Gaussian, per-pair amount z-score on LOW_VAR pairs only), `find_motif_structuring` (Bernoulli, 1 if this edge participates in any structuring motif), `edge_curvature_frc` (Gaussian, combinatorial Forman-Ricci curvature of the underlying undirected transaction graph: `4 − deg(u) − deg(v) + #triangles(u, v)` — negative values mark sparse-hub topology, near-zero marks tight rings, positive marks over-clustered local structure; no params). Values are baked into the event polygon shape via `dimension_kinds` and written as a sidecar Lance dataset at `_gds_meta/edge_features/{pid}/data.lance` for runtime per-edge predicate filtering.
 
 ### Anchor pattern
 
@@ -467,7 +469,9 @@ patterns:
 
 Both patterns share the same derived dimensions (registered once, deduplicated automatically).
 Different `group_by_property` and `tracked_properties` produce independent calibrations.
-Use `composite_risk` in the MCP layer to combine signals via Fisher's method.
+Use `composite_risk` in the MCP layer to combine signals via the Wilson harmonic-mean
+p-value (HMP), robust under positive dependence between patterns sharing derived
+dimensions.
 
 ### Relation fields
 

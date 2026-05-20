@@ -7,6 +7,80 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-05-18
+
+### Added
+
+#### Sphere format 3.0 + Lance 6.0 modernization (breaking)
+- **Sphere format bumped 2.4 → 3.0 (breaking).** Geometry is stored as a single Lance dataset per pattern with calibration epochs tracked as native Lance dataset versions tagged `epoch_<N>`; the public navigator API is unchanged. **Spheres on format 2.4 do not open on this release** — `GDSVersionError` points to a clean rebuild.
+- Lance dependency bumped 4.0.0 → 6.0.0; auto-applied SIMD distance kernels, zonemap improvements, manifest interning, eager I/O scheduling, and FTS prewarm wins on the cold read path.
+- `storage.reader.read_geometry_batched` and `storage.reader.read_temporal_batched` now batch by bytes instead of rows; the `batch_size` parameter is renamed `batch_size_bytes`.
+
+#### Entity-side investigation orchestrator
+- `GDSNavigator.investigate_entity(primary_key, *, pattern_id, line_id, chain_pattern_id=None, include_polygon=True, include_explain=True, include_witness_cohort=True, include_chains=True, include_root_cause=True, include_graph_geometry_tension=True, include_per_edge_counterfactual=False, top_n_witnesses=5, top_n_chains=3, top_n_edges=5)` — one-call entity investigation orchestrator returning one block per included step plus `steps_status` mapping step name to `{ok, error}` and `elapsed_ms`.
+
+#### Detector composition
+- `GDSNavigator.combine_anomaly_pvalues(pattern_id, *, detectors, weights, sample_size, top_n)` — multi-detector anomaly consensus across `delta_norm`, `neighbor_contamination`, `segment_shift`, `trajectory_continuous`, and `density_gap` (skipped silently); returns ranked `{primary_key, hmp, p_per_detector, rank}`.
+- `GDSNavigator.classify_detector_consensus(pattern_id, *, detectors, sample_size, top_n, anomaly_threshold, normal_threshold)` — categorical detector-agreement typology with band-gap thresholding returning `{primary_key, classification, anomalous_detectors, normal_detectors, borderline_detectors, n_detectors_fired, hmp, p_per_detector, rank}`.
+- `engine.composition.harmonic_mean_p(p_values, *, weights=None)` — Wilson harmonic-mean p-value combiner with optional per-detector weights.
+- `engine.composition.hmp_threshold_at_alpha(L, alpha, *, n_simulation_draws=1_000_000)` — null-simulation HMP threshold lookup at level `alpha` for `L` tests.
+- `engine.topology.trajectory_continuous_score(solid, *, sample_size)` — per-entity DTW distance against the population-median trajectory.
+- `engine.p_value_calibration` module — five adapter functions mapping detector scores to per-entity p-values: `detector_p_value_delta_norm`, `detector_p_value_neighbor_contamination`, `detector_p_value_segment_shift`, `detector_p_value_density_gap`, `detector_p_value_trajectory_continuous`.
+- `composite_risk` and `composite_risk_batch` now combine cross-pattern p-values via the Wilson harmonic-mean p-value (HMP) instead of Fisher's method; `combined_p`, `n_patterns`, `per_pattern{}` retained, `chi2` and `df` removed.
+
+#### Counterfactual suite
+- `GDSNavigator.simulate_edge_removal(primary_key, *, pattern_id, line_id, top_n=5, edge_ids=None)` — per-edge counterfactual returning `(edge_id, delta_norm_before, delta_norm_after, drop_pct, dominant_dim_label, source_value_pvalues, min_pvalue, dominant_significance_dim, dimensions_skipped)` ranked by composite of `|drop_pct|` and source-value extremeness.
+- `GDSNavigator.simulate_counterparty_removal(primary_key, *, pattern_id, line_id, top_n=5, edge_top_n=None)` — per-counterparty rollup returning `{partner_key, n_edges, sum_drop_pct, sum_abs_drop_pct, max_abs_drop_pct, dominant_dim_label, edge_ids}` sorted by `sum_abs_drop_pct`.
+- `GDSNavigator.select_minimal_joint_edge_removal(primary_key, *, pattern_id, line_id, target_drop_pct=50.0, k_max=10)` — greedy joint counterfactual returning `{selected_edge_ids, selected_partner_keys, achieved_drop_pct, achieved_abs_drop_pct, selection_sequence, target_reached, k_max_reached, delta_norm_before}`.
+- `GDSNavigator.simulate_dimension_change(primary_key, *, pattern_id, line_id, set_dimension, top_n=5)` — what-if dimension override returning `delta_norm_before/after`, `delta_norm_pct_change`, `is_anomaly_before/after/change`, `top_witness_dims_after`, `dimensions_overridden`.
+- `engine.counterfactual` module — pure-math primitives for direct embedding: `simulate_joint_edge_removal`, `select_minimal_joint_removal`, `aggregate_edge_removals_by_counterparty`, `ecdf_pvalue_upper_tail`, `compute_per_edge_source_value_pvalues`.
+
+#### Multi-hypothesis explanation
+- `GDSNavigator.find_diverse_explanations(primary_key, *, pattern_id, n_hypotheses=3, min_contribution_pct=0.10, validate=False)` — K diverse disjoint hypotheses for why an entity is anomalous returning `{primary_key, pattern_id, delta_norm, theta_norm, n_hypotheses_requested, n_hypotheses_returned, hypotheses, diversity_score, degraded_reason}`.
+
+#### FDR upgrades
+- `engine.fdr.fdr_multi_resolution(cell_p_values, *, hierarchy, temporal_levels, method, alpha)` — multi-resolution FDR over a cell-tuple lattice with Tippett min-p aggregation up each declared level.
+- `engine.fdr.cell_p_values_from_anomaly_indicator(geometry, *, hierarchy_dims, temporal_dim, anomaly_col)` — per-cell Fisher exact 2×2 upper-tail p-value on an anomaly indicator.
+- `Pattern.fdr_hierarchy: list[FDRHierarchyLevel]` and `Pattern.fdr_temporal_hierarchy: list[FDRTemporalLevel]` — declarative sphere.yaml schema for spatial and temporal FDR hierarchies; `GDSNavigator.π5_attract_anomaly` and `find_anomalies` gain `fdr_resolution` and `fdr_temporal_resolution` parameters, survivors carry `cell_q_spatial`, `cell_q_temporal`, `cell_path`. When a resolution is set, unspecified `p_value_method` defaults to `"chi2"` and unspecified `fdr_method` to `"storey"`.
+- `builder.temporal_bucket` — opt-in per-anchor centroid-timestamp bucketing materialiser triggered automatically when `fdr_temporal_hierarchy:` declares a `slice_dimension` missing from the geometry table.
+- `engine.fdr.per_dim_p_values_chi2_univariate(deltas)` and `engine.fdr.fdr_per_dimension(p_values_per_dim, *, alpha, method)` — per-entity-per-dim chi²(1) two-sided p-values with BH/Storey correction applied independently per column.
+- `GDSNavigator.π5_attract_anomaly` gains `fdr_axis: "entity" | "per_dim" | "both"` and `rank_by: "delta_norm" | "min_q_per_dim"`; per-dim mode attaches `q_values_per_dim`, `min_q_per_dim`, `dominant_q_dim_idx` to each survivor.
+
+#### Chain extensions
+- `GDSNavigator.chain_witness_intersection(chain_id, *, chain_pattern, member_pattern, min_jaccard=0.5, top_k_witness=5)` — coordinated-witness diagnosis returning `{chain_id, chain_pattern, member_pattern, n_members, n_members_explained, n_members_skipped, intersected_witness_dims, union_witness_dims, mean_pairwise_witness_jaccard, coordinated, interpretation, per_member_top_dims}`.
+- `GDSNavigator.chain_drift_trajectory(chain_id, *, chain_pattern, member_pattern, n_windows=4)` — per-member regime + chain-level drift score returning `{chain_id, chain_pattern, member_pattern, n_members, n_members_with_history, n_members_skipped, n_members_short_history, n_windows, per_position_trajectory, chain_level_regime, chain_drift_score}`.
+
+#### Graph-geometry primitives
+- `GDSNavigator.find_graph_geometry_tension(primary_key, *, pattern_id, line_id, k_geometric=20, top_n_hidden=5, top_n_suspicious=5)` — per-entity 2×2 cross-tab of behavioural k-NN vs graph adjacency returning `{primary_key, hidden_cluster, suspicious_links, tension_score}`.
+- `edge_curvature_frc` — opt-in build-time edge dimension materialising combinatorial Forman-Ricci curvature per transaction edge via `edge_dimensions: [edge_curvature_frc]`.
+- `engine.dim_audit.fit_lda_direction(*, deltas, labels, regularization=1e-6)` — Fisher LDA direction fit over labeled delta vectors returning `{direction, fisher_score, n_anom, n_normal}`.
+
+#### Reliability triage
+- `engine.geometry.compute_reliability_flags(delta, *, pattern, anomaly_confidence, dominant_dim_threshold=0.7, confidence_threshold=0.5)` — per-polygon reliability triage returning `{single_dim_driven, dominant_dim, dominant_dim_share, low_confidence_bucket, confidence, flags}`. Surfaced on `π5_attract_anomaly`, `explain_anomaly`, `composite_risk`, `combine_anomaly_pvalues`, and `investigate_entity`; additive on every surface.
+
+#### Persistent-homology stack
+- `GDSNavigator.find_topological_anomalies(pattern_id, *, top_n=20, force=False, sample_size=50_000, k_neighbors=50, homology_dim=1, pca_dim=10)` — per-entity local k-NN Vietoris–Rips H_1 cycle-persistence ranking returning `{primary_key, topo_score, h1_max_persistence, h0_mean_death, n_h1_features, computed_at}`; optional dependency `pip install hypertopos[topology]`.
+- `engine.topology.find_topological_anomalies(geometry_table, *, k_neighbors, homology_dim, pca_dim, sample_size, top_n)` — engine primitive accepting any Arrow table with `primary_key` plus numeric feature columns.
+- `engine.topology.find_topological_trajectory_anomalies(solid_table, *, homology_dim, min_timesteps, pca_dim, sample_size, top_n)` — per-entity trajectory-PH anomaly score returning `trajectory_topo_score`, `dominant_feature_birth`, `dominant_feature_death`.
+- `storage.topology_cache` module — sidecar cache helpers `cache_path`, `read_cache`, `write_cache` with `ANOMALIES_SCHEMA` and `TRAJECTORY_SCHEMA`.
+
+#### Sphere-validation cheap-tier
+- `sphere_overview.dim_quality_warnings` gains `dominant_dim_mass` (one dim accounts for ≥70% of population p99-tail variance) and `negative_space` (gaussian-declared dims with empirical `p50==0`); each warning carries `type`, `dim_label`, `reason`, `advice`, with `evidence_value` and `threshold` on `dominant_dim_mass`.
+
+#### Declarative compliance rules
+- `Pattern.conformance_rules: list[ConformanceRule]` — declarative compliance rules in a safe AST predicate language (`and` / `or` / `not` over `==`, `!=`, `<`, `<=`, `>`, `>=`, `in`); builder evaluates rules vectorised via PyArrow and persists violations alongside `rule_set_hash`. Helpers `compile_predicate` and `compute_rule_set_hash`.
+- `GDSNavigator.find_conformance_violations(pattern_id, *, rule_id=None, severity_min="low", top_n=100)` — query primitive returning `{pattern_id, n_violations, violations, rules_evaluated, manifest, warnings, follow_up}`; detects rule-set hash mismatch as a warning.
+
+### Fixed
+
+#### Stress-test follow-up hardening
+- `GDSNavigator.π7_attract_hub_and_stats` and `GDSNavigator.hub_score_history` no longer raise a broadcast error on anchor patterns whose geometry dim count exceeds the relation count (the synthetic conformance / motif dims tail at the end of `pattern.delta`). Hub-scoring code paths now slice the shape matrix to `len(pattern.edge_max)` before the per-relation weight multiply, matching the fix already applied to `π7_attract_hub`. `find_hubs` and `hub_history` are now callable on these patterns without `line_id_filter` as a workaround.
+- `GDSNavigator.simulate_edge_removal` no longer scans the entity's full adjacency on hub entities — a new `max_edges_loaded` parameter (default 2000) truncates the candidate edge list before the sidecar IN-clause and the engine evaluation. Per-call latency on entities with tens of thousands of edges drops from indefinite to seconds.
+- `GDSNavigator.select_minimal_joint_edge_removal` accepts a new `max_candidates` parameter (default 500) capping the greedy search input; results carry `n_candidates_seen`, `n_candidates_used`, and `candidates_truncated` so the agent sees when truncation occurred.
+- `GDSNavigator.edge_potential` (backing `score_edge` / `score_motif`) now names the pattern type and the expected key shape in its `Entity not found` error — event patterns require event keys, anchor patterns require anchor keys, and the message points the agent at `search_entities` for discovery.
+- `GDSNavigator.classify_detector_consensus` ranking is deterministic on the HMP-saturation case — `delta_norm` (pulled from the reliability flags attached by `combine_anomaly_pvalues`) is used as a final tiebreaker when the per-detector p-value vector is identical across entities. The previous behaviour returned an order determined by floating-point sort tie-break.
+- `GDSNavigator.find_high_potential_motifs` and `GDSNavigator.score_motif` reject event `pattern_id` early with a `GDSNavigationError` that names the correct anchor companion. The previous behaviour silently returned an empty result after burning the full enumeration cost (the geometry's `primary_key` column carries event keys, but the adjacency index is keyed on entities; no seed ever passed the active-seed gate).
+
 ## [0.6.7] — 2026-05-10
 
 ### Added

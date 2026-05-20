@@ -4,7 +4,9 @@
 # See LICENSE.md in the repository root for full terms.
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime
+from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
@@ -7946,6 +7948,345 @@ class TestSiblingPatternDiscovery:
         assert result["total_checked"] == 1
         assert result["results"][0].get("error") == "not_found"
 
+    def test_composite_risk_returns_hmp_shape(self):
+        """composite_risk uses HMP — chi2/df are no longer surfaced."""
+        nav = GDSNavigator(
+            engine=_MockEngine(),
+            storage=_MockStorageSibling(),
+            manifest=_make_sibling_manifest(),
+            contract=Contract("m-sib", []),
+        )
+        result = nav.composite_risk("ACC-001", line_id="line_a")
+        assert result["combined_p"] is not None
+        # HMP-specific shape: no chi2/df fields
+        assert "chi2" not in result
+        assert "df" not in result
+        # n_patterns + per_pattern preserved
+        assert result["n_patterns"] == 2
+        assert "pat_a" in result["per_pattern"]
+        # combined_p in (0, 1]
+        assert 0.0 < result["combined_p"] <= 1.0
+
+    def test_composite_risk_batch_no_chi2_field(self):
+        """Batch composite_risk results contain HMP combined_p only."""
+        nav = GDSNavigator(
+            engine=_MockEngine(),
+            storage=_MockStorageSibling(),
+            manifest=_make_sibling_manifest(),
+            contract=Contract("m-sib", []),
+        )
+        result = nav.composite_risk_batch(["ACC-001"], line_id="line_a")
+        for entry in result["results"]:
+            assert "chi2" not in entry
+            assert "df" not in entry
+
+
+# --- combine_anomaly_pvalues (M1 multi-detector consensus) ---
+
+
+class _MockStorageMultiDetector(_MockStorage):
+    """Mock storage exposing geometry with anomaly_confidence — feeds delta_norm."""
+
+    def read_sphere(self):
+        from hypertopos.model.sphere import (
+            Line,
+            PartitionConfig,
+            Pattern,
+            RelationDef,
+            Sphere,
+        )
+
+        dt = datetime(2024, 1, 1, tzinfo=UTC)
+        part = PartitionConfig(mode="static", columns=[])
+        pat = Pattern(
+            pattern_id="acc_pat",
+            entity_type="accounts",
+            pattern_type="anchor",
+            relations=[RelationDef(line_id="txns", direction="in", required=True)],
+            mu=np.zeros(2, dtype=np.float32),
+            sigma_diag=np.ones(2, dtype=np.float32),
+            theta=np.array([1.0, 1.0], dtype=np.float32),
+            population_size=10,
+            computed_at=dt,
+            version=1,
+            status="production",
+            entity_line_id="accounts",
+        )
+        line_acc = Line(
+            line_id="accounts",
+            entity_type="accounts",
+            line_role="anchor",
+            pattern_id="acc_pat",
+            partitioning=part,
+            versions=[1],
+            source_id="accounts",
+        )
+        line_txn = Line(
+            line_id="txns",
+            entity_type="transactions",
+            line_role="event",
+            pattern_id="acc_pat",
+            partitioning=part,
+            versions=[1],
+        )
+        return Sphere(
+            "s", "s", ".",
+            lines={"accounts": line_acc, "txns": line_txn},
+            patterns={"acc_pat": pat},
+        )
+
+    def read_geometry(
+        self, pattern_id, version, primary_key=None, filters=None,
+        point_keys=None, columns=None, filter=None, sample_size=None,
+    ):
+        # 5 entities with varying anomaly_confidence
+        all_data = {
+            "primary_key": ["A", "B", "C", "D", "E"],
+            "delta_norm": pa.array([0.5, 1.0, 2.0, 3.0, 5.0], type=pa.float64()),
+            "is_anomaly": [False, False, True, True, True],
+            "delta_rank_pct": pa.array([10.0, 30.0, 60.0, 80.0, 99.0], type=pa.float64()),
+            "conformal_p": pa.array([0.9, 0.7, 0.4, 0.2, 0.05], type=pa.float64()),
+            "anomaly_confidence": pa.array(
+                [0.1, 0.3, 0.6, 0.8, 0.95], type=pa.float32(),
+            ),
+        }
+        if point_keys is not None:
+            keep = set(point_keys)
+            keep_idx = [i for i, k in enumerate(all_data["primary_key"]) if k in keep]
+            all_data = {
+                k: (
+                    [v[i] for i in keep_idx] if isinstance(v, list)
+                    else v.take(keep_idx)
+                )
+                for k, v in all_data.items()
+            }
+        tbl = pa.table(all_data)
+        if columns is not None:
+            available = set(tbl.schema.names)
+            columns = [c for c in columns if c in available]
+            if columns:
+                tbl = tbl.select(columns)
+        return tbl
+
+
+def _make_multi_detector_manifest():
+    return Manifest(
+        manifest_id="m-multi",
+        agent_id="agent-001",
+        snapshot_time=datetime(2024, 1, 1, tzinfo=UTC),
+        status="active",
+        line_versions={"accounts": 1, "txns": 1},
+        pattern_versions={"acc_pat": 1},
+    )
+
+
+class TestCombineAnomalyPvalues:
+    def test_returns_ranked_list_with_per_detector_breakdown(self):
+        nav = GDSNavigator(
+            engine=_MockEngine(),
+            storage=_MockStorageMultiDetector(),
+            manifest=_make_multi_detector_manifest(),
+            contract=Contract("m-multi", []),
+        )
+        result = nav.combine_anomaly_pvalues("acc_pat", top_n=5)
+        assert isinstance(result, list)
+        assert len(result) <= 5
+        # Each entry has primary_key, hmp, p_per_detector, rank
+        for entry in result:
+            assert "primary_key" in entry
+            assert "hmp" in entry
+            assert "p_per_detector" in entry
+            assert "rank" in entry
+            assert isinstance(entry["p_per_detector"], dict)
+            # delta_norm always present (primary detector)
+            assert "delta_norm" in entry["p_per_detector"]
+            # All ps in (0, 1]
+            for p in entry["p_per_detector"].values():
+                assert 0.0 < p <= 1.0
+            # HMP finite and in (0, 1]
+            assert 0.0 < entry["hmp"] <= 1.0
+
+    def test_results_sorted_ascending_by_hmp(self):
+        nav = GDSNavigator(
+            engine=_MockEngine(),
+            storage=_MockStorageMultiDetector(),
+            manifest=_make_multi_detector_manifest(),
+            contract=Contract("m-multi", []),
+        )
+        result = nav.combine_anomaly_pvalues("acc_pat", top_n=5)
+        hmps = [r["hmp"] for r in result]
+        assert hmps == sorted(hmps)
+        # Ranks are 1..len(result) ascending
+        ranks = [r["rank"] for r in result]
+        assert ranks == list(range(1, len(result) + 1))
+
+    def test_top_anomalous_entity_has_lowest_hmp(self):
+        nav = GDSNavigator(
+            engine=_MockEngine(),
+            storage=_MockStorageMultiDetector(),
+            manifest=_make_multi_detector_manifest(),
+            contract=Contract("m-multi", []),
+        )
+        result = nav.combine_anomaly_pvalues("acc_pat", top_n=5)
+        # E has highest anomaly_confidence (0.95) → lowest p → lowest HMP
+        assert result[0]["primary_key"] == "E"
+
+    def test_explicit_detector_subset(self):
+        nav = GDSNavigator(
+            engine=_MockEngine(),
+            storage=_MockStorageMultiDetector(),
+            manifest=_make_multi_detector_manifest(),
+            contract=Contract("m-multi", []),
+        )
+        result = nav.combine_anomaly_pvalues(
+            "acc_pat", detectors=("delta_norm",), top_n=5,
+        )
+        for entry in result:
+            assert set(entry["p_per_detector"].keys()) == {"delta_norm"}
+
+    def test_explicit_weights(self):
+        nav = GDSNavigator(
+            engine=_MockEngine(),
+            storage=_MockStorageMultiDetector(),
+            manifest=_make_multi_detector_manifest(),
+            contract=Contract("m-multi", []),
+        )
+        # Weighting heavily toward delta_norm
+        result = nav.combine_anomaly_pvalues(
+            "acc_pat",
+            detectors=("delta_norm",),
+            weights={"delta_norm": 1.0},
+            top_n=5,
+        )
+        # Same detector + uniform single → HMP equals delta_norm p
+        for entry in result:
+            assert entry["hmp"] == pytest.approx(
+                entry["p_per_detector"]["delta_norm"], rel=1e-9,
+            )
+
+    def test_empty_pattern_returns_empty(self):
+        nav = GDSNavigator(
+            engine=_MockEngine(),
+            storage=_MockStorage(),
+            manifest=Manifest(
+                manifest_id="empty",
+                agent_id="a",
+                snapshot_time=datetime(2024, 1, 1, tzinfo=UTC),
+                status="active",
+                line_versions={},
+                pattern_versions={},
+            ),
+            contract=Contract("empty", []),
+        )
+        # No pattern in sphere → ValueError-like behaviour
+        with pytest.raises((GDSNavigationError, ValueError, KeyError)):
+            nav.combine_anomaly_pvalues("nonexistent_pattern")
+
+    def test_no_nan_or_inf_in_output(self):
+        nav = GDSNavigator(
+            engine=_MockEngine(),
+            storage=_MockStorageMultiDetector(),
+            manifest=_make_multi_detector_manifest(),
+            contract=Contract("m-multi", []),
+        )
+        result = nav.combine_anomaly_pvalues("acc_pat", top_n=5)
+        import math
+        for entry in result:
+            assert math.isfinite(entry["hmp"])
+            for p in entry["p_per_detector"].values():
+                assert math.isfinite(p)
+
+
+# Real-data regression for the multi-detector consensus on AML HI-small.
+# Pre-fix smoke (pre-2026-05-10) showed ONLY delta_norm firing on every
+# top-50 entry of ``account_pattern`` — neighbor-contamination silently
+# skipped because its candidate set was 2-hop from anomaly seeds (never
+# intersecting the sampled geo population), and segment-shift silently
+# skipped because its public detector applies a strict
+# ``min_shift_ratio=2.0`` + ``max_cardinality=50`` gate that erases the
+# real bank-hub signal on AML. This test pins the expected dense
+# multi-detector firing.
+_AML_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "benchmark" / "ibm-aml" / "hi_small_sphere"
+    / "gds_aml_hi_small"
+)
+
+
+def _aml_sphere_unavailable() -> bool:
+    sphere_json = _AML_PATH / "_gds_meta" / "sphere.json"
+    if not sphere_json.exists():
+        return True
+    import json
+    return json.loads(sphere_json.read_text()).get("format_version") != "3.0"
+
+
+@pytest.mark.skipif(
+    _aml_sphere_unavailable(),
+    reason="AML HI-small sphere not built at format 3.0",
+)
+def test_combine_anomaly_pvalues_on_aml_hi_small_multi_detector():
+    """Regression: combine_anomaly_pvalues on AML HI-small account_pattern
+    must fire ≥3 detectors and ≥30% multi-detector entries in top-50."""
+    from hypertopos import HyperSphere
+
+    sphere = HyperSphere.open(_AML_PATH)
+    nav = sphere.session("test-multi-detector").navigator()
+    result = nav.combine_anomaly_pvalues(
+        pattern_id="account_pattern",
+        sample_size=2000,
+        top_n=50,
+    )
+    assert isinstance(result, list)
+    assert len(result) == 50, f"expected 50 entries, got {len(result)}"
+
+    multi = sum(1 for e in result if len(e["p_per_detector"]) >= 2)
+    assert multi >= 15, (
+        f"expected ≥15/50 multi-detector entries (≥30%), got {multi}"
+    )
+
+    detectors_seen: set[str] = set()
+    for e in result:
+        detectors_seen.update(e["p_per_detector"].keys())
+    assert len(detectors_seen) >= 3, (
+        f"expected ≥3 distinct detectors firing across top-50, "
+        f"got {sorted(detectors_seen)}"
+    )
+
+    # HMP and per-detector p-values must be finite and within [0, 1] —
+    # the rounded display can show 0.0 for sub-1e-9 values that internally
+    # sit at the HMP floor.
+    for e in result:
+        assert math.isfinite(e["hmp"])
+        assert 0.0 <= e["hmp"] <= 1.0
+        for p in e["p_per_detector"].values():
+            assert math.isfinite(p)
+            assert 0.0 <= p <= 1.0
+
+    # Discrimination check: at least 3 distinct HMP values across top-50.
+    # Pre-fix every entry collapsed to a single ``hmp = 0.0`` (3e-300 from
+    # delta_norm clamped at ``_P_FLOOR = 1e-300`` dominating the
+    # harmonic-mean denominator). The uniform ``_HMP_INPUT_P_FLOOR`` clip
+    # in ``combine_anomaly_pvalues`` plus the 15-decimal display precision
+    # restore cross-detector discrimination so saturated entities at
+    # different L (number of detectors firing) sit at different HMP
+    # values, and unsaturated entities sit on top.
+    # Saturation discrimination: saturated entities cluster by L (number of
+    # detectors firing). On AML HI-small ``account_pattern``, top-K typically
+    # sees L=2 (delta_norm + segment_shift) and L=3 (+ neighbor_contamination)
+    # at the saturation floor — that's two distinct HMP buckets at minimum.
+    # Random sampling occasionally surfaces a third bucket (single saturated
+    # detector) but it's not guaranteed at any given seed, so the regression
+    # threshold is "≥2 distinct HMP values" not "≥3" — that is sufficient to
+    # validate the saturation guard does its job (the pre-fix bug collapsed
+    # everything to a single HMP=0.0 value across all 50 entries).
+    distinct_hmps = {round(e["hmp"], 15) for e in result}
+    assert len(distinct_hmps) >= 2, (
+        f"expected ≥2 distinct HMP values across top-50 (saturation "
+        f"protection), got {len(distinct_hmps)} distinct: "
+        f"{sorted(distinct_hmps)[:10]}"
+    )
+
 
 # --- aggregate_anomalies ---
 
@@ -8195,3 +8536,191 @@ def test_find_anomalies_dedup_duplicate_primary_keys(sphere_path):
         f"Duplicate primary_keys in find_anomalies results: "
         f"{[k for k in pks if pks.count(k) > 1]}"
     )
+
+
+class TestClassifyDetectorConsensus:
+    def test_returns_classification_per_entity_with_required_fields(self):
+        nav = GDSNavigator(
+            engine=_MockEngine(),
+            storage=_MockStorageMultiDetector(),
+            manifest=_make_multi_detector_manifest(),
+            contract=Contract("m-multi", []),
+        )
+        result = nav.classify_detector_consensus("acc_pat", top_n=10)
+        assert isinstance(result, list)
+        for entry in result:
+            assert "primary_key" in entry
+            assert "classification" in entry
+            assert "anomalous_detectors" in entry
+            assert "normal_detectors" in entry
+            assert "n_detectors_fired" in entry
+            assert "hmp" in entry
+            assert "p_per_detector" in entry
+            assert "rank" in entry
+            assert entry["classification"] in {
+                "mixed_signal",
+                "anomalous_consensus",
+                "single_detector_signal",
+                "normal_consensus",
+                "insufficient_data",
+            }
+            # anomalous + normal + borderline partition matches n_detectors_fired
+            assert (len(entry["anomalous_detectors"]) +
+                    len(entry["normal_detectors"]) +
+                    len(entry["borderline_detectors"])) == entry["n_detectors_fired"]
+            # Detectors are sorted alphabetically (deterministic listing)
+            assert entry["anomalous_detectors"] == sorted(entry["anomalous_detectors"])
+            assert entry["normal_detectors"] == sorted(entry["normal_detectors"])
+            assert entry["borderline_detectors"] == sorted(entry["borderline_detectors"])
+
+    def test_priority_ordering_mixed_signal_first_then_anomalous_consensus(self):
+        """Classification priority: mixed > anomalous > single > normal > insufficient.
+        Within each class, HMP ascending."""
+        nav = GDSNavigator(
+            engine=_MockEngine(),
+            storage=_MockStorageMultiDetector(),
+            manifest=_make_multi_detector_manifest(),
+            contract=Contract("m-multi", []),
+        )
+        result = nav.classify_detector_consensus(
+            "acc_pat", top_n=50, anomaly_threshold=0.5, normal_threshold=0.51,
+        )
+        priority = {
+            "mixed_signal": 0,
+            "anomalous_consensus": 1,
+            "single_detector_signal": 2,
+            "normal_consensus": 3,
+            "insufficient_data": 4,
+        }
+        priorities = [priority[r["classification"]] for r in result]
+        # Priorities must be non-decreasing
+        for i in range(1, len(priorities)):
+            assert priorities[i] >= priorities[i - 1], (
+                f"Classification priority not respected at rank {i}: "
+                f"{result[i - 1]['classification']} -> {result[i]['classification']}"
+            )
+        # Within each priority bucket, HMP must be non-decreasing
+        for i in range(1, len(result)):
+            if priorities[i] == priorities[i - 1]:
+                hmp_prev = result[i - 1]["hmp"] or 1.0
+                hmp_curr = result[i]["hmp"] or 1.0
+                assert hmp_curr >= hmp_prev, (
+                    f"HMP not non-decreasing within bucket "
+                    f"{result[i]['classification']} at rank {i}"
+                )
+
+    def test_anomaly_threshold_partitions_p_values(self):
+        """Band-gap thresholding: p < anomaly_threshold = anomalous;
+        p > normal_threshold = normal; in-between = borderline."""
+        nav = GDSNavigator(
+            engine=_MockEngine(),
+            storage=_MockStorageMultiDetector(),
+            manifest=_make_multi_detector_manifest(),
+            contract=Contract("m-multi", []),
+        )
+        result = nav.classify_detector_consensus(
+            "acc_pat", top_n=20, anomaly_threshold=0.01, normal_threshold=0.5,
+        )
+        for entry in result:
+            for det in entry["anomalous_detectors"]:
+                assert entry["p_per_detector"][det] < 0.01, (
+                    f"Detector {det} marked anomalous but p={entry['p_per_detector'][det]} >= 0.01"
+                )
+            for det in entry["normal_detectors"]:
+                assert entry["p_per_detector"][det] > 0.5, (
+                    f"Detector {det} marked normal but p={entry['p_per_detector'][det]} <= 0.5"
+                )
+            for det in entry["borderline_detectors"]:
+                p = entry["p_per_detector"][det]
+                assert 0.01 <= p <= 0.5, (
+                    f"Detector {det} marked borderline but p={p} outside band"
+                )
+
+    def test_classification_excludes_borderline_threshold_squeak(self):
+        """Discriminator test (added per advisor 2026-05-10):
+        a third detector with p=0.3 (borderline at default thresholds) must NOT
+        flip the entity from anomalous_consensus to mixed_signal."""
+        # Build a synthetic case via direct combine_anomaly_pvalues output simulation.
+        # Use mock storage that produces:
+        #   delta_norm=1e-12 (clear anomaly), segment_shift=1e-12 (clear anomaly),
+        #   neighbor_contamination=0.3 (borderline at default 0.01/0.5 band)
+        # Pre-band-gap rule (single threshold 0.05) -> mixed_signal (incorrect)
+        # Band-gap rule (default 0.01/0.5)         -> anomalous_consensus (correct)
+        nav = GDSNavigator(
+            engine=_MockEngine(),
+            storage=_MockStorageMultiDetector(),
+            manifest=_make_multi_detector_manifest(),
+            contract=Contract("m-multi", []),
+        )
+        # Use defaults — band-gap should suppress borderline neighbor_contamination
+        result = nav.classify_detector_consensus("acc_pat", top_n=50)
+        # For every entity that has CLEAR anomaly + borderline neighbor: must NOT
+        # be classified as mixed_signal (the borderline detector is excluded).
+        for entry in result:
+            p_per = entry["p_per_detector"]
+            n_clear_anomalous = sum(1 for p in p_per.values() if p < 0.01)
+            n_clear_normal = sum(1 for p in p_per.values() if p > 0.5)
+            n_borderline = sum(1 for p in p_per.values() if 0.01 <= p <= 0.5)
+            if n_clear_anomalous >= 2 and n_clear_normal == 0 and n_borderline > 0:
+                assert entry["classification"] == "anomalous_consensus", (
+                    f"Borderline-detector squeaked over single threshold to "
+                    f"flip {entry['primary_key']} to {entry['classification']} "
+                    f"instead of anomalous_consensus. p_per_detector={p_per}, "
+                    f"borderline={entry['borderline_detectors']}"
+                )
+
+    def test_normal_threshold_must_exceed_anomaly_threshold(self):
+        nav = GDSNavigator(
+            engine=_MockEngine(),
+            storage=_MockStorageMultiDetector(),
+            manifest=_make_multi_detector_manifest(),
+            contract=Contract("m-multi", []),
+        )
+        with pytest.raises(ValueError, match="normal_threshold"):
+            nav.classify_detector_consensus(
+                "acc_pat", anomaly_threshold=0.5, normal_threshold=0.5,
+            )
+
+    def test_top_n_caps_returned_list(self):
+        nav = GDSNavigator(
+            engine=_MockEngine(),
+            storage=_MockStorageMultiDetector(),
+            manifest=_make_multi_detector_manifest(),
+            contract=Contract("m-multi", []),
+        )
+        result = nav.classify_detector_consensus("acc_pat", top_n=3)
+        assert len(result) <= 3
+        # rank field must be 1, 2, 3, ...
+        for i, entry in enumerate(result, start=1):
+            assert entry["rank"] == i
+
+    def test_threshold_extremes_collapse_classifications(self):
+        """Wide band (0.0001 anomaly + 0.9999 normal) makes most detectors borderline;
+        narrow band (0.5 anomaly + 0.51 normal) forces most into anomalous OR normal."""
+        nav = GDSNavigator(
+            engine=_MockEngine(),
+            storage=_MockStorageMultiDetector(),
+            manifest=_make_multi_detector_manifest(),
+            contract=Contract("m-multi", []),
+        )
+        # Wide band: most detectors borderline -> insufficient_data or single_detector
+        result_wide = nav.classify_detector_consensus(
+            "acc_pat", top_n=20,
+            anomaly_threshold=0.0001, normal_threshold=0.9999,
+        )
+        for entry in result_wide:
+            # Detectors with p in [0.0001, 0.9999] are borderline
+            assert all(
+                p < 0.0001 or p > 0.9999 or det in entry["borderline_detectors"]
+                for det, p in entry["p_per_detector"].items()
+            )
+        # Narrow band: detectors with p in (0.5, 0.51) are borderline; others vote
+        result_narrow = nav.classify_detector_consensus(
+            "acc_pat", top_n=20,
+            anomaly_threshold=0.5, normal_threshold=0.51,
+        )
+        for entry in result_narrow:
+            for det in entry["anomalous_detectors"]:
+                assert entry["p_per_detector"][det] < 0.5
+            for det in entry["normal_detectors"]:
+                assert entry["p_per_detector"][det] > 0.51

@@ -192,7 +192,7 @@ def test_geometry_has_edges_struct_not_json(tmp_path):
     )
     builder.build()
 
-    geo_path = tmp_path / "gds" / "geometry" / "customer_pattern" / "v=1" / "data.lance"
+    geo_path = tmp_path / "gds" / "geometry" / "customer_pattern" / "data.lance"
     geo_table = lance.dataset(str(geo_path)).to_table()
 
     assert "edges" in geo_table.schema.names
@@ -247,7 +247,7 @@ def test_build_creates_geometry_file(tmp_path):
 
     b = _make_minimal_builder(tmp_path)
     out = b.build()
-    assert (Path(out) / "geometry" / "gl_entry_pattern" / "v=1" / "data.lance").exists()
+    assert (Path(out) / "geometry" / "gl_entry_pattern" / "data.lance").exists()
 
 
 def test_integration_build_and_navigate(tmp_path):
@@ -440,7 +440,7 @@ def test_builder_geometry_delta_is_fixed_size_list(tmp_path):
     b = _make_minimal_builder(tmp_path)
     b.build()
 
-    geo_path = str(tmp_path / "gds_test" / "geometry" / "gl_entry_pattern" / "v=1" / "data.lance")
+    geo_path = str(tmp_path / "gds_test" / "geometry" / "gl_entry_pattern" / "data.lance")
     ds = lance.dataset(geo_path)
     delta_field = ds.schema.field("delta")
     assert hasattr(delta_field.type, "list_size"), (
@@ -457,7 +457,7 @@ def test_builder_geometry_has_ann_index_when_large(tmp_path):
     b = _make_large_builder(tmp_path, n_entities=300)
     b.build()
 
-    geo_path = str(tmp_path / "gds_large" / "geometry" / "gl_entry_pattern" / "v=1" / "data.lance")
+    geo_path = str(tmp_path / "gds_large" / "geometry" / "gl_entry_pattern" / "data.lance")
     ds = lance.dataset(geo_path)
 
     # Lance stores index metadata accessible via ds.describe_indices()
@@ -866,7 +866,7 @@ def test_builder_zero_theta_no_anomalies(tmp_path):
     )
     b.build()
 
-    geo_path = str(tmp_path / "gds" / "geometry" / "item_pattern" / "v=1" / "data.lance")
+    geo_path = str(tmp_path / "gds" / "geometry" / "item_pattern" / "data.lance")
     geo = lance.dataset(geo_path).to_table()
 
     anomaly_flags = geo["is_anomaly"].to_pylist()
@@ -957,7 +957,7 @@ def test_delta_rank_pct_consistent_after_two_builds(tmp_path):
     out = b1.build()
 
     writer = GDSWriter(out)
-    geo_path = tmp_path / "gds" / "geometry" / "gp" / "v=1" / "data.lance"
+    geo_path = tmp_path / "gds" / "geometry" / "gp" / "data.lance"
     existing_tbl = lance.dataset(str(geo_path)).to_table(columns=["delta_norm"])
     all_norms_before = [v for v in existing_tbl["delta_norm"].to_pylist() if v is not None]
     max_norm = max(all_norms_before)
@@ -987,7 +987,7 @@ def test_delta_rank_pct_consistent_after_two_builds(tmp_path):
         schema=GEOMETRY_EVENT_SCHEMA,
     )
     # append_geometry automatically recomputes delta_rank_pct globally
-    writer.append_geometry(new_row, "gp", version=1)
+    writer.append_geometry(new_row, "gp")
 
     # After fix: verify global consistency
     tbl_fixed = lance.dataset(str(geo_path)).to_table(
@@ -1050,7 +1050,7 @@ def test_continuous_mode_shape_values(tmp_path):
     mu = np.array(pat["mu"], dtype=np.float32)
     sigma = np.maximum(np.array(pat["sigma_diag"], dtype=np.float32), 1e-2)
 
-    geo = lance.dataset(str(tmp_path / "gds" / "geometry" / "cp" / "v=1" / "data.lance")).to_table()
+    geo = lance.dataset(str(tmp_path / "gds" / "geometry" / "cp" / "data.lance")).to_table()
     rows = {
         geo["primary_key"][i].as_py(): np.array(geo["delta"][i].as_py(), dtype=np.float32)
         for i in range(geo.num_rows)
@@ -1125,7 +1125,7 @@ def test_builder_geometry_stats_anomaly_count_consistent(tmp_path):
         (Path(out) / "_gds_meta" / "geometry_stats" / "gl_entry_pattern_v1.json").read_text()
     )
 
-    geo_path = str(Path(out) / "geometry" / "gl_entry_pattern" / "v=1" / "data.lance")
+    geo_path = str(Path(out) / "geometry" / "gl_entry_pattern" / "data.lance")
     geo = lance.dataset(geo_path).to_table(columns=["is_anomaly"])
     actual_anomaly_count = sum(1 for v in geo["is_anomaly"].to_pylist() if v)
 
@@ -1193,7 +1193,7 @@ def test_prop_sigma_floor_caps_deltas(tmp_path):
     assert sigma[1] >= 0.2, f"Prop sigma {sigma[1]} should be >= 0.2"
 
     # Read geometry to check delta values
-    geo_path = Path(path) / "geometry" / "entity_pattern" / "v=1" / "data.lance"
+    geo_path = Path(path) / "geometry" / "entity_pattern" / "data.lance"
     geo = lance.dataset(str(geo_path)).to_table()
     deltas = [row.as_py() for row in geo["delta"]]
 
@@ -1317,7 +1317,7 @@ def test_streaming_stats_match_full_population(tmp_path, monkeypatch):
         (Path(out_a) / "_gds_meta" / "sphere.json").read_text(),
     )
     geo_a = lance.dataset(
-        str(Path(out_a) / "geometry" / "gl_pattern" / "v=1" / "data.lance"),
+        str(Path(out_a) / "geometry" / "gl_pattern" / "data.lance"),
     ).to_table()
 
     # Path B: non-streaming (chunk_size huge, all in-memory)
@@ -1328,7 +1328,7 @@ def test_streaming_stats_match_full_population(tmp_path, monkeypatch):
         (Path(out_b) / "_gds_meta" / "sphere.json").read_text(),
     )
     geo_b = lance.dataset(
-        str(Path(out_b) / "geometry" / "gl_pattern" / "v=1" / "data.lance"),
+        str(Path(out_b) / "geometry" / "gl_pattern" / "data.lance"),
     ).to_table()
 
     pat_a = sphere_a["patterns"]["gl_pattern"]
@@ -1450,10 +1450,10 @@ def test_streaming_stats_with_dim_weights(tmp_path, monkeypatch):
 
     # Geometry norms must match
     geo_a = lance.dataset(
-        str(Path(out_a) / "geometry" / "glp" / "v=1" / "data.lance"),
+        str(Path(out_a) / "geometry" / "glp" / "data.lance"),
     ).to_table()
     geo_b = lance.dataset(
-        str(Path(out_b) / "geometry" / "glp" / "v=1" / "data.lance"),
+        str(Path(out_b) / "geometry" / "glp" / "data.lance"),
     ).to_table()
 
     def _sorted_norms(geo):
@@ -1620,10 +1620,10 @@ def test_streaming_with_tracked_properties(tmp_path, monkeypatch):
 
     # Geometry comparison
     geo_a = lance.dataset(
-        str(Path(out_a) / "geometry" / "cp" / "v=1" / "data.lance"),
+        str(Path(out_a) / "geometry" / "cp" / "data.lance"),
     ).to_table()
     geo_b = lance.dataset(
-        str(Path(out_b) / "geometry" / "cp" / "v=1" / "data.lance"),
+        str(Path(out_b) / "geometry" / "cp" / "data.lance"),
     ).to_table()
 
     def _sorted_norms(geo):
@@ -1862,7 +1862,7 @@ def test_geometry_writes_null_confidence_when_bootstrap_skipped(tmp_path):
     # Build without bootstrap — bootstrap_iterations defaults to 0 or is not set
     builder.build()
 
-    geo_path = tmp_path / "gds" / "geometry" / "customer_pattern" / "v=1" / "data.lance"
+    geo_path = tmp_path / "gds" / "geometry" / "customer_pattern" / "data.lance"
     geo_table = lance.dataset(str(geo_path)).to_table(columns=["anomaly_confidence"])
 
     # All values must be null (None), not 0.0

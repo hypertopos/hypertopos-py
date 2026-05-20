@@ -19,10 +19,11 @@ from hypertopos.model.objects import SolidSlice
 
 # Lance write defaults — applied to ALL write_dataset calls via _write_lance().
 # data_storage_version="2.2" pins the explicit format version. The "stable"
-# alias in pylance 3.x still resolves to 2.0; 2.2 is the current production
-# format and unlocks structural-decode parallelism plus block-level LZ4/zstd
-# compression on top of the 2.1 features (BSS float compression, cascading
-# codecs, RLE). Older spheres written with 2.0/2.1 remain readable transparently.
+# alias in pylance moves across major versions; 2.2 is pinned explicitly for
+# reproducibility under pylance 6.0 (verified 2026-05-14: 4.x-written spheres
+# at format 2.2 open transparently under pylance 6.0). Newer storage formats
+# are not adopted here — sphere format compatibility with existing 2.4 spheres
+# outweighs micro-perf from a newer storage format.
 #
 # Schema constraint enforced by GDSBuilder: pattern delta vectors must have
 # width >= 1. A zero-width fixed-size-list column triggers a Lance write
@@ -332,7 +333,7 @@ class GDSWriter:
         The delta column must already be stored as a fixed-size list; call
         cast_geometry_delta_to_fixed_size first if this is not guaranteed.
         """
-        lance_path = self._base / "geometry" / pattern_id / f"v={version}" / "data.lance"
+        lance_path = self._base / "geometry" / pattern_id / "data.lance"
         if _ds is not None:
             ds = _ds
         elif lance_path.exists():
@@ -375,7 +376,7 @@ class GDSWriter:
 
         Returns True if the index was rebuilt, False otherwise.
         """
-        lance_path = self._base / "geometry" / pattern_id / f"v={version}" / "data.lance"
+        lance_path = self._base / "geometry" / pattern_id / "data.lance"
         if not lance_path.exists():
             return False
         ds = _lance.dataset(str(lance_path))
@@ -436,7 +437,7 @@ class GDSWriter:
             return False
         return True
 
-    def recompute_delta_rank_pct(self, pattern_id: str, version: int = 1) -> None:
+    def recompute_delta_rank_pct(self, pattern_id: str) -> None:
         """Recompute delta_rank_pct globally across all entities in the pattern geometry.
 
         Called automatically by append_geometry after each incremental write.
@@ -449,7 +450,7 @@ class GDSWriter:
         appends and calling recompute_delta_rank_pct only at the end of each ingestion
         session rather than on every individual append.
         """
-        lance_path = self._base / "geometry" / pattern_id / f"v={version}" / "data.lance"
+        lance_path = self._base / "geometry" / pattern_id / "data.lance"
         if not lance_path.exists():
             return
         ds = _lance.dataset(str(lance_path))
@@ -469,7 +470,7 @@ class GDSWriter:
         })
         ds.merge_insert("primary_key").when_matched_update_all().execute(updates)
 
-    def append_geometry(self, table: pa.Table, pattern_id: str, version: int = 1) -> None:
+    def append_geometry(self, table: pa.Table, pattern_id: str) -> None:
         """Append new geometry rows to an existing Lance geometry dataset.
 
         Writes the rows via lance write_dataset(mode='append') and then checks
@@ -481,7 +482,7 @@ class GDSWriter:
         Automatically recomputes delta_rank_pct globally after appending to ensure
         percentile ranks reflect the full population, not just the appended batch.
         """
-        lance_path = self._base / "geometry" / pattern_id / f"v={version}" / "data.lance"
+        lance_path = self._base / "geometry" / pattern_id / "data.lance"
         lance_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Cast delta to fixed-size list if it is a variable-size list
@@ -503,8 +504,8 @@ class GDSWriter:
             ds.merge_insert("primary_key").when_matched_update_all().when_not_matched_insert_all().execute(table)
         else:
             _write_lance(table, str(lance_path), mode="create")
-        self._maybe_reindex_geometry(pattern_id, version=version)
-        self.recompute_delta_rank_pct(pattern_id, version=version)
+        self._maybe_reindex_geometry(pattern_id)
+        self.recompute_delta_rank_pct(pattern_id)
 
     def _build_indices_on_lance_path(
         self, lance_path: Path, n_rows: int, list_size: int | None,

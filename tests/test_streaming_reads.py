@@ -64,7 +64,7 @@ def test_read_geometry_batched_total_rows(fixtures_path):
 
     batches = reader.read_geometry_batched(pattern_id, version, columns=["primary_key"])
     total_batched = sum(len(b) for b in batches)
-    total_eager = reader.count_geometry_rows(pattern_id, version)
+    total_eager = reader.count_geometry_rows(pattern_id)
     assert total_batched == total_eager
 
 

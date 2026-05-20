@@ -140,7 +140,7 @@ class TestMvccSessionIsolation:
         before_keys = set(before["primary_key"].to_pylist())
 
         # Append a new row to the geometry dataset AFTER session was opened.
-        geo_path = str(Path(out) / "geometry" / pattern_id / f"v={version}" / "data.lance")
+        geo_path = str(Path(out) / "geometry" / pattern_id / "data.lance")
         _append_geometry_row(geo_path, "TEST-MVCC-NEW-999")
 
         # The session must NOT see the newly written row.
@@ -165,7 +165,7 @@ class TestMvccSessionIsolation:
         version = sphere._sphere.patterns[pattern_id].version
 
         # Append a row BEFORE opening the new session.
-        geo_path = str(Path(out) / "geometry" / pattern_id / f"v={version}" / "data.lance")
+        geo_path = str(Path(out) / "geometry" / pattern_id / "data.lance")
         _append_geometry_row(geo_path, "TEST-MVCC-AFTER-999")
 
         # Open a fresh session after the write — it should see the new row.
@@ -193,7 +193,7 @@ class TestMvccSessionIsolation:
             k for k, p in sphere._sphere.patterns.items() if p.pattern_type == "event"
         )
         version = sphere._sphere.patterns[pattern_id].version
-        geo_path = str(Path(out) / "geometry" / pattern_id / f"v={version}" / "data.lance")
+        geo_path = str(Path(out) / "geometry" / pattern_id / "data.lance")
 
         # Session A opened before the write.
         session_a = sphere.session("agent-concurrent-a")

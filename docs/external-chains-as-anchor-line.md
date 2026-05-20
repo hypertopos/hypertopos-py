@@ -110,7 +110,7 @@ None of these require `chain_keys`. They treat `sar_chain_pattern` as any other 
 
 ## Chain-coherent loop (R9 family)
 
-To unlock `find_chains_with_coherent_anomaly`, `anomaly_propagation_in_chain`, `classify_chain_typology`, `extend_chain`, and `investigate_chain`, the chain anchor line must carry the `chain_keys` column populated per the convention (comma-joined member primary_keys in chain order).
+To unlock `find_chains_with_coherent_anomaly`, `anomaly_propagation_in_chain`, `classify_chain_typology`, `extend_chain`, `investigate_chain`, `chain_witness_intersection`, and `chain_drift_trajectory`, the chain anchor line must carry the `chain_keys` column populated per the convention (comma-joined member primary_keys in chain order).
 
 When `chain_keys` is present:
 
@@ -122,6 +122,8 @@ When `chain_keys` is present:
 | `extend_chain(chain_id, "sar_chain_pattern", anchor_pattern_id="account_pattern", direction="forward")` | Boundary candidates — entities that follow the chain's anomalous run in OTHER chains and are themselves anomalous. |
 | `chain_investigation_summary("sar_chain_pattern", anchor_pattern_id="account_pattern")` | Population-level triage: `coherent_run_rate`, `cross_pattern_overlap`, `recommended_min_hops`. |
 | `investigate_chain(chain_id, "sar_chain_pattern", anchor_pattern_id="account_pattern")` | One-shot orchestrator — runs trace + typology + shape lookup + extension forward + extension backward and returns a SAR-ready summary. |
+| `chain_witness_intersection(chain_id, "sar_chain_pattern", member_pattern="account_pattern")` | Intersect the top witness dims of the chain's members — `coordinated=True` when their mean pairwise Jaccard clears the threshold, indicating a single anomaly mechanism rather than independent member-level reasons. |
+| `chain_drift_trajectory(chain_id, "sar_chain_pattern", member_pattern="account_pattern", n_windows=4)` | Per-member regime (`normalizing` / `deteriorating` / `neutral`) over time-bucketed `delta_norm`, rolled up to a chain-level regime + drift score; spots chains drifting toward anomaly before any single hop crosses the threshold. |
 
 The R9 loop expects each member key in `chain_keys` to exist as a `primary_key` on the corresponding member-anchor line (e.g. `account_pattern`'s entity line). Members not present on that line are silently skipped during the per-hop trace.
 

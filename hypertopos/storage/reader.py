@@ -44,6 +44,7 @@ from hypertopos.storage.calibration_history import (
     history_dir,
     list_calibration_versions as _list_versions_on_disk,
 )
+from hypertopos.storage.exceptions import GDSVersionError
 
 _RECOVERABLE_READ_ERRORS = (
     OSError,
@@ -67,13 +68,21 @@ _ROW_ID_CACHE_MAXSIZE = 2000
 # avoid loading the full dataset into memory in a single allocation.
 BATCH_SCAN_THRESHOLD = 10_000_000  # rows; use batched path above this
 
+# Target Lance scanner batch size in BYTES — replaces the prior row-count
+# heuristic (65_536 rows) per Lance #6428 byte-batching. Wider-dim patterns
+# (e.g. 60-dim AML account_pattern with prop columns) and narrow-dim patterns
+# (e.g. 5-dim chain anchor pattern) used to share the same row count, an
+# order-of-magnitude difference in actual memory pressure. With bytes, both
+# converge to a stable ~16 MB working set per batch.
+_BATCH_SIZE_BYTES = 16 * 1024 * 1024
+
 
 class GDSReader:
     def __init__(self, base_path: str) -> None:
         self._base = Path(base_path)
         self._storage_config: StorageConfig | None = None
         self._points_cache: dict[tuple[str, int], pa.Table] = {}
-        self._lance_dataset_cache: dict[tuple[str, int], Any] = {}
+        self._lance_dataset_cache: dict[str, Any] = {}
         # Lance version pinned at session open time for MVCC isolation.
         # Key: pattern_id (geometry) or "temporal:<pattern_id>" (temporal).
         # Value: Lance dataset version integer captured when the session opened.
@@ -103,6 +112,13 @@ class GDSReader:
 
     def read_sphere(self) -> Sphere:
         raw = json.loads((self._base / "_gds_meta" / "sphere.json").read_text())
+        fmt = raw.get("format_version")
+        if fmt != "3.0":
+            raise GDSVersionError(
+                f"Unsupported sphere format_version {fmt!r}: native Lance MVCC "
+                "geometry requires 3.0. Rebuild the sphere from source "
+                "(see CHANGELOG 0.7.0).",
+            )
         lines = {k: self._parse_line(v) for k, v in raw.get("lines", {}).items()}
         patterns = {k: self._parse_pattern(v) for k, v in raw.get("patterns", {}).items()}
         aliases = {k: self._parse_alias(v) for k, v in raw.get("aliases", {}).items()}
@@ -201,7 +217,24 @@ class GDSReader:
             for ed in raw.get("event_dimensions", [])
         ]
 
-        from hypertopos.model.sphere import EdgeDimAggregationsRef
+        from hypertopos.model.sphere import (
+            EdgeDimAggregationsRef,
+            FDRHierarchyLevel,
+            FDRTemporalLevel,
+            _rule_from_dict,
+        )
+        fdr_hierarchy = [
+            FDRHierarchyLevel.from_dict(lvl)
+            for lvl in (raw.get("fdr_hierarchy") or [])
+        ]
+        fdr_temporal_hierarchy = [
+            FDRTemporalLevel.from_dict(lvl)
+            for lvl in (raw.get("fdr_temporal_hierarchy") or [])
+        ]
+        conformance_rules = [
+            _rule_from_dict(r)
+            for r in (raw.get("conformance_rules") or [])
+        ]
         eda_raw = raw.get("edge_dim_aggregations")
         if eda_raw:
             eda_dims = (
@@ -282,6 +315,9 @@ class GDSReader:
             timestamp_col=raw.get("timestamp_col"),
             dimension_kinds=raw.get("dimension_kinds"),
             edge_dim_aggregations=edge_dim_aggregations,
+            fdr_hierarchy=fdr_hierarchy,
+            fdr_temporal_hierarchy=fdr_temporal_hierarchy,
+            conformance_rules=conformance_rules,
         )
 
     def _parse_alias(self, raw: dict[str, Any]) -> Alias:
@@ -402,8 +438,7 @@ class GDSReader:
         self, pattern_id: str, version: int,
     ) -> set[str]:
         """Return the set of column names in a geometry Lance dataset."""
-        folder = self._base / "geometry" / pattern_id / f"v={version}"
-        lance_path = folder / "data.lance"
+        lance_path = self._base / "geometry" / pattern_id / "data.lance"
         if not lance_path.exists():
             return set()
         ds = _lance.dataset(str(lance_path))
@@ -420,8 +455,7 @@ class GDSReader:
         filter: str | None = None,
         sample_size: int | None = None,
     ) -> pa.Table:
-        folder = self._base / "geometry" / pattern_id / f"v={version}"
-        lance_path = str(folder / "data.lance")
+        lance_path = str(self._base / "geometry" / pattern_id / "data.lance")
         # Use session-pinned Lance version for MVCC isolation.
         pinned = self._pinned_lance_versions.get(pattern_id)
         if (
@@ -432,8 +466,8 @@ class GDSReader:
             and point_keys is None
         ):
             ds = _lance.dataset(lance_path)
-            if pinned is not None:
-                ds = _lance.dataset(lance_path, version=pinned)
+            if pinned is not None and pinned != ds.latest_version:
+                ds = ds.checkout_version(pinned)
             if sample_size >= ds.count_rows():
                 return ds.to_table(columns=columns)
             table = ds.sample(sample_size, columns=columns, randomize_order=False)
@@ -485,15 +519,16 @@ class GDSReader:
         return table
 
     def count_geometry_rows(
-        self, pattern_id: str, version: int, filter: str | None = None
+        self, pattern_id: str, filter: str | None = None
     ) -> int:
-        folder = self._base / "geometry" / pattern_id / f"v={version}"
-        cache_key = (pattern_id, version)
-        if cache_key not in self._lance_dataset_cache:
-            self._lance_dataset_cache[cache_key] = _lance.dataset(
-                str(folder / "data.lance")
-            )
-        return self._lance_dataset_cache[cache_key].count_rows(filter=filter)
+        lance_path = self._base / "geometry" / pattern_id / "data.lance"
+        if pattern_id not in self._lance_dataset_cache:
+            self._lance_dataset_cache[pattern_id] = _lance.dataset(str(lance_path))
+        ds = self._lance_dataset_cache[pattern_id]
+        pinned = self._pinned_lance_versions.get(pattern_id)
+        if pinned is not None and pinned != ds.latest_version:
+            ds = ds.checkout_version(pinned)
+        return ds.count_rows(filter=filter)
 
     def read_edge_features(self, pattern_id: str) -> pa.Table:
         """Read the per-edge derived dimension sidecar for an event pattern.
@@ -521,22 +556,22 @@ class GDSReader:
         version: int,
         columns: list[str] | None = None,
         filter_expr: str | None = None,
-        batch_size: int = 65_536,
+        batch_size_bytes: int = _BATCH_SIZE_BYTES,
     ) -> Iterator[pa.RecordBatch]:
         """Streaming read of geometry Lance dataset.
 
         Yields pa.RecordBatch chunks instead of loading the full table.
         Use for bulk scans on large spheres (>BATCH_SCAN_THRESHOLD rows).
         """
-        lance_path = self._base / "geometry" / pattern_id / f"v={version}" / "data.lance"
+        lance_path = self._base / "geometry" / pattern_id / "data.lance"
         pinned = self._pinned_lance_versions.get(pattern_id)
         ds = _lance.dataset(str(lance_path))
         if pinned is not None and pinned != ds.latest_version:
-            ds = _lance.dataset(str(lance_path), version=pinned)
+            ds = ds.checkout_version(pinned)
         scanner = ds.scanner(
             filter=filter_expr,
             columns=columns,
-            batch_size=batch_size,
+            batch_size_bytes=batch_size_bytes,
         )
         yield from scanner.to_batches()
 
@@ -556,7 +591,7 @@ class GDSReader:
         # Optimization: skip version= when pinned equals latest.
         ds = _lance.dataset(lance_path)
         if lance_version is not None and lance_version != ds.latest_version:
-            ds = _lance.dataset(lance_path, version=lance_version)
+            ds = ds.checkout_version(lance_version)
         # Check if entity_keys column exists in schema
         field_names = [f.name for f in ds.schema]
         schema_names = set(field_names)
@@ -659,7 +694,7 @@ class GDSReader:
         pinned = self._pinned_lance_versions.get(f"temporal:{pattern_id}")
         ds = _lance.dataset(str(lance_path))
         if pinned is not None and pinned != ds.latest_version:
-            ds = _lance.dataset(str(lance_path), version=pinned)
+            ds = ds.checkout_version(pinned)
         table = ds.to_table()
         if filters and table.num_rows > 0:
             table = self._apply_temporal_filters(table, filters)
@@ -668,7 +703,7 @@ class GDSReader:
     def read_temporal_batched(
         self,
         pattern_id: str,
-        batch_size: int = 65_536,
+        batch_size_bytes: int = _BATCH_SIZE_BYTES,
         timestamp_from: str | None = None,
         timestamp_to: str | None = None,
         keys: list[str] | None = None,
@@ -698,7 +733,7 @@ class GDSReader:
         pinned = self._pinned_lance_versions.get(f"temporal:{pattern_id}")
         ds = _lance.dataset(str(lance_path))
         if pinned is not None and pinned != ds.latest_version:
-            ds = _lance.dataset(str(lance_path), version=pinned)
+            ds = ds.checkout_version(pinned)
         # Build int64 microsecond SQL filter to avoid Lance's TimestampTz Substrait crash
         # (TimestampTz literals are unsupported in Lance's Substrait layer; CAST to BIGINT works).
         filter_parts: list[str] = []
@@ -723,7 +758,7 @@ class GDSReader:
             filter_parts.append(f"CAST(timestamp AS BIGINT) < {to_us}")
         sql_filter: str | None = " AND ".join(filter_parts) if filter_parts else None
         yield from ds.scanner(
-            columns=columns, filter=sql_filter, batch_size=batch_size,
+            columns=columns, filter=sql_filter, batch_size_bytes=batch_size_bytes,
         ).to_batches()
 
     def _apply_temporal_filters(
@@ -1149,7 +1184,7 @@ class GDSReader:
         # avoids Lance version reconstruction overhead — up to 12x faster).
         ds = _lance.dataset(lance_path)
         if lance_version is not None and lance_version != ds.latest_version:
-            ds = _lance.dataset(lance_path, version=lance_version)
+            ds = ds.checkout_version(lance_version)
         if columns is not None:
             schema_names = {f.name for f in ds.schema}
             columns = [c for c in columns if c in schema_names] or None
@@ -1204,7 +1239,7 @@ class GDSReader:
         filter_expr: optional Lance SQL predicate applied at ANN time (e.g. 'is_anomaly = true').
         Combines ANN + scalar filter in a single kernel pass for maximum efficiency.
         """
-        lance_path = self._base / "geometry" / pattern_id / f"v={version}" / "data.lance"
+        lance_path = self._base / "geometry" / pattern_id / "data.lance"
         if not lance_path.exists():
             return None
         exclude = exclude_keys or set()
@@ -1297,9 +1332,9 @@ class GDSReader:
         entity_keys column (caller should fall back to full scan).
         Returns empty list if no matches found.
         """
-        folder = self._base / "geometry" / pattern_id / f"v={version}"
-        lance_path = str(folder / "data.lance")
-        if not folder.exists():
+        lance_dir = self._base / "geometry" / pattern_id / "data.lance"
+        lance_path = str(lance_dir)
+        if not lance_dir.exists():
             return None
         ds = _lance.dataset(lance_path)
         field_names = {f.name for f in ds.schema}
@@ -1387,8 +1422,8 @@ class GDSReader:
             )
         pinned = self._pinned_lance_versions.get(f"edges:{pattern_id}")
         ds = _lance.dataset(str(lance_path))
-        if pinned is not None:
-            ds = _lance.dataset(str(lance_path), version=pinned)
+        if pinned is not None and pinned != ds.latest_version:
+            ds = ds.checkout_version(pinned)
 
         # Build filter expression
         parts: list[str] = []

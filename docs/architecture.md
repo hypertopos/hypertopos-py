@@ -113,7 +113,7 @@ For a denser top-down view, this stack is a useful shorthand:
 
 ```text
 ┌─────────────────────────────────────┐
-│  MCP Server (hypertopos-mcp)        │  80 tools, smart detection mode
+│  MCP Server (hypertopos-mcp)        │  101 tools, smart detection mode
 ├─────────────────────────────────────┤
 │  PassiveScanner                     │  multi-source batch screening
 ├─────────────────────────────────────┤
@@ -175,7 +175,7 @@ graph LR
     ST --> E["Engine\ngeometry, delta,\nclustering, DTW"]
     E --> N["Navigator\nπ1–π12, detect_*"]
     N --> PS["PassiveScanner\nmulti-source\nbatch screening"]
-    N --> MCP["MCP Server\n80 tools\nstdio transport"]
+    N --> MCP["MCP Server\n101 tools\nstdio transport"]
     MCP --> Agent["AI Agent"]
     CT["CalibrationTracker\nonline drift\nWelford stats"] -.-> E
     M["Manifest\nMVCC version pin"] -.-> ST

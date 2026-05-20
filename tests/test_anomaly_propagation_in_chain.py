@@ -19,9 +19,18 @@ AML_PATH = (
 )
 
 
+def _aml_sphere_unavailable() -> bool:
+    sphere_json = AML_PATH / "_gds_meta" / "sphere.json"
+    if not sphere_json.exists():
+        return True
+    import json
+    raw = json.loads(sphere_json.read_text())
+    return raw.get("format_version") != "3.0"
+
+
 pytestmark = pytest.mark.skipif(
-    not (AML_PATH / "_gds_meta" / "sphere.json").exists(),
-    reason="AML HI-small sphere not built",
+    _aml_sphere_unavailable(),
+    reason="AML HI-small sphere not built at format 3.0",
 )
 
 

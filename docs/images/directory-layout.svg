@@ -68,7 +68,7 @@
     <line x1="10" y1="32" x2="165" y2="32" stroke="#f59e0b" stroke-opacity="0.3" stroke-width="0.5"/>
 
     <rect x="10" y="42" width="155" height="28" rx="5" fill="#2a1f00" stroke="#f59e0b" stroke-width="0.7"/>
-    <text x="88" y="60" fill="#fcd34d" font-size="10" text-anchor="middle">{pattern_id}/v={n}/</text>
+    <text x="88" y="60" fill="#fcd34d" font-size="10" text-anchor="middle">{pattern_id}/data.lance</text>
     <text x="88" y="82" fill="#b89a40" font-size="8" text-anchor="middle">delta vectors, edges, norms</text>
     <text x="88" y="94" fill="#b89a40" font-size="8" text-anchor="middle">anomaly flags, rank percentiles</text>
 
@@ -94,5 +94,5 @@
   </g>
 
   <!-- Bottom annotation -->
-  <text x="380" y="433" fill="#7777aa" font-size="12" text-anchor="middle">All data files use Lance format (columnar, versioned). v={n} directories are Hive-style version partitions.</text>
+  <text x="380" y="433" fill="#7777aa" font-size="12" text-anchor="middle">All data files use Lance format (columnar, versioned). points/ uses v={n} Hive partitions; geometry/ tracks epochs via Lance tags.</text>
 </svg>

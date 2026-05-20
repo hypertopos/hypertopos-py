@@ -1013,7 +1013,7 @@ class TestChunkedGeometryWrite:
         # Verify geometry Lance dataset has correct row count
         import lance
 
-        geo_path = tmp_path / "sphere" / "geometry" / "acct_pat" / "v=1" / "data.lance"
+        geo_path = tmp_path / "sphere" / "geometry" / "acct_pat" / "data.lance"
         assert geo_path.exists()
         ds = lance.dataset(str(geo_path))
         assert ds.count_rows() == n_entities
@@ -1313,7 +1313,7 @@ class TestPipelineBuild:
 
         # Compare geometry
         for suffix in [
-            "geometry/acct_pattern/v=1/data.lance",
+            "geometry/acct_pattern/data.lance",
         ]:
             seq_ds = lance.dataset(str(seq_path / suffix))
             pipe_ds = lance.dataset(str(pipe_path / suffix))
@@ -1406,8 +1406,8 @@ class TestPipelineBuild:
         }])
 
         # Geometry for both patterns
-        assert (path / "geometry/acct_pattern/v=1/data.lance").exists()
-        assert (path / "geometry/cat_pattern/v=1/data.lance").exists()
+        assert (path / "geometry/acct_pattern/data.lance").exists()
+        assert (path / "geometry/cat_pattern/data.lance").exists()
 
         # Temporal only for acct_pattern (targeted by config)
         assert (path / "temporal/acct_pattern/data.lance").exists()

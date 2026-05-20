@@ -28,6 +28,7 @@ def _write_lance(path: Path, table: pa.Table) -> None:
 def generate_sphere_json() -> None:
     sphere = {
         "sphere_id": "sales_sphere",
+        "format_version": "3.0",
         "name": "Sales Sphere",
         "lines": {
             "customers": {
@@ -185,7 +186,13 @@ def generate_geometry() -> None:
             f"delta_dim_{dim_idx}",
             pa.array(matrix[:, dim_idx], type=pa.float32()),
         )
-    _write_lance(BASE / "geometry" / "customer_pattern" / "v=1" / "data.lance", table)
+    geo_lance_path = BASE / "geometry" / "customer_pattern" / "data.lance"
+    _write_lance(geo_lance_path, table)
+    # Tag the just-written internal Lance version as calibration epoch 1
+    # (native MVCC layout — sphere format 3.0).
+    from hypertopos.storage._lance_versions import tag_epoch
+
+    tag_epoch(lance.dataset(str(geo_lance_path)), 1)
     # Build geometry stats cache
     from hypertopos.storage.writer import GDSWriter
 

@@ -27,8 +27,8 @@ gds_{sphere_id}/
 │   │   └── data.lance           # entity records for this line version
 │   └── ...
 ├── geometry/
-│   ├── {pattern_id}/v={n}/
-│   │   └── data.lance           # delta vectors and edges for this pattern version
+│   ├── {pattern_id}/
+│   │   └── data.lance           # delta vectors and edges; calibration epochs tracked internally as Lance versions tagged `epoch_<N>`
 │   └── ...
 ├── edges/
 │   ├── {pattern_id}/
@@ -40,7 +40,7 @@ gds_{sphere_id}/
     └── ...
 ```
 
-All data files use [Lance](https://github.com/lancedb/lance) format (columnar, versioned, with native ANN index support). The `v={n}` directories are Hive-style version partitions.
+All data files use [Lance](https://github.com/lancedb/lance) format (columnar, versioned, with native ANN index support). The `v={n}` directories on `points/` are Hive-style version partitions; `geometry/` is a single flat Lance dataset per pattern with calibration epochs tracked via native Lance version tags (`epoch_<N>`).
 
 ---
 
@@ -51,6 +51,7 @@ The central config file. Loaded once on `open_sphere` (typically a few KB). Cont
 | Field | Type | Description |
 |-------|------|-------------|
 | `sphere_id` | string | Unique sphere identifier |
+| `format_version` | string | On-disk layout version. Current: `"3.0"` (flat single-dataset geometry with native Lance epoch tags). Reader rejects earlier values and points to a clean rebuild from source. |
 | `lines` | dict | Line definitions: versions, columns, partition config, descriptions |
 | `patterns` | dict | Pattern stats: `mu`, `sigma_diag`, `theta`, `edge_max`, `dimension_weights`, `group_stats` |
 | `aliases` | dict | Alias definitions: `base_pattern`, cutting plane (`normal` vector, `bias`) |
@@ -104,7 +105,9 @@ Event patterns with adjacency structure (`has_edge_table: true`) carry an `edge_
 
 Domain columns vary per line. The `primary_key` column is always present and always string-typed.
 
-### Geometry (`geometry/{pattern_id}/v={n}/data.lance`)
+### Geometry (`geometry/{pattern_id}/data.lance`)
+
+Single Lance dataset per pattern. Calibration epochs are not separate directories — each rebuild creates a new internal Lance dataset version, which is tagged `epoch_<N>` so historical epochs remain readable via `LanceDataset.checkout_version(<tag>)`. The current epoch counter is `Sphere.patterns[pid].version`; the on-disk Lance version is resolved via the tag.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -221,7 +224,7 @@ per-source-dim `_count_above_threshold` cutoffs persisted only when the
 anchor pattern declares `edge_dim_aggregations:`, otherwise omitted). The
 file is immutable for the lifetime of the epoch.
 
-`sphere.json` adds three fields starting at format_version `2.4`:
+`sphere.json` carries three calibration-history fields (introduced in the prior format and retained under `3.0`):
 
 - root: `calibration_history_policy: {"last_k": 5}` — number of most-recent
   epochs to keep on disk. `last_k < 1` is rejected with `ValueError` at load
@@ -250,6 +253,12 @@ that existing readers continue to use unchanged. The history dir is purely
 additive.
 
 ---
+
+## Row IDs
+
+The reader uses `with_row_id=True` on Lance scanner calls (`storage/reader.py` point-lookup + filter-cache paths) to populate two LRU caches keyed by `(pattern_id, version, primary_key)`. The cached `_rowid` is consumed within the same `GDSReader` instance only — it is never persisted to disk, never carried in any `Manifest`, and never returned to MCP callers. The contract is **within-session use only**.
+
+Cross-session row-ID stability (Lance's "Stable Row IDs through updates" surface, exposed as `LanceDataset.has_stable_row_ids` from Lance 6.0.0) is not yet consumed. Persisting row IDs across sessions would require gating on `has_stable_row_ids` per dataset and is paired with the future native-MVCC migration.
 
 ## See Also
 

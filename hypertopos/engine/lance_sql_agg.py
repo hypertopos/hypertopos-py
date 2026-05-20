@@ -129,7 +129,7 @@ def aggregate_count(
     ----------
     geo_lance_path
         Filesystem path to the event pattern's geometry Lance dataset
-        (``geometry/{pattern_id}/v={version}/data.lance``).
+        (``geometry/{pattern_id}/data.lance``).
     pattern
         The Pattern model object — read for its ``relations`` list to resolve
         which positional slots in ``entity_keys`` belong to ``group_by_line``.
@@ -333,10 +333,9 @@ def find_anomalies(
     if offset < 0:
         raise ValueError(f"find_anomalies: offset must be >= 0, got {offset}")
 
-    if lance_version is not None:
-        ds = _lance.dataset(geo_lance_path, version=lance_version)
-    else:
-        ds = _lance.dataset(geo_lance_path)
+    ds = _lance.dataset(geo_lance_path)
+    if lance_version is not None and lance_version != ds.latest_version:
+        ds = ds.checkout_version(lance_version)
 
     base_filter = f"delta_norm >= {threshold}"
     if min_confidence > 0.0:
@@ -747,7 +746,7 @@ def aggregate_metric(
     Parameters
     ----------
     geo_lance_path
-        Filesystem path to ``geometry/{event_pattern}/v={version}/data.lance``.
+        Filesystem path to ``geometry/{event_pattern}/data.lance``.
     ctx_lance_path
         Filesystem path to ``points/{event_line}/v={version}/data.lance``.
     pattern

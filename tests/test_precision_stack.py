@@ -282,7 +282,7 @@ class TestConformalP:
         import lance
 
         geo = lance.dataset(
-            str(tmp_path / "gds" / "geometry" / "acct_pattern" / "v=1" / "data.lance")
+            str(tmp_path / "gds" / "geometry" / "acct_pattern" / "data.lance")
         ).to_table(columns=["conformal_p"])
         assert "conformal_p" in geo.schema.names
         p_vals = geo["conformal_p"].to_numpy()
@@ -356,14 +356,14 @@ class TestDimensionWeights:
 
         norms1 = (
             lance.dataset(
-                str(tmp_path / "a" / "gds" / "geometry" / "acct_pattern" / "v=1" / "data.lance")
+                str(tmp_path / "a" / "gds" / "geometry" / "acct_pattern" / "data.lance")
             )
             .to_table(columns=["delta_norm"])["delta_norm"]
             .to_numpy()
         )
         norms2 = (
             lance.dataset(
-                str(tmp_path / "b" / "gds" / "geometry" / "acct_pattern" / "v=1" / "data.lance")
+                str(tmp_path / "b" / "gds" / "geometry" / "acct_pattern" / "data.lance")
             )
             .to_table(columns=["delta_norm"])["delta_norm"]
             .to_numpy()
@@ -399,14 +399,14 @@ class TestDimensionWeights:
 
         norms1 = (
             lance.dataset(
-                str(tmp_path / "a" / "gds" / "geometry" / "acct_pattern" / "v=1" / "data.lance")
+                str(tmp_path / "a" / "gds" / "geometry" / "acct_pattern" / "data.lance")
             )
             .to_table(columns=["delta_norm"])["delta_norm"]
             .to_numpy()
         )
         norms2 = (
             lance.dataset(
-                str(tmp_path / "b" / "gds" / "geometry" / "acct_pattern" / "v=1" / "data.lance")
+                str(tmp_path / "b" / "gds" / "geometry" / "acct_pattern" / "data.lance")
             )
             .to_table(columns=["delta_norm"])["delta_norm"]
             .to_numpy()
@@ -545,14 +545,14 @@ class TestGMM:
 
         norms1 = (
             lance.dataset(
-                str(tmp_path / "a" / "gds" / "geometry" / "acct_pattern" / "v=1" / "data.lance")
+                str(tmp_path / "a" / "gds" / "geometry" / "acct_pattern" / "data.lance")
             )
             .to_table(columns=["delta_norm"])["delta_norm"]
             .to_numpy()
         )
         norms2 = (
             lance.dataset(
-                str(tmp_path / "b" / "gds" / "geometry" / "acct_pattern" / "v=1" / "data.lance")
+                str(tmp_path / "b" / "gds" / "geometry" / "acct_pattern" / "data.lance")
             )
             .to_table(columns=["delta_norm"])["delta_norm"]
             .to_numpy()
@@ -608,7 +608,7 @@ class TestIET:
         import lance
 
         geo = lance.dataset(
-            str(tmp_path / "gds" / "geometry" / "p" / "v=1" / "data.lance")
+            str(tmp_path / "gds" / "geometry" / "p" / "data.lance")
         ).to_table(columns=["primary_key", "delta_norm"])
         assert geo.num_rows == 2
 
@@ -661,7 +661,7 @@ class TestMahalanobis:
 
         norms = (
             lance.dataset(
-                str(tmp_path / "gds" / "geometry" / "acct_pattern" / "v=1" / "data.lance")
+                str(tmp_path / "gds" / "geometry" / "acct_pattern" / "data.lance")
             )
             .to_table(columns=["delta_norm"])["delta_norm"]
             .to_numpy()
@@ -704,7 +704,7 @@ class TestMahalanobis:
         import lance
 
         geo = lance.dataset(
-            str(tmp_path / "gds" / "geometry" / "acct_pattern" / "v=1" / "data.lance")
+            str(tmp_path / "gds" / "geometry" / "acct_pattern" / "data.lance")
         ).to_table(columns=["n_anomalous_dims"])
         assert "n_anomalous_dims" in geo.schema.names
         vals = geo["n_anomalous_dims"].to_numpy()
@@ -843,7 +843,7 @@ class TestCrossPatternProfile:
             import lance
 
             geo = lance.dataset(
-                str(tmp_path / "gds" / "geometry" / "acct_pattern" / "v=1" / "data.lance")
+                str(tmp_path / "gds" / "geometry" / "acct_pattern" / "data.lance")
             ).to_table(columns=["primary_key", "is_anomaly"])
             anom_keys = [
                 geo["primary_key"][i].as_py()

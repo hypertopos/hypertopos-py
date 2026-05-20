@@ -539,6 +539,22 @@ def _add_pattern(
             pat_cfg.edge_dim_aggregations, pattern_type=pat_cfg.type,
         )
 
+    # Multi-resolution FDR hierarchies — YAML dicts → model dataclasses.
+    # from_dict() raises ValueError with a clear message on missing keys.
+    _fdr_hierarchy = None
+    if pat_cfg.fdr_hierarchy:
+        from hypertopos.model.sphere import FDRHierarchyLevel
+        _fdr_hierarchy = [
+            FDRHierarchyLevel.from_dict(d) for d in pat_cfg.fdr_hierarchy
+        ]
+    _fdr_temporal_hierarchy = None
+    if pat_cfg.fdr_temporal_hierarchy:
+        from hypertopos.model.sphere import FDRTemporalLevel
+        _fdr_temporal_hierarchy = [
+            FDRTemporalLevel.from_dict(d)
+            for d in pat_cfg.fdr_temporal_hierarchy
+        ]
+
     builder.add_pattern(  # type: ignore[union-attr]
         pid,
         pattern_type=pat_cfg.type,
@@ -557,6 +573,8 @@ def _add_pattern(
         semantic_dim=pat_cfg.semantic_dim,
         edge_dimensions=_edge_dims_cfg,
         edge_dim_aggregations=_edge_dim_agg_cfg,
+        fdr_hierarchy=_fdr_hierarchy,
+        fdr_temporal_hierarchy=_fdr_temporal_hierarchy,
     )
 
     # Event dimensions

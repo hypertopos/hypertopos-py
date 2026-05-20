@@ -19,7 +19,7 @@ from typing import Any
 
 import numpy as np
 
-from hypertopos.navigation.navigator import GDSError
+from hypertopos.storage.exceptions import GDSError
 
 
 class CalibrationNotFoundError(GDSError):

@@ -289,6 +289,7 @@ class TestBuilderDimBlockIntegration:
         cfg_path = tmp_path / "sphere.yaml"
         cfg_path.write_text(yaml.dump({
             "sphere_id": "test_blocks",
+            "format_version": "3.0",
             "version": "0.1.0",
             "sources": {
                 "s1": {"path": "dummy.csv"},

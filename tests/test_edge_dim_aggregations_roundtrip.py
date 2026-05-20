@@ -9,7 +9,7 @@ from hypertopos.storage.reader import GDSReader
 def test_pattern_edge_dim_aggregations_roundtrips_via_sphere_json(tmp_path: Path):
     raw = {
         "sphere_id": "s",
-        "format_version": "2.4",
+        "format_version": "3.0",
         "name": "s",
         "lines": {},
         "patterns": {
@@ -49,7 +49,7 @@ def test_pattern_edge_dim_aggregations_roundtrips_via_sphere_json(tmp_path: Path
 def test_pattern_without_edge_dim_aggregations_returns_none(tmp_path: Path):
     raw = {
         "sphere_id": "s",
-        "format_version": "2.4",
+        "format_version": "3.0",
         "name": "s",
         "lines": {},
         "patterns": {
@@ -79,7 +79,7 @@ def test_pattern_without_edge_dim_aggregations_returns_none(tmp_path: Path):
 def test_pattern_edge_dim_aggregations_dims_default_to_all(tmp_path: Path):
     raw = {
         "sphere_id": "s",
-        "format_version": "2.4",
+        "format_version": "3.0",
         "name": "s",
         "lines": {},
         "patterns": {

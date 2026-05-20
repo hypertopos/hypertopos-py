@@ -561,7 +561,7 @@ def aggregate(
                 for gk in all_group_keys:
                     lance_filter = _build_lance_filter(gk)
                     cnt = reader.count_geometry_rows(
-                        event_pattern_id, pattern.version, filter=lance_filter,
+                        event_pattern_id, filter=lance_filter,
                     )
                     if cnt > 0:
                         computed[gk] = cnt
@@ -625,7 +625,7 @@ def aggregate(
                                 _d_gf_parts.append(f"array_has_any(entity_keys, [{_d_keys_str}])")
                     _d_geo_filter = " AND ".join(_d_gf_parts) if _d_gf_parts else None
                     _d_geo_total = reader.count_geometry_rows(
-                        event_pattern_id, pattern.version, filter=_d_geo_filter,
+                        event_pattern_id, filter=_d_geo_filter,
                     )
                     _d_total = sum(computed.values())
                     _d_dropped = _d_geo_total - _d_total
@@ -1138,7 +1138,7 @@ def aggregate(
             _base = reader._base.resolve()
             _geo_lance = str(
                 _base / "geometry" / event_pattern_id
-                / f"v={pattern.version}" / "data.lance"
+                / "data.lance"
             )
             computed = _lance_sql_count(_geo_lance, pattern, group_by_line)
             group_values: dict = {k: [1] * v for k, v in computed.items()}
@@ -1181,7 +1181,7 @@ def aggregate(
             _base = reader._base.resolve()
             _geo_lance = str(
                 _base / "geometry" / event_pattern_id
-                / f"v={pattern.version}" / "data.lance"
+                / "data.lance"
             )
             _ctx_lance = str(
                 _base / "points" / event_line_id
@@ -1264,7 +1264,7 @@ def aggregate(
             _base = reader._base.resolve()
             _geo_lance = str(
                 _base / "geometry" / event_pattern_id
-                / f"v={pattern.version}" / "data.lance"
+                / "data.lance"
             )
             _ctx_lance = str(
                 _base / "points" / event_line_id
@@ -1313,7 +1313,7 @@ def aggregate(
         _base = reader._base.resolve()
         _geo_lance = str(
             _base / "geometry" / event_pattern_id
-            / f"v={pattern.version}" / "data.lance"
+            / "data.lance"
         )
         _ctx_lance = str(
             _base / "points" / event_line_id
@@ -1344,7 +1344,7 @@ def aggregate(
             _base = reader._base.resolve()
             _geo_lance = str(
                 _base / "geometry" / event_pattern_id
-                / f"v={pattern.version}" / "data.lance"
+                / "data.lance"
             )
             _event_lance = str(
                 _base / "points" / event_line_id
@@ -1452,7 +1452,7 @@ def aggregate(
             _base = reader._base.resolve()
             _geo_lance = str(
                 _base / "geometry" / event_pattern_id
-                / f"v={pattern.version}" / "data.lance"
+                / "data.lance"
             )
             _prop_lance = str(
                 _base / "points" / prop_line_id

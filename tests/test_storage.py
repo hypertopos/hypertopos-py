@@ -121,7 +121,7 @@ def test_read_geometry_sample_size(tmp_path):
         }
     )
     writer = GDSWriter(base_path=str(tmp_path))
-    geo_dir = tmp_path / "geometry" / "pat1" / "v=1"
+    geo_dir = tmp_path / "geometry" / "pat1"
     writer.write_lance_geometry(geo_table, geo_dir)
 
     meta_dir = tmp_path / "_gds_meta"
@@ -130,6 +130,7 @@ def test_read_geometry_sample_size(tmp_path):
         json_mod.dumps(
             {
                 "sphere_id": "test",
+                "format_version": "3.0",
                 "name": "Test",
                 "lines": {},
                 "patterns": {},
@@ -1056,6 +1057,7 @@ def test_parse_sphere_with_storage_config(tmp_path):
         _json.dumps(
             {
                 "sphere_id": "test",
+                "format_version": "3.0",
                 "name": "test",
                 "lines": {},
                 "patterns": {},
@@ -1091,6 +1093,7 @@ def test_parse_sphere_without_storage_config(tmp_path):
         _json.dumps(
             {
                 "sphere_id": "test",
+                "format_version": "3.0",
                 "name": "test",
                 "lines": {},
                 "patterns": {},
@@ -1112,6 +1115,7 @@ def test_parse_sphere_partial_storage_config(tmp_path):
         _json.dumps(
             {
                 "sphere_id": "test",
+                "format_version": "3.0",
                 "name": "test",
                 "lines": {},
                 "patterns": {},
@@ -1367,7 +1371,7 @@ class TestLanceGeometry:
             }
         )
         writer = GDSWriter(base_path=str(tmp_path))
-        geo_dir = tmp_path / "geometry" / "test_pattern" / "v=1"
+        geo_dir = tmp_path / "geometry" / "test_pattern"
         writer.write_lance_geometry(geo_table, geo_dir)
 
         reader = GDSReader(base_path=str(tmp_path))
@@ -1403,7 +1407,7 @@ class TestLanceGeometry:
         )
         # Write Lance dataset
         writer = GDSWriter(base_path=str(tmp_path))
-        geo_dir = tmp_path / "geometry" / "pat1" / "v=1"
+        geo_dir = tmp_path / "geometry" / "pat1"
         writer.write_lance_geometry(geo_table, geo_dir)
 
         # Write sphere.json with geometry.format=lance
@@ -1411,6 +1415,7 @@ class TestLanceGeometry:
         meta_dir.mkdir(parents=True, exist_ok=True)
         sphere_json = {
             "sphere_id": "test",
+            "format_version": "3.0",
             "name": "Test",
             "lines": {},
             "patterns": {},
@@ -1454,7 +1459,7 @@ class TestLanceGeometry:
             }
         )
         writer = GDSWriter(base_path=str(tmp_path))
-        geo_dir = tmp_path / "geometry" / "pat1" / "v=1"
+        geo_dir = tmp_path / "geometry" / "pat1"
         writer.write_lance_geometry(geo_table, geo_dir)
 
         ds = lance.dataset(str(geo_dir / "data.lance"))
@@ -1492,7 +1497,7 @@ class TestLanceGeometry:
             }
         )
         writer = GDSWriter(base_path=str(tmp_path))
-        geo_dir = tmp_path / "geometry" / "pat1" / "v=1"
+        geo_dir = tmp_path / "geometry" / "pat1"
         writer.write_lance_geometry(geo_table, geo_dir)
 
         ds = lance.dataset(str(geo_dir / "data.lance"))
@@ -1534,7 +1539,7 @@ class TestLanceGeometry:
             }
         )
         writer = GDSWriter(base_path=str(tmp_path))
-        geo_dir = tmp_path / "geometry" / "pat1" / "v=1"
+        geo_dir = tmp_path / "geometry" / "pat1"
         writer.write_lance_geometry(geo_table, geo_dir)
 
         ds = lance.dataset(str(geo_dir / "data.lance"))
@@ -1572,7 +1577,7 @@ class TestLanceGeometry:
             }
         )
         writer = GDSWriter(base_path=str(tmp_path))
-        geo_dir = tmp_path / "geometry" / "pat1" / "v=1"
+        geo_dir = tmp_path / "geometry" / "pat1"
         writer.write_lance_geometry(geo_table, geo_dir)
 
         meta_dir = tmp_path / "_gds_meta"
@@ -1581,6 +1586,7 @@ class TestLanceGeometry:
             json_mod.dumps(
                 {
                     "sphere_id": "test",
+                    "format_version": "3.0",
                     "name": "Test",
                     "lines": {},
                     "patterns": {},
@@ -1592,7 +1598,7 @@ class TestLanceGeometry:
 
         reader = GDSReader(base_path=str(tmp_path))
         reader.read_sphere()
-        count = reader.count_geometry_rows("pat1", 1)
+        count = reader.count_geometry_rows("pat1")
         assert count == n
 
     def test_count_geometry_rows_with_filter(self, tmp_path):
@@ -1625,7 +1631,7 @@ class TestLanceGeometry:
             }
         )
         writer = GDSWriter(base_path=str(tmp_path))
-        geo_dir = tmp_path / "geometry" / "pat1" / "v=1"
+        geo_dir = tmp_path / "geometry" / "pat1"
         writer.write_lance_geometry(geo_table, geo_dir)
 
         meta_dir = tmp_path / "_gds_meta"
@@ -1634,6 +1640,7 @@ class TestLanceGeometry:
             json_mod.dumps(
                 {
                     "sphere_id": "test",
+                    "format_version": "3.0",
                     "name": "Test",
                     "lines": {},
                     "patterns": {},
@@ -1647,15 +1654,15 @@ class TestLanceGeometry:
         reader.read_sphere()
         # CUST-000 appears every 5 rows → 100/5 = 20
         count = reader.count_geometry_rows(
-            "pat1", 1, filter="array_contains(entity_keys, 'CUST-000')"
+            "pat1", filter="array_contains(entity_keys, 'CUST-000')"
         )
         assert count == 20
 
     def test_count_geometry_rows_reuses_dataset_object(self, tmp_path):
         """count_geometry_rows reuses the same Lance dataset object across calls.
 
-        Repeated calls with the same (pattern_id, version) must not re-open
-        the dataset — otherwise LABEL_LIST index is reloaded from disk each time.
+        Repeated calls with the same pattern_id must not re-open the dataset
+        — otherwise LABEL_LIST index is reloaded from disk each time.
         """
         import json as json_mod
 
@@ -1686,7 +1693,7 @@ class TestLanceGeometry:
             }
         )
         writer = GDSWriter(base_path=str(tmp_path))
-        geo_dir = tmp_path / "geometry" / "pat1" / "v=1"
+        geo_dir = tmp_path / "geometry" / "pat1"
         writer.write_lance_geometry(geo_table, geo_dir)
 
         meta_dir = tmp_path / "_gds_meta"
@@ -1695,6 +1702,7 @@ class TestLanceGeometry:
             json_mod.dumps(
                 {
                     "sphere_id": "test",
+                    "format_version": "3.0",
                     "name": "Test",
                     "lines": {},
                     "patterns": {},
@@ -1719,9 +1727,9 @@ class TestLanceGeometry:
 
         reader_module._lance.dataset = counting_dataset
         try:
-            reader.count_geometry_rows("pat1", 1)
-            reader.count_geometry_rows("pat1", 1, filter="array_contains(entity_keys, 'K-000')")
-            reader.count_geometry_rows("pat1", 1, filter="array_contains(entity_keys, 'K-001')")
+            reader.count_geometry_rows("pat1")
+            reader.count_geometry_rows("pat1", filter="array_contains(entity_keys, 'K-000')")
+            reader.count_geometry_rows("pat1", filter="array_contains(entity_keys, 'K-001')")
         finally:
             reader_module._lance.dataset = original_dataset
 
@@ -1771,7 +1779,7 @@ class TestLanceGeometry:
                 ),
             }
         )
-        lance_dir = tmp_path / "geometry" / "pat" / "v=1"
+        lance_dir = tmp_path / "geometry" / "pat"
         lance_dir.mkdir(parents=True)
         lance.write_dataset(table, str(lance_dir / "data.lance"))
         ds = lance.dataset(str(lance_dir / "data.lance"))
@@ -1834,7 +1842,7 @@ class TestLanceGeometry:
                 ),
             }
         )
-        lance_dir = tmp_path / "geometry" / "pat" / "v=1"
+        lance_dir = tmp_path / "geometry" / "pat"
         lance_dir.mkdir(parents=True)
         lance.write_dataset(table, str(lance_dir / "data.lance"))
 
@@ -1905,7 +1913,7 @@ class TestLanceGeometry:
         )
 
         # Write as Lance
-        lance_dir = tmp_path / "geometry" / "pat" / "v=1"
+        lance_dir = tmp_path / "geometry" / "pat"
         lance_dir.mkdir(parents=True)
         lance.write_dataset(table, str(lance_dir / "data.lance"))
 
@@ -1916,6 +1924,7 @@ class TestLanceGeometry:
             json_mod.dumps(
                 {
                     "sphere_id": "test",
+                    "format_version": "3.0",
                     "name": "test",
                     "storage": {"geometry": {"format": "lance"}},
                     "lines": {},
@@ -1977,7 +1986,7 @@ class TestLanceGeometry:
             }
         )
 
-        lance_dir = tmp_path / "geometry" / "p" / "v=1"
+        lance_dir = tmp_path / "geometry" / "p"
         lance_dir.mkdir(parents=True)
         lance.write_dataset(table, str(lance_dir / "data.lance"))
 
@@ -1987,6 +1996,7 @@ class TestLanceGeometry:
             json_mod.dumps(
                 {
                     "sphere_id": "t",
+                    "format_version": "3.0",
                     "name": "t",
                     "storage": {"geometry": {"format": "lance"}},
                     "lines": {},
@@ -2030,7 +2040,7 @@ class TestLanceGeometry:
             }
         )
         writer = GDSWriter(base_path=str(tmp_path))
-        geo_dir = tmp_path / "geometry" / "pat1" / "v=1"
+        geo_dir = tmp_path / "geometry" / "pat1"
         writer.write_lance_geometry(geo_table, geo_dir)
 
         meta_dir = tmp_path / "_gds_meta"
@@ -2039,6 +2049,7 @@ class TestLanceGeometry:
             json_mod.dumps(
                 {
                     "sphere_id": "test",
+                    "format_version": "3.0",
                     "name": "Test",
                     "lines": {},
                     "patterns": {},
@@ -2107,7 +2118,7 @@ class TestLanceGeometry:
             }
         )
 
-        lance_dir = tmp_path / "geometry" / "p" / "v=1"
+        lance_dir = tmp_path / "geometry" / "p"
         lance_dir.mkdir(parents=True)
         lance.write_dataset(table, str(lance_dir / "data.lance"))
 
@@ -2117,6 +2128,7 @@ class TestLanceGeometry:
             json_mod.dumps(
                 {
                     "sphere_id": "t",
+                    "format_version": "3.0",
                     "name": "t",
                     "storage": {"geometry": {"format": "lance"}},
                     "lines": {},
@@ -2164,7 +2176,7 @@ class TestLanceGeometry:
             }
         )
         writer = GDSWriter(base_path=str(tmp_path))
-        geo_dir = tmp_path / "geometry" / "pat1" / "v=1"
+        geo_dir = tmp_path / "geometry" / "pat1"
         writer.write_lance_geometry(geo_table, geo_dir)
 
         meta_dir = tmp_path / "_gds_meta"
@@ -2173,6 +2185,7 @@ class TestLanceGeometry:
             json_mod.dumps(
                 {
                     "sphere_id": "test",
+                    "format_version": "3.0",
                     "name": "Test",
                     "lines": {},
                     "patterns": {},
@@ -2235,7 +2248,7 @@ class TestLanceGeometry:
             }
         )
         writer = GDSWriter(base_path=str(tmp_path))
-        geo_dir = tmp_path / "geometry" / "pat1" / "v=1"
+        geo_dir = tmp_path / "geometry" / "pat1"
         writer.write_lance_geometry(geo_table, geo_dir)
 
         meta_dir = tmp_path / "_gds_meta"
@@ -2244,6 +2257,7 @@ class TestLanceGeometry:
             json_mod.dumps(
                 {
                     "sphere_id": "test",
+                    "format_version": "3.0",
                     "name": "Test",
                     "lines": {},
                     "patterns": {},
@@ -2749,6 +2763,7 @@ class TestResolveByEntityKeys:
         # sphere.json with gl_pattern having two relations: customers, company_codes
         sphere_json = {
             "sphere_id": "test",
+            "format_version": "3.0",
             "name": "test",
             "lines": {
                 "customers": {
@@ -2809,7 +2824,7 @@ class TestResolveByEntityKeys:
                 ],
             }
         )
-        geo_path = tmp_path / "geometry" / "gl_pattern" / "v=1" / "data.lance"
+        geo_path = tmp_path / "geometry" / "gl_pattern" / "data.lance"
         geo_path.parent.mkdir(parents=True, exist_ok=True)
         ds = _write_lance(geo_table, str(geo_path))
         ds.create_scalar_index("entity_keys", index_type="LABEL_LIST")
@@ -2873,7 +2888,7 @@ class TestAppendGeometry:
         writer = GDSWriter(base_path=str(tmp_path))
         table = self._make_geo_table(10, rng)
         writer.append_geometry(table, "test_pattern")
-        lance_path = tmp_path / "geometry" / "test_pattern" / "v=1" / "data.lance"
+        lance_path = tmp_path / "geometry" / "test_pattern" / "data.lance"
         assert lance_path.exists()
         ds = lance.dataset(str(lance_path))
         assert ds.count_rows() == 10
@@ -2888,7 +2903,7 @@ class TestAppendGeometry:
         writer.append_geometry(initial, "test_pattern")
         extra = self._make_geo_table(5, rng, start_idx=20)
         writer.append_geometry(extra, "test_pattern")
-        lance_path = tmp_path / "geometry" / "test_pattern" / "v=1" / "data.lance"
+        lance_path = tmp_path / "geometry" / "test_pattern" / "data.lance"
         ds = lance.dataset(str(lance_path))
         assert ds.count_rows() == 25
 
@@ -2912,7 +2927,7 @@ class TestAppendGeometry:
                 "is_anomaly": pa.array([], type=pa.bool_()),
             }
         )
-        lance_dir = tmp_path / "geometry" / "pat" / "v=1"
+        lance_dir = tmp_path / "geometry" / "pat"
         lance_dir.mkdir(parents=True)
         lance.write_dataset(empty, str(lance_dir / "data.lance"))
         result = writer._maybe_reindex_geometry("pat", version=1)
@@ -2930,7 +2945,7 @@ class TestAppendGeometry:
         # Write a small dataset (no ANN index — Lance won't build one < 256 rows)
         writer = GDSWriter(base_path=str(tmp_path))
         table = self._make_geo_table(50, rng)
-        lance_dir = tmp_path / "geometry" / "pat" / "v=1"
+        lance_dir = tmp_path / "geometry" / "pat"
         lance_dir.mkdir(parents=True)
         lance.write_dataset(table, str(lance_dir / "data.lance"))
 
@@ -2976,7 +2991,7 @@ class TestAppendGeometry:
         n = 300
         writer = GDSWriter(base_path=str(tmp_path))
         table = self._make_geo_table(n, rng)
-        lance_dir = tmp_path / "geometry" / "pat" / "v=1"
+        lance_dir = tmp_path / "geometry" / "pat"
         lance_dir.mkdir(parents=True)
         lance.write_dataset(table, str(lance_dir / "data.lance"))
         # Do NOT build an index — _maybe_reindex should detect it is missing and rebuild
@@ -3004,7 +3019,7 @@ class TestAppendGeometry:
 
         # Write initial geometry without ANN index
         initial = self._make_geo_table(n_initial, rng, start_idx=0)
-        lance_dir = tmp_path / "geometry" / "pat" / "v=1"
+        lance_dir = tmp_path / "geometry" / "pat"
         lance_dir.mkdir(parents=True)
         fixed_type = pa.list_(pa.float32(), self._D)
         delta_col = initial["delta"].cast(fixed_type)
@@ -3018,7 +3033,7 @@ class TestAppendGeometry:
 
         # Append extra rows — this should trigger reindex (100% unindexed)
         extra = self._make_geo_table(n_extra, rng, start_idx=n_initial)
-        writer.append_geometry(extra, "pat", version=1)
+        writer.append_geometry(extra, "pat")
 
         # Verify total row count
         ds_after = lance.dataset(str(lance_dir / "data.lance"))
@@ -3050,7 +3065,7 @@ class TestAppendGeometry:
 
         # Write initial dataset with a "pretend" full index
         initial = self._make_geo_table(300, rng)
-        lance_dir = tmp_path / "geometry" / "pat" / "v=1"
+        lance_dir = tmp_path / "geometry" / "pat"
         lance_dir.mkdir(parents=True)
         lance.write_dataset(initial, str(lance_dir / "data.lance"))
 
@@ -3070,7 +3085,7 @@ class TestAppendGeometry:
 
         # Append a small number of rows (well below 10% of 300 = 30)
         extra = self._make_geo_table(5, rng, start_idx=300)
-        writer.append_geometry(extra, "pat", version=1)
+        writer.append_geometry(extra, "pat")
 
         # _maybe_reindex_geometry must have been called
         assert len(rebuild_calls) == 1
@@ -3138,6 +3153,7 @@ def test_parse_pattern_reads_prop_columns(tmp_path):
         _json.dumps(
             {
                 "sphere_id": "s",
+                "format_version": "3.0",
                 "name": "s",
                 "lines": {},
                 "patterns": {
@@ -3180,6 +3196,7 @@ def test_parse_pattern_reads_dim_percentiles(tmp_path):
         _json.dumps(
             {
                 "sphere_id": "s",
+                "format_version": "3.0",
                 "name": "s",
                 "lines": {},
                 "patterns": {
@@ -3217,6 +3234,7 @@ def test_parse_pattern_dim_percentiles_absent(tmp_path):
         _json.dumps(
             {
                 "sphere_id": "s",
+                "format_version": "3.0",
                 "name": "s",
                 "lines": {},
                 "patterns": {

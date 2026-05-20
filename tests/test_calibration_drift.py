@@ -251,7 +251,7 @@ def _write_minimal_2_4_sphere(base: Path, epochs: dict[int, dict]) -> None:
         "schema_hash": latest_blob.get("schema_hash", "a" * 64),
     }
     sphere_meta = {
-        "format_version": "2.4",
+        "format_version": "3.0",
         "calibration_history_policy": {"last_k": 5},
         "patterns": {"p": pattern_node},
     }

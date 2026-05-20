@@ -121,6 +121,215 @@ def _arrow_type_to_str(arrow_type: pa.DataType) -> str:
     return str(arrow_type)
 
 
+def _validate_fdr_hierarchy_columns(
+    pattern: Any,
+    geometry_columns: list[str],
+) -> None:
+    """Verify fdr_hierarchy.from_dimension columns are present in geometry.
+
+    Run AFTER `_inject_fdr_hierarchy_columns` and
+    `_maybe_materialise_temporal_buckets` so the post-injection column set is
+    what the validator sees. fdr_temporal_hierarchy.slice_dimension columns
+    are NOT validated here — the builder materialises missing slice_dimension
+    columns at build time via `_maybe_materialise_temporal_buckets`.
+    """
+    for level in getattr(pattern, "fdr_hierarchy", []) or []:
+        if level.from_dimension not in geometry_columns:
+            raise ValueError(
+                f"Pattern {pattern.pattern_id!r}: fdr_hierarchy level "
+                f"{level.level!r} references from_dimension "
+                f"{level.from_dimension!r} which is not present in geometry "
+                f"columns. Add this column to the anchor line schema or "
+                f"correct the level name.",
+            )
+
+
+def _inject_fdr_hierarchy_columns(
+    pattern: Any,
+    *,
+    geometry_table: pa.Table,
+    anchor_table: pa.Table,
+) -> pa.Table:
+    """For each fdr_hierarchy.from_dimension column that is not yet on the
+    geometry table, project it from the anchor line table via primary_key
+    join and append it as a flat column.
+
+    No-op when fdr_hierarchy is empty or every from_dimension is already
+    present on the geometry table. Raises ValueError when a from_dimension
+    is missing from BOTH geometry AND the anchor line — the anchor line is
+    the only valid source for these carrier columns.
+    """
+    levels = getattr(pattern, "fdr_hierarchy", []) or []
+    if not levels:
+        return geometry_table
+    existing = set(geometry_table.column_names)
+    anchor_cols = set(anchor_table.column_names)
+    entity_line = getattr(pattern, "entity_line_id", None) or "<unknown>"
+    out = geometry_table
+    for level in levels:
+        col = level.from_dimension
+        if col in existing:
+            continue
+        if col not in anchor_cols:
+            raise ValueError(
+                f"Pattern {pattern.pattern_id!r}: fdr_hierarchy level "
+                f"{level.level!r} references from_dimension {col!r} which is "
+                f"present on neither the geometry nor the anchor line "
+                f"{entity_line!r}. Add {col!r} as a column on the anchor line "
+                f"source or correct the from_dimension name.",
+            )
+        # PyArrow's Table.join doesn't support list/fixed_size_list non-key
+        # fields (geometry's `delta` column is a fixed_size_list<float>), so
+        # use a hash-based take instead: index by primary_key, then take
+        # ordered by geometry's primary_key sequence.
+        anchor_pk = anchor_table["primary_key"].to_pylist()
+        anchor_vals = anchor_table[col].to_pylist()
+        index = {pk: i for i, pk in enumerate(anchor_pk)}
+        geom_pk = out["primary_key"].to_pylist()
+        aligned = [
+            anchor_vals[index[pk]] if pk in index else None for pk in geom_pk
+        ]
+        out = out.append_column(
+            col,
+            pa.array(aligned, type=anchor_table.schema.field(col).type),
+        )
+        existing.add(col)
+    return out
+
+
+def _auto_discover_event_pattern_for_anchor(
+    anchor_pattern: Any,
+    all_patterns: dict[str, Any],
+) -> Any:
+    """Find the unique event pattern whose ``relations`` reference the anchor's
+    entity_line. Used to source the event_table + edge_table columns for
+    materialising ``fdr_temporal_hierarchy.slice_dimension`` from event
+    timestamps when the anchor pattern declares the hierarchy.
+
+    The heuristic: an event pattern P references an anchor A iff at least one
+    of P.relations has ``line_id == A.entity_line``. This is direction-agnostic
+    at the pattern level — a single event pattern with two relations both
+    pointing at the anchor's line is one candidate, not two. The auto-discover
+    helper additionally requires the candidate to declare an ``edge_table``
+    with a non-null ``timestamp_col``, since both are required by
+    ``materialise_temporal_bucket``.
+
+    Raises ValueError when zero, multiple, or no-edge-table candidates exist.
+    """
+    anchor_line = anchor_pattern.entity_line
+    candidates: list[Any] = []
+    for pat in all_patterns.values():
+        if pat.pattern_type != "event":
+            continue
+        if pat.pattern_id == anchor_pattern.pattern_id:
+            continue
+        for rel in pat.relations:
+            if rel.line_id == anchor_line:
+                candidates.append(pat)
+                break
+
+    if not candidates:
+        raise ValueError(
+            f"Anchor pattern {anchor_pattern.pattern_id!r} declares "
+            f"fdr_temporal_hierarchy but no event pattern references its "
+            f"entity_line {anchor_line!r}; declare an event pattern with a "
+            f"relation pointing at line {anchor_line!r}.",
+        )
+
+    if len(candidates) > 1:
+        names = sorted(p.pattern_id for p in candidates)
+        raise ValueError(
+            f"Multiple event patterns {names} reference anchor "
+            f"{anchor_pattern.pattern_id!r}'s entity_line {anchor_line!r}; "
+            f"ambiguous — auto-discover for fdr_temporal_hierarchy supports "
+            f"exactly one event pattern per anchor line. Disambiguate by "
+            f"removing fdr_temporal_hierarchy from anchors that share "
+            f"the line.",
+        )
+
+    event_pat = candidates[0]
+    if event_pat.edge_table is None:
+        raise ValueError(
+            f"Anchor pattern {anchor_pattern.pattern_id!r} declares "
+            f"fdr_temporal_hierarchy and the matching event pattern "
+            f"{event_pat.pattern_id!r} has no edge_table; declare an "
+            f"edge_table with timestamp_col on {event_pat.pattern_id!r} "
+            f"so the bucket materialiser can read event timestamps.",
+        )
+    if event_pat.edge_table.timestamp_col is None:
+        raise ValueError(
+            f"Anchor pattern {anchor_pattern.pattern_id!r} declares "
+            f"fdr_temporal_hierarchy and the matching event pattern "
+            f"{event_pat.pattern_id!r} has an edge_table without "
+            f"timestamp_col; declare a timestamp_col so the bucket "
+            f"materialiser can derive per-anchor centroid timestamps.",
+        )
+    return event_pat
+
+
+def _maybe_materialise_temporal_buckets(
+    pattern: Any,
+    *,
+    geometry_table: pa.Table,
+    event_table: pa.Table | None,
+    anchor_key_col_options: tuple[str, ...],
+    timestamp_col: str,
+) -> pa.Table:
+    """For each fdr_temporal_hierarchy level whose slice_dimension is not yet
+    on geometry_table, materialise it from event timestamps via
+    builder.temporal_bucket.materialise_temporal_bucket.
+
+    No-op when no fdr_temporal_hierarchy declared OR all slice_dimensions
+    already present. Returns the (possibly-extended) geometry table.
+    """
+    from hypertopos.builder.temporal_bucket import materialise_temporal_bucket
+
+    levels = getattr(pattern, "fdr_temporal_hierarchy", []) or []
+    if not levels:
+        return geometry_table
+    existing = set(geometry_table.column_names)
+    out = geometry_table
+    for level in levels:
+        if level.slice_dimension in existing:
+            continue
+        if event_table is None:
+            raise ValueError(
+                f"Pattern {pattern.pattern_id!r}: fdr_temporal_hierarchy level "
+                f"{level.level!r} requires materialising "
+                f"{level.slice_dimension!r} from event timestamps, but no "
+                f"event_table is in scope (anchor patterns without an event "
+                f"line cannot materialise temporal buckets).",
+            )
+        bucket_table = materialise_temporal_bucket(
+            event_table=event_table,
+            anchor_keys=out["primary_key"].to_pylist(),
+            anchor_key_col_options=anchor_key_col_options,
+            timestamp_col=timestamp_col,
+            bucket=level.bucket,
+        )
+        if level.slice_dimension != "temporal_bucket":
+            bucket_table = bucket_table.rename_columns(
+                ["primary_key", level.slice_dimension],
+            )
+        # Same list-typed-field limitation as in _inject_fdr_hierarchy_columns:
+        # pa.Table.join rejects fixed_size_list non-key fields (geometry's
+        # `delta`). Hash-based take instead.
+        col_name = level.slice_dimension
+        bucket_pk = bucket_table["primary_key"].to_pylist()
+        bucket_vals = bucket_table[col_name].to_pylist()
+        index = {pk: i for i, pk in enumerate(bucket_pk)}
+        geom_pk = out["primary_key"].to_pylist()
+        aligned = [
+            bucket_vals[index[pk]] if pk in index else None for pk in geom_pk
+        ]
+        out = out.append_column(
+            col_name,
+            pa.array(aligned, type=bucket_table.schema.field(col_name).type),
+        )
+        existing.add(col_name)
+    return out
+
+
 def compute_entity_geometry(
     entity_table: pa.Table,
     mu: np.ndarray,
@@ -310,6 +519,16 @@ class _PatternReg:
     # ``EdgeDimensionsConfig.dims`` keyed by dim_name → params dict.
     edge_dimensions: Any = None  # EdgeDimensionsConfig | None
     edge_dim_aggregations: Any = None  # EdgeDimAggregationsConfig | None
+    # Multi-resolution FDR hierarchies (lists of FDRHierarchyLevel /
+    # FDRTemporalLevel from hypertopos.model.sphere). Empty defaults mean
+    # no behaviour change for patterns that do not opt in.
+    fdr_hierarchy: list = field(default_factory=list)
+    fdr_temporal_hierarchy: list = field(default_factory=list)
+    # Declarative conformance rules (M1.7) — list of ConformanceRule from
+    # hypertopos.model.sphere. Empty default is the cost-neutral fast path;
+    # when populated, the builder evaluates them after points materialization
+    # and writes a sidecar Lance dataset of violations.
+    conformance_rules: list = field(default_factory=list)
 
 
 @dataclass
@@ -608,6 +827,8 @@ class GDSBuilder:
         bootstrap_iterations: int = 200,
         edge_dimensions: Any = None,
         edge_dim_aggregations: Any = None,
+        fdr_hierarchy: list | None = None,
+        fdr_temporal_hierarchy: list | None = None,
     ) -> GDSBuilder:
         _VALID_DW = ("auto", "kurtosis", "uniform")
         if isinstance(dimension_weights, str) and dimension_weights not in _VALID_DW:
@@ -634,6 +855,8 @@ class GDSBuilder:
             semantic_dim=semantic_dim,
             edge_dimensions=edge_dimensions,
             edge_dim_aggregations=edge_dim_aggregations,
+            fdr_hierarchy=fdr_hierarchy or [],
+            fdr_temporal_hierarchy=fdr_temporal_hierarchy or [],
         )
         return self
 
@@ -2241,6 +2464,77 @@ class GDSBuilder:
             schema=EDGE_TABLE_SCHEMA,
         )
 
+    def _inject_fdr_hierarchy_carriers(
+        self,
+        pat: _PatternReg,
+        geometry_table: pa.Table,
+    ) -> pa.Table:
+        """For an anchor pattern with ``fdr_hierarchy``, copy each
+        ``from_dimension`` that lives only on the anchor line onto
+        ``geometry_table`` so the validation gate and downstream
+        find_anomalies aggregation can see it. No-op for event patterns and
+        for patterns without ``fdr_hierarchy``.
+
+        Called by all three geometry-write paths BEFORE
+        ``_inject_fdr_temporal_buckets`` and BEFORE
+        ``_validate_fdr_hierarchy_columns``.
+        """
+        if not pat.fdr_hierarchy:
+            return geometry_table
+        if pat.pattern_type != "anchor":
+            return geometry_table
+        line_reg = self._lines.get(pat.entity_line)
+        if line_reg is None:
+            raise ValueError(
+                f"Pattern {pat.pattern_id!r}: fdr_hierarchy declared on anchor "
+                f"with entity_line {pat.entity_line!r} which is not registered "
+                f"on this builder.",
+            )
+        return _inject_fdr_hierarchy_columns(
+            pat,
+            geometry_table=geometry_table,
+            anchor_table=line_reg.table,
+        )
+
+    def _inject_fdr_temporal_buckets(
+        self,
+        pat: _PatternReg,
+        geometry_table: pa.Table,
+    ) -> pa.Table:
+        """For an anchor pattern that declares ``fdr_temporal_hierarchy``,
+        materialise missing slice_dimension columns onto ``geometry_table``
+        via the event pattern auto-discovered from this builder's pattern
+        registry. No-op for patterns without ``fdr_temporal_hierarchy``.
+
+        Called by all three geometry-write paths so the materialised buckets
+        land before write_geometry / write_chunk_fn.
+        """
+        if not pat.fdr_temporal_hierarchy:
+            return geometry_table
+        if pat.pattern_type != "anchor":
+            return geometry_table
+        event_pat = _auto_discover_event_pattern_for_anchor(
+            pat, self._patterns,
+        )
+        event_reg = self._lines.get(event_pat.entity_line)
+        if event_reg is None:
+            raise ValueError(
+                f"Pattern {pat.pattern_id!r}: auto-discovered event pattern "
+                f"{event_pat.pattern_id!r} references entity_line "
+                f"{event_pat.entity_line!r} which is not registered on this "
+                f"builder.",
+            )
+        return _maybe_materialise_temporal_buckets(
+            pat,
+            geometry_table=geometry_table,
+            event_table=event_reg.table,
+            anchor_key_col_options=(
+                event_pat.edge_table.from_col,
+                event_pat.edge_table.to_col,
+            ),
+            timestamp_col=event_pat.edge_table.timestamp_col,
+        )
+
     @staticmethod
     def _to_epoch_seconds(col: pa.Array) -> pa.Array:
         """Convert Arrow column to float64 epoch seconds."""
@@ -2328,7 +2622,7 @@ class GDSBuilder:
             if areg.base_pattern_id not in _delta_cache:
                 geo_path = (
                     self.output_path / "geometry" / areg.base_pattern_id
-                    / "v=1" / "data.lance"
+                    / "data.lance"
                 )
                 ds = lance.dataset(str(geo_path))
                 delta_col = ds.to_table(columns=["delta"])["delta"]
@@ -2562,6 +2856,25 @@ class GDSBuilder:
                 pat_dict["dim_percentiles"] = pbr.dim_percentiles
             if pat.description:
                 pat_dict["description"] = pat.description
+            if pat.fdr_hierarchy:
+                pat_dict["fdr_hierarchy"] = [
+                    {"level": lvl.level, "from_dimension": lvl.from_dimension}
+                    for lvl in pat.fdr_hierarchy
+                ]
+            if pat.fdr_temporal_hierarchy:
+                pat_dict["fdr_temporal_hierarchy"] = [
+                    {
+                        "level": lvl.level,
+                        "slice_dimension": lvl.slice_dimension,
+                        "bucket": lvl.bucket,
+                    }
+                    for lvl in pat.fdr_temporal_hierarchy
+                ]
+            if pat.conformance_rules:
+                from hypertopos.model.sphere import _rule_to_dict
+                pat_dict["conformance_rules"] = [
+                    _rule_to_dict(r) for r in pat.conformance_rules
+                ]
             # Edge table metadata
             edge_cfg = self._resolve_edge_table_config(pat)
             if edge_cfg is not None:
@@ -2598,7 +2911,7 @@ class GDSBuilder:
 
         sphere_dict: dict[str, Any] = {
             "sphere_id": self.sphere_id,
-            "format_version": "2.4",
+            "format_version": "3.0",
             "calibration_history_policy": {"last_k": 5},
             "name": self._name or self.sphere_id,
             "lines": lines_dict,
@@ -2882,6 +3195,46 @@ class GDSBuilder:
                         edge_max=em,
                     ))
 
+    def _evaluate_conformance_rules(self) -> None:
+        """Build conformance sidecars for every pattern that declares rules.
+
+        Cost-neutral fast path: short-circuits when no pattern in the
+        builder declares any rules. Called once at the start of
+        ``build()`` after points are materialized and before geometry.
+
+        Sidecars land at version=1 alongside the geometry write — every
+        pattern in the builder writes version=1 in the same build call.
+        """
+        # Cost-neutral guard — single linear scan of _patterns.
+        if not any(p.conformance_rules for p in self._patterns.values()):
+            return
+
+        from hypertopos.builder.conformance import build_conformance_for_pattern
+        from hypertopos.model.sphere import Pattern as _Pattern
+
+        for pat_id, pat in self._patterns.items():
+            if not pat.conformance_rules:
+                continue
+            line_reg = self._lines.get(pat.entity_line)
+            if line_reg is None:
+                raise ValueError(
+                    f"conformance evaluation: pattern '{pat_id}' references "
+                    f"unknown entity_line '{pat.entity_line}'",
+                )
+            points_table = line_reg.table
+            # Shallow ``Pattern`` shim — the conformance evaluator reads
+            # ``pattern_id`` + ``conformance_rules`` only. The full Pattern
+            # dataclass is not materialised until after geometry build.
+            shim = _Pattern.__new__(_Pattern)
+            object.__setattr__(shim, "pattern_id", pat_id)
+            object.__setattr__(shim, "conformance_rules", pat.conformance_rules)
+            build_conformance_for_pattern(
+                base_path=self.output_path,
+                pattern=shim,
+                points_table=points_table,
+                version=1,
+            )
+
     def build(
         self,
         *,
@@ -2943,6 +3296,11 @@ class GDSBuilder:
             for lid, lr in real_lines:
                 _write_line_points(lid, lr)
 
+        # 1.5 Conformance rules — evaluate after points are materialized
+        # and BEFORE geometry build. Cost-neutral fast path when no
+        # pattern declares any rules: short-circuit on the first check.
+        self._evaluate_conformance_rules()
+
         # 2. Build geometry (and optionally temporal) per pattern
         _stats_writer = GDSWriter(str(self.output_path))
 
@@ -2968,6 +3326,11 @@ class GDSBuilder:
                 return pat_id_out, pbr
 
             geom_table, ps = self._build_geometry_table(pat)
+            geom_table = self._inject_fdr_hierarchy_carriers(pat, geom_table)
+            geom_table = self._inject_fdr_temporal_buckets(pat, geom_table)
+            _validate_fdr_hierarchy_columns(
+                pat, list(geom_table.column_names),
+            )
             write_geometry(
                 self.output_path, pat_id, geom_table, version=1,
             )
@@ -3491,7 +3854,7 @@ class GDSBuilder:
             ).to_table()
 
             geom_path = (
-                self.output_path / "geometry" / anchor_pat_id / "v=1" / "data.lance"
+                self.output_path / "geometry" / anchor_pat_id / "data.lance"
             )
             if not geom_path.exists():
                 continue
@@ -3551,9 +3914,9 @@ class GDSBuilder:
         reader = GDSReader(str(self.output_path))
         tracker = reader.read_calibration_tracker(pattern_id)
 
-        # 3. Resolve geometry Lance path
+        # 3. Resolve geometry Lance path (native MVCC — flat directory).
         lance_path = str(
-            self.output_path / "geometry" / pattern_id / f"v={version}" / "data.lance"
+            self.output_path / "geometry" / pattern_id / "data.lance"
         )
 
         # 4. Classify changed entity keys
@@ -3720,7 +4083,7 @@ class GDSBuilder:
 
         # 10. Recompute delta_rank_pct (O(N) global)
         writer = GDSWriter(str(self.output_path))
-        writer.recompute_delta_rank_pct(pattern_id, version=version)
+        writer.recompute_delta_rank_pct(pattern_id)
 
         # 11. Compute new population size
         ds = _lance.dataset(lance_path)
@@ -3846,6 +4209,11 @@ class GDSBuilder:
                 ps.is_anomaly_arr, ps.n_anom_dims,
                 bregman_norms_arr=ps.bregman_norms,
                 anomaly_confidence_arr=confidence_arr,
+            )
+            chunk_table = self._inject_fdr_hierarchy_carriers(pat, chunk_table)
+            chunk_table = self._inject_fdr_temporal_buckets(pat, chunk_table)
+            _validate_fdr_hierarchy_columns(
+                pat, list(chunk_table.column_names),
             )
             write_chunk_fn(
                 self.output_path, pat_id, chunk_table, version=1,
@@ -4637,6 +5005,11 @@ class GDSBuilder:
                 anomaly_confidence_arr=None,
                 entity_table_override=chunk_entity_table,
             )
+            geom_table = self._inject_fdr_hierarchy_carriers(pat, geom_table)
+            geom_table = self._inject_fdr_temporal_buckets(pat, geom_table)
+            _validate_fdr_hierarchy_columns(
+                pat, list(geom_table.column_names),
+            )
 
             write_chunk_fn(
                 self.output_path, pat_id, geom_table, version=1,
@@ -5253,7 +5626,7 @@ class GDSBuilder:
         import lance as _lance
 
         geo_path = (
-            self.output_path / "geometry" / pat_id / "v=1" / "data.lance"
+            self.output_path / "geometry" / pat_id / "data.lance"
         )
         if not geo_path.exists():
             return

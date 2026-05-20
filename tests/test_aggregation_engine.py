@@ -189,7 +189,7 @@ class _MockReader:
             geo = geo.select(available)
         return geo
 
-    def count_geometry_rows(self, pattern_id, version, filter=None):
+    def count_geometry_rows(self, pattern_id, filter=None):
         geo = self._geometry
         if filter and "entity_keys" in geo.schema.names:
             import re

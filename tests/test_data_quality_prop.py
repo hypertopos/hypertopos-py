@@ -84,7 +84,7 @@ def _make_dqi_navigator(
 
     storage.read_sphere.return_value = sphere
     storage.read_geometry_stats.return_value = None
-    storage.count_geometry_rows.side_effect = lambda pid, ver, filter=None: (
+    storage.count_geometry_rows.side_effect = lambda pid, filter=None: (
         0 if filter else geo_rows
     )
 

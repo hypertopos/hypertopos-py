@@ -97,6 +97,7 @@ def _attach_per_dim_columns(table: pa.Table, list_size: int) -> pa.Table:
 def generate_sphere_json() -> None:
     sphere = {
         "sphere_id": "synthetic_chain_sphere",
+        "format_version": "3.0",
         "name": "Synthetic Chain Sphere",
         "lines": {
             "accounts": {
@@ -302,9 +303,11 @@ def generate_account_geometry() -> None:
         pks, ACCOUNT_DELTAS, ACCOUNT_MU, ACCOUNT_SIGMA, ACCOUNT_THETA,
         pattern_name="account_pattern",
     )
-    _write_lance(
-        BASE / "geometry" / "account_pattern" / "v=1" / "data.lance", table,
-    )
+    geo_path = BASE / "geometry" / "account_pattern" / "data.lance"
+    _write_lance(geo_path, table)
+    from hypertopos.storage._lance_versions import tag_epoch
+
+    tag_epoch(lance.dataset(str(geo_path)), 1)
 
     from hypertopos.storage.writer import GDSWriter
 
@@ -335,9 +338,11 @@ def generate_chain_geometry() -> None:
         pks, chain_deltas, CHAIN_MU, CHAIN_SIGMA, CHAIN_THETA,
         pattern_name="chain_pattern",
     )
-    _write_lance(
-        BASE / "geometry" / "chain_pattern" / "v=1" / "data.lance", table,
-    )
+    geo_path = BASE / "geometry" / "chain_pattern" / "data.lance"
+    _write_lance(geo_path, table)
+    from hypertopos.storage._lance_versions import tag_epoch
+
+    tag_epoch(lance.dataset(str(geo_path)), 1)
 
     from hypertopos.storage.writer import GDSWriter
 

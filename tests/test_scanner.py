@@ -781,9 +781,7 @@ class TestRelatedCountEntitySpecific:
         # filter_expr="" means read ALL chains (anomalous or not)
         scanner.add_source("chains", "chain_pattern", key_type="chain", filter_expr="")
 
-        manifest = sess._manifest
-        version = manifest.pattern_version("chain_pattern")
-        total_chains = sess._reader.count_geometry_rows("chain_pattern", version)
+        total_chains = sess._reader.count_geometry_rows("chain_pattern")
 
         result = scanner.scan("accounts", threshold=1)
 
@@ -828,9 +826,7 @@ class TestRelatedCountEntitySpecific:
         scanner, sess = _make_scanner_fixture(tmp_path, n=50, seed=42)
         scanner.add_source("pairs", "pair_pattern", key_type="composite")
 
-        manifest = sess._manifest
-        version = manifest.pattern_version("pair_pattern")
-        total_composites = sess._reader.count_geometry_rows("pair_pattern", version)
+        total_composites = sess._reader.count_geometry_rows("pair_pattern")
 
         result = scanner.scan("accounts", threshold=1)
 

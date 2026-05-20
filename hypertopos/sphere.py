@@ -69,10 +69,10 @@ class HyperSphere:
 
         # Pin Lance dataset versions at session-open time (MVCC isolation).
         pinned: dict[str, int] = {}
-        for pattern_id, version in manifest.pattern_versions.items():
+        for pattern_id, _version in manifest.pattern_versions.items():
             geo_path = (
                 session_reader._base
-                / "geometry" / pattern_id / f"v={version}" / "data.lance"
+                / "geometry" / pattern_id / "data.lance"
             )
             if geo_path.exists():
                 with suppress(Exception):
@@ -228,9 +228,10 @@ class HyperSession:
 
         new_table = pa.table(new_columns)
 
-        # 6. Lance overwrite + reindex
+        # 6. Lance overwrite + reindex (native MVCC — same flat path, new
+        # internal Lance version).
         geo_path = (
-            self._reader._base / "geometry" / pattern_id / f"v={version}" / "data.lance"
+            self._reader._base / "geometry" / pattern_id / "data.lance"
         )
         _write_lance(new_table, str(geo_path), mode="overwrite")
         self._writer.build_index_if_needed(pattern_id, version)

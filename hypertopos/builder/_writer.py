@@ -11,6 +11,7 @@ import lance as _lance
 import numpy as np
 import pyarrow as pa
 
+from hypertopos.storage._lance_versions import tag_epoch
 from hypertopos.storage.writer import GDSWriter, _write_lance
 
 
@@ -128,7 +129,7 @@ def write_geometry(
         if n_unique < 256:
             skip_vector = True
 
-    lance_path = base_path / "geometry" / pattern_id / f"v={version}" / "data.lance"
+    lance_path = base_path / "geometry" / pattern_id / "data.lance"
     lance_path.parent.mkdir(parents=True, exist_ok=True)
     ds = _write_lance(sorted_table, str(lance_path))
 
@@ -136,6 +137,10 @@ def write_geometry(
     writer.build_index_if_needed(
         pattern_id, version, _ds=ds, skip_vector_index=skip_vector,
     )
+    # Tag the just-written internal Lance version as calibration epoch 1.
+    # Re-open after build_index_if_needed so latest_version reflects any
+    # index manifest commits Lance may emit during create_index.
+    tag_epoch(_lance.dataset(str(lance_path)), 1)
 
 
 def write_geometry_chunk(
@@ -152,7 +157,7 @@ def write_geometry_chunk(
     prepared, _list_size = _prepare_geometry_for_lance(table)
 
     lance_path = (
-        base_path / "geometry" / pattern_id / f"v={version}" / "data.lance"
+        base_path / "geometry" / pattern_id / "data.lance"
     )
     lance_path.parent.mkdir(parents=True, exist_ok=True)
     mode = "append" if lance_path.exists() else "create"
@@ -169,7 +174,7 @@ def finalize_geometry_chunks(
     Call once after all write_geometry_chunk() calls for a pattern.
     """
     lance_path = (
-        base_path / "geometry" / pattern_id / f"v={version}" / "data.lance"
+        base_path / "geometry" / pattern_id / "data.lance"
     )
     if not lance_path.exists():
         return
@@ -210,6 +215,10 @@ def finalize_geometry_chunks(
     writer.build_index_if_needed(
         pattern_id, version, _ds=ds, skip_vector_index=skip_vector,
     )
+    # Tag the just-written internal Lance version as calibration epoch 1.
+    # Re-open after build_index_if_needed so latest_version reflects any
+    # index manifest commits Lance may emit during create_index.
+    tag_epoch(_lance.dataset(str(lance_path)), 1)
 
 
 def update_points(

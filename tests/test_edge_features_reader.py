@@ -15,7 +15,7 @@ def _make_minimal_sphere(tmp: Path) -> Path:
     base = tmp / "s"
     (base / "_gds_meta").mkdir(parents=True)
     (base / "_gds_meta" / "sphere.json").write_text(
-        '{"sphere_id": "s", "format_version": "2.4", '
+        '{"sphere_id": "s", "format_version": "3.0", '
         '"patterns": [], "lines": []}',
         encoding="utf-8",
     )

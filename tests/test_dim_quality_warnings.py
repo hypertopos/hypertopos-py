@@ -41,7 +41,8 @@ def _make_pattern(
 
 def test_no_warnings_on_healthy_pattern():
     """Pattern with non-zero sigma everywhere and no sparse dims → no
-    warnings."""
+    dead_dim or sparse_dim warnings (other auditor types are out of
+    scope for this test)."""
     pat = _make_pattern(
         sigma_diag=[0.5, 1.0, 0.8],
         dim_percentiles={
@@ -50,7 +51,8 @@ def test_no_warnings_on_healthy_pattern():
         },
     )
     warnings = GDSNavigator._compute_dim_quality_warnings(pat)
-    assert warnings == []
+    scoped = [w for w in warnings if w["type"] in {"dead_dim", "sparse_dim"}]
+    assert scoped == []
 
 
 def test_dead_dim_flagged_when_sigma_zero():
@@ -151,7 +153,10 @@ def test_sparse_dim_fraction_zero_buckets():
 
 
 def test_dead_and_sparse_can_coexist():
-    """A pattern with both classes flagged returns both warnings."""
+    """A pattern with both classes flagged returns both warnings.
+    Filters out other auditor types that may coincidentally fire on the
+    fixture (e.g. dominant_dim_mass when one surviving-sigma dim drives
+    the p99-tail mass)."""
     pat = _make_pattern(
         sigma_diag=[1.0, 0.0, 1.0],   # dim 1 is dead
         dim_percentiles={
@@ -160,8 +165,10 @@ def test_dead_and_sparse_can_coexist():
         },
     )
     warnings = GDSNavigator._compute_dim_quality_warnings(pat)
-    types = {w["type"] for w in warnings}
-    assert types == {"dead_dim", "sparse_dim"}
+    scoped = {
+        w["type"] for w in warnings if w["type"] in {"dead_dim", "sparse_dim"}
+    }
+    assert scoped == {"dead_dim", "sparse_dim"}
 
 
 def test_warning_carries_advice_field():

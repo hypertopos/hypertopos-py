@@ -17,13 +17,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 BERKA_PATH = PROJECT_ROOT / "benchmark" / "berka" / "sphere" / "gds_berka_banking"
 
 
-def _has_berka() -> bool:
-    return (BERKA_PATH / "_gds_meta" / "sphere.json").exists()
+def _has_berka_3_0() -> bool:
+    sphere_json = BERKA_PATH / "_gds_meta" / "sphere.json"
+    if not sphere_json.exists():
+        return False
+    import json
+    return json.loads(sphere_json.read_text()).get("format_version") == "3.0"
 
 
 pytestmark = pytest.mark.skipif(
-    not _has_berka(),
-    reason="Berka sphere not built (run benchmark/berka/sphere/sphere.yaml first)",
+    not _has_berka_3_0(),
+    reason="Berka sphere not built at format 3.0 (run benchmark/berka/sphere/sphere.yaml first)",
 )
 
 

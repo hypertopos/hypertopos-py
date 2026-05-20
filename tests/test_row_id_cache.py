@@ -146,7 +146,7 @@ def test_row_id_cache_invalidated_after_stale_rowid(fixtures_path):
     import lance as _lance_mod
 
     pattern_id, version, pk = _first_anchor_pattern(fixtures_path)
-    lance_path = str(fixtures_path / "geometry" / pattern_id / f"v={version}" / "data.lance")
+    lance_path = str(fixtures_path / "geometry" / pattern_id / "data.lance")
 
     # Sub-case 1: out-of-range row ID raises OSError from Lance.
     reader = GDSReader(str(fixtures_path))

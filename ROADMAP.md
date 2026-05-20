@@ -2,6 +2,16 @@
 
 > Planned direction. Priorities may change based on feedback.
 
+## 0.7.0
+
+Detector composition and counterfactual primitives on native Lance MVCC — multi-detector consensus, per-edge / joint / per-counterparty influence math, topological cycle persistence, multi-resolution FDR, and the entity-side investigation orchestrator land on a modernized Lance 6.0 storage substrate with sphere format 3.0.
+
+- **0.7.0** — Lance 4.0 → 6.0 bump; sphere format 2.4 → 3.0 (breaking — single Lance dataset per pattern, calibration epochs tagged `epoch_<N>`, no migration tool); Wilson HMP combiner + `combine_anomaly_pvalues` + `classify_detector_consensus` over five orthogonal anomaly axes; counterfactual family (`simulate_edge_removal`, `select_minimal_joint_edge_removal`, `simulate_counterparty_removal`); `find_topological_anomalies` H_1 cycle persistence + `find_topological_trajectory_anomalies`; `find_graph_geometry_tension` 2×2 behavioural-vs-graph cross-tab; multi-resolution FDR with `Pattern.fdr_hierarchy` + `fdr_temporal_hierarchy`; per-dim FDR axis + `rank_by="min_q_per_dim"`; `investigate_entity` orchestrator; `edge_curvature_frc` Forman-Ricci edge dimension; `reliability_flags` triage on five primitive outputs; `composite_risk` switches Fisher → HMP.
+
+See [CHANGELOG](CHANGELOG.md) for the full feature list.
+
+---
+
 ## 0.6.0
 
 Architecture-emergent analytics, properly enabled — calibration is now versioned, and patent-aligned analytics ride on that versioning.

@@ -121,6 +121,7 @@ def _build_edge_sphere(tmp_path: Path) -> Path:
     # sphere.json
     sphere = {
         "sphere_id": "heredity_test",
+        "format_version": "3.0",
         "name": "Heredity Test Sphere",
         "lines": {
             "accounts": {
@@ -234,7 +235,7 @@ def _build_edge_sphere(tmp_path: Path) -> Path:
             f"delta_dim_{dim_idx}",
             pa.array(matrix[:, dim_idx], type=pa.float32()),
         )
-    geo_path = sphere_dir / "geometry" / "account_pattern" / "v=1" / "data.lance"
+    geo_path = sphere_dir / "geometry" / "account_pattern" / "data.lance"
     geo_path.parent.mkdir(parents=True, exist_ok=True)
     lance.write_dataset(geo_table, str(geo_path), mode="overwrite")
 

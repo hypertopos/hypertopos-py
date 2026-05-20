@@ -137,14 +137,14 @@ def tiny_sphere_factory():
 
 def test_build_once_writes_v1(tiny_sphere_factory, tmp_path):
     """First builder run on a fresh dir writes v=1.json with schema_hash and
-    sphere.json with format_version=2.4 + calibration_epoch=1."""
+    sphere.json with format_version=3.0 + calibration_epoch=1."""
     from hypertopos.storage.reader import GDSReader
 
     sphere_path = tmp_path / "sphere"
     pid = tiny_sphere_factory(sphere_path)
 
     meta = json.loads((sphere_path / "_gds_meta" / "sphere.json").read_text())
-    assert meta["format_version"] == "2.4"
+    assert meta["format_version"] == "3.0"
     assert meta["calibration_history_policy"] == {"last_k": 5}
     assert meta["patterns"][pid]["calibration_epoch"] == 1
     assert len(meta["patterns"][pid]["schema_hash"]) == 64
@@ -465,13 +465,14 @@ def test_pattern_removed_leaves_orphan_dir(tiny_two_pattern_factory, tmp_path):
     assert (orphan_dir / "v=1.json").exists()
 
 
-def test_2_3_sphere_first_06_build_migrates_to_2_4(tiny_sphere_factory, tmp_path):
-    """A 2.3 sphere on disk (no calibration_epoch field, no history dir) gets
-    migrated to 2.4 by the first 0.6.0 builder run."""
+def test_legacy_sphere_first_build_writes_3_0(tiny_sphere_factory, tmp_path):
+    """A legacy (pre-3.0) sphere.json on disk is rewritten as 3.0 by the
+    first builder run — the builder always emits 3.0 regardless of prior
+    format_version, since the only supported reader path requires 3.0."""
     sphere_path = tmp_path / "sphere"
     sphere_path.mkdir(parents=True)
 
-    # Build a valid sphere first, then downgrade it to 2.3 by editing sphere.json.
+    # Build a valid sphere first, then mark sphere.json as legacy.
     pid = tiny_sphere_factory(sphere_path)
     sphere_path_meta = sphere_path / "_gds_meta" / "sphere.json"
     meta = json.loads(sphere_path_meta.read_text())
@@ -482,17 +483,17 @@ def test_2_3_sphere_first_06_build_migrates_to_2_4(tiny_sphere_factory, tmp_path
         p_node.pop("schema_hash", None)
     sphere_path_meta.write_text(json.dumps(meta, indent=2))
 
-    # Wipe history dir to fully simulate a 2.3 sphere
+    # Wipe history dir to fully simulate a legacy sphere.
     history_root = sphere_path / "_gds_meta" / "calibration_history"
     if history_root.exists():
         import shutil
         shutil.rmtree(history_root)
 
-    # Re-build — should migrate to 2.4
+    # Re-build — fresh 3.0 metadata.
     pid = tiny_sphere_factory(sphere_path)
 
     meta_after = json.loads(sphere_path_meta.read_text())
-    assert meta_after["format_version"] == "2.4"
+    assert meta_after["format_version"] == "3.0"
     assert meta_after["calibration_history_policy"] == {"last_k": 5}
     assert meta_after["patterns"][pid]["calibration_epoch"] == 1
     assert "schema_hash" in meta_after["patterns"][pid]

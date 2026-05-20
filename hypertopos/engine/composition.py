@@ -2,7 +2,7 @@
 # Licensed under the Business Source License 1.1 (the "License");
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
-"""Cross-pattern composition via Fisher's method and co-dispersion.
+"""Cross-pattern composition via Fisher's method, Wilson harmonic-mean p-value, and co-dispersion.
 
 No scipy dependency — chi2 survival via regularized incomplete gamma (numpy + math only),
 Spearman via rank-transform + Pearson.
@@ -10,10 +10,15 @@ Spearman via rank-transform + Pearson.
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 
 import numpy as np
 
 _P_FLOOR = 1e-15
+# HMP-specific clamp — denominator of the harmonic mean blows up at p=0,
+# so we clamp lower than the Fisher floor to keep the math finite without
+# squashing legitimately tiny p-values from chi2 survival.
+_HMP_P_FLOOR = 1e-300
 
 
 def _chi2_sf(x: float, df: int) -> float:
@@ -178,3 +183,117 @@ def co_dispersion(
         "n": n,
         "insufficient_data": False,
     }
+
+
+def _sanitize_p(value: float) -> float:
+    """Return ``value`` clamped into (_HMP_P_FLOOR, 1.0]; map NaN/inf to 1.0."""
+    if not math.isfinite(value):
+        return 1.0
+    if value <= 0.0:
+        return _HMP_P_FLOOR
+    if value > 1.0:
+        return 1.0
+    return float(value)
+
+
+def harmonic_mean_p(
+    p_values: dict[str, float],
+    weights: dict[str, float] | None = None,
+) -> float:
+    """Combine per-detector p-values via Wilson 2019 harmonic-mean p-value.
+
+    HMP = (sum w_i) / (sum w_i / p_i)
+
+    Sanitization rules to keep the strict-JSON contract:
+        - p_i <= 0 is clamped to 1e-300 (denominator stays finite)
+        - non-finite p_i (NaN / +-inf) is treated as 1.0 (no signal)
+        - empty input raises ValueError
+        - if all weights sum to 0, returns 1.0 (no signal)
+
+    Args:
+        p_values: ``{detector_id: p}`` — at least one entry required.
+        weights: ``{detector_id: weight}`` — must sum to 1 if interpreted as
+            proper weights, but any non-negative values are accepted; the
+            implementation normalises by ``sum(weights)``. Defaults to uniform
+            ``1/n`` weighting.
+
+    Returns:
+        Combined p-value in (1e-300, 1.0].
+    """
+    if not p_values:
+        raise ValueError("harmonic_mean_p requires at least one p-value")
+    keys = list(p_values.keys())
+    n = len(keys)
+    if weights is None:
+        w_arr = np.full(n, 1.0 / n, dtype=np.float64)
+    else:
+        w_arr = np.array(
+            [max(float(weights.get(k, 0.0)), 0.0) for k in keys], dtype=np.float64,
+        )
+    weight_sum = float(np.sum(w_arr))
+    if weight_sum <= 0.0:
+        return 1.0
+    p_arr = np.array(
+        [_sanitize_p(float(p_values[k])) for k in keys], dtype=np.float64,
+    )
+    denom = float(np.sum(w_arr / p_arr))
+    if denom <= 0.0 or not math.isfinite(denom):
+        return 1.0
+    hmp = weight_sum / denom
+    return _sanitize_p(hmp)
+
+
+@lru_cache(maxsize=512)
+def hmp_threshold_at_alpha(
+    L: int,
+    alpha: float,
+    *,
+    n_simulation_draws: int = 1_000_000,
+) -> float:
+    """Wilson 2019 corrected threshold for the harmonic-mean p-value.
+
+    The asymptotic null of HMP is heavy-tailed (Landau distribution under the
+    Goeman–Vovk reformulation). Rather than relying on the asymptotic Wilson
+    correction, we estimate the alpha quantile via direct null simulation:
+    ``n_simulation_draws`` independent samples of L Uniform(0, 1] p-values are
+    combined with uniform weights and the alpha-quantile of the resulting HMP
+    distribution returned. The result is cached per ``(L, alpha,
+    n_simulation_draws)`` so repeated calls in the same process are O(1).
+
+    Determinism: the simulation seed is derived from ``(L, n_simulation_draws,
+    int(alpha * 1e9))`` so the threshold is reproducible across calls and
+    machines (modulo numpy version drift).
+
+    Args:
+        L: Number of independent p-values being combined.
+        alpha: Significance level, must be in (0, 1).
+        n_simulation_draws: Sample size for null simulation.
+
+    Returns:
+        Threshold ``t`` such that ``HMP < t`` rejects the null at level alpha.
+    """
+    if L <= 0:
+        raise ValueError(f"L must be a positive integer, got {L}")
+    if not (0.0 < alpha < 1.0):
+        raise ValueError(f"alpha must be in (0, 1), got {alpha}")
+    if n_simulation_draws <= 0:
+        raise ValueError(
+            f"n_simulation_draws must be positive, got {n_simulation_draws}",
+        )
+
+    seed = (
+        int(L) * 0x9E3779B1
+        ^ int(n_simulation_draws) * 0x85EBCA77
+        ^ int(round(float(alpha) * 1e9))
+    )
+    rng = np.random.default_rng(seed & 0xFFFFFFFF)
+    # Uniform(0, 1] (avoid exact zero).
+    samples = rng.uniform(low=1e-12, high=1.0, size=(n_simulation_draws, L))
+    # HMP with uniform 1/L weights: HMP = L / sum(1 / p_i)
+    hmp_null = L / np.sum(1.0 / samples, axis=1)
+    threshold = float(np.quantile(hmp_null, alpha))
+    if not math.isfinite(threshold) or threshold <= 0.0:
+        return _HMP_P_FLOOR
+    if threshold > 1.0:
+        return 1.0
+    return threshold

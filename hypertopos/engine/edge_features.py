@@ -25,6 +25,7 @@ EDGE_DIM_KINDS: dict[str, str] = {
     "time_since_pair_last_edge": "gaussian",
     "pair_amount_zscore":        "gaussian",
     "find_motif_structuring":    "bernoulli",
+    "edge_curvature_frc":        "gaussian",
 }
 
 
@@ -723,6 +724,97 @@ def aggregate_edge_dims_for_anchor(
     return pa.table(out_cols)
 
 
+def compute_edge_curvature_frc(edges: pa.Table) -> pa.Array:
+    """Combinatorial Forman-Ricci curvature per edge.
+
+    For an undirected graph G = (V, E), the combinatorial Forman-Ricci
+    curvature of edge ``(u, v)`` is::
+
+        F(u, v) = 4 − deg(u) − deg(v) + #triangles_containing(u, v)
+
+    Algebraically equivalent to ``2 + #triangles − (deg(u) − 1) − (deg(v) − 1)``.
+
+    Triangle counts come from ``(A @ A).multiply(A)`` — the elementwise
+    product of the adjacency-squared matrix with the adjacency matrix
+    itself, restricted to entries where an edge exists. This avoids
+    materialising the full ``V × V`` density of ``A @ A`` on graphs with
+    hub structure.
+
+    Multigraph collapse: the adjacency matrix carries presence (1), not
+    multiplicity. Combinatorial FRC is defined on simple graphs; the same
+    ``(u, v)`` pair appearing N times in the event table still represents
+    a single undirected edge for curvature purposes — ``(kA) @ (kA) = k² · (A @ A)``
+    would otherwise inflate triangle counts quadratically.
+
+    Direction canonicalisation: AML transactions are directed
+    (sender → receiver) but FRC is undirected. Edges ``(u, v)`` and
+    ``(v, u)`` between the same accounts share the same FRC value because
+    they share the same triangle structure in the undirected sense — the
+    pair key is canonicalised via ``sorted([from_key, to_key])``.
+
+    Per-event output: all events sharing the same canonical ``(min, max)``
+    pair receive the same FRC value, broadcast back to the input event
+    order via the packed-key + ``searchsorted`` pattern (mirror of
+    ``compute_pair_edge_count``).
+    """
+    if edges.num_rows == 0:
+        return pa.array([], type=pa.float32())
+
+    from scipy import sparse
+
+    # ── 1. Per-event canonical undirected pair key ──────────────────────
+    fks = np.asarray(edges["from_key"].to_pylist(), dtype=object)
+    tks = np.asarray(edges["to_key"].to_pylist(), dtype=object)
+    lo = np.where(fks <= tks, fks, tks)
+    hi = np.where(fks <= tks, tks, fks)
+    sep = "\x00"
+    e_key = np.array([f"{a}{sep}{b}" for a, b in zip(lo, hi, strict=False)],
+                     dtype=object)
+
+    # ── 2. Unique undirected pairs ──────────────────────────────────────
+    unique_keys, e_to_pair = np.unique(e_key, return_inverse=True)
+    n_pairs = len(unique_keys)
+
+    pair_lo = np.empty(n_pairs, dtype=object)
+    pair_hi = np.empty(n_pairs, dtype=object)
+    for p_idx in range(n_pairs):
+        a, b = unique_keys[p_idx].split(sep)
+        pair_lo[p_idx] = a
+        pair_hi[p_idx] = b
+
+    # ── 3. Node index over union of endpoints ───────────────────────────
+    # np.unique returns sorted array; pure-numpy searchsorted avoids a
+    # Python dict (~50 MB overhead on 515 k-node spheres) and matches the
+    # searchsorted discipline used for the per-event broadcast below.
+    all_nodes = np.unique(np.concatenate([pair_lo, pair_hi]))
+    V = len(all_nodes)
+    u_idx = np.searchsorted(all_nodes, pair_lo)
+    v_idx = np.searchsorted(all_nodes, pair_hi)
+
+    # ── 4. Symmetric sparse adjacency (presence, not multiplicity) ──────
+    # Multigraph collapse: data is np.ones(...) — same pair appearing many
+    # times in events still contributes a single 1 to A (see docstring).
+    rows = np.concatenate([u_idx, v_idx])
+    cols = np.concatenate([v_idx, u_idx])
+    data = np.ones(2 * n_pairs, dtype=np.float64)
+    A = sparse.coo_matrix((data, (rows, cols)), shape=(V, V)).tocsr()
+
+    # ── 5. Triangle counts: (A @ A).multiply(A), restricted to edges ───
+    A2_restricted = (A @ A).multiply(A)
+    # Pull per-pair triangle counts in one batched sparse fancy-index.
+    tri_counts = np.asarray(A2_restricted[u_idx, v_idx]).flatten()
+
+    # ── 6. Degrees ──────────────────────────────────────────────────────
+    deg = np.asarray(A.sum(axis=1)).flatten()
+
+    # ── 7. Per-pair FRC: 4 − deg(u) − deg(v) + #triangles ───────────────
+    pair_frc = (4.0 - deg[u_idx] - deg[v_idx] + tri_counts).astype(np.float32)
+
+    # ── 8. Broadcast per-pair → per-event order ─────────────────────────
+    out = pair_frc[e_to_pair]
+    return pa.array(out, type=pa.float32())
+
+
 def compute_all_edge_dims(
     edges: pa.Table, config: dict[str, dict[str, Any]],
 ) -> pa.Table:
@@ -754,6 +846,8 @@ def compute_all_edge_dims(
                 amt1_min=float(params["amt1_min"]),
                 amt2_max=float(params["amt2_max"]),
             )
+        elif dim_name == "edge_curvature_frc":
+            columns[dim_name] = compute_edge_curvature_frc(edges)
         else:
             raise ValueError(
                 f"unknown edge dimension: {dim_name!r}; "

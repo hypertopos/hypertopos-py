@@ -1,4 +1,4 @@
-"""Parity + correctness tests for distinct_neighbors_out/in (OPI-116 hotfix)."""
+"""Parity + correctness tests for distinct_neighbors_out/in."""
 from __future__ import annotations
 
 from hypertopos.engine.adjacency import AdjacencyIndex

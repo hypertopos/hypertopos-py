@@ -7,9 +7,17 @@ SCRIPT_PATH = REPO_ROOT / "benchmark" / "ibm-aml" / "profile_motif_perf.py"
 SPHERE_PATH = REPO_ROOT / "benchmark" / "ibm-aml" / "hi_small_sphere" / "gds_aml_hi_small"
 
 
+def _sphere_unavailable() -> bool:
+    sphere_json = SPHERE_PATH / "_gds_meta" / "sphere.json"
+    if not sphere_json.exists():
+        return True
+    import json
+    return json.loads(sphere_json.read_text()).get("format_version") != "3.0"
+
+
 @pytest.mark.skipif(
-    not SPHERE_PATH.exists(),
-    reason="AML HI-Small sphere not present (CI / fresh-clone environment)",
+    _sphere_unavailable(),
+    reason="AML HI-Small sphere not present at format 3.0",
 )
 def test_profile_script_produces_output(tmp_path, monkeypatch):
     """Integration smoke: cProfile script runs end-to-end and writes output."""

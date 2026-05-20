@@ -205,13 +205,14 @@ def test_compute_all_edge_dims_full_config():
         "pair_amount_zscore":        {"cv_threshold": 0.05, "min_count": 3},
         "find_motif_structuring":    {"time_window_hours": 1.0,
                                        "amt1_min": 10000.0, "amt2_max": 10000.0},
+        "edge_curvature_frc":        {},
     }
     out = ef.compute_all_edge_dims(edges, config)
     assert out.num_rows == 3
     assert set(out.column_names) == {
         "event_key", "pair_edge_count", "position_in_chain",
         "time_since_pair_last_edge", "pair_amount_zscore",
-        "find_motif_structuring",
+        "find_motif_structuring", "edge_curvature_frc",
     }
     assert sorted(out["event_key"].to_pylist()) == ["ek1", "ek2", "ek3"]
 
@@ -227,3 +228,139 @@ def test_compute_all_edge_dims_unknown_dim_raises():
     import pytest
     with pytest.raises(ValueError, match="unknown edge dimension"):
         ef.compute_all_edge_dims(edges, config={"nonsense": {}})
+
+
+# ─── edge_curvature_frc ────────────────────────────────────────────────
+
+def test_edge_dim_kinds_includes_frc():
+    """FRC is real-valued (can be negative on sparse local neighbourhoods)
+    → gaussian for Bregman."""
+    assert ef.EDGE_DIM_KINDS["edge_curvature_frc"] == "gaussian"
+
+
+def test_frc_triangle_each_edge_curvature_one():
+    """Triangle A-B-C-A: every edge sits on 1 triangle, every endpoint
+    degree 2 → F = 4 − 2 − 2 + 1 = 1."""
+    edges = _edges([
+        ("A", "B", "ek1", 0.0, 100.0),
+        ("B", "C", "ek2", 1.0, 100.0),
+        ("C", "A", "ek3", 2.0, 100.0),
+    ])
+    arr = ef.compute_edge_curvature_frc(edges)
+    np.testing.assert_array_equal(
+        arr.to_numpy(), np.array([1.0, 1.0, 1.0], dtype=np.float32),
+    )
+
+
+def test_frc_path_no_triangles():
+    """Path A-B, B-C: no triangles. A has degree 1, B has degree 2, C has degree 1.
+    F(A,B) = 4 − 1 − 2 + 0 = 1; F(B,C) = 4 − 2 − 1 + 0 = 1."""
+    edges = _edges([
+        ("A", "B", "ek1", 0.0, 100.0),
+        ("B", "C", "ek2", 1.0, 100.0),
+    ])
+    arr = ef.compute_edge_curvature_frc(edges)
+    np.testing.assert_array_equal(
+        arr.to_numpy(), np.array([1.0, 1.0], dtype=np.float32),
+    )
+
+
+def test_frc_star_negative_curvature():
+    """Star: H-L1, H-L2, H-L3, H-L4. Hub degree 4, each leaf degree 1, no triangles.
+    F = 4 − 4 − 1 + 0 = −1 per edge."""
+    edges = _edges([
+        ("H", "L1", "ek1", 0.0, 100.0),
+        ("H", "L2", "ek2", 1.0, 100.0),
+        ("H", "L3", "ek3", 2.0, 100.0),
+        ("H", "L4", "ek4", 3.0, 100.0),
+    ])
+    arr = ef.compute_edge_curvature_frc(edges)
+    np.testing.assert_array_equal(
+        arr.to_numpy(), np.array([-1.0, -1.0, -1.0, -1.0], dtype=np.float32),
+    )
+
+
+def test_frc_k4_zero_curvature():
+    """K4 (4 nodes, 6 edges, fully connected): every edge sits on 2 triangles,
+    every degree 3 → F = 4 − 3 − 3 + 2 = 0."""
+    edges = _edges([
+        ("A", "B", "ek1", 0.0, 100.0),
+        ("A", "C", "ek2", 1.0, 100.0),
+        ("A", "D", "ek3", 2.0, 100.0),
+        ("B", "C", "ek4", 3.0, 100.0),
+        ("B", "D", "ek5", 4.0, 100.0),
+        ("C", "D", "ek6", 5.0, 100.0),
+    ])
+    arr = ef.compute_edge_curvature_frc(edges)
+    np.testing.assert_array_equal(
+        arr.to_numpy(), np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+    )
+
+
+def test_frc_direction_canonicalised_undirected():
+    """`(A, B)` and `(B, A)` events between the same accounts share the same
+    FRC value because the underlying graph is undirected."""
+    edges = _edges([
+        ("A", "B", "ek1", 0.0, 100.0),
+        ("B", "A", "ek2", 1.0, 100.0),  # reversed direction, same pair
+        ("B", "C", "ek3", 2.0, 100.0),
+        ("C", "A", "ek4", 3.0, 100.0),
+    ])
+    arr = ef.compute_edge_curvature_frc(edges).to_numpy()
+    # Underlying undirected graph is the triangle A-B-C → every edge FRC = 1.
+    # The (A,B) and (B,A) events both belong to the same undirected edge.
+    np.testing.assert_array_equal(
+        arr, np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32),
+    )
+
+
+def test_frc_multigraph_collapse_no_count_inflation():
+    """Duplicate `(A, B)` events must NOT inflate the triangle count.
+    Underlying simple graph is the triangle A-B-C → FRC = 1 for every event."""
+    edges = _edges([
+        ("A", "B", "ek1", 0.0, 100.0),
+        ("A", "B", "ek2", 1.0, 100.0),  # duplicate
+        ("A", "B", "ek3", 2.0, 100.0),  # duplicate
+        ("B", "C", "ek4", 3.0, 100.0),
+        ("C", "A", "ek5", 4.0, 100.0),
+    ])
+    arr = ef.compute_edge_curvature_frc(edges).to_numpy()
+    np.testing.assert_array_equal(
+        arr, np.array([1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32),
+    )
+
+
+def test_frc_single_mega_hub_pathological():
+    """Single-hub topology: 1 hub + 200 leaves, no triangles. Exercises the
+    pathological case where A @ A could blow up without the .multiply(A) mask
+    — the hub has degree 200 so its row in A @ A would have 200 non-zero
+    entries each pointing back to itself; the mask restricts the result to
+    actual edges. FRC = 4 − 200 − 1 + 0 = −197 per edge."""
+    edges = _edges([
+        ("H", f"L{i}", f"ek{i}", float(i), 100.0) for i in range(200)
+    ])
+    arr = ef.compute_edge_curvature_frc(edges).to_numpy()
+    np.testing.assert_array_equal(
+        arr, np.full(200, -197.0, dtype=np.float32),
+    )
+
+
+def test_frc_empty_table_returns_empty():
+    edges = _edges([])
+    arr = ef.compute_edge_curvature_frc(edges)
+    assert arr.type == pa.float32()
+    assert len(arr) == 0
+
+
+def test_compute_all_edge_dims_dispatches_frc():
+    edges = _edges([
+        ("A", "B", "ek1", 0.0, 100.0),
+        ("B", "C", "ek2", 1.0, 100.0),
+        ("C", "A", "ek3", 2.0, 100.0),
+    ])
+    result = ef.compute_all_edge_dims(edges, config={"edge_curvature_frc": {}})
+    assert "edge_curvature_frc" in result.column_names
+    np.testing.assert_array_equal(
+        result["edge_curvature_frc"].to_numpy(),
+        np.array([1.0, 1.0, 1.0], dtype=np.float32),
+    )

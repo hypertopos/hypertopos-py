@@ -129,7 +129,7 @@ class TestMixedBinaryContinuousDims:
 
     def test_delta_has_two_dimensions(self, event_sphere):
         out_path, _ = event_sphere
-        geo_path = str(Path(out_path) / "geometry" / "event_pattern" / "v=1" / "data.lance")
+        geo_path = str(Path(out_path) / "geometry" / "event_pattern" / "data.lance")
         geo = lance.dataset(geo_path).to_table()
         deltas = geo["delta"].to_pylist()
 
@@ -139,7 +139,7 @@ class TestMixedBinaryContinuousDims:
 
     def test_binary_dim_values_are_zero_or_one(self, event_sphere):
         out_path, _ = event_sphere
-        geo_path = str(Path(out_path) / "geometry" / "event_pattern" / "v=1" / "data.lance")
+        geo_path = str(Path(out_path) / "geometry" / "event_pattern" / "data.lance")
         geo = lance.dataset(geo_path).to_table()
 
         # Reconstruct shape vectors from delta: shape = delta * sigma + mu
@@ -159,7 +159,7 @@ class TestMixedBinaryContinuousDims:
 
     def test_continuous_dim_in_range_zero_to_three(self, event_sphere):
         out_path, _ = event_sphere
-        geo_path = str(Path(out_path) / "geometry" / "event_pattern" / "v=1" / "data.lance")
+        geo_path = str(Path(out_path) / "geometry" / "event_pattern" / "data.lance")
         geo = lance.dataset(geo_path).to_table()
 
         # Reconstruct shape vectors from delta
@@ -182,7 +182,7 @@ class TestMixedBinaryContinuousDims:
 
     def test_continuous_dim_has_non_binary_values(self, event_sphere):
         out_path, _ = event_sphere
-        geo_path = str(Path(out_path) / "geometry" / "event_pattern" / "v=1" / "data.lance")
+        geo_path = str(Path(out_path) / "geometry" / "event_pattern" / "data.lance")
         geo = lance.dataset(geo_path).to_table()
 
         # Reconstruct shape vectors from delta
@@ -208,7 +208,7 @@ class TestAnomalyDetectsValueOutlier:
 
     def test_outlier_is_anomaly(self, event_sphere):
         out_path, _ = event_sphere
-        geo_path = str(Path(out_path) / "geometry" / "event_pattern" / "v=1" / "data.lance")
+        geo_path = str(Path(out_path) / "geometry" / "event_pattern" / "data.lance")
         geo = lance.dataset(geo_path).to_table()
 
         pks = geo["primary_key"].to_pylist()
@@ -275,7 +275,7 @@ class TestBinaryOnlyBackwardCompat:
 
     def test_all_deltas_binary(self, binary_only_sphere):
         out_path = binary_only_sphere
-        geo_path = str(Path(out_path) / "geometry" / "binary_event_pattern" / "v=1" / "data.lance")
+        geo_path = str(Path(out_path) / "geometry" / "binary_event_pattern" / "data.lance")
         geo = lance.dataset(geo_path).to_table()
 
         # Reconstruct shape vectors: shape = delta * sigma + mu

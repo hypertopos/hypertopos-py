@@ -127,6 +127,11 @@ class PatternConfig:
     # --- Edge-derived dimensions ---
     edge_dimensions: list | None = None  # list[str | dict] from YAML — parsed lazily
     edge_dim_aggregations: dict | None = None  # {"from": <event_pid>, "dims": [...]} — parsed lazily
+    # --- Multi-resolution FDR hierarchies ---
+    # Raw YAML lists. Converted to FDRHierarchyLevel / FDRTemporalLevel
+    # in cli.build._add_pattern before being passed to builder.add_pattern.
+    fdr_hierarchy: list | None = None  # list[dict] with {level, from_dimension}
+    fdr_temporal_hierarchy: list | None = None  # list[dict] with {level, slice_dimension, bucket?}
 
 
 @dataclass
@@ -624,6 +629,26 @@ def _parse_one_pattern(
             "n_components": int(raw_sd["n_components"]),
         }
 
+    fdr_hier_raw = spec.get("fdr_hierarchy")
+    fdr_hierarchy: list | None = None
+    if fdr_hier_raw is not None:
+        if not isinstance(fdr_hier_raw, list):
+            raise ValueError(
+                f"Pattern '{pid}' fdr_hierarchy must be a list, "
+                f"got {type(fdr_hier_raw).__name__}"
+            )
+        fdr_hierarchy = [dict(level) for level in fdr_hier_raw]
+
+    fdr_temporal_raw = spec.get("fdr_temporal_hierarchy")
+    fdr_temporal_hierarchy: list | None = None
+    if fdr_temporal_raw is not None:
+        if not isinstance(fdr_temporal_raw, list):
+            raise ValueError(
+                f"Pattern '{pid}' fdr_temporal_hierarchy must be a list, "
+                f"got {type(fdr_temporal_raw).__name__}"
+            )
+        fdr_temporal_hierarchy = [dict(level) for level in fdr_temporal_raw]
+
     return PatternConfig(
         type=ptype,
         entity_line=str(entity_line),
@@ -645,6 +670,8 @@ def _parse_one_pattern(
         semantic_dim=semantic_dim,
         edge_dimensions=spec.get("edge_dimensions"),
         edge_dim_aggregations=spec.get("edge_dim_aggregations"),
+        fdr_hierarchy=fdr_hierarchy,
+        fdr_temporal_hierarchy=fdr_temporal_hierarchy,
     )
 
 

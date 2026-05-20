@@ -4,12 +4,124 @@
 # See LICENSE.md in the repository root for full terms.
 from __future__ import annotations
 
+import hashlib
+import json
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
 import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Conformance rules (M1.7) — declarative compliance predicates evaluated at
+# build time against a pattern's points table. Predicate language is a safe
+# AST: logical compounds (and/or/not) wrapping leaf comparisons (==, !=, <,
+# <=, >, >=, in). No eval() — compiled to PyArrow expressions in the
+# builder.conformance module.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ConformancePredicate:
+    """Predicate AST — logical compound or leaf comparison.
+
+    Logical ops (``and``, ``or``, ``not``) carry ``terms`` (children).
+    Comparison ops (``==``, ``!=``, ``<``, ``<=``, ``>``, ``>=``, ``in``)
+    carry ``prop`` (column name on the points table) and ``value``
+    (RHS literal — list/tuple for ``in``).
+    """
+
+    op: Literal["and", "or", "not", "==", "!=", "<", "<=", ">", ">=", "in"]
+    terms: list[ConformancePredicate] | None = None
+    prop: str | None = None
+    value: Any = None
+
+
+@dataclass(frozen=True)
+class ConformanceRule:
+    """One conformance rule attached to a Pattern.
+
+    The rule fires when ``violates_when`` evaluates True on an entity row.
+    ``severity`` is one of ``low``, ``medium``, ``high``, ``critical``.
+    """
+
+    rule_id: str
+    severity: Literal["low", "medium", "high", "critical"]
+    violates_when: ConformancePredicate
+    description: str | None = None
+
+
+def _predicate_to_dict(pred: ConformancePredicate) -> dict[str, Any]:
+    """Serialize a predicate AST to a JSON-safe dict."""
+    out: dict[str, Any] = {"op": pred.op}
+    if pred.terms is not None:
+        out["terms"] = [_predicate_to_dict(t) for t in pred.terms]
+    if pred.prop is not None:
+        out["prop"] = pred.prop
+    if pred.value is not None:
+        # tuple → list for JSON round-trip stability
+        if isinstance(pred.value, tuple):
+            out["value"] = list(pred.value)
+        else:
+            out["value"] = pred.value
+    return out
+
+
+def _predicate_from_dict(d: dict[str, Any]) -> ConformancePredicate:
+    """Parse a predicate AST from a JSON dict."""
+    op = d["op"]
+    terms_raw = d.get("terms")
+    terms = (
+        [_predicate_from_dict(t) for t in terms_raw]
+        if terms_raw is not None else None
+    )
+    return ConformancePredicate(
+        op=op,
+        terms=terms,
+        prop=d.get("prop"),
+        value=d.get("value"),
+    )
+
+
+def _rule_to_dict(rule: ConformanceRule) -> dict[str, Any]:
+    """Serialize a single rule to JSON-safe dict."""
+    out: dict[str, Any] = {
+        "rule_id": rule.rule_id,
+        "severity": rule.severity,
+        "violates_when": _predicate_to_dict(rule.violates_when),
+    }
+    if rule.description is not None:
+        out["description"] = rule.description
+    return out
+
+
+def _rule_from_dict(d: dict[str, Any]) -> ConformanceRule:
+    """Parse a single rule from a JSON dict."""
+    return ConformanceRule(
+        rule_id=d["rule_id"],
+        severity=d["severity"],
+        violates_when=_predicate_from_dict(d["violates_when"]),
+        description=d.get("description"),
+    )
+
+
+def compute_rule_set_hash(rules: list[ConformanceRule]) -> str:
+    """Deterministic SHA-256 hex digest of a rule set.
+
+    Order-invariant: sorts rules by ``rule_id`` before hashing so
+    ``[r1, r2]`` and ``[r2, r1]`` produce the same digest. Empty rule
+    list hashes to the SHA-256 of an empty JSON list.
+    """
+    sorted_rules = sorted(rules, key=lambda r: r.rule_id)
+    payload = json.dumps(
+        [_rule_to_dict(r) for r in sorted_rules],
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 @dataclass
@@ -71,6 +183,51 @@ class EventDimDef:
     display_name: str | None = None
 
 
+@dataclass
+class FDRHierarchyLevel:
+    """One level of a spatial FDR hierarchy.
+
+    Read by GDSNavigator.π5_attract_anomaly when find_anomalies is called
+    with `fdr_resolution` set.
+    """
+    level: str
+    from_dimension: str
+
+    @classmethod
+    def from_dict(cls, d: dict) -> FDRHierarchyLevel:
+        if "level" not in d or "from_dimension" not in d:
+            raise ValueError(
+                "FDR hierarchy level requires both 'level' and 'from_dimension', "
+                f"got {d!r}",
+            )
+        return cls(level=str(d["level"]), from_dimension=str(d["from_dimension"]))
+
+
+@dataclass
+class FDRTemporalLevel:
+    """One level of a temporal FDR hierarchy.
+
+    The builder materialises `slice_dimension` at build time when the column
+    is not yet present on the geometry table.
+    """
+    level: str
+    slice_dimension: str
+    bucket: str = "90d"
+
+    @classmethod
+    def from_dict(cls, d: dict) -> FDRTemporalLevel:
+        if "level" not in d or "slice_dimension" not in d:
+            raise ValueError(
+                "FDR temporal level requires both 'level' and 'slice_dimension', "
+                f"got {d!r}",
+            )
+        return cls(
+            level=str(d["level"]),
+            slice_dimension=str(d["slice_dimension"]),
+            bucket=str(d.get("bucket", "90d")),
+        )
+
+
 @dataclass(frozen=True)
 class EdgeDimAggregationsRef:
     from_event_pattern: str
@@ -120,6 +277,9 @@ class Pattern:
     timestamp_col: str | None = None
     dimension_kinds: list[str] | None = None
     edge_dim_aggregations: "EdgeDimAggregationsRef | None" = None
+    fdr_hierarchy: list[FDRHierarchyLevel] = field(default_factory=list)
+    fdr_temporal_hierarchy: list[FDRTemporalLevel] = field(default_factory=list)
+    conformance_rules: list[ConformanceRule] = field(default_factory=list)
 
     def delta_dim(self) -> int:
         base = (

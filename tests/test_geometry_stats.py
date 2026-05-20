@@ -146,7 +146,7 @@ class TestWriteLanceGeometryAutoStats:
         Callers who know theta_norm must call write_geometry_stats explicitly."""
         writer = GDSWriter(str(tmp_path))
         reader = GDSReader(str(tmp_path))
-        geo_dir = tmp_path / "geometry" / "pat" / "v=1"
+        geo_dir = tmp_path / "geometry" / "pat" 
         table = self._make_geo_table(10)
 
         writer.write_lance_geometry(table, geo_dir)
@@ -164,7 +164,7 @@ class TestWriteLanceGeometryAutoStats:
         table = self._make_geo_table(10)
 
         # Write geometry directly (bypasses write_lance_geometry)
-        lance_path = tmp_path / "geometry" / "bi_pat" / "v=1" / "data.lance"
+        lance_path = tmp_path / "geometry" / "bi_pat" / "data.lance"
         lance_path.parent.mkdir(parents=True, exist_ok=True)
         delta_col = table["delta"]
         list_size = len(delta_col[0].as_py())

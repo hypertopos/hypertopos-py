@@ -12,9 +12,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pyarrow as pa
 import pytest
-
 from hypertopos.model.manifest import Contract, Manifest
-from hypertopos.model.objects import Polygon
 from hypertopos.model.sphere import (
     Alias,
     AliasFilter,
@@ -344,6 +342,33 @@ class TestPi5FdrSelect:
                 "test_pattern", top_n=5, fdr_method="bogus",
             )
 
+    def test_pi5_rank_by_invalid_raises(self, nav_pi5):
+        with pytest.raises(ValueError, match="rank_by must be"):
+            nav_pi5.π5_attract_anomaly(
+                "test_pattern", top_n=5, rank_by="bogus",
+            )
+
+    def test_pi5_rank_by_min_q_per_dim_requires_fdr_alpha(self, nav_pi5):
+        with pytest.raises(ValueError, match="requires fdr_alpha"):
+            nav_pi5.π5_attract_anomaly(
+                "test_pattern", top_n=5, rank_by="min_q_per_dim",
+                fdr_alpha=None, fdr_axis="per_dim",
+            )
+
+    def test_pi5_rank_by_min_q_per_dim_requires_per_dim_axis(self, nav_pi5):
+        with pytest.raises(ValueError, match="fdr_axis"):
+            nav_pi5.π5_attract_anomaly(
+                "test_pattern", top_n=5, rank_by="min_q_per_dim",
+                fdr_alpha=0.05, fdr_axis="entity",
+            )
+
+    def test_pi5_rank_by_min_q_per_dim_incompatible_with_diverse(self, nav_pi5):
+        with pytest.raises(ValueError, match="select='diverse'"):
+            nav_pi5.π5_attract_anomaly(
+                "test_pattern", top_n=5, rank_by="min_q_per_dim",
+                fdr_alpha=0.05, fdr_axis="per_dim", select="diverse",
+            )
+
 
 # ======================================================================
 # π6 attract_boundary
@@ -370,7 +395,7 @@ class TestPi6FdrSelect:
             "test_alias", "test_pattern", top_n=20, fdr_alpha=0.05,
         )
         assert len(filtered) <= len(base)
-        for poly, dist in filtered:
+        for poly, _dist in filtered:
             assert hasattr(poly, "q_value")
             assert poly.q_value <= 0.05  # type: ignore[attr-defined]
 
@@ -436,7 +461,7 @@ class TestPi7FdrSelect:
         )
         assert len(filtered) <= len(base)
         # All results are still 3-tuples
-        for pk, count, score in filtered:
+        for pk, _count, score in filtered:
             assert isinstance(pk, str)
             assert isinstance(score, float)
 

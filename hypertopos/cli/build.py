@@ -39,6 +39,7 @@ def run_build(
     no_temporal: bool = False,
     no_chains: bool = False,
     no_edges: bool = False,
+    label_aware_calibration: bool = False,
 ) -> None:
     """Execute the ``hypertopos build`` command."""
     try:
@@ -67,6 +68,7 @@ def run_build(
             cfg, base_dir, str(out_path), verbose,
             no_temporal=no_temporal, no_chains=no_chains,
             no_edges=no_edges,
+            label_aware_calibration=label_aware_calibration,
         )
         print(f"Built: {out_path}")
     except Exception as exc:
@@ -212,6 +214,7 @@ def build_from_config(
     verbose: bool = False,
     no_temporal: bool = False,
     no_chains: bool = False,
+    label_aware_calibration: bool = False,
 ) -> None:
     """Build a sphere from a parsed SphereConfig.
 
@@ -222,6 +225,7 @@ def build_from_config(
     _do_build(
         cfg, base_dir, str(output_path), verbose,
         no_temporal=no_temporal, no_chains=no_chains,
+        label_aware_calibration=label_aware_calibration,
     )
 
 
@@ -236,6 +240,7 @@ def _do_build(
     no_temporal: bool = False,
     no_chains: bool = False,
     no_edges: bool = False,
+    label_aware_calibration: bool = False,
 ) -> None:
     """Core build: loads sources, wires GDSBuilder, calls build + temporal."""
     import time
@@ -375,6 +380,17 @@ def _do_build(
     # Suppress edge table emission if --no-edges
     if no_edges:
         builder._no_edges = True
+
+    # Opt-in label-aware per-dim calibration. Cost is zero unless the
+    # YAML config also declares a label_audit block selecting patterns
+    # (consumed via builder._label_audit_block). The CLI flag toggles
+    # the engine path; the YAML block tells the builder which patterns
+    # to calibrate and which column carries the label. Both must be
+    # set for label-aware calibration to fire.
+    if label_aware_calibration:
+        builder._label_aware_calibration = True
+    if cfg.label_audit is not None:
+        builder._label_audit_block = cfg.label_audit
 
     t_phase = time.time()
     tc_dicts: list[dict[str, str]] | None = None
@@ -555,6 +571,25 @@ def _add_pattern(
             for d in pat_cfg.fdr_temporal_hierarchy
         ]
 
+    # Declarative conformance rules (YAML list → ConformanceRule list).
+    # ``available_columns`` lets the loader reject prop references that
+    # are not actual columns on the entity points table — fails fast at
+    # build start, not at evaluate time.
+    _conformance_rules: list = []
+    if pat_cfg.conformance_rules:
+        from hypertopos.builder.conformance_mapping import (
+            parse_conformance_rules,
+        )
+        line_reg = builder._lines.get(pat_cfg.entity_line)  # type: ignore[attr-defined]
+        avail_cols: set[str] | None = (
+            set(line_reg.table.column_names) if line_reg is not None else None
+        )
+        _conformance_rules = parse_conformance_rules(
+            pat_cfg.conformance_rules,
+            pattern_id=pid,
+            available_columns=avail_cols,
+        )
+
     builder.add_pattern(  # type: ignore[union-attr]
         pid,
         pattern_type=pat_cfg.type,
@@ -575,6 +610,7 @@ def _add_pattern(
         edge_dim_aggregations=_edge_dim_agg_cfg,
         fdr_hierarchy=_fdr_hierarchy,
         fdr_temporal_hierarchy=_fdr_temporal_hierarchy,
+        conformance_rules=_conformance_rules,
     )
 
     # Event dimensions

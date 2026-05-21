@@ -629,3 +629,79 @@ def test_per_dim_subset_flips_schema_hash_vs_all_five(tmp_path: Path):
     # full: 1 derived + 2 dims × 5 aggs = 11; subset: 1 derived + 1 + 2 = 4
     assert len(kinds_full) == 11
     assert len(kinds_subset) == 4
+
+
+def test_dim_percentiles_cover_aggregated_edge_dims(tmp_path: Path):
+    """Builder emits dim_percentiles entries for every aggregated edge dim,
+    keyed by the canonical ``{source_dim}_{aggregate}`` label from
+    ``Pattern._edge_dim_aggregation_names``. Pre-fix the cache covered
+    only event_dims / prop_cols, so percentile-keyed consumers
+    (sphere_overview profiling_alerts, audit_pattern_dims thresholds)
+    had no signal for the aggregation block — the new aggregated
+    dimensions were invisible to those auditors.
+    """
+    out = tmp_path / "gds_with"
+    _make_sphere(out, with_aggregations=True).build()
+    sphere = GDSReader(str(out)).read_sphere()
+    pat = sphere.patterns["account_pattern"]
+
+    agg_names = pat._edge_dim_aggregation_names()
+    assert agg_names, "fixture must declare at least one agg dim"
+    # 1 source dim × 5 aggs (mean / max / std / p95 / count_above_threshold)
+    expected_aggs = {
+        "pair_edge_count_mean",
+        "pair_edge_count_max",
+        "pair_edge_count_std",
+        "pair_edge_count_p95",
+        "pair_edge_count_count_above_threshold",
+    }
+    assert set(agg_names) == expected_aggs
+
+    dp = pat.dim_percentiles or {}
+    missing = set(agg_names) - set(dp)
+    assert not missing, (
+        f"dim_percentiles must contain an entry for every aggregated edge "
+        f"dim; missing: {sorted(missing)}; have: {sorted(dp)}"
+    )
+
+    # Schema parity with event_dims / prop_cols path: same six keys per
+    # entry. Any drift here breaks consumers that read the cache uniformly.
+    expected_keys = {"min", "p25", "p50", "p75", "p99", "max"}
+    for label in agg_names:
+        assert set(dp[label]) == expected_keys, (
+            f"dim_percentiles[{label!r}] schema {set(dp[label])} != "
+            f"expected {expected_keys}"
+        )
+        # Percentile invariants: monotone non-decreasing, finite.
+        entry = dp[label]
+        for k in ("min", "p25", "p50", "p75", "p99", "max"):
+            assert entry[k] == entry[k], f"NaN at {label!r}[{k!r}]"
+        assert entry["min"] <= entry["p50"] <= entry["max"], (
+            f"non-monotone percentiles for {label!r}: {entry}"
+        )
+
+
+def test_dim_percentiles_absent_for_anchor_without_aggregations(
+    tmp_path: Path,
+):
+    """Discriminator: when the anchor has no edge_dim_aggregations
+    block, no agg-label entries leak into ``dim_percentiles``. Catches a
+    bug class where the new code path would always run regardless of
+    whether the pattern declares aggregations.
+    """
+    out = tmp_path / "gds_baseline"
+    _make_sphere(out, with_aggregations=False).build()
+    sphere = GDSReader(str(out)).read_sphere()
+    pat = sphere.patterns["account_pattern"]
+
+    assert pat._edge_dim_aggregation_names() == []
+    dp = pat.dim_percentiles or {}
+    # No "<dim>_<agg>" entries should appear when no aggregations declared.
+    agg_suffixes = ("_mean", "_max", "_std", "_p95", "_count_above_threshold")
+    leaked = [k for k in dp if any(k.endswith(s) for s in agg_suffixes)]
+    # tx_out_count is a derived dim with edge_max — it gets a percentile entry
+    # but doesn't end in any of the agg suffixes, so the filter is clean.
+    assert not leaked, (
+        f"aggregation labels leaked into dim_percentiles for an anchor "
+        f"without aggregations: {leaked}"
+    )

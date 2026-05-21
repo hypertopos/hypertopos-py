@@ -980,6 +980,7 @@ def test_delta_rank_pct_consistent_after_two_builds(tmp_path):
             "bregman_divergence": pa.array([0.0], type=pa.float32()),
             "anomaly_confidence": pa.array([0.0], type=pa.float32()),
             "n_anomalous_dims": pa.array([0], type=pa.int32()),
+            "delta_norm_signed": pa.array([None], type=pa.float32()),
             "entity_keys": pa.array([[]], type=pa.list_(pa.string())),
             "last_refresh_at": pa.array([now], type=pa.timestamp("us", tz="UTC")),
             "updated_at": pa.array([now], type=pa.timestamp("us", tz="UTC")),
@@ -1681,6 +1682,100 @@ def test_streaming_complex_mode_falls_back_to_chunked(tmp_path, monkeypatch):
         assert mock_chunked.call_count == 1, (
             "Complex mode (group_by) must use _build_and_write_chunked"
         )
+
+
+def test_heteroscedasticity_diagnostic_persisted_when_group_by_property(tmp_path):
+    """Patterns with `group_by_property` get a Brown-Forsythe Levene
+    entry persisted into sphere.json under
+    `heteroscedasticity_diagnostic`, keyed by the grouping column name.
+    Engineered anchor-pattern fixture: customers carry an `event_count`
+    numeric column whose distribution differs sharply by region — region
+    `high` is N(50, 30) tailed, regions `low_1`/`low_2` are N(20, 3).
+    The `edge_max` relation turns those counts into delta vector entries,
+    so delta_norm variance differs by region ⇒ Levene p ≪ 0.01."""
+    import json
+
+    rng = np.random.default_rng(42)
+
+    customers: list[dict] = []
+    cust_id = 0
+    for region_label, mean_count, std_count in (
+        ("low_1", 20, 3),
+        ("low_2", 20, 3),
+        ("high", 50, 30),
+    ):
+        for _ in range(100):
+            event_count = max(0, int(rng.normal(mean_count, std_count)))
+            customers.append({
+                "cust_id": f"C-{cust_id:04d}",
+                "region": region_label,
+                "event_count": event_count,
+            })
+            cust_id += 1
+
+    out_path = tmp_path / "gds_het"
+    b = GDSBuilder("het_test", str(out_path))
+    b.add_line(
+        "customers", customers, key_col="cust_id", source_id="test",
+    )
+    b.add_pattern(
+        "cust_pat",
+        pattern_type="anchor",
+        entity_line="customers",
+        relations=[
+            RelationSpec(
+                "customers", fk_col="event_count",
+                direction="in", edge_max=100,
+            ),
+        ],
+        group_by_property="region",
+        anomaly_percentile=95.0,
+    )
+    b.build()
+
+    sphere_json_path = out_path / "_gds_meta" / "sphere.json"
+    with open(sphere_json_path) as f:
+        sphere = json.load(f)
+    pat_node = sphere["patterns"]["cust_pat"]
+    assert "heteroscedasticity_diagnostic" in pat_node, (
+        "heteroscedasticity_diagnostic missing on a pattern that carries "
+        "group_by_property — diagnostic was not threaded through "
+        "PopulationStats / PatternBuildResult / sphere.json writer"
+    )
+    diag = pat_node["heteroscedasticity_diagnostic"]
+    assert "region" in diag
+    entry = diag["region"]
+    assert entry["k_groups"] == 3
+    assert entry["skipped_groups_low_n"] == 0
+    assert entry["W_statistic"] is not None
+    assert entry["p_value"] is not None
+    assert set(entry["per_group_n"].keys()) == {"low_1", "low_2", "high"}
+    # Engineered fixture: high-region std ~10x low-region std ⇒ Levene
+    # must reject equal-variance well below the 0.01 warning threshold.
+    assert entry["p_value"] < 0.01
+
+    # Round-trip: reopen the sphere and verify the warning surfaces via
+    # sphere_overview's dim_quality_warnings block — proves the
+    # build → sphere.json → reader → Pattern → navigator chain.
+    from hypertopos.sphere import HyperSphere
+
+    sphere_obj = HyperSphere.open(str(out_path))
+    session = sphere_obj.session(agent_id="het_test")
+    nav = session.navigator()
+    entries = nav.sphere_overview()
+    pat_entry = next(e for e in entries if e["pattern_id"] == "cust_pat")
+    het = [
+        w for w in pat_entry.get("dim_quality_warnings", [])
+        if w["type"] == "heteroscedasticity"
+    ]
+    assert len(het) == 1, (
+        "heteroscedasticity warning missing from sphere_overview — the "
+        "field round-trip from sphere.json → reader → Pattern → navigator "
+        "is broken"
+    )
+    assert het[0]["dim_label"] == "region"
+    assert het[0]["threshold"] == 0.01
+    assert het[0]["evidence_value"] < 0.01
 
 
 def test_welford_batch_update_accuracy():

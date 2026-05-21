@@ -113,17 +113,30 @@ class GDSReader:
     def read_sphere(self) -> Sphere:
         raw = json.loads((self._base / "_gds_meta" / "sphere.json").read_text())
         fmt = raw.get("format_version")
-        if fmt != "3.0":
+        # Major-only comparison: format 3.x is accepted, anything else is
+        # rejected. New optional top-level fields ride the minor bump
+        # without breaking readers older than the bump (e.g. label_audit
+        # added in 3.1 is invisible to readers that don't look for it).
+        try:
+            major = int(str(fmt).split(".", 1)[0])
+        except (ValueError, AttributeError):
+            raise GDSVersionError(
+                f"Unsupported sphere format_version {fmt!r}: malformed "
+                "version string, expected major.minor. Rebuild the sphere "
+                "from source.",
+            ) from None
+        if major != 3:
             raise GDSVersionError(
                 f"Unsupported sphere format_version {fmt!r}: native Lance MVCC "
-                "geometry requires 3.0. Rebuild the sphere from source "
-                "(see CHANGELOG 0.7.0).",
+                "geometry requires format major 3. Rebuild the sphere from "
+                "source.",
             )
         lines = {k: self._parse_line(v) for k, v in raw.get("lines", {}).items()}
         patterns = {k: self._parse_pattern(v) for k, v in raw.get("patterns", {}).items()}
         aliases = {k: self._parse_alias(v) for k, v in raw.get("aliases", {}).items()}
         storage = self._parse_storage_config(raw)
         self._storage_config = storage
+        label_audit = raw.get("label_audit")
         sphere = Sphere(
             sphere_id=raw["sphere_id"],
             name=raw["name"],
@@ -132,6 +145,7 @@ class GDSReader:
             patterns=patterns,
             aliases=aliases,
             storage=storage,
+            label_audit=label_audit if isinstance(label_audit, dict) else None,
         )
         for alias in sphere.aliases.values():
             cp = alias.filter.cutting_plane
@@ -258,6 +272,27 @@ class GDSReader:
         else:
             edge_dim_aggregations = None
 
+        # Hydrate label-aware per-dim calibration when sphere.json carries
+        # it (sphere format 3.1+, builder hook fired). Each entry is
+        # wrapped in a SimpleNamespace so the MCP audit_pattern_dims tool's
+        # attribute access (``dim_cal.mu_pos``, ``dim_cal.direction``)
+        # works identically to in-build ``DimCalibration`` instances.
+        lac_raw = raw.get("label_aware_calibration")
+        label_aware_calibration: dict[str, Any] | None = None
+        if isinstance(lac_raw, dict) and lac_raw:
+            from types import SimpleNamespace
+            label_aware_calibration = {
+                label: SimpleNamespace(
+                    mu_pos=float(entry.get("mu_pos", 0.0)),
+                    sigma_pos=float(entry.get("sigma_pos", 0.0)),
+                    mu_neg=float(entry.get("mu_neg", 0.0)),
+                    sigma_neg=float(entry.get("sigma_neg", 0.0)),
+                    direction=float(entry.get("direction", 0.0)),
+                )
+                for label, entry in lac_raw.items()
+                if isinstance(entry, dict)
+            }
+
         return Pattern(
             pattern_id=raw["pattern_id"],
             entity_type=raw["entity_type"],
@@ -314,10 +349,16 @@ class GDSReader:
             dim_percentiles=raw.get("dim_percentiles"),
             timestamp_col=raw.get("timestamp_col"),
             dimension_kinds=raw.get("dimension_kinds"),
+            dim_normality_pvalues=raw.get("dim_normality_pvalues"),
             edge_dim_aggregations=edge_dim_aggregations,
             fdr_hierarchy=fdr_hierarchy,
             fdr_temporal_hierarchy=fdr_temporal_hierarchy,
             conformance_rules=conformance_rules,
+            heteroscedasticity_diagnostic=raw.get(
+                "heteroscedasticity_diagnostic",
+            ),
+            edge_dim_names=list(raw.get("edge_dim_names") or []),
+            label_aware_calibration=label_aware_calibration,
         )
 
     def _parse_alias(self, raw: dict[str, Any]) -> Alias:
@@ -1149,6 +1190,7 @@ class GDSReader:
             last_calibrated_at=_parse_dt(
                 pattern_node.get("last_calibrated_at") or pattern_node["computed_at"]
             ),
+            dim_normality_pvalues=pattern_node.get("dim_normality_pvalues"),
         )
 
     def read_calibration_history_policy(self) -> dict[str, int]:

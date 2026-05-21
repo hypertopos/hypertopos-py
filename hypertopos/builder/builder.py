@@ -570,6 +570,24 @@ class PopulationStats:
     dim_block_names: list[str] = field(default_factory=list)
     dim_block_stats: dict[str, Any] | None = None
     theta_sensitivity: dict[str, dict[str, float]] | None = None
+    # Per-entity values for aggregated edge dims, (N, n_agg_cols) float32.
+    # None when the pattern declares no edge_dim_aggregations.
+    # Parallel label list — canonical "{dim}_{agg}" names in column order,
+    # matching ``Pattern._edge_dim_aggregation_names`` at read time.
+    edge_dim_agg_matrix: np.ndarray | None = None
+    edge_dim_agg_labels: list[str] = field(default_factory=list)
+    # Brown-Forsythe (median-centred Levene) diagnostic of delta_norm
+    # variance equality across the levels of `group_by_property`. None
+    # when the pattern has no group_by_property or when fewer than two
+    # groups survive the low-N filter inside the diagnostic. Keyed by
+    # the grouping column name to leave room for future multi-group
+    # variants without a schema break.
+    heteroscedasticity_diagnostic: dict[str, dict[str, Any]] | None = None
+    # Edge-derived per-event dim names emitted on event patterns when
+    # ``edge_dimensions:`` is declared. Order matches the shape-vector
+    # concatenation between event_dim_matrix and prop_fill_matrix; empty
+    # for patterns without edge_dimensions.
+    edge_dim_names: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -594,6 +612,18 @@ class PatternBuildResult:
     dim_block_stats: dict[str, Any] | None = None
     edge_dim_thresholds: dict[str, float] | None = None
     theta_sensitivity: dict[str, dict[str, float]] | None = None
+    heteroscedasticity_diagnostic: dict[str, dict[str, Any]] | None = None
+    dim_normality_pvalues: dict[str, float] | None = None
+    # Edge-derived per-event dim names — populated on event patterns with
+    # ``edge_dimensions:`` declared, empty otherwise.
+    edge_dim_names: list[str] = field(default_factory=list)
+    # Label-aware per-dim calibration (Fisher LDA per-dim moments + global
+    # direction). Populated by ``_run_label_aware_calibration`` when the
+    # pattern is listed under ``label_audit.patterns`` in sphere.yaml AND
+    # ``_label_aware_calibration`` is set. ``None`` otherwise. Persisted
+    # into sphere.json as ``label_aware_calibration`` and hydrated back
+    # into ``Pattern.label_aware_calibration`` by the storage reader.
+    label_aware_calibration: dict[str, Any] | None = None
 
 
 @dataclass
@@ -723,6 +753,21 @@ class GDSBuilder:
         self._precomputed_dims: list = []  # PrecomputedDimSpec list
         self._aliases: dict[str, _AliasReg] = {}
         self._no_edges: bool = False  # set by CLI --no-edges
+        # Opt-in label-aware calibration plumbing. The CLI sets
+        # `_label_aware_calibration = True`; the YAML loader populates
+        # `_label_audit_block` with the pattern selection and label
+        # column resolution. Until both are set, the build path
+        # short-circuits — no behavior change for unlabeled spheres.
+        self._label_aware_calibration: bool = False
+        self._label_audit_block: object | None = None
+        # In-build registry of per-pattern label-aware Fisher LDA direction
+        # vectors. Populated by the label-aware calibration hook (driven by
+        # ``_label_aware_calibration`` + ``_label_audit_block``) before the
+        # geometry pass; the geometry pass projects each polygon's delta
+        # vector onto the registered direction and writes the scalar to
+        # the ``delta_norm_signed`` Lance column. Patterns without an entry
+        # get all-null ``delta_norm_signed`` — column is nullable.
+        self._label_aware_directions: dict[str, np.ndarray] = {}
         # Per-pattern calibration epoch state populated during build by
         # _write_calibration_epoch_for_pattern. Each thread writes a distinct
         # pattern_id key, so plain assignment is safe under ThreadPoolExecutor.
@@ -747,6 +792,142 @@ class GDSBuilder:
         resolved = _resolve_count_above_thresholds(sidecar, dims, user_overrides)
         self._edge_dim_thresholds[pattern_id] = resolved
         return resolved
+
+    def _dim_labels_for_pattern(
+        self,
+        pat: _PatternReg,
+        ps: PopulationStats,
+    ) -> list[str]:
+        """Compose the dim_label list for a pattern in storage-layout order.
+
+        Mirrors ``Pattern.dim_labels``: relations → event_dimensions →
+        edge_dim_names → prop_columns → edge_dim_agg_labels. Built from
+        ``_PatternReg`` + ``PopulationStats`` because at calibration time
+        the runtime ``Pattern`` dataclass has not been constructed yet.
+        """
+        labels: list[str] = []
+        for r in pat.relations:
+            labels.append(r.display_name if r.display_name else r.line_id)
+        for ed in pat.event_dimensions:
+            labels.append(ed.display_name or ed.column)
+        labels.extend(ps.edge_dim_names)
+        labels.extend(ps.prop_columns)
+        labels.extend(ps.edge_dim_agg_labels)
+        return labels
+
+    def _run_label_aware_calibration(
+        self,
+        pat: _PatternReg,
+        ps: PopulationStats,
+    ) -> dict[str, Any] | None:
+        """Fit label-aware per-dim calibration when the pattern opts in.
+
+        Returns the per-dim mapping ``{dim_label: DimCalibration}`` and
+        registers the global Fisher LDA direction in
+        ``self._label_aware_directions[pat.pattern_id]`` so the downstream
+        geometry pass can populate ``delta_norm_signed``. Returns ``None``
+        when the pattern is not opted in, when prerequisites are missing,
+        or when the LDA fit raises (degenerate inputs are logged and
+        treated as "no calibration available" — never abort the build).
+
+        Hook contract: callers MUST invoke this AFTER
+        ``_compute_population_stats`` returns (``ps.deltas`` is the full
+        delta matrix) AND BEFORE ``_build_geometry_slice`` runs (the
+        slice reads ``_label_aware_directions``).
+        """
+        if not self._label_aware_calibration:
+            return None
+        block = self._label_audit_block
+        if block is None:
+            return None
+        if pat.pattern_id not in set(block.patterns):
+            return None
+        # Streaming path skips this hook entirely (the delta matrix is
+        # not materialised). The plan accepts this as a known limitation;
+        # warn so the user can re-run with a non-streaming pattern shape.
+        deltas = ps.deltas
+        if deltas is None or deltas.ndim != 2 or deltas.shape[1] == 0:
+            logger.warning(
+                "label-aware calibration skipped for pattern %r — "
+                "no delta matrix available (streaming or zero-dim path)",
+                pat.pattern_id,
+            )
+            return None
+
+        entity_table = self._lines[pat.entity_line].table
+        if block.label_column not in entity_table.schema.names:
+            logger.warning(
+                "label-aware calibration skipped for pattern %r — "
+                "label_column %r not present on entity line %r",
+                pat.pattern_id, block.label_column, pat.entity_line,
+            )
+            return None
+        label_col = entity_table[block.label_column]
+        # Binarise: positive value matches → 1, everything else → 0.
+        # PyArrow's ``equal`` handles mixed-type comparison safely (the
+        # YAML loader keeps ``label_positive_value`` as the raw scalar).
+        # ``fill_null(False)`` turns null entries into non-matches so the
+        # bool mask round-trips cleanly through ``to_numpy``.
+        pos_value = block.label_positive_value
+        try:
+            mask = pc.fill_null(
+                pc.equal(label_col, pa.scalar(pos_value)),
+                False,
+            ).to_numpy(zero_copy_only=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "label-aware calibration skipped for pattern %r — "
+                "could not compare label_column %r against positive "
+                "value %r: %s",
+                pat.pattern_id, block.label_column, pos_value, exc,
+            )
+            return None
+        labels = np.where(mask, 1, 0).astype(np.int32)
+        if labels.shape[0] != deltas.shape[0]:
+            logger.warning(
+                "label-aware calibration skipped for pattern %r — "
+                "label vector length %d != delta row count %d",
+                pat.pattern_id, labels.shape[0], deltas.shape[0],
+            )
+            return None
+        if labels.sum() == 0 or labels.sum() == labels.shape[0]:
+            logger.warning(
+                "label-aware calibration skipped for pattern %r — "
+                "only one class present in label_column %r",
+                pat.pattern_id, block.label_column,
+            )
+            return None
+
+        dim_labels = self._dim_labels_for_pattern(pat, ps)
+        if len(dim_labels) != deltas.shape[1]:
+            logger.warning(
+                "label-aware calibration skipped for pattern %r — "
+                "dim_label count %d != delta column count %d",
+                pat.pattern_id, len(dim_labels), deltas.shape[1],
+            )
+            return None
+
+        from hypertopos.engine.calibration_label_aware import (
+            calibrate_label_aware,
+        )
+
+        try:
+            result = calibrate_label_aware(
+                deltas=deltas.astype(np.float32, copy=False),
+                labels=labels,
+                dim_labels=dim_labels,
+            )
+        except (ValueError, np.linalg.LinAlgError) as exc:
+            logger.warning(
+                "label-aware calibration failed for pattern %r — %s",
+                pat.pattern_id, exc,
+            )
+            return None
+
+        self._label_aware_directions[pat.pattern_id] = np.asarray(
+            result.signed_direction_vector, dtype=np.float32,
+        )
+        return dict(result.per_dim)
 
     def add_line(
         self,
@@ -829,6 +1010,7 @@ class GDSBuilder:
         edge_dim_aggregations: Any = None,
         fdr_hierarchy: list | None = None,
         fdr_temporal_hierarchy: list | None = None,
+        conformance_rules: list | None = None,
     ) -> GDSBuilder:
         _VALID_DW = ("auto", "kurtosis", "uniform")
         if isinstance(dimension_weights, str) and dimension_weights not in _VALID_DW:
@@ -857,6 +1039,7 @@ class GDSBuilder:
             edge_dim_aggregations=edge_dim_aggregations,
             fdr_hierarchy=fdr_hierarchy or [],
             fdr_temporal_hierarchy=fdr_temporal_hierarchy or [],
+            conformance_rules=conformance_rules or [],
         )
         return self
 
@@ -1324,6 +1507,7 @@ class GDSBuilder:
         # 1a-bis. Anchor-pattern aggregation of edge-derived dims (S1 ext, 0.6.1).
         edge_dim_agg_matrix = np.empty((n, 0), dtype=np.float32)
         edge_dim_agg_kinds: list[str] = []
+        edge_dim_agg_labels: list[str] = []
         if (
             pat.edge_dim_aggregations is not None
             and pat.pattern_type == "anchor"
@@ -1459,6 +1643,7 @@ class GDSBuilder:
                         extra[f"{d}_{agg}"].to_numpy()
                     )
                     edge_dim_agg_kinds.append(aggregate_kind(src_kind, agg))
+                    edge_dim_agg_labels.append(f"{d}_{agg}")
                     col_idx += 1
 
         # 1b. Build event dimension values
@@ -1755,6 +1940,7 @@ class GDSBuilder:
         # 4. Compute stats + deltas
         group_stats_dict: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, int]] | None = None
         mah_cov_inv: np.ndarray | None = None
+        heteroscedasticity_diagnostic: dict[str, dict[str, Any]] | None = None
 
         if pat.group_by_property:
             if pat.use_mahalanobis:
@@ -1811,6 +1997,22 @@ class GDSBuilder:
                 D_full = full_shape_vectors.shape[1]
                 component = theta_scalar / np.sqrt(D_full) if D_full > 0 else 0.0
                 theta = np.full(D_full, component, dtype=np.float32)
+
+            # Brown-Forsythe homoscedasticity diagnostic on the global-
+            # normalised delta_norms across `group_by_property` levels.
+            # The diagnostic answers "is global θ statistically valid
+            # for this pattern given the grouping it carries?", so the
+            # array fed must be the GLOBAL-mu/sigma norms, not the
+            # per-group-normalised ones (which would silently test
+            # residual heteroscedasticity after calibration — a
+            # different question).
+            from hypertopos.engine.diagnostics import levene_test_per_group
+
+            heteroscedasticity_diagnostic = {
+                pat.group_by_property: levene_test_per_group(
+                    global_norms, group_ids,
+                ),
+            }
         else:
             mu, sigma, theta, deltas, delta_norms, mah_cov_inv = compute_stats(
                 full_shape_vectors, pat.anomaly_percentile,
@@ -2012,6 +2214,13 @@ class GDSBuilder:
             dim_block_names=dim_block_names,
             dim_block_stats=dim_block_stats if dim_block_stats else None,
             theta_sensitivity=theta_sensitivity,
+            edge_dim_agg_matrix=(
+                edge_dim_agg_matrix
+                if edge_dim_agg_matrix.shape[1] > 0 else None
+            ),
+            edge_dim_agg_labels=edge_dim_agg_labels,
+            heteroscedasticity_diagnostic=heteroscedasticity_diagnostic,
+            edge_dim_names=edge_dim_names,
         )
 
     def _build_geometry_slice(
@@ -2192,6 +2401,19 @@ class GDSBuilder:
             else pa.array(np.full(cn, 0.05, dtype=np.float32), type=pa.float32())
         )
 
+        # Label-aware signed delta projection. The registered direction
+        # vector is unit-norm with the same dim count as ``chunk_deltas``;
+        # ``chunk_deltas @ direction`` yields one signed scalar per
+        # polygon — positive = pushed toward the positive-labelled
+        # centroid, negative = toward negative. Patterns without a
+        # registered direction get a full-null column.
+        direction_vec = self._label_aware_directions.get(pat.pattern_id)
+        if direction_vec is not None and chunk_deltas.shape[1] == direction_vec.shape[0]:
+            signed_norms = chunk_deltas.astype(np.float32) @ direction_vec.astype(np.float32)
+            chunk_signed_arr = pa.array(signed_norms, type=pa.float32())
+        else:
+            chunk_signed_arr = pa.array([None] * cn, type=pa.float32())
+
         common_cols = {
             "primary_key":     pk_str,
             "scale":           _const_i32(1),
@@ -2215,6 +2437,7 @@ class GDSBuilder:
                 if n_anom_dims is not None
                 else pa.array(np.zeros(cn, dtype=np.int32), type=pa.int32())
             ),
+            "delta_norm_signed": chunk_signed_arr,
         }
 
         if pat.pattern_type == "event":
@@ -2237,14 +2460,22 @@ class GDSBuilder:
 
     def _build_geometry_table(
         self, pat: _PatternReg,
-    ) -> tuple[pa.Table, PopulationStats]:
+    ) -> tuple[pa.Table, PopulationStats, dict[str, Any] | None]:
         """Build geometry Arrow table for a pattern (single-pass, in-memory).
 
         Returns:
-            (geometry_table, population_stats)
+            (geometry_table, population_stats, label_aware_calibration).
+            ``label_aware_calibration`` is the ``{dim_label: DimCalibration}``
+            mapping when the pattern opted into label-aware calibration
+            and the LDA fit succeeded, ``None`` otherwise. Populating it
+            here so the result reaches sphere.json via PatternBuildResult.
         """
         n = len(self._lines[pat.entity_line].table)
         ps = self._compute_population_stats(pat)
+        # Run label-aware calibration BEFORE _build_geometry_slice so the
+        # Fisher LDA direction is registered in _label_aware_directions
+        # and the slice can project deltas to delta_norm_signed.
+        lac = self._run_label_aware_calibration(pat, ps)
 
         # Bootstrap confidence — requires full shape vectors in memory.
         # Skip when: use_mahalanobis, population > _BOOTSTRAP_MAX_N
@@ -2289,7 +2520,7 @@ class GDSBuilder:
             bregman_norms_arr=ps.bregman_norms,
             anomaly_confidence_arr=confidence_arr,
         )
-        return table, ps
+        return table, ps, lac
 
     # ── Edge table helpers ─────────────────────────────────────
 
@@ -2686,8 +2917,24 @@ class GDSBuilder:
         return result
 
     def _compute_dim_percentiles(
-        self, entity_line_id: str,
+        self,
+        entity_line_id: str,
+        edge_dim_agg_matrix: np.ndarray | None = None,
+        edge_dim_agg_labels: list[str] | None = None,
     ) -> dict[str, dict[str, float]] | None:
+        """Compute per-dim percentile cache.
+
+        Walks ``entity_table`` float columns for event_dims / prop_cols
+        (legacy path) and, when ``edge_dim_agg_matrix`` is supplied,
+        appends one entry per aggregated edge dim keyed by its canonical
+        ``{source_dim}_{aggregate}`` label. Labels and matrix columns
+        must be 1:1 in order — the caller hands us the parallel list it
+        built when populating the matrix. Same six percentile keys
+        (``min / p25 / p50 / p75 / p99 / max``) and same numpy.percentile
+        call, so downstream consumers (find_anomalies percentile-based
+        scoring, sphere_overview profiling_alerts, audit_pattern_dims)
+        see a uniform schema across all dim families.
+        """
         entity_table = self._lines[entity_line_id].table
         percentiles: dict[str, dict[str, float]] = {}
         for col_field in entity_table.schema:
@@ -2707,7 +2954,101 @@ class GDSBuilder:
                 "p99": round(float(np.percentile(valid, 99)), 4),
                 "max": round(float(np.max(valid)), 4),
             }
+        # Aggregated edge dims live in the in-memory matrix, not in the
+        # entity table. Compute percentiles per column with the same six
+        # keys + the same rounding so the cache schema is identical to
+        # the event_dim / prop_col entries above. Skip the block silently
+        # when no aggregations are declared (matrix is None or empty).
+        if (
+            edge_dim_agg_matrix is not None
+            and edge_dim_agg_labels is not None
+            and edge_dim_agg_matrix.shape[1] > 0
+        ):
+            if len(edge_dim_agg_labels) != edge_dim_agg_matrix.shape[1]:
+                raise ValueError(
+                    f"edge_dim_agg_labels length ({len(edge_dim_agg_labels)}) "
+                    f"does not match matrix column count "
+                    f"({edge_dim_agg_matrix.shape[1]}) — label list must be "
+                    f"1:1 with matrix columns",
+                )
+            for col_idx, label in enumerate(edge_dim_agg_labels):
+                col_arr = edge_dim_agg_matrix[:, col_idx]
+                valid = col_arr[~np.isnan(col_arr)]
+                if len(valid) == 0:
+                    continue
+                percentiles[label] = {
+                    "min": round(float(np.min(valid)), 4),
+                    "p25": round(float(np.percentile(valid, 25)), 4),
+                    "p50": round(float(np.percentile(valid, 50)), 4),
+                    "p75": round(float(np.percentile(valid, 75)), 4),
+                    "p99": round(float(np.percentile(valid, 99)), 4),
+                    "max": round(float(np.max(valid)), 4),
+                }
         return percentiles if percentiles else None
+
+    def _compute_dim_normality_pvalues(
+        self,
+        entity_line_id: str,
+        edge_dim_agg_matrix: np.ndarray | None = None,
+        edge_dim_agg_labels: list[str] | None = None,
+    ) -> dict[str, float] | None:
+        """Compute per-dim normality test p-values.
+
+        Mirrors ``_compute_dim_percentiles`` — walks the same float
+        columns on the entity table plus aggregated edge-dim matrix
+        columns, keyed by the same raw column / label name so the
+        navigator's ``_build_raw_dim_name_to_index`` mapping can look
+        up the entry at warning time. Stores only the p-value (caller
+        compares against alpha); the test family + statistic are
+        diagnostic detail the warning path does not need to surface.
+
+        The test family (Shapiro-Wilk vs Kolmogorov-Smirnov) is picked
+        per-dim by sample size inside ``normality_test_per_dim`` — no
+        per-dim plumbing required here. Dims with fewer than three
+        finite values, or zero variance, return ``nan`` from the
+        primitive; we skip those keys so the persisted dict only
+        carries actionable p-values.
+
+        Kind filtering (gaussian-only) is deferred to the navigator
+        warning emitter — keeping the persisted blob test-everything
+        means a future re-declaration of a column's kind does not
+        require a rebuild to surface the appropriate warning.
+        """
+        from hypertopos.engine.dim_audit import normality_test_per_dim
+
+        entity_table = self._lines[entity_line_id].table
+        pvalues: dict[str, float] = {}
+        for col_field in entity_table.schema:
+            if col_field.name == "primary_key":
+                continue
+            if col_field.type not in (pa.float32(), pa.float64()):
+                continue
+            arr = entity_table[col_field.name].to_numpy(zero_copy_only=False)
+            result = normality_test_per_dim(np.asarray(arr, dtype=np.float64))
+            p = result["p_value"]
+            if np.isfinite(p):
+                pvalues[col_field.name] = float(p)
+        if (
+            edge_dim_agg_matrix is not None
+            and edge_dim_agg_labels is not None
+            and edge_dim_agg_matrix.shape[1] > 0
+        ):
+            if len(edge_dim_agg_labels) != edge_dim_agg_matrix.shape[1]:
+                raise ValueError(
+                    f"edge_dim_agg_labels length ({len(edge_dim_agg_labels)}) "
+                    f"does not match matrix column count "
+                    f"({edge_dim_agg_matrix.shape[1]}) — label list must be "
+                    f"1:1 with matrix columns",
+                )
+            for col_idx, label in enumerate(edge_dim_agg_labels):
+                col_arr = edge_dim_agg_matrix[:, col_idx]
+                result = normality_test_per_dim(
+                    np.asarray(col_arr, dtype=np.float64),
+                )
+                p = result["p_value"]
+                if np.isfinite(p):
+                    pvalues[label] = float(p)
+        return pvalues if pvalues else None
 
     def _build_sphere_json(
         self,
@@ -2812,6 +3153,10 @@ class GDSBuilder:
                 "last_calibrated_at": now_str,
                 "prop_columns": pbr.prop_columns,
                 "excluded_properties": pbr.excluded_properties,
+                **(
+                    {"edge_dim_names": list(pbr.edge_dim_names)}
+                    if pbr.edge_dim_names else {}
+                ),
             }
             if pbr.dim_block_names:
                 pat_dict["dim_block_names"] = pbr.dim_block_names
@@ -2854,6 +3199,28 @@ class GDSBuilder:
                 pat_dict["dimension_kinds"] = pbr.dimension_kinds
             if pbr.dim_percentiles:
                 pat_dict["dim_percentiles"] = pbr.dim_percentiles
+            if pbr.heteroscedasticity_diagnostic:
+                pat_dict["heteroscedasticity_diagnostic"] = (
+                    pbr.heteroscedasticity_diagnostic
+                )
+            if pbr.dim_normality_pvalues:
+                pat_dict["dim_normality_pvalues"] = pbr.dim_normality_pvalues
+            if pbr.label_aware_calibration:
+                # Flatten DimCalibration dataclasses to JSON-safe dicts.
+                # Reader hydrates each entry back to a SimpleNamespace
+                # (engine.DimCalibration shape: mu_pos/sigma_pos/mu_neg/
+                # sigma_neg/direction) so audit_pattern_dims' attribute
+                # access (`dim_cal.mu_pos`) keeps working on round-trip.
+                pat_dict["label_aware_calibration"] = {
+                    label: {
+                        "mu_pos": float(dc.mu_pos),
+                        "sigma_pos": float(dc.sigma_pos),
+                        "mu_neg": float(dc.mu_neg),
+                        "sigma_neg": float(dc.sigma_neg),
+                        "direction": float(dc.direction),
+                    }
+                    for label, dc in pbr.label_aware_calibration.items()
+                }
             if pat.description:
                 pat_dict["description"] = pat.description
             if pat.fdr_hierarchy:
@@ -2909,9 +3276,13 @@ class GDSBuilder:
             pat_dict["schema_hash"] = cal_state.get("schema_hash")
             patterns_dict[pat_id] = pat_dict
 
+        # Sphere format minor-bump: 3.1 when a label_audit block is
+        # registered, else 3.0. Readers compare on major only, so 3.0
+        # readers transparently load 3.1 spheres.
+        fmt_version = "3.1" if self._label_audit_block is not None else "3.0"
         sphere_dict: dict[str, Any] = {
             "sphere_id": self.sphere_id,
-            "format_version": "3.0",
+            "format_version": fmt_version,
             "calibration_history_policy": {"last_k": 5},
             "name": self._name or self.sphere_id,
             "lines": lines_dict,
@@ -2924,6 +3295,13 @@ class GDSBuilder:
         }
         if self._description:
             sphere_dict["description"] = self._description
+        if self._label_audit_block is not None:
+            la = self._label_audit_block
+            sphere_dict["label_audit"] = {
+                "label_column": la.label_column,
+                "label_positive_value": la.label_positive_value,
+                "patterns": list(la.patterns),
+            }
         return sphere_dict
 
     def _resolve_derived(self) -> None:
@@ -3325,7 +3703,7 @@ class GDSBuilder:
                 self._write_calibration_epoch_for_pattern(pat, pbr)
                 return pat_id_out, pbr
 
-            geom_table, ps = self._build_geometry_table(pat)
+            geom_table, ps, lac = self._build_geometry_table(pat)
             geom_table = self._inject_fdr_hierarchy_carriers(pat, geom_table)
             geom_table = self._inject_fdr_temporal_buckets(pat, geom_table)
             _validate_fdr_hierarchy_columns(
@@ -3375,11 +3753,21 @@ class GDSBuilder:
                 cholesky_inv=ps.cholesky_inv,
                 dim_percentiles=self._compute_dim_percentiles(
                     pat.entity_line,
+                    edge_dim_agg_matrix=ps.edge_dim_agg_matrix,
+                    edge_dim_agg_labels=ps.edge_dim_agg_labels,
                 ),
                 dimension_kinds=ps.dimension_kinds,
                 dim_block_names=ps.dim_block_names,
                 dim_block_stats=ps.dim_block_stats,
                 theta_sensitivity=ps.theta_sensitivity,
+                heteroscedasticity_diagnostic=ps.heteroscedasticity_diagnostic,
+                dim_normality_pvalues=self._compute_dim_normality_pvalues(
+                    pat.entity_line,
+                    edge_dim_agg_matrix=ps.edge_dim_agg_matrix,
+                    edge_dim_agg_labels=ps.edge_dim_agg_labels,
+                ),
+                edge_dim_names=ps.edge_dim_names,
+                label_aware_calibration=lac,
             )
             self._write_calibration_epoch_for_pattern(pat, pbr)
             return pat_id, pbr
@@ -3646,6 +4034,7 @@ class GDSBuilder:
             last_calibrated_at=now,
             edge_dim_thresholds=self._edge_dim_thresholds.get(pat.pattern_id),
             theta_sensitivity=pbr.theta_sensitivity,
+            dim_normality_pvalues=pbr.dim_normality_pvalues,
         )
         write_calibration_history_epoch(
             self.output_path, fit, last_k=last_k,
@@ -4039,6 +4428,11 @@ class GDSBuilder:
                 ),
                 "anomaly_confidence": pa.array([None] * n_new, type=pa.float32()),
                 "n_anomalous_dims": pa.array(n_anom_dims, type=pa.int32()),
+                # ``update_sphere`` does not yet rehydrate the
+                # label-aware direction from sphere.json — incremental
+                # rows on a label-aware pattern receive null values
+                # until pattern.json carries the direction vector.
+                "delta_norm_signed": pa.array([None] * n_new, type=pa.float32()),
                 "entity_keys": pa.array(entity_key_lists, type=pa.list_(pa.string())),
                 "last_refresh_at": pa.array([now] * n_new, type=ts_type),
                 "updated_at": pa.array([now] * n_new, type=ts_type),
@@ -4167,6 +4561,11 @@ class GDSBuilder:
 
         # 1. Compute population stats
         ps = self._compute_population_stats(pat)
+        # Label-aware calibration — same hook as the in-memory path. Must
+        # run BEFORE the per-chunk _build_geometry_slice loop so the
+        # registered direction is available when each chunk projects its
+        # deltas to delta_norm_signed.
+        lac = self._run_label_aware_calibration(pat, ps)
 
         theta_norm = float(np.linalg.norm(ps.theta))
 
@@ -4258,11 +4657,21 @@ class GDSBuilder:
             cholesky_inv=ps.cholesky_inv,
             dim_percentiles=self._compute_dim_percentiles(
                 pat.entity_line,
+                edge_dim_agg_matrix=ps.edge_dim_agg_matrix,
+                edge_dim_agg_labels=ps.edge_dim_agg_labels,
             ),
             dimension_kinds=ps.dimension_kinds,
             dim_block_names=ps.dim_block_names,
             dim_block_stats=ps.dim_block_stats,
             theta_sensitivity=ps.theta_sensitivity,
+            heteroscedasticity_diagnostic=ps.heteroscedasticity_diagnostic,
+            dim_normality_pvalues=self._compute_dim_normality_pvalues(
+                pat.entity_line,
+                edge_dim_agg_matrix=ps.edge_dim_agg_matrix,
+                edge_dim_agg_labels=ps.edge_dim_agg_labels,
+            ),
+            edge_dim_names=ps.edge_dim_names,
+            label_aware_calibration=lac,
         )
 
     def _build_shape_chunk(
@@ -4376,6 +4785,26 @@ class GDSBuilder:
             welford_batch_update,
         )
 
+        # Streaming path never materialises the full delta matrix, so
+        # label-aware calibration (which needs every row to fit Fisher
+        # LDA) silently degrades to "no calibration". Warn loudly when
+        # the pattern was selected for label-aware calibration so the
+        # user can fall back to a non-streaming build shape.
+        if (
+            self._label_aware_calibration
+            and self._label_audit_block is not None
+            and pat.pattern_id in set(self._label_audit_block.patterns)
+        ):
+            logger.warning(
+                "label-aware calibration skipped for pattern %r — "
+                "streaming build path does not materialise the full "
+                "delta matrix; rebuild with a non-streaming pattern "
+                "shape (avoid group_by_property / gmm / mahalanobis "
+                "OR reduce population below GEOMETRY_CHUNK_SIZE) to "
+                "produce delta_norm_signed and label_aware_calibration",
+                pat.pattern_id,
+            )
+
         entity_line = self._lines[pat.entity_line]
         entity_table = entity_line.table
         n = len(entity_table)
@@ -4477,6 +4906,7 @@ class GDSBuilder:
         # ── Anchor-pattern edge-dim aggregation (S1 ext, 0.6.1) ──
         edge_dim_agg_matrix = np.empty((n, 0), dtype=np.float32)
         edge_dim_agg_kinds: list[str] = []
+        edge_dim_agg_labels: list[str] = []
         if (
             pat.edge_dim_aggregations is not None
             and pat.pattern_type == "anchor"
@@ -4611,6 +5041,7 @@ class GDSBuilder:
                         extra[f"{d}_{agg}"].to_numpy()
                     )
                     edge_dim_agg_kinds.append(aggregate_kind(src_kind, agg))
+                    edge_dim_agg_labels.append(f"{d}_{agg}")
                     col_idx += 1
 
         D_edge_agg = edge_dim_agg_matrix.shape[1]
@@ -5057,9 +5488,27 @@ class GDSBuilder:
             cholesky_inv=None,
             dim_percentiles=self._compute_dim_percentiles(
                 pat.entity_line,
+                edge_dim_agg_matrix=(
+                    edge_dim_agg_matrix
+                    if edge_dim_agg_matrix.shape[1] > 0 else None
+                ),
+                edge_dim_agg_labels=(
+                    edge_dim_agg_labels if edge_dim_agg_labels else None
+                ),
             ),
             dimension_kinds=dimension_kinds,
             theta_sensitivity=compute_theta_sensitivity_from_sorted(sorted_norms),
+            dim_normality_pvalues=self._compute_dim_normality_pvalues(
+                pat.entity_line,
+                edge_dim_agg_matrix=(
+                    edge_dim_agg_matrix
+                    if edge_dim_agg_matrix.shape[1] > 0 else None
+                ),
+                edge_dim_agg_labels=(
+                    edge_dim_agg_labels if edge_dim_agg_labels else None
+                ),
+            ),
+            edge_dim_names=edge_dim_names,
         )
 
     @staticmethod

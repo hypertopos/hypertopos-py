@@ -562,6 +562,73 @@ def test_pattern_dim_index_unknown_lists_prop_columns():
         pattern.dim_index("unknown")
 
 
+def test_pattern_dim_index_covers_edge_dim_aggregations():
+    """``dim_index`` resolves aggregated edge-dim labels alongside
+    relations / event_dimensions / prop_columns. Aggregation block lives
+    at offset ``len(relations) + len(event_dimensions) + len(prop_columns)``
+    in delta-vector order — the same convention used by
+    ``edge_agg_dim_offset`` in the counterfactual primitives. Label
+    format is ``{dim}_{aggregate}`` per ``_edge_dim_aggregation_names``.
+    """
+    import datetime
+
+    import numpy as np
+    from hypertopos.model.sphere import (
+        EdgeDimAggregationsRef,
+        EventDimDef,
+        Pattern,
+        RelationDef,
+    )
+
+    pattern = Pattern(
+        pattern_id="p",
+        entity_type="customer",
+        pattern_type="anchor",
+        relations=[
+            RelationDef(line_id="orders", direction="out", required=True),
+            RelationDef(line_id="stores", direction="in", required=False),
+        ],
+        mu=np.zeros(10, dtype=np.float32),
+        sigma_diag=np.ones(10, dtype=np.float32),
+        theta=np.full(10, 3.0, dtype=np.float32),
+        population_size=100,
+        computed_at=datetime.datetime(2024, 1, 1, tzinfo=datetime.UTC),
+        version=1,
+        status="production",
+        event_dimensions=[EventDimDef(column="amount", edge_max=100.0)],
+        prop_columns=["country"],
+        edge_dim_aggregations=EdgeDimAggregationsRef(
+            from_event_pattern="ev",
+            dims=("price", "qty"),
+            aggregates_per_dim={
+                "price": ("mean", "max", "std"),
+                "qty": ("mean", "max", "std"),
+            },
+        ),
+    )
+    # Sanity: total dim count = 2 relations + 1 event_dim + 1 prop_col
+    # + (2 dims × 3 aggregates) = 10.
+    assert pattern.delta_dim() == 10
+    # Relations occupy indices 0..1.
+    assert pattern.dim_index("orders") == 0
+    assert pattern.dim_index("stores") == 1
+    # Event dim at index 2 (after 2 relations).
+    assert pattern.dim_index("amount") == 2
+    # Prop column at index 3 (after 2 relations + 1 event_dim).
+    assert pattern.dim_index("country") == 3
+    # Aggregated edge-dim labels at indices 4..9, in build order
+    # (dims outer loop × aggregates inner loop).
+    assert pattern.dim_index("price_mean") == 4
+    assert pattern.dim_index("price_max") == 5
+    assert pattern.dim_index("price_std") == 6
+    assert pattern.dim_index("qty_mean") == 7
+    assert pattern.dim_index("qty_max") == 8
+    assert pattern.dim_index("qty_std") == 9
+    # Unknown still raises with all labels in the error message.
+    with pytest.raises(ValueError, match="qty_std"):
+        pattern.dim_index("unknown_agg")
+
+
 # --- Polygon.count_alive_edges_to ---
 
 

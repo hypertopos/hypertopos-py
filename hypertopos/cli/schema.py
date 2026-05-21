@@ -132,6 +132,11 @@ class PatternConfig:
     # in cli.build._add_pattern before being passed to builder.add_pattern.
     fdr_hierarchy: list | None = None  # list[dict] with {level, from_dimension}
     fdr_temporal_hierarchy: list | None = None  # list[dict] with {level, slice_dimension, bucket?}
+    # --- Declarative conformance rules ---
+    # Raw YAML list of rule entries. Parsed in cli.build._add_pattern via
+    # builder.conformance_mapping.parse_conformance_rules before being
+    # passed to builder.add_pattern(conformance_rules=...).
+    conformance_rules: list | None = None
 
 
 @dataclass
@@ -211,6 +216,20 @@ class TemporalConfig:
 
 
 @dataclass
+class LabelAuditConfig:
+    """Optional top-level label-audit block selecting patterns for label-aware calibration.
+
+    Consumed by the builder when ``--label-aware-calibration`` is passed
+    on the CLI. ``label_column`` names the column on the entity_line
+    that carries the binary label; ``label_positive_value`` is the value
+    treated as the positive class (anything not equal to it is negative).
+    """
+    label_column: str
+    label_positive_value: Any
+    patterns: list[str] = field(default_factory=list)
+
+
+@dataclass
 class SphereConfig:
     sphere_id: str
     version: str = "0.1.0"
@@ -223,6 +242,7 @@ class SphereConfig:
     composite_lines: dict[str, CompositeLineConfig] = field(default_factory=dict)
     chain_lines: dict[str, ChainLineConfig] = field(default_factory=dict)
     temporal: list[TemporalConfig] = field(default_factory=list)
+    label_audit: LabelAuditConfig | None = None
 
 
 # ── parser ───────────────────────────────────────────────────────────
@@ -268,6 +288,7 @@ def parse_config(yaml_path: str | Path) -> SphereConfig:
             )
     temporal = _parse_temporal(raw.get("temporal") or [], all_patterns)
     aliases = _parse_aliases(raw.get("aliases") or {}, all_patterns)
+    label_audit = _parse_label_audit(raw.get("label_audit"), all_patterns)
 
     cfg = SphereConfig(
         sphere_id=str(sphere_id),
@@ -281,6 +302,7 @@ def parse_config(yaml_path: str | Path) -> SphereConfig:
         composite_lines=composite_lines,
         chain_lines=chain_lines,
         temporal=temporal,
+        label_audit=label_audit,
     )
 
     # ── Cross-block validation: chain_lines.edge_dim_aggregations ──
@@ -649,6 +671,15 @@ def _parse_one_pattern(
             )
         fdr_temporal_hierarchy = [dict(level) for level in fdr_temporal_raw]
 
+    conformance_rules_raw = spec.get("conformance_rules")
+    if conformance_rules_raw is not None and not isinstance(
+        conformance_rules_raw, list,
+    ):
+        raise ValueError(
+            f"Pattern '{pid}' conformance_rules must be a list, "
+            f"got {type(conformance_rules_raw).__name__}"
+        )
+
     return PatternConfig(
         type=ptype,
         entity_line=str(entity_line),
@@ -672,6 +703,7 @@ def _parse_one_pattern(
         edge_dim_aggregations=spec.get("edge_dim_aggregations"),
         fdr_hierarchy=fdr_hierarchy,
         fdr_temporal_hierarchy=fdr_temporal_hierarchy,
+        conformance_rules=conformance_rules_raw,
     )
 
 
@@ -931,6 +963,53 @@ def _parse_aliases(
         )
         result[alias_id] = acfg
     return result
+
+
+# ── label audit ──────────────────────────────────────────────────────
+
+
+def _parse_label_audit(
+    raw: Any,
+    patterns: dict[str, PatternConfig],
+) -> LabelAuditConfig | None:
+    """Parse the optional top-level ``label_audit:`` block.
+
+    Returns ``None`` when the block is absent. Raises ``ValueError`` on
+    malformed input — missing ``label_column``, missing/empty ``patterns``
+    list, or an unknown pattern name.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"label_audit must be a YAML mapping, got {type(raw).__name__}"
+        )
+    label_column = raw.get("label_column")
+    if not label_column or not isinstance(label_column, str):
+        raise ValueError(
+            "label_audit must specify 'label_column' (non-empty string)"
+        )
+    if "label_positive_value" not in raw:
+        raise ValueError(
+            "label_audit must specify 'label_positive_value'"
+        )
+    raw_pats = raw.get("patterns")
+    if not raw_pats or not isinstance(raw_pats, list):
+        raise ValueError(
+            "label_audit must specify 'patterns' as a non-empty list"
+        )
+    pattern_ids = [str(p) for p in raw_pats]
+    for pid in pattern_ids:
+        if pid not in patterns:
+            raise ValueError(
+                f"label_audit references unknown pattern '{pid}'. "
+                f"Available: {sorted(patterns)}"
+            )
+    return LabelAuditConfig(
+        label_column=str(label_column),
+        label_positive_value=raw["label_positive_value"],
+        patterns=pattern_ids,
+    )
 
 
 # ── chain lines ─────────────────────────────────────────────────────

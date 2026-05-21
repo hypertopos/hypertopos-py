@@ -30,7 +30,14 @@ __all__ = [
     "compute_per_dim_label_auroc",
     "filter_delta_norm",
     "fit_lda_direction",
+    "normality_test_per_dim",
 ]
+
+# Shapiro-Wilk is the highest-power normality test for small N but its
+# scipy implementation rejects N > 5000. Above that, Kolmogorov-Smirnov
+# against a fitted normal is used — same null hypothesis, much weaker
+# power at small N but well-defined at any N.
+_SHAPIRO_MAX_N = 5000
 
 
 def _auroc_unsafe(scores: np.ndarray, labels: np.ndarray) -> float:
@@ -273,4 +280,85 @@ def fit_lda_direction(
         "fisher_score": fisher_score,
         "n_anom": n_anom,
         "n_normal": n_normal,
+    }
+
+
+def normality_test_per_dim(values: np.ndarray) -> dict[str, Any]:
+    """Test whether a 1-D sample is drawn from a normal distribution.
+
+    Hypothesis pair is the standard one for both tests:
+        H0: the sample is normally distributed
+        H1: the sample is NOT normally distributed
+
+    The test is selected by sample size — Shapiro-Wilk has the highest
+    power for small N but its scipy implementation rejects N > 5000;
+    above that threshold we switch to a Kolmogorov-Smirnov test against
+    a normal fitted to the sample mean and (unbiased) standard
+    deviation. Both tests reject H0 when p < alpha (typically 0.01 or
+    0.05) — a low p-value means the dim distribution is NOT normal, so
+    the gaussian z-score `(x - mu) / sigma` is a poor anomaly scorer on
+    that dim.
+
+    NaN values are stripped before testing; the test runs on the finite
+    subset. Less than three finite values, or zero variance after NaN
+    drop, returns ``p_value = nan`` and the caller treats that as
+    "insufficient data — no claim".
+
+    Args:
+        values: 1-D numeric array. NaN entries are dropped. Need not be
+            standardised; KS standardises internally against the sample
+            mean and std.
+
+    Returns:
+        ``{test_name: "shapiro" | "ks", statistic: float, p_value: float,
+        n: int}``. ``n`` is the count AFTER NaN drop. ``p_value`` is in
+        ``[0, 1]`` when defined, ``nan`` when the sample is too small or
+        constant.
+
+    Raises:
+        ValueError: if ``values`` is not 1-D.
+    """
+    from scipy import stats
+
+    if values.ndim != 1:
+        raise ValueError(f"values must be 1-D, got shape {values.shape}")
+    arr = np.asarray(values, dtype=np.float64)
+    finite = arr[np.isfinite(arr)]
+    n = int(finite.size)
+
+    # Both tests need at least three observations and non-zero spread.
+    # Returning nan rather than raising keeps the caller's per-dim loop
+    # robust against pathological columns (all-zero, all-NaN, constant)
+    # without forcing it to pre-filter — the warning emitter already
+    # ignores nan p-values.
+    if n < 3 or float(np.std(finite, ddof=1)) < 1e-12:
+        return {
+            "test_name": "shapiro" if n <= _SHAPIRO_MAX_N else "ks",
+            "statistic": float("nan"),
+            "p_value": float("nan"),
+            "n": n,
+        }
+
+    if n <= _SHAPIRO_MAX_N:
+        result = stats.shapiro(finite)
+        return {
+            "test_name": "shapiro",
+            "statistic": float(result.statistic),
+            "p_value": float(result.pvalue),
+            "n": n,
+        }
+
+    # KS against a fitted normal — standardise the sample and compare
+    # against the standard normal CDF. Equivalent to kstest(values,
+    # 'norm', args=(mean, std)) but lets scipy fall on the well-tested
+    # one-sample path.
+    mean = float(np.mean(finite))
+    std = float(np.std(finite, ddof=1))
+    standardised = (finite - mean) / std
+    result = stats.kstest(standardised, "norm")
+    return {
+        "test_name": "ks",
+        "statistic": float(result.statistic),
+        "p_value": float(result.pvalue),
+        "n": n,
     }

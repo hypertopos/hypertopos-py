@@ -5,10 +5,14 @@
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import lance
 import pytest
+
+from hypertopos.engine.geometry import GDSEngine
+from hypertopos.navigation.navigator import GDSNavigator
 
 FIXTURES_PATH = Path(__file__).parent / "fixtures" / "gds" / "sales_sphere"
 SYNTHETIC_CHAIN_FIXTURES_PATH = (
@@ -35,6 +39,36 @@ def ensure_fixtures() -> None:
             [sys.executable, str(synthetic_script)],
             check=True,
         )
+
+
+@pytest.fixture(autouse=True)
+def _restore_navigator_engine_class_attrs() -> Iterator[None]:
+    """Snapshot+restore GDSNavigator / GDSEngine class attributes around each test.
+
+    Defends against the MagicMock-leak class: when a test replaces a class-level
+    method via raw ``setattr(GDSNavigator, "...", MagicMock())`` (i.e. NOT via
+    ``monkeypatch.setattr``) and then short-circuits via ``pytest.raises``, the
+    MagicMock leaks into the next test that touches the same method. The teardown
+    half of this fixture restores every non-dunder attribute whose identity
+    changed during the test, regardless of how the test exited. ``monkeypatch``
+    callers are unaffected — their own teardown runs first and restores the
+    original, so the identity check here is a no-op for them.
+    """
+    snapshots = {
+        cls: {
+            name: cls.__dict__[name]
+            for name in list(cls.__dict__)
+            if not (name.startswith("__") and name.endswith("__"))
+        }
+        for cls in (GDSNavigator, GDSEngine)
+    }
+    try:
+        yield
+    finally:
+        for cls, snap in snapshots.items():
+            for name, original in snap.items():
+                if cls.__dict__.get(name) is not original:
+                    setattr(cls, name, original)
 
 
 @pytest.fixture
@@ -96,5 +130,3 @@ def _clone_entry(src: Path, dst: Path) -> None:
     dst.mkdir(parents=True, exist_ok=True)
     for child in src.iterdir():
         _clone_entry(child, dst / child.name)
-
-

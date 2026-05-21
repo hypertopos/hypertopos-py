@@ -11,6 +11,7 @@ from hypertopos.engine.dim_audit import (
     compute_per_dim_label_auroc,
     filter_delta_norm,
     fit_lda_direction,
+    normality_test_per_dim,
 )
 
 
@@ -344,3 +345,83 @@ def test_lda_fisher_score_higher_for_better_separation():
     r_far = fit_lda_direction(deltas=far_deltas, labels=labels)
     r_near = fit_lda_direction(deltas=near_deltas, labels=labels)
     assert r_far["fisher_score"] > r_near["fisher_score"]
+
+
+# ── normality_test_per_dim ────────────────────────────────────────────
+
+
+def test_normality_shapiro_path_on_normal_data_does_not_reject():
+    """Synthetic normal sample at small-N → Shapiro-Wilk path → p > 0.05.
+
+    The seed is fixed so the assertion is reproducible; the test is
+    deliberately lenient (``> 0.05``) because Shapiro's null
+    distribution has wide spread at small N — a tighter bound would
+    flake on rng draws that happen to land in the tail.
+    """
+    rng = np.random.default_rng(42)
+    values = rng.normal(loc=10.0, scale=2.0, size=500)
+    result = normality_test_per_dim(values)
+    assert result["test_name"] == "shapiro"
+    assert result["n"] == 500
+    assert result["p_value"] > 0.05
+
+
+def test_normality_shapiro_path_on_pareto_data_rejects():
+    """Synthetic Pareto-distributed sample → heavily right-skewed →
+    Shapiro p < 0.001 (well below the 0.01 alpha)."""
+    rng = np.random.default_rng(43)
+    values = rng.pareto(a=1.5, size=500) + 1.0
+    result = normality_test_per_dim(values)
+    assert result["test_name"] == "shapiro"
+    assert result["p_value"] < 0.001
+
+
+def test_normality_ks_path_when_n_exceeds_5000():
+    """Sample size above 5000 must switch to KS — Shapiro's scipy
+    implementation rejects N > 5000."""
+    rng = np.random.default_rng(44)
+    values = rng.normal(0.0, 1.0, size=10_000)
+    result = normality_test_per_dim(values)
+    assert result["test_name"] == "ks"
+    assert result["n"] == 10_000
+    # Standard normal sample → KS should not reject.
+    assert result["p_value"] > 0.01
+
+
+def test_normality_ks_path_rejects_pareto_at_large_n():
+    """Large-N heavy-tailed sample → KS rejects with tiny p-value."""
+    rng = np.random.default_rng(45)
+    values = rng.pareto(a=1.5, size=10_000) + 1.0
+    result = normality_test_per_dim(values)
+    assert result["test_name"] == "ks"
+    assert result["p_value"] < 1e-10
+
+
+def test_normality_small_sample_returns_nan_p_value():
+    """Fewer than three finite values → nan p-value, not raise."""
+    result = normality_test_per_dim(np.array([1.0, 2.0]))
+    assert np.isnan(result["p_value"])
+    assert result["n"] == 2
+
+
+def test_normality_constant_sample_returns_nan_p_value():
+    """Zero variance after NaN drop → nan p-value, not raise."""
+    result = normality_test_per_dim(np.array([3.0, 3.0, 3.0, 3.0, 3.0]))
+    assert np.isnan(result["p_value"])
+    assert result["n"] == 5
+
+
+def test_normality_strips_nan_before_testing():
+    """NaN entries are dropped; n reflects the finite-only count."""
+    rng = np.random.default_rng(46)
+    values = rng.normal(0.0, 1.0, size=100)
+    values[::10] = np.nan
+    result = normality_test_per_dim(values)
+    assert result["n"] == 90
+    assert np.isfinite(result["p_value"])
+
+
+def test_normality_rejects_non_1d_input():
+    """Defensive — 2-D array raises rather than silently flattening."""
+    with pytest.raises(ValueError, match="must be 1-D"):
+        normality_test_per_dim(np.zeros((10, 2)))

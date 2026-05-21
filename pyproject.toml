@@ -4,15 +4,18 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hypertopos"
-version = "0.7.0"
+version = "0.7.1"
 description = "Understand the structure of your data — without training machine learning models"
 requires-python = ">=3.12"
 license = {text = "BSL-1.1"}
 dependencies = [
     "pyarrow>=14.0",
     "numpy>=1.26",
+    "scipy>=1.11",
+    "pandas>=2.0",
     "pylance>=6.0,<7.0",
     "pyyaml>=6.0",
+    "packaging>=23.0",
 ]
 
 [project.optional-dependencies]
@@ -22,10 +25,12 @@ graph = [
 topology = [
     "ripser>=0.6.14",
     "persim>=0.3.5",
+    "scikit-learn>=1.3",
 ]
 dev = [
     "pytest",
     "pytest-cov",
+    "pytest-asyncio",
     "ruff",
     "mypy",
     "igraph>=0.11",

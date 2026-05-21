@@ -16,10 +16,13 @@ methods on real spheres:
     (no aggregation history), but ``pattern.mu`` is the full delta_dim.
     ``shape - pattern.mu`` raises a broadcast error.
 
-  Class C — anomaly_summary: when ``pattern.dim_labels`` undercounts the
-    on-disk delta width (event patterns with stored mu wider than
-    ``delta_dim()``), the ``dim_sq_totals`` accumulator sized by
-    ``len(labels)`` cannot absorb the wider per-cluster ``sq`` vector.
+  Class C — anomaly_summary: event patterns declared with
+    ``edge_dimensions:`` carry edge-derived dim names. The Pattern model
+    exposes those via ``edge_dim_names`` so ``delta_dim()`` matches the
+    on-disk delta width and ``dim_labels`` covers every stored dim. The
+    test verifies the round-trip is consistent and that the
+    ``anomaly_summary`` accumulator (sized by ``len(dim_labels)``)
+    absorbs the per-cluster ``sq`` vector without truncation or crash.
 
 Each test engineers a fixture that reproduces exactly one of the three
 mismatches so a future regression is caught at the unit level instead of
@@ -95,19 +98,21 @@ def _make_anchor_with_aggregations(
     )
 
 
-def _make_event_with_undercount(
+def _make_event_with_edge_dims(
     n_relations: int = 4,
     n_event_dims: int = 8,
-    n_stored_extra: int = 5,
+    n_edge_dims: int = 5,
 ) -> Pattern:
-    """Build an event pattern that mimics tx_pattern's storage undercount.
+    """Build an event pattern with edge-derived dim names.
 
-    On real spheres `tx_pattern` carries 17-wide mu/sigma/theta on disk but
-    ``delta_dim()`` returns 4 + 8 + 0 = 12. The five extra stored dims have
-    no counterpart in ``dim_labels``. This fixture reproduces the same gap
-    by sizing mu/sigma/theta wider than the labelled-dim count.
+    Mirrors the on-disk shape of a transaction-style event pattern that
+    declared ``edge_dimensions:`` in sphere.yaml: the builder concatenates
+    relations → event_dims → edge_dims into mu/sigma/theta, and the Pattern
+    model surfaces the edge-dim block via ``edge_dim_names``. The fixture
+    is sized so ``delta_dim() == len(dim_labels) == len(mu)`` exactly,
+    which is the post-fix invariant for every event pattern.
     """
-    stored_width = n_relations + n_event_dims + n_stored_extra
+    stored_width = n_relations + n_event_dims + n_edge_dims
     relations = [
         RelationDef(line_id=f"rel_{i}", direction="in", required=False)
         for i in range(n_relations)
@@ -117,8 +122,15 @@ def _make_event_with_undercount(
         EventDimDef(column=f"col_{j}", edge_max=1.0)
         for j in range(n_event_dims)
     ]
+    edge_dim_names = [
+        "pair_edge_count",
+        "position_in_chain",
+        "time_since_pair_last_edge",
+        "pair_amount_zscore",
+        "find_motif_structuring",
+    ][:n_edge_dims]
     return Pattern(
-        pattern_id="event_undercount",
+        pattern_id="event_with_edge_dims",
         entity_type="events",
         pattern_type="event",
         relations=relations,
@@ -131,6 +143,7 @@ def _make_event_with_undercount(
         version=1,
         status="production",
         event_dimensions=event_dimensions,
+        edge_dim_names=edge_dim_names,
     )
 
 
@@ -526,24 +539,27 @@ def test_detect_trajectory_anomaly_with_aggregations_handles_narrow_snapshot():
 
 
 # ---------------------------------------------------------------------------
-# Class C — anomaly_summary dim_sq_totals undercount
+# Class C — anomaly_summary on event patterns with edge-derived dims
 # ---------------------------------------------------------------------------
 
 
-def test_anomaly_summary_with_undercounted_dim_labels_does_not_crash():
-    """anomaly_summary must size dim_sq_totals by the on-disk delta width,
-    not by len(pattern.dim_labels), and must tolerate labels shorter than
-    the delta. Reproduces the tx_pattern crash where stored mu/delta width
-    is 17 but dim_labels reports 12."""
-    pat = _make_event_with_undercount(
-        n_relations=4, n_event_dims=8, n_stored_extra=5,
+def test_anomaly_summary_with_edge_dim_names_does_not_crash():
+    """anomaly_summary must absorb the per-cluster delta vector cleanly
+    when the event pattern declared edge_dim_names. Post-fix invariant:
+    ``delta_dim() == len(dim_labels) == len(mu)``, so the
+    ``dim_sq_totals`` accumulator sized by ``len(dim_labels)`` matches
+    the per-cluster sq vector exactly — no truncation, no fallback
+    label, no broadcast error."""
+    pat = _make_event_with_edge_dims(
+        n_relations=4, n_event_dims=8, n_edge_dims=5,
     )
     nav = _make_navigator_with_sphere(pat)
 
     stored_width = len(pat.mu)
     labels_width = len(pat.dim_labels)
-    assert labels_width < stored_width, (
-        "fixture must reproduce the undercount invariant"
+    assert labels_width == stored_width == pat.delta_dim(), (
+        "fixture must hold the post-fix invariant: "
+        "delta_dim() == len(dim_labels) == len(mu)"
     )
 
     theta_norm = float(np.linalg.norm(pat.theta))
@@ -570,15 +586,19 @@ def test_anomaly_summary_with_undercounted_dim_labels_does_not_crash():
     })
     nav._storage.read_geometry = MagicMock(return_value=geo_table)
 
-    # Must not raise the (12,) (17,) (12,) broadcast error
-    result = nav.anomaly_summary(pattern_id="event_undercount")
+    result = nav.anomaly_summary(pattern_id="event_with_edge_dims")
     assert result["total_entities"] == 6
     assert result["total_anomalies"] >= 1
-    # top_driving_dimensions can reference dim indices beyond len(labels);
-    # those must fall back to a synthesized label, not crash.
+    # Every top_driving_dimensions entry must point to a real labelled
+    # dim — synthesized "dim_{i}" fallbacks indicate the band-aid path
+    # is still active.
     for entry in result["top_driving_dimensions"]:
         assert isinstance(entry["label"], str)
-        assert entry["label"]  # not empty
+        assert entry["label"]
+        assert not entry["label"].startswith("dim_"), (
+            f"top driving dim {entry['dim']} fell back to a synthesized "
+            f"label {entry['label']!r} — band-aid path leaked through"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -588,13 +608,39 @@ def test_anomaly_summary_with_undercounted_dim_labels_does_not_crash():
 
 def test_aggregation_fixture_invariants():
     """Guard the fixtures themselves: anchor-with-aggs must have
-    edge_max narrower than mu, and event-with-undercount must have
-    dim_labels narrower than mu."""
+    edge_max narrower than mu, and event-with-edge-dims must hold the
+    post-fix invariant ``delta_dim() == len(dim_labels) == len(mu)``."""
     pat_a = _make_anchor_with_aggregations()
     assert len(pat_a.edge_max) < len(pat_a.mu)
     assert len(pat_a.edge_max) == len(pat_a.relations)
     assert pat_a.delta_dim() == len(pat_a.mu)
 
-    pat_c = _make_event_with_undercount()
-    assert len(pat_c.dim_labels) < len(pat_c.mu)
-    assert pat_c.delta_dim() == len(pat_c.dim_labels)
+    pat_c = _make_event_with_edge_dims()
+    assert pat_c.delta_dim() == len(pat_c.dim_labels) == len(pat_c.mu)
+    # edge_dim_names must surface in the dim_labels block, ordered AFTER
+    # event_dimensions and BEFORE prop_columns (storage layout).
+    n_rel = len(pat_c.relations)
+    n_ev = len(pat_c.event_dimensions)
+    assert pat_c.dim_labels[n_rel + n_ev:n_rel + n_ev + 5] == [
+        "pair_edge_count",
+        "position_in_chain",
+        "time_since_pair_last_edge",
+        "pair_amount_zscore",
+        "find_motif_structuring",
+    ]
+
+
+def test_pattern_delta_dim_matches_mu_for_event_with_edge_dims():
+    """The ``M2.1.5`` acceptance: ``delta_dim()`` must report the stored
+    mu width for event patterns that declared ``edge_dimensions:``."""
+    pat = _make_event_with_edge_dims(n_relations=4, n_event_dims=8, n_edge_dims=5)
+    assert pat.delta_dim() == len(pat.mu) == 17
+    # dim_index() must round-trip every edge_dim_name to a valid offset.
+    for offset, name in enumerate([
+        "pair_edge_count",
+        "position_in_chain",
+        "time_since_pair_last_edge",
+        "pair_amount_zscore",
+        "find_motif_structuring",
+    ]):
+        assert pat.dim_index(name) == 4 + 8 + offset

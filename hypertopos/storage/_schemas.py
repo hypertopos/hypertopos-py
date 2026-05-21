@@ -25,6 +25,12 @@ GEOMETRY_SCHEMA = pa.schema([
     pa.field("bregman_divergence", pa.float32()),
     pa.field("anomaly_confidence", pa.float32()),
     pa.field("n_anomalous_dims",   pa.int32()),
+    # Projection of per-polygon delta onto the label-aware Fisher LDA
+    # direction. Populated only for patterns whose builder calibration
+    # produced a ``signed_direction_vector``; all-null for patterns
+    # without label-aware calibration. Sign preserved — positive values
+    # mean the polygon is pushed toward the positive-labelled centroid.
+    pa.field("delta_norm_signed",  pa.float32()),
     pa.field("edges",           pa.list_(EDGE_STRUCT_TYPE)),
     pa.field("entity_keys",     pa.list_(pa.string())),
     pa.field("last_refresh_at", pa.timestamp("us", tz="UTC")),

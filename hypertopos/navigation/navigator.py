@@ -423,6 +423,25 @@ _SIGMA_SAFE_FLOOR = 1e-12
 # "one dim drives the score".
 _DOMINANT_DIM_MASS_SHARE_THRESHOLD = 0.7
 
+# Brown-Forsythe (median-centred Levene) p-value below which delta_norm
+# variance is taken to differ meaningfully across the levels of a
+# pattern's ``group_by_property`` — i.e. the global θ assumption is
+# statistically violated and the agent should treat a single global
+# threshold with caution. 0.01 keeps the false-positive rate low on
+# multi-group spheres (typical agent surfaces 4-12 patterns ⇒ a 0.05
+# threshold would fire spuriously on healthy spheres).
+_HETEROSCEDASTICITY_P_THRESHOLD = 0.01
+
+# Per-dim normality alpha — Shapiro-Wilk / KS p-value below this fires
+# the ``non_normal_dim`` warning on gaussian dims. 0.01 is intentionally
+# stricter than the classical 0.05 because pattern dims are tested in
+# batch (one test per dim) and the calibration scan happens on the full
+# population (large N) — both push raw p-values down, so a tighter alpha
+# keeps the warning surface focused on dims with material distributional
+# departure rather than near-normal dims with statistically significant
+# but practically negligible skew.
+_NON_NORMAL_DIM_PVALUE_THRESHOLD = 0.01
+
 
 def _compute_calibration_drift(
     fit_from: CalibrationFit,
@@ -1933,17 +1952,8 @@ class GDSNavigator:
             cluster_list = cluster_list[:max_clusters]
 
         # Compute top_driving_dimensions from cluster data
-        # Size by the actual on-disk delta width (== mu width), not len(dim_labels):
-        # event patterns can have dim_labels undercount stored dims (e.g. tx_pattern
-        # has 12 labels but 17 stored mu/delta dims). Fall back to a synthesized
-        # label when the labels list is shorter than the on-disk width.
         labels = pattern.dim_labels
-        delta_width = (
-            len(cluster_list[0]["delta"])
-            if cluster_list
-            else (len(pattern.mu) if pattern.mu is not None else len(labels))
-        )
-        dim_sq_totals = np.zeros(delta_width, dtype=np.float64)
+        dim_sq_totals = np.zeros(len(labels), dtype=np.float64)
         total_weight = 0.0
         for cluster in cluster_list:
             delta = np.array(cluster["delta"], dtype=np.float32)
@@ -1951,7 +1961,7 @@ class GDSNavigator:
             count = cluster["count"]
             delta_norm_c = float(np.linalg.norm(delta))
             weight = delta_norm_c * count
-            dim_sq_totals[:len(sq)] += sq * weight
+            dim_sq_totals += sq * weight
             total_weight += weight
         if total_weight > 1e-10:
             pcts = dim_sq_totals / dim_sq_totals.sum() * 100
@@ -1959,7 +1969,7 @@ class GDSNavigator:
             top_driving_dimensions = [
                 {
                     "dim": int(i),
-                    "label": labels[i] if i < len(labels) else f"dim_{i}",
+                    "label": labels[i],
                     "mean_contribution_pct": round(float(pcts[i]), 1),
                 }
                 for i in top_idx if pcts[i] > 3.0
@@ -7656,7 +7666,7 @@ class GDSNavigator:
         """Surface build-time dim-quality issues that silently break z-score
         / delta_norm semantics.
 
-        Four classes flagged:
+        Five classes flagged:
 
         - **dead_dim**: ``sigma_diag[i] < 1e-10`` — the dim has zero
           variance across the population, so the z-score `(x - mu) / sigma`
@@ -7684,9 +7694,22 @@ class GDSNavigator:
           and asks for a re-declare; this rule narrows the action to
           gaussian-only cases where the kind itself is the bug.
 
-        All four are computed from cached pattern state (``sigma_diag``,
-        ``dim_percentiles``, ``mu``, ``dimension_kinds``) — sub-millisecond,
-        no storage scan.
+        - **non_normal_dim**: a dim declared with ``kind='gaussian'``
+          whose build-time Shapiro-Wilk / KS p-value is below
+          ``_NON_NORMAL_DIM_PVALUE_THRESHOLD`` — the gaussian z-score
+          assumes the dim distribution is approximately normal. When
+          the empirical distribution is heavy-tailed (Pareto, log-normal
+          income / amount data), z-scoring concentrates the delta mass
+          in a few extreme rows and poorly discriminates the bulk of
+          the population. Test family is picked per-dim at build time
+          by sample size (Shapiro-Wilk for N <= 5000, KS otherwise).
+          Suppressed when ``negative_space`` already fires on the same
+          dim — that warning's remediation (re-declare kind) supersedes
+          the normality complaint, and double-flagging is noise.
+
+        All five are computed from cached pattern state (``sigma_diag``,
+        ``dim_percentiles``, ``mu``, ``dimension_kinds``,
+        ``dim_normality_pvalues``) — sub-millisecond, no storage scan.
         """
         def _build_raw_dim_name_to_index(pattern: Any) -> dict[str, int]:
             """Map dim_percentiles raw keys (column / line_id-without-_d_
@@ -7938,9 +7961,149 @@ class GDSNavigator:
         if dom_warning is not None:
             warnings.append(dom_warning)
 
-        warnings.extend(_compute_negative_space_warnings(pattern))
+        negative_space_warnings = _compute_negative_space_warnings(pattern)
+        warnings.extend(negative_space_warnings)
+
+        # Per-dim normality test outcome. Gaussian-only (z-score assumes
+        # normality, so the test is meaningless on bernoulli / poisson
+        # kinds). Suppress for dims already flagged by `negative_space`
+        # because that warning's remediation ("re-declare kind") is the
+        # right action and the normality complaint is downstream noise.
+        negative_space_labels = {
+            w["dim_label"] for w in negative_space_warnings
+        }
+        warnings.extend(
+            GDSNavigator._compute_non_normal_dim_warnings(
+                pattern, suppress_labels=negative_space_labels,
+            ),
+        )
+
+        # Heteroscedasticity — Brown-Forsythe p-value persisted by the
+        # builder when the pattern carries `group_by_property`. The
+        # dim_label here references the grouping variable (a categorical
+        # line property), not a δ-dim — the warning's role is to flag
+        # that the global θ / Cohen's d pooled-σ / APS global-percentile
+        # assumptions are violated for this pattern, not that any one
+        # δ-dim is misbehaving.
+        het_diag = getattr(pattern, "heteroscedasticity_diagnostic", None) or {}
+        for prop_name, entry in het_diag.items():
+            p_value = entry.get("p_value")
+            # None: < 2 qualifying groups (low-N skip exhausted the test).
+            # NaN: every qualifying group had zero residual variance
+            # (degenerate distribution — typical of event-line shapes
+            # with one in-relation, but also a bug-screen surface). In
+            # neither case is the global-θ assumption "violated" — the
+            # diagnostic simply could not be computed.
+            if p_value is None or not np.isfinite(p_value):
+                continue
+            if p_value >= _HETEROSCEDASTICITY_P_THRESHOLD:
+                continue
+            w_stat = entry.get("W_statistic")
+            warnings.append({
+                "type": "heteroscedasticity",
+                "dim_label": prop_name,
+                "reason": (
+                    f"Levene W={float(w_stat):.2f} p={float(p_value):.2e} "
+                    f"on group_by={prop_name} — global θ assumption "
+                    f"violated"
+                ),
+                "advice": (
+                    "Per-group θ calibration is statistically warranted "
+                    "on this grouping; if per-group θ is undesirable "
+                    "downstream consider a variance-stabilizing "
+                    "transform (log1p) on delta_norm before "
+                    "thresholding."
+                ),
+                "evidence_value": float(p_value),
+                "threshold": _HETEROSCEDASTICITY_P_THRESHOLD,
+            })
 
         return warnings
+
+    @staticmethod
+    def _compute_non_normal_dim_warnings(
+        pattern: Any,
+        *,
+        suppress_labels: set[str],
+    ) -> list[dict[str, Any]]:
+        """Emit ``non_normal_dim`` warnings for gaussian dims that failed
+        the build-time normality test (Shapiro-Wilk for N <= 5000, KS
+        otherwise). Returns an empty list when the pattern lacks
+        ``dim_normality_pvalues`` (pre-diagnostic build), when no
+        gaussian dim has a p-value below the alpha threshold, or when
+        every below-threshold dim is already covered by a
+        ``negative_space`` warning.
+        """
+        pvalues = getattr(pattern, "dim_normality_pvalues", None)
+        if not pvalues:
+            return []
+
+        dimension_kinds = getattr(pattern, "dimension_kinds", None)
+        dim_labels = pattern.dim_labels if pattern.dim_labels else []
+        if dimension_kinds is None or len(dimension_kinds) != len(dim_labels):
+            # Legacy / mis-shaped pattern — no reliable way to confirm
+            # the dim is gaussian, so do not emit.
+            return []
+
+        # Reuse the navigator's keying convention: raw column / line_id
+        # without `_d_` prefix / prop name → delta-vector index. Same
+        # build as the `negative_space` auditor so a dim's normality
+        # entry resolves to the same kind slot.
+        def _raw_to_idx(pattern: Any) -> dict[str, int]:
+            mapping: dict[str, int] = {}
+            for i, rel in enumerate(pattern.relations):
+                if rel.line_id.startswith("_d_"):
+                    stripped = rel.line_id[3:]
+                    mapping[stripped] = i
+                    parts = stripped.split("_", 1)
+                    if len(parts) > 1:
+                        mapping.setdefault(parts[1], i)
+                else:
+                    mapping[rel.line_id] = i
+            k = len(pattern.relations)
+            for j, ed in enumerate(pattern.event_dimensions):
+                mapping[ed.column] = k + j
+            k2 = k + len(pattern.event_dimensions)
+            for j, prop in enumerate(pattern.prop_columns):
+                mapping[prop] = k2 + j
+            return mapping
+
+        raw_to_idx = _raw_to_idx(pattern)
+        out: list[dict[str, Any]] = []
+        for raw_name, p_value in pvalues.items():
+            if raw_name in suppress_labels:
+                continue
+            i = raw_to_idx.get(raw_name)
+            if i is None or i >= len(dimension_kinds):
+                continue
+            if dimension_kinds[i] != "gaussian":
+                continue
+            if not np.isfinite(p_value):
+                continue
+            if p_value >= _NON_NORMAL_DIM_PVALUE_THRESHOLD:
+                continue
+            out.append({
+                "type": "non_normal_dim",
+                "dim_label": raw_name,
+                "reason": (
+                    f"normality test p={p_value:.2e} < "
+                    f"{_NON_NORMAL_DIM_PVALUE_THRESHOLD} — z-score "
+                    f"assumes normality, this dim's distribution is "
+                    f"heavy-tailed or otherwise non-normal"
+                ),
+                "advice": (
+                    "Consider a log1p / sqrt / rank transform of the "
+                    "raw shape values before mu/sigma computation, or "
+                    "re-declare kind as 'poisson' (discrete counts) or "
+                    "'bernoulli' (binary presence) if applicable. "
+                    "Untransformed, the gaussian z-score concentrates "
+                    "the delta mass in a few extreme rows and poorly "
+                    "discriminates the bulk of the population."
+                ),
+                "evidence_value": float(p_value),
+                "threshold": _NON_NORMAL_DIM_PVALUE_THRESHOLD,
+            })
+        return out
 
     def _build_theta_sensitivity_summary(self, pattern_id: str) -> dict | None:
         """Compact theta_sensitivity diagnostic for sphere_overview.
@@ -16760,25 +16923,18 @@ class GDSNavigator:
 
         # Validate dim labels (raise GDSNavigationError listing available
         # labels) and override values (raise listing offenders).
-        # Resolution priority: try ``pattern.dim_index`` (relations /
-        # event_dimensions / prop_columns by line_id or display_name),
-        # then fall back to ``pattern.dim_labels.index`` so labels emitted
-        # by ``edge_dim_aggregations`` (which dim_index does not search)
-        # are accepted too — the synthesized dim_labels list is the public
-        # contract surfaced through sphere_overview and explain_anomaly.
+        # ``pattern.dim_index`` covers relations, event_dimensions,
+        # prop_columns, and edge_dim_aggregations labels — a single
+        # canonical resolution path.
         resolved_indices: dict[str, int] = {}
-        dim_labels = pattern.dim_labels
         for label in set_dimension:
             try:
                 resolved_indices[label] = pattern.dim_index(label)
             except ValueError:
-                if label in dim_labels:
-                    resolved_indices[label] = dim_labels.index(label)
-                else:
-                    raise GDSNavigationError(
-                        f"unknown dim_label {label!r} for pattern "
-                        f"{pattern_id!r}; available: {dim_labels}",
-                    ) from None
+                raise GDSNavigationError(
+                    f"unknown dim_label {label!r} for pattern "
+                    f"{pattern_id!r}; available: {pattern.dim_labels}",
+                ) from None
 
         bad_values = [
             (label, value)

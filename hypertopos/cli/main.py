@@ -51,6 +51,14 @@ def main() -> None:
         "--no-edges", action="store_true",
         help="Skip edge table emission",
     )
+    build_p.add_argument(
+        "--label-aware-calibration", action="store_true",
+        help=(
+            "Enable label-aware per-dim calibration. No-op unless the "
+            "sphere config declares a label_audit block selecting "
+            "patterns to calibrate."
+        ),
+    )
 
     # --- validate ---
     validate_p = sub.add_parser(
@@ -77,6 +85,7 @@ def main() -> None:
                 args.config, args.output, args.force, args.verbose,
                 no_temporal=args.no_temporal, no_chains=args.no_chains,
                 no_edges=args.no_edges,
+                label_aware_calibration=args.label_aware_calibration,
             )
     elif args.command == "validate":
         from hypertopos.cli.build import run_validate

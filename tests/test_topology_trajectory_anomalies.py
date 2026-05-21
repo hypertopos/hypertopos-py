@@ -10,6 +10,9 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
+pytest.importorskip("ripser")
+pytest.importorskip("sklearn")
+
 
 def _circular_trajectory(T: int, radius: float = 1.0, dim: int = 5, seed: int = 0) -> np.ndarray:
     rng = np.random.default_rng(seed)

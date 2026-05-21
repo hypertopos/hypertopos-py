@@ -11,6 +11,9 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
+pytest.importorskip("ripser")
+pytest.importorskip("sklearn")
+
 
 def _embedded_loop_with_bg(
     n_loop: int = 30, n_bg: int = 1970, dim: int = 10, seed: int = 0,

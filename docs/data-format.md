@@ -51,11 +51,12 @@ The central config file. Loaded once on `open_sphere` (typically a few KB). Cont
 | Field | Type | Description |
 |-------|------|-------------|
 | `sphere_id` | string | Unique sphere identifier |
-| `format_version` | string | On-disk layout version. Current: `"3.0"` (flat single-dataset geometry with native Lance epoch tags). Reader rejects earlier values and points to a clean rebuild from source. |
+| `format_version` | string | On-disk layout version, written as `"<major>.<minor>"`. Major `3` is required; minor bumps (e.g. `"3.1"`) ride a backward-compatible field addition and load on any major-3 reader. Pre-3.x and malformed values are rejected with a rebuild hint. |
 | `lines` | dict | Line definitions: versions, columns, partition config, descriptions |
 | `patterns` | dict | Pattern stats: `mu`, `sigma_diag`, `theta`, `edge_max`, `dimension_weights`, `group_stats` |
 | `aliases` | dict | Alias definitions: `base_pattern`, cutting plane (`normal` vector, `bias`) |
 | `storage` | dict | Storage config per layer (format, partition mode) |
+| `label_audit` | dict, optional | Top-level label-aware calibration metadata — `{label_column, label_positive_value, patterns: [...]}`. Present only when the build registered a YAML `label_audit:` block; absent on spheres built without one. When present, `format_version` is stamped `"3.1"`. |
 
 Example (abridged pattern entry):
 

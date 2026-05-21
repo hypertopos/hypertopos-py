@@ -19,7 +19,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from hypertopos.model.sphere import Pattern, RelationDef
+from hypertopos.model.sphere import EdgeDimAggregationsRef, Pattern, RelationDef
 from hypertopos.navigation.navigator import GDSNavigationError, GDSNavigator
 
 
@@ -234,48 +234,48 @@ def test_unknown_dim_label_raises_with_available_list():
     assert "available" in msg.lower()
 
 
-def test_aggregation_label_resolves_via_dim_labels_fallback():
-    """Labels exposed only through `pattern.dim_labels` (e.g.
-    `edge_dim_aggregations` aggregate names) must resolve via the
-    dim_labels.index() fallback when `pattern.dim_index` rejects them.
-    The public contract is "any label in `pattern.dim_labels` is overridable".
+def test_aggregation_label_resolves_via_dim_index():
+    """Aggregated edge-dim labels (``{dim}_{aggregate}`` emitted by
+    ``edge_dim_aggregations``) must resolve through ``Pattern.dim_index``
+    in a single canonical lookup — no special-case fallback in the
+    navigator.
 
-    Real reproduction: AML HI-small `account_pattern` exposes
-    `pair_edge_count_*` and `find_motif_structuring_*` labels in
-    `dim_labels` but `dim_index` only searches relations / event_dims /
-    prop_columns — without the fallback these labels raise unknown."""
-    extra_label = "edge_count_max_aggregation"
-    pattern_real = _make_pattern(
-        line_ids=["A", "B", extra_label],  # carry 3 slots in relations…
-        mu=[0.0, 0.0, 0.0],
-        sigma_diag=[1.0, 1.0, 1.0],
-        theta=[2.0, 2.0, 2.0],
+    Public contract: any label in ``pattern.dim_labels`` is overridable
+    by ``simulate_dimension_change``. Real-world reproduction:
+    ``account_pattern`` exposes aggregated edge-dim labels alongside
+    relations / event_dims / prop_columns, and all of them resolve
+    through the same path."""
+    agg_label = "amount_max"
+    pattern = Pattern(
+        pattern_id="test_pattern",
+        entity_type="account",
+        pattern_type="anchor",
+        relations=[
+            RelationDef(line_id="A", direction="out", required=False),
+            RelationDef(line_id="B", direction="out", required=False),
+        ],
+        mu=np.zeros(3, dtype=np.float64),
+        sigma_diag=np.ones(3, dtype=np.float64),
+        theta=np.full(3, 2.0, dtype=np.float64),
+        population_size=1000,
+        computed_at=datetime(2026, 5, 17, tzinfo=UTC),
+        version=1,
+        status="production",
+        edge_dim_aggregations=EdgeDimAggregationsRef(
+            from_event_pattern="ev_pattern",
+            dims=("amount",),
+            aggregates_per_dim={"amount": ("max",)},
+        ),
     )
-    # …then wrap to make dim_index reject extra_label (simulating that
-    # it is NOT a relation, only an aggregation entry in dim_labels).
-    def fake_dim_index(name):
-        if name in ("A", "B"):
-            return ["A", "B"].index(name)
-        raise ValueError(
-            f"Dimension {name!r} not found in pattern relations. "
-            f"Available: ['A', 'B']"
-        )
-
-    wrapper = MagicMock(wraps=pattern_real)
-    wrapper.dim_labels = ["A", "B", extra_label]
-    wrapper.dim_index.side_effect = fake_dim_index
-    wrapper.mu = pattern_real.mu
-    wrapper.sigma_diag = pattern_real.sigma_diag
-    wrapper.theta = pattern_real.theta
-    wrapper.cholesky_inv = pattern_real.cholesky_inv
-    wrapper.dimension_weights = pattern_real.dimension_weights
-    wrapper.pattern_type = pattern_real.pattern_type
+    # Aggregation label resolves through dim_index to idx=2 (after 2
+    # relations + 0 event_dims + 0 prop_columns).
+    assert pattern.dim_index(agg_label) == 2
 
     delta_np = np.asarray([0.5, 0.3, 0.7], dtype=np.float64)
     nav = GDSNavigator.__new__(GDSNavigator)
     nav._storage = MagicMock()
     nav._storage.read_sphere.return_value = MagicMock(
-        patterns={"test_pattern": wrapper},
+        patterns={"test_pattern": pattern},
     )
     nav._storage.read_geometry.return_value = pa.table({
         "primary_key": ["E1"],
@@ -285,15 +285,13 @@ def test_aggregation_label_resolves_via_dim_labels_fallback():
     })
     nav._resolve_version = MagicMock(return_value=1)
 
-    # Override the aggregation label — must NOT raise; resolves to idx=2
-    # via dim_labels.index() fallback after dim_index ValueError.
     result = nav.simulate_dimension_change(
         "E1",
         pattern_id="test_pattern",
         line_id="line_A",
-        set_dimension={extra_label: 0.0},
+        set_dimension={agg_label: 0.0},
     )
-    assert result["dimensions_overridden"][0]["dim_label"] == extra_label
+    assert result["dimensions_overridden"][0]["dim_label"] == agg_label
     assert result["dimensions_overridden"][0]["dim_index"] == 2
 
 

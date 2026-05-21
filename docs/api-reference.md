@@ -688,6 +688,7 @@ Key methods: `slice_at(timestamp)` -- binary search for the slice active at a gi
 | `population_size` | `int` | Total entity count at calibration time |
 | `version` | `int` | Pattern version |
 | `prop_columns` | `list[str]` | Boolean property columns tracked as dimensions |
+| `edge_dim_names` | `list[str]` | Edge-derived dim names for event patterns that declared an `edge_dimensions:` block in `sphere.yaml`. Order matches the storage layout (after `event_dimensions`, before `prop_columns`). Empty for patterns without `edge_dimensions:`. |
 | `dimension_weights` | `np.ndarray \| None` | Per-dimension importance weights |
 | `dimension_kinds` | `list[str] \| None` | Per-dimension distribution family: `"gaussian"`, `"poisson"`, or `"bernoulli"`. Populated at build time; `None` on pre-2.3 spheres. |
 

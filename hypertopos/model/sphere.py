@@ -276,15 +276,33 @@ class Pattern:
     dim_percentiles: dict[str, dict[str, float]] | None = None
     timestamp_col: str | None = None
     dimension_kinds: list[str] | None = None
+    dim_normality_pvalues: dict[str, float] | None = None
     edge_dim_aggregations: "EdgeDimAggregationsRef | None" = None
     fdr_hierarchy: list[FDRHierarchyLevel] = field(default_factory=list)
     fdr_temporal_hierarchy: list[FDRTemporalLevel] = field(default_factory=list)
     conformance_rules: list[ConformanceRule] = field(default_factory=list)
+    heteroscedasticity_diagnostic: dict[str, dict[str, Any]] | None = None
+    # Edge-derived per-event dim names emitted on event patterns when
+    # ``edge_dimensions:`` is declared in sphere.yaml. Order matches the
+    # storage layout: builder concatenates relations → event_dims →
+    # edge_dim_names → prop_cols → dim_blocks into the full shape vector.
+    # Empty for patterns without edge_dimensions (no behaviour change).
+    edge_dim_names: list[str] = field(default_factory=list)
+    # Label-aware per-dim calibration result, populated by the builder when
+    # the pattern is listed under ``label_audit.patterns`` in sphere.yaml
+    # AND the ``--label-aware-calibration`` build flag is set. Maps a
+    # dim_label to an object exposing ``mu_pos``, ``sigma_pos``, ``mu_neg``,
+    # ``sigma_neg``, ``direction`` (matches
+    # ``engine.calibration_label_aware.DimCalibration``). ``None`` on
+    # patterns built without the block — readers and the MCP
+    # ``audit_pattern_dims`` tool fall back to raw mu/sigma in that case.
+    label_aware_calibration: dict[str, Any] | None = None
 
     def delta_dim(self) -> int:
         base = (
             len(self.relations)
             + len(self.event_dimensions)
+            + len(self.edge_dim_names)
             + len(self.prop_columns)
         )
         return base + len(self._edge_dim_aggregation_names())
@@ -318,11 +336,18 @@ class Pattern:
 
     @property
     def dim_labels(self) -> list[str]:
-        """Human-readable dimension labels: relations + event dims + props + aggregated edge dims."""
+        """Human-readable dimension labels in storage layout order.
+
+        Layout: relations → event_dimensions → edge_dim_names →
+        prop_columns → aggregated edge dim names. The middle ``edge_dim_names``
+        block is populated on event patterns that declared
+        ``edge_dimensions:`` in sphere.yaml; empty otherwise.
+        """
         labels = [r.display_name if r.display_name else r.line_id for r in self.relations]
         labels.extend(
             ed.display_name or ed.column for ed in self.event_dimensions
         )
+        labels.extend(self.edge_dim_names)
         labels.extend(self.prop_columns)
         labels.extend(self._edge_dim_aggregation_names())
         return labels
@@ -346,9 +371,13 @@ class Pattern:
     def dim_index(self, dim_name: str) -> int:
         """Resolve dimension name to delta vector index.
 
-        Searches in order: relations (line_id, display_name),
-        event dimensions (column, display_name), prop_columns.
-        Raises ValueError if dim_name is not found.
+        Searches in storage-layout order: relations (line_id, display_name),
+        event dimensions (column, display_name), edge_dim_names emitted by
+        ``edge_dimensions:``, prop_columns, then aggregated edge dim labels
+        (``{dim}_{aggregate}``) emitted by ``edge_dim_aggregations``. Offsets
+        match the builder concatenation order in
+        ``_compute_population_stats``. Raises ValueError if dim_name is not
+        found.
         """
         k = len(self.relations)
         for i, rel in enumerate(self.relations):
@@ -358,16 +387,24 @@ class Pattern:
         for j, ed in enumerate(self.event_dimensions):
             if ed.column == dim_name or (ed.display_name and ed.display_name == dim_name):
                 return k + j
+        k_edge = k2 + len(self.edge_dim_names)
+        for j, ed_name in enumerate(self.edge_dim_names):
+            if ed_name == dim_name:
+                return k2 + j
         for j, prop in enumerate(self.prop_columns):
             if prop == dim_name:
-                return k2 + j
+                return k_edge + j
+        k3 = k_edge + len(self.prop_columns)
+        for j, agg_label in enumerate(self._edge_dim_aggregation_names()):
+            if agg_label == dim_name:
+                return k3 + j
         available = [
             rel.line_id + (f" ({rel.display_name})" if rel.display_name else "")
             for rel in self.relations
         ] + [
             ed.column + (f" ({ed.display_name})" if ed.display_name else "")
             for ed in self.event_dimensions
-        ] + self.prop_columns
+        ] + self.edge_dim_names + self.prop_columns + self._edge_dim_aggregation_names()
         raise ValueError(
             f"Dimension '{dim_name}' not found in pattern relations. "
             f"Available: {available}"
@@ -477,6 +514,11 @@ class Sphere:
     aliases: dict[str, Alias] = field(default_factory=dict)
     storage: StorageConfig = field(default_factory=StorageConfig)
     description: str | None = None
+    # Top-level label_audit block from sphere.json (format 3.1+). Holds
+    # the pattern selection and label column for label-aware calibration.
+    # ``None`` when the sphere was built without one — readers treat this
+    # as "no label-aware calibration available".
+    label_audit: dict[str, Any] | None = None
     reverse_index: dict[str, list[str]] = field(init=False, default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -554,6 +596,7 @@ class CalibrationFit:
     last_calibrated_at: datetime
     edge_dim_thresholds: dict[str, float] | None = None
     theta_sensitivity: dict[str, dict[str, float]] | None = None
+    dim_normality_pvalues: dict[str, float] | None = None
 
 
 @dataclass(frozen=True)

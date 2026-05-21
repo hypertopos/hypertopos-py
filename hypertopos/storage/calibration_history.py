@@ -112,6 +112,7 @@ def serialize_fit(fit: Any) -> dict[str, Any]:
         "last_calibrated_at": _format_dt(fit.last_calibrated_at),
         "edge_dim_thresholds": fit.edge_dim_thresholds,
         "theta_sensitivity": fit.theta_sensitivity,
+        "dim_normality_pvalues": fit.dim_normality_pvalues,
     }
 
 
@@ -138,6 +139,7 @@ def deserialize_fit(blob: dict[str, Any]) -> Any:
         last_calibrated_at=_parse_dt(blob["last_calibrated_at"]),
         edge_dim_thresholds=blob.get("edge_dim_thresholds"),
         theta_sensitivity=blob.get("theta_sensitivity"),
+        dim_normality_pvalues=blob.get("dim_normality_pvalues"),
     )
 
 

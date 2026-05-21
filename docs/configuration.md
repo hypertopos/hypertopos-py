@@ -376,6 +376,7 @@ patterns:
 | `edge_table` | dict | `null` | Explicit edge table config (see below). Auto-emitted for event patterns with 2+ FK relations to same anchor line. |
 | `edge_dimensions` | list | `null` | Build-time per-edge dims for event patterns. Each item is either a bare dim name or a single-key dict with overrides. Five dims available: `pair_edge_count`, `position_in_chain` (`min_position` ≥ 3, default 5), `time_since_pair_last_edge`, `pair_amount_zscore` (LOW_VAR pairs only), `find_motif_structuring`. |
 | `edge_dim_aggregations` | dict | `null` | **Anchor patterns only.** Aggregate per-edge sidecar dims of an event pattern up to per-anchor `_mean` / `_max` columns baked into the anchor polygon. `from: <event_pid>` is required and must reference an event pattern that declares `edge_dimensions:`. `dims: [...]` is required — must be a non-empty list of source dim names from the referenced sidecar (the previous "omit `dims` to aggregate everything" shorthand was removed; explicit declaration prevents build-vs-runtime label drift). Anchor regimes: `single` (account-style, anchor PK matches edge `from_key` OR `to_key`) and `pair` (composite-key, anchor PK = `<from>__<to>`); `chain` raises `NotImplementedError`. Builder switches to a two-phase build (events first, anchors second) when this block is present. |
+| `conformance_rules` | list | `null` | Declarative compliance predicates evaluated at build time against the entity-line points table. Each entry has shape `{rule_id?, severity, description?, violates_when}` where `severity` is one of `low` / `medium` / `high` / `critical` and `violates_when` is a predicate AST. `rule_id` is auto-assigned as `r0`, `r1`, ... when omitted; duplicate `rule_id`s are rejected. Predicate ops: `and`, `or`, `not` (logical compounds carry `terms`), `==`, `!=`, `<`, `<=`, `>`, `>=` (carry `prop` + scalar `value`), and `in` (carries `prop` + list `value`). The `prop` field references a raw column on the entity-line points table — unknown columns fail the build immediately. Violators land in a sidecar Lance dataset read by `find_conformance_violations`. |
 | `bootstrap_iterations` | int | `200` | Number of bootstrap resamples used to compute `anomaly_confidence` per entity. Skipped automatically for N > 50K, `group_by_property`, or `use_mahalanobis`. |
 
 ### Edge Table
@@ -443,6 +444,61 @@ patterns:
 | `semantic_dim.n_components` | int | — | **Required** (within `semantic_dim`). Target number of PCA dimensions. |
 
 Dimension prefixes (`g:`, `t:`, `s:`) appear in `explain_anomaly` output, making it clear which block a dimension belongs to.
+
+### Conformance Rules
+
+Patterns optionally accept a `conformance_rules:` block that declares compliance predicates evaluated at build time against the entity-line points table. Violators land in a sidecar Lance dataset surfaced by the `find_conformance_violations` navigator primitive and MCP tool.
+
+```yaml
+patterns:
+  account_pattern:
+    type: anchor
+    entity_line: accounts
+    relations: []
+    conformance_rules:
+      - rule_id: high_amount
+        severity: high
+        description: account average above compliance ceiling
+        violates_when:
+          op: ">"
+          prop: avg_amount             # Column on the entity-line points table.
+          value: 10000
+
+      - rule_id: sanctioned_region
+        severity: critical
+        violates_when:
+          op: in
+          prop: country
+          value: [XX, ZZ]
+
+      - rule_id: high_value_and_sanctioned
+        severity: critical
+        violates_when:
+          op: and
+          terms:
+            - op: ">"
+              prop: avg_amount
+              value: 10000
+            - op: in
+              prop: country
+              value: [XX, ZZ]
+```
+
+Predicate language:
+
+| Op | Shape | Description |
+|----|-------|-------------|
+| `and`, `or` | `{op, terms: [...]}` | Logical compound — non-empty list of child predicates. |
+| `not` | `{op, terms: [child]}` | Logical negation — exactly one child predicate. |
+| `==`, `!=`, `<`, `<=`, `>`, `>=` | `{op, prop, value}` | Comparison on a single column against a scalar literal. |
+| `in` | `{op, prop, value: [...]}` | Membership in a list literal. |
+
+Rules:
+
+- `severity` is one of `low`, `medium`, `high`, `critical`.
+- `rule_id` is optional; when omitted, rules are auto-assigned `r0`, `r1`, ... in YAML order. Duplicate `rule_id`s within a pattern are rejected at parse time.
+- `description` is optional and surfaced in violation responses for audit context.
+- `prop` references a raw column on the entity-line points table — not a dim label. An unknown column fails the build immediately.
 
 ### Multiple patterns on the same entity line
 

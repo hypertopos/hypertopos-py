@@ -10,6 +10,7 @@ Used for: money laundering chain detection, supply chain path analysis.
 from __future__ import annotations
 
 import contextlib
+import math
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -173,7 +174,23 @@ class Chain:
             for i in range(len(self.amounts) - 1)
         )
 
-    def to_dict(self) -> dict:
+    def to_dict(
+        self,
+        *,
+        delta_by_key: dict[str, np.ndarray] | None = None,
+    ) -> dict:
+        """Serialise the chain to a JSON-safe dict.
+
+        ``delta_by_key`` is an optional pre-fetched mapping from entity key
+        to that entity's polygon delta vector against the chain's anchor
+        pattern. When supplied, the output gains an ``edge_potentials``
+        field — one Euclidean distance ``||delta(keys[i]) - delta(keys[i+1])||``
+        per consecutive-pair hop. Element is ``None`` when either endpoint
+        lacks a delta entry, the vectors have mismatched or zero length,
+        or the resulting distance is non-finite (NaN / inf — strict-JSON
+        sanitised). When ``delta_by_key`` is None, ``edge_potentials`` is
+        a list of ``None`` of the appropriate length.
+        """
         amt_std = float(np.std(self.amounts)) if self.amounts else 0.0
         amt_mean = float(np.mean(self.amounts)) if self.amounts else 0.0
         return {
@@ -196,7 +213,49 @@ class Chain:
             "amount_monotone_decreasing": (
                 self.amount_monotone_decreasing()
             ),
+            "edge_potentials": _compute_edge_potentials(
+                self.keys, delta_by_key,
+            ),
         }
+
+
+def _compute_edge_potentials(
+    keys: list[str],
+    delta_by_key: dict[str, np.ndarray] | None,
+) -> list[float | None]:
+    """Euclidean distance ``||delta(keys[i]) - delta(keys[i+1])||`` per hop.
+
+    Length is ``max(0, len(keys) - 1)``. Element is ``None`` when:
+      - ``delta_by_key`` is None (the caller did not pre-fetch deltas);
+      - either endpoint's key is missing from ``delta_by_key``;
+      - the two delta vectors have mismatched or zero length;
+      - the computed distance is not finite (NaN / inf).
+
+    NaN / inf protection keeps the result strict-JSON-safe: any non-finite
+    distance is replaced by ``None`` before serialisation.
+    """
+    n_hops = max(0, len(keys) - 1)
+    if n_hops == 0:
+        return []
+    if delta_by_key is None:
+        return [None] * n_hops
+
+    out: list[float | None] = []
+    for i in range(n_hops):
+        a = delta_by_key.get(keys[i])
+        b = delta_by_key.get(keys[i + 1])
+        if a is None or b is None:
+            out.append(None)
+            continue
+        if a.shape != b.shape or a.size == 0:
+            out.append(None)
+            continue
+        d = float(np.linalg.norm(a - b))
+        if not math.isfinite(d):
+            out.append(None)
+            continue
+        out.append(d)
+    return out
 
 
 def extract_chains(

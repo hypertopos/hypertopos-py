@@ -2,13 +2,14 @@
 
 > A behavioral feature layer for graph and temporal data — turning behavior into coordinates, trajectories, and explanations.
 
+[![Test](https://github.com/hypertopos/hypertopos-py/actions/workflows/test.yml/badge.svg)](https://github.com/hypertopos/hypertopos-py/actions/workflows/test.yml)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License: BSL 1.1](https://img.shields.io/badge/license-BSL%201.1-orange.svg)](LICENSE.md)
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19482069.svg)](https://doi.org/10.5281/zenodo.19482069)
 [![PyArrow](https://img.shields.io/badge/format-PyArrow-red.svg)](https://arrow.apache.org/docs/python/)
 [![Lance](https://img.shields.io/badge/storage-Lance-blueviolet.svg)](https://github.com/lance-format/lance)
 [![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io)
-[![Version](https://img.shields.io/badge/version-0.7.1-%235500FF.svg)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.7.2-%235500FF.svg)](pyproject.toml)
 
 hypertopos is not a database, and not a machine learning model. It is a layer that turns relational data into a coordinate system where every entity gets a position derived from its relationships and the population around it.
 

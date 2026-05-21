@@ -201,6 +201,7 @@ class GDSEngine:
         manifest: Manifest,
         filters: dict[str, str | list[str]] | None = None,
         timestamp: datetime | None = None,
+        counterfactual_frozen_population: bool = False,
     ) -> Solid:
         base = self.build_polygon(primary_key, pattern_id, manifest)
         table = self._storage.read_temporal(
@@ -216,6 +217,11 @@ class GDSEngine:
         pattern = sphere.patterns[pattern_id]
         sigma = np.maximum(pattern.sigma_diag, self.SIGMA_EPSILON)
         slices: list[SolidSlice] = []
+        # When counterfactual_frozen_population is requested, capture each
+        # slice's raw shape_snapshot so the frozen-trajectory recompute can
+        # run after the loop using the chronologically-first slice's shape
+        # as the entity-relative reference.
+        raw_shapes: list[np.ndarray] = []
         for i in range(table.num_rows):
             row = {col: table[col][i].as_py() for col in table.schema.names}
             shape = np.array(row["shape_snapshot"], dtype=np.float32)
@@ -241,11 +247,45 @@ class GDSEngine:
                 changed_line_id=row.get("changed_line_id"),
                 added_edge=None,
             ))
-        slices.sort(key=lambda s: s.timestamp)
+            if counterfactual_frozen_population:
+                raw_shapes.append(shape)
+        # Pair raw_shapes with their slice and sort jointly so the
+        # chronologically-first slice's raw shape becomes the frozen
+        # reference even when temporal rows arrive out of order.
+        if counterfactual_frozen_population and slices:
+            paired = sorted(
+                zip(slices, raw_shapes, strict=True),
+                key=lambda p: p[0].timestamp,
+            )
+            slices = [p[0] for p in paired]
+            raw_shapes = [p[1] for p in paired]
+        else:
+            slices.sort(key=lambda s: s.timestamp)
         if timestamp is not None:
             if timestamp.tzinfo is None:
                 timestamp = timestamp.replace(tzinfo=UTC)
-            slices = [s for s in slices if s.timestamp <= timestamp]
+            if counterfactual_frozen_population:
+                surviving = [
+                    (s, r) for s, r in zip(slices, raw_shapes, strict=True)
+                    if s.timestamp <= timestamp
+                ]
+                slices = [p[0] for p in surviving]
+                raw_shapes = [p[1] for p in surviving]
+            else:
+                slices = [s for s in slices if s.timestamp <= timestamp]
+        if counterfactual_frozen_population and slices:
+            from hypertopos.engine.counterfactual import (
+                recompute_delta_norm_against_frozen,
+            )
+            mu_frozen = raw_shapes[0]
+            _w = mu_frozen.shape[-1]
+            sigma_frozen = sigma[:_w]
+            for slc, raw in zip(slices, raw_shapes, strict=True):
+                slc.delta_norm_frozen_pop = recompute_delta_norm_against_frozen(
+                    shape=raw,
+                    mu_frozen=mu_frozen,
+                    sigma=sigma_frozen,
+                )
         return Solid(primary_key=primary_key, pattern_id=pattern_id,
                      base_polygon=base, slices=slices)
 

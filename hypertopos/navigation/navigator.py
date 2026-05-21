@@ -55,6 +55,48 @@ _NAVIGATION_RECOVERABLE_ERRORS = (
     pa.ArrowTypeError,
 )
 
+
+def _auroc_rank_sum(scores: np.ndarray, labels: np.ndarray) -> float:
+    """Compute AUROC via the Mann-Whitney U / rank-sum identity.
+
+    Equivalent to ``sklearn.metrics.roc_auc_score(labels, scores)`` for
+    binary labels. Vendored to avoid adding sklearn to the main runtime
+    deps — it currently lives in the ``[topology]`` extra. Uses average
+    ranks to handle ties correctly.
+
+    AUROC = (R_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg),
+    where R_pos is the sum of ranks of positive-class scores after a
+    stable sort assigning ties the average of the tied positions.
+
+    Caller must ensure ``n_pos > 0`` AND ``n_neg > 0``.
+    """
+    n = scores.shape[0]
+    if n == 0:
+        return float("nan")
+    # Average ranks for tie handling.
+    order = np.argsort(scores, kind="mergesort")
+    ranks = np.empty(n, dtype=np.float64)
+    ranks[order] = np.arange(1, n + 1, dtype=np.float64)
+    # Replace tied groups with their mean rank.
+    sorted_scores = scores[order]
+    sorted_ranks = ranks[order]
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and sorted_scores[j] == sorted_scores[i]:
+            j += 1
+        if j > i + 1:
+            mean_rank = sorted_ranks[i:j].mean()
+            sorted_ranks[i:j] = mean_rank
+        i = j
+    ranks[order] = sorted_ranks
+    n_pos = int(labels.sum())
+    n_neg = int(n - n_pos)
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    rank_sum_pos = float(ranks[labels == 1].sum())
+    return (rank_sum_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+
 if TYPE_CHECKING:
     from hypertopos.engine.adjacency import AdjacencyIndex
     from hypertopos.engine.geometry import GDSEngine
@@ -442,6 +484,20 @@ _HETEROSCEDASTICITY_P_THRESHOLD = 0.01
 # but practically negligible skew.
 _NON_NORMAL_DIM_PVALUE_THRESHOLD = 0.01
 
+# ``kind_mismatch`` gates. The warning fires on a gaussian-declared dim
+# when the Fisher LDA direction component is near zero (the dim does
+# not carry the label-discriminating signal in the global axis) AND the
+# raw class moments still show separation. The two-sided gate guards
+# against (a) noise dims with near-zero direction and near-zero
+# cohens_d (Dim C in the engineered fixture — both terms zero, nothing
+# to surface) and (b) genuine high-direction dims that happen to have
+# moderate cohens_d (Dim B — already captured by the Fisher axis, no
+# mismatch). The 0.05 direction threshold mirrors the
+# ``investigate_drift`` boundary used by the MCP ``audit_pattern_dims``
+# tool so the two surfaces tell the same story.
+_KIND_MISMATCH_DIRECTION_THRESHOLD = 0.05
+_KIND_MISMATCH_COHENS_D_THRESHOLD = 0.3
+
 
 def _compute_calibration_drift(
     fit_from: CalibrationFit,
@@ -779,9 +835,28 @@ class GDSNavigator:
         primary_key: str,
         pattern_id: str,
         timestamp: datetime | None = None,
+        *,
+        counterfactual_frozen_population: bool = False,
     ) -> GDSNavigator:
+        """Dive into an entity's temporal Solid.
+
+        When ``counterfactual_frozen_population=True``, each returned
+        ``SolidSlice`` carries an additional ``delta_norm_frozen_pop`` field —
+        the per-slice L2 norm recomputed against the FIRST slice's raw shape
+        as the entity-relative reference epoch (sigma stays at the current
+        pattern's diagonal). Answers "is this entity's apparent normalisation
+        a real change, or just population drift around a stationary entity?"
+        — a stationary entity yields ``delta_norm_frozen_pop = 0`` across all
+        slices while ``delta_norm_snapshot`` reflects the drifting population.
+        Default ``False`` keeps ``delta_norm_frozen_pop = None`` and preserves
+        the existing return shape.
+        """
         solid = self._engine.build_solid(
-            primary_key, pattern_id, self._manifest, timestamp=timestamp
+            primary_key,
+            pattern_id,
+            self._manifest,
+            timestamp=timestamp,
+            counterfactual_frozen_population=counterfactual_frozen_population,
         )
         self._position = solid
         return self
@@ -1002,6 +1077,58 @@ class GDSNavigator:
                 anomaly_confidence=poly.anomaly_confidence,
             )
 
+    @staticmethod
+    def _attach_signed_confidence_fields(
+        polygons: list[Polygon],
+        *,
+        pattern: Any,
+    ) -> None:
+        """Compute and attach the signed-confidence triad per polygon.
+
+        Composes three already-shipped signals into one confidence-weighted
+        score:
+
+            score = delta_norm_signed × |lda_alignment| × (1 − penalty)
+
+        where ``delta_norm_signed = delta · direction`` (sign-preserving
+        projection onto the Fisher LDA axis), ``lda_alignment = (delta /
+        ||delta||) · direction`` (cosine on the LDA axis, in ``[-1, 1]``),
+        and ``penalty = 0.5 · single_dim_driven + 0.5 ·
+        low_confidence_bucket``. Pre-condition: caller verified that
+        ``pattern.label_aware_calibration`` is populated and
+        ``reliability_flags`` is already attached on each polygon.
+        Zero-norm polygons receive ``lda_alignment = 0`` to avoid
+        div-by-zero; non-finite scores are sanitised to ``0.0`` so
+        downstream JSON serialisation stays clean.
+        """
+        cal = pattern.label_aware_calibration
+        direction_vec = np.array(
+            [float(cal[label].direction) for label in pattern.dim_labels],
+            dtype=np.float64,
+        )
+        for poly in polygons:
+            delta = np.asarray(poly.delta, dtype=np.float64)
+            norm = float(np.linalg.norm(delta))
+            signed = float(delta @ direction_vec)
+            alignment = float(signed / norm) if norm > 0.0 else 0.0
+            # Clip into [-1, 1] to absorb float noise; the direction is
+            # unit-norm by construction but |cosine| occasionally slips
+            # past 1.0 by ~1e-7.
+            if alignment > 1.0:
+                alignment = 1.0
+            elif alignment < -1.0:
+                alignment = -1.0
+            r_flags = getattr(poly, "reliability_flags", None) or {}
+            sdd = 1.0 if r_flags.get("single_dim_driven") else 0.0
+            lcb = 1.0 if r_flags.get("low_confidence_bucket") else 0.0
+            penalty = 0.5 * sdd + 0.5 * lcb
+            score = signed * abs(alignment) * (1.0 - penalty)
+            if not np.isfinite(score):
+                score = 0.0
+            poly.signed_confidence_score = score  # type: ignore[attr-defined]
+            poly.lda_alignment = alignment  # type: ignore[attr-defined]
+            poly.reliability_penalty = penalty  # type: ignore[attr-defined]
+
     def _apply_fdr_multi_resolution_gate(
         self,
         polygons: list[Polygon],
@@ -1184,6 +1311,20 @@ class GDSNavigator:
             the dimension that produced the strongest single-dim signal;
             requires ``fdr_alpha`` set and ``fdr_axis in {"per_dim", "both"}``;
             incompatible with ``select="diverse"``.
+          - ``"signed_confidence"`` — sort by a confidence-weighted signed
+            score ``delta_norm_signed × |lda_alignment| × (1 - penalty)``
+            descending, where ``delta_norm_signed = delta · direction`` and
+            ``lda_alignment = (delta / ||delta||) · direction`` project onto
+            the Fisher LDA axis declared by ``label_audit:``, and
+            ``penalty = 0.5 · single_dim_driven + 0.5 ·
+            low_confidence_bucket``. Each surviving polygon carries
+            ``signed_confidence_score`` / ``lda_alignment`` /
+            ``reliability_penalty`` for transparency. The sort is sign-
+            preserving — anti-aligned polygons (negative signed score)
+            land at the bottom by design, not the top. Requires
+            ``pattern.label_aware_calibration`` to be populated (raises
+            ``GDSNavigationError`` otherwise — no silent fallback to
+            ``delta_norm``); incompatible with ``select="diverse"``.
 
         Warning: ``fdr_axis="per_dim"`` and ``rank_by="min_q_per_dim"`` use
         chi²(1) two-sided survival on ``delta_i,d``, which is *direction-
@@ -1255,9 +1396,10 @@ class GDSNavigator:
             )
         if metric not in ("L2", "Linf"):
             raise ValueError(f"metric must be 'L2' or 'Linf', got '{metric}'")
-        if rank_by not in ("delta_norm", "min_q_per_dim"):
+        if rank_by not in ("delta_norm", "min_q_per_dim", "signed_confidence"):
             raise ValueError(
-                f"rank_by must be 'delta_norm' or 'min_q_per_dim', got {rank_by!r}"
+                f"rank_by must be 'delta_norm', 'min_q_per_dim', or "
+                f"'signed_confidence', got {rank_by!r}"
             )
         if rank_by == "min_q_per_dim":
             if fdr_alpha is None:
@@ -1275,9 +1417,25 @@ class GDSNavigator:
                     "rank_by='min_q_per_dim' is incompatible with select='diverse' — "
                     "diverse selection re-orders by representativeness, not q-values",
                 )
+        if rank_by == "signed_confidence" and select != "top_norm":
+            raise ValueError(
+                "rank_by='signed_confidence' is incompatible with select='diverse' — "
+                "diverse selection re-orders by representativeness, not signed scores",
+            )
         version = self._resolve_version(pattern_id)
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns[pattern_id]
+        # signed_confidence ranking requires label-aware calibration —
+        # fail fast with a structured error instead of silently degrading
+        # to delta_norm ranking, so callers know they need to rebuild with
+        # ``label_audit:`` enabled.
+        if rank_by == "signed_confidence" and pattern.label_aware_calibration is None:
+            raise GDSNavigationError(
+                "signed_confidence ranking requires a label_audit:-enabled "
+                "pattern; this pattern has no label-aware calibration. "
+                "Rebuild with label_audit: pointing at this pattern, or use "
+                "rank_by='delta_norm' (default).",
+            )
         # Multi-resolution FDR — validate against pattern-declared hierarchy
         if fdr_resolution is not None or fdr_temporal_resolution is not None:
             if fdr_alpha is None:
@@ -1340,6 +1498,7 @@ class GDSNavigator:
             and rank_by_property is None
             and metric == "L2"
             and weight_vector is None
+            and rank_by != "signed_confidence"
         ):
             from hypertopos.engine.lance_sql_agg import (
                 find_anomalies as _lance_sql_find_anomalies,
@@ -1563,13 +1722,22 @@ class GDSNavigator:
             # Full sort for deterministic pagination (population is pre-filtered
             # to anomalies above threshold, typically 5-20% of total)
             sorted_local = np.argsort(valid_norms)[::-1]
-            n = min(offset + top_n, len(sorted_local))
-            # Include all entities tied with the boundary norm to prevent
-            # pagination duplicates when tied entities shift positions
-            if n < len(sorted_local):
-                boundary_norm = valid_norms[sorted_local[n - 1]]
-                while n < len(sorted_local) and valid_norms[sorted_local[n]] == boundary_norm:
-                    n += 1
+            if rank_by == "signed_confidence":
+                # signed_confidence re-ranks the candidate pool by a score that
+                # composes delta_norm_signed, LDA alignment, and reliability
+                # flags — top_n by delta_norm is too narrow to surface anti-
+                # aligned demotions, so we widen the pool to the full anomalous
+                # population. The post-truncation top_n still bounds the
+                # returned envelope.
+                n = len(sorted_local)
+            else:
+                n = min(offset + top_n, len(sorted_local))
+                # Include all entities tied with the boundary norm to prevent
+                # pagination duplicates when tied entities shift positions
+                if n < len(sorted_local):
+                    boundary_norm = valid_norms[sorted_local[n - 1]]
+                    while n < len(sorted_local) and valid_norms[sorted_local[n]] == boundary_norm:
+                        n += 1
             top_idx = valid_idx[sorted_local[:n]]
             top_keys = [str(light["primary_key"][int(i)].as_py()) for i in top_idx]
             key_to_norm = {str(light["primary_key"][int(i)].as_py()): float(norms[i]) for i in top_idx}
@@ -1655,7 +1823,11 @@ class GDSNavigator:
                 seen[p.primary_key] = p
         # Sort by (-delta_norm, primary_key) for deterministic pagination on tied norms
         results = sorted(seen.values(), key=lambda p: (-p.delta_norm, p.primary_key))
-        results = results[offset:offset + top_n]
+        # signed_confidence defers the top_n truncation until after the
+        # score is computed so the full anomalous pool is re-ranked rather
+        # than only the delta_norm top_n.
+        if rank_by != "signed_confidence":
+            results = results[offset:offset + top_n]
         results = self._apply_fdr_select_polygons(
             results, fdr_alpha=fdr_alpha, select=select, top_n=top_n,
             fdr_method=fdr_method, p_value_method=p_value_method,
@@ -1681,6 +1853,18 @@ class GDSNavigator:
         )
         meta = {"total_anomalies_unfiltered": total_anomalies_unfiltered} if property_filters else None
         self._attach_reliability_flags(results, pattern=pattern)
+        if rank_by == "signed_confidence":
+            self._attach_signed_confidence_fields(results, pattern=pattern)
+            # Sort by signed_confidence_score descending; sign of
+            # delta_norm_signed is preserved, so anti-aligned polygons
+            # (negative scores) land at the bottom by design.
+            results.sort(
+                key=lambda p: (
+                    -float(getattr(p, "signed_confidence_score", 0.0) or 0.0),
+                    p.primary_key,
+                ),
+            )
+            results = results[offset:offset + top_n]
         return results, total_found, emerging, meta
 
     @staticmethod
@@ -7707,9 +7891,25 @@ class GDSNavigator:
           dim — that warning's remediation (re-declare kind) supersedes
           the normality complaint, and double-flagging is noise.
 
-        All five are computed from cached pattern state (``sigma_diag``,
+        - **kind_mismatch**: a dim declared with ``kind='gaussian'``
+          whose Fisher LDA direction component is below
+          ``_KIND_MISMATCH_DIRECTION_THRESHOLD`` (the global axis
+          assigns near-zero weight to the dim) WHILE the raw per-class
+          moments still separate
+          (``|cohens_d_pos_neg| >= _KIND_MISMATCH_COHENS_D_THRESHOLD``).
+          The combination means the dim's variance is captured by
+          another dim's Fisher axis — re-declaring kind or splitting
+          the dim into binary + continuous components is the right
+          remediation. Pre-requisite: ``Pattern.label_aware_calibration``
+          must be non-None; patterns built without the
+          ``label_audit:`` block in sphere.yaml are skipped silently.
+          Suppressed when ``negative_space`` already fires on the same
+          dim — same dedup convention as ``non_normal_dim``.
+
+        All six are computed from cached pattern state (``sigma_diag``,
         ``dim_percentiles``, ``mu``, ``dimension_kinds``,
-        ``dim_normality_pvalues``) — sub-millisecond, no storage scan.
+        ``dim_normality_pvalues``, ``label_aware_calibration``) —
+        sub-millisecond, no storage scan.
         """
         def _build_raw_dim_name_to_index(pattern: Any) -> dict[str, int]:
             """Map dim_percentiles raw keys (column / line_id-without-_d_
@@ -7978,6 +8178,28 @@ class GDSNavigator:
             ),
         )
 
+        # Kind-tag mismatch — gaussian dims with near-zero Fisher LDA
+        # direction component but raw class separation, signalling that
+        # the dim's variance is captured by another dim's axis. Skipped
+        # silently when ``label_aware_calibration`` is None (pattern
+        # built without the ``label_audit:`` block). Suppressed by INDEX
+        # for dims already covered by ``negative_space`` — the two
+        # auditors key their dim_labels off slightly different naming
+        # schemes (negative_space uses the raw ``dim_percentiles`` key,
+        # ``label_aware_calibration`` uses the storage-layout
+        # ``dim_labels`` entry), so index-based dedup is the only
+        # reliable join.
+        warnings.extend(
+            GDSNavigator._compute_kind_mismatch_warnings(
+                pattern,
+                negative_space_indices=(
+                    GDSNavigator._negative_space_indices(
+                        pattern, negative_space_warnings,
+                    )
+                ),
+            ),
+        )
+
         # Heteroscedasticity — Brown-Forsythe p-value persisted by the
         # builder when the pattern carries `group_by_property`. The
         # dim_label here references the grouping variable (a categorical
@@ -8102,6 +8324,132 @@ class GDSNavigator:
                 ),
                 "evidence_value": float(p_value),
                 "threshold": _NON_NORMAL_DIM_PVALUE_THRESHOLD,
+            })
+        return out
+
+    @staticmethod
+    def _negative_space_indices(
+        pattern: Any,
+        negative_space_warnings: list[dict[str, Any]],
+    ) -> set[int]:
+        """Translate ``negative_space`` warning labels to delta-vector
+        indices.
+
+        ``negative_space`` keys its ``dim_label`` off the
+        ``dim_percentiles`` raw column name; the kind_mismatch auditor
+        keys off the storage-layout ``dim_labels`` entry. The two names
+        can differ (e.g. relations whose ``line_id`` is ``_d_foo`` show
+        up as ``foo`` in the percentile cache but as ``_d_foo`` in
+        ``dim_labels``). Resolving via the shared raw-to-index mapping
+        gives a single source of truth for suppression.
+        """
+        if not negative_space_warnings:
+            return set()
+        # Inline the mapping logic — the outer helper
+        # ``_build_raw_dim_name_to_index`` is scoped inside
+        # ``_compute_dim_quality_warnings`` and not reachable here.
+        mapping: dict[str, int] = {}
+        for i, rel in enumerate(pattern.relations):
+            if rel.line_id.startswith("_d_"):
+                stripped = rel.line_id[3:]
+                mapping[stripped] = i
+                parts = stripped.split("_", 1)
+                if len(parts) > 1:
+                    mapping.setdefault(parts[1], i)
+            else:
+                mapping[rel.line_id] = i
+        k = len(pattern.relations)
+        for j, ed in enumerate(pattern.event_dimensions):
+            mapping[ed.column] = k + j
+        k2 = k + len(pattern.event_dimensions)
+        for j, prop in enumerate(pattern.prop_columns):
+            mapping[prop] = k2 + j
+
+        out: set[int] = set()
+        for w in negative_space_warnings:
+            label = w.get("dim_label")
+            if label is None:
+                continue
+            idx = mapping.get(label)
+            if idx is not None:
+                out.add(idx)
+        return out
+
+    @staticmethod
+    def _compute_kind_mismatch_warnings(
+        pattern: Any,
+        *,
+        negative_space_indices: set[int],
+    ) -> list[dict[str, Any]]:
+        """Emit ``kind_mismatch`` warnings for gaussian-declared dims
+        whose Fisher LDA direction component is near zero AND whose raw
+        per-class moments still separate.
+
+        Returns an empty list when the pattern lacks
+        ``label_aware_calibration`` (no Fisher direction to test
+        against), when ``dimension_kinds`` is missing or mis-shaped, or
+        when no dim crosses both gates.
+        """
+        lac = getattr(pattern, "label_aware_calibration", None)
+        if not lac:
+            return []
+
+        dimension_kinds = getattr(pattern, "dimension_kinds", None)
+        dim_labels = pattern.dim_labels if pattern.dim_labels else []
+        if dimension_kinds is None or len(dimension_kinds) != len(dim_labels):
+            return []
+
+        out: list[dict[str, Any]] = []
+        for i, label in enumerate(dim_labels):
+            if i in negative_space_indices:
+                continue
+            if i >= len(dimension_kinds):
+                continue
+            if dimension_kinds[i] != "gaussian":
+                continue
+            dim_cal = lac.get(label) if isinstance(lac, dict) else None
+            if dim_cal is None:
+                continue
+            mu_pos = float(getattr(dim_cal, "mu_pos", 0.0))
+            sigma_pos = float(getattr(dim_cal, "sigma_pos", 0.0))
+            mu_neg = float(getattr(dim_cal, "mu_neg", 0.0))
+            sigma_neg = float(getattr(dim_cal, "sigma_neg", 0.0))
+            direction = float(getattr(dim_cal, "direction", 0.0))
+
+            if not np.isfinite(direction):
+                continue
+            denom_sq = (sigma_pos * sigma_pos + sigma_neg * sigma_neg) / 2.0
+            if denom_sq <= 0.0:
+                cohens_d = 0.0
+            else:
+                cohens_d = abs(mu_pos - mu_neg) / float(np.sqrt(denom_sq))
+            if not np.isfinite(cohens_d):
+                continue
+
+            abs_dir = abs(direction)
+            if abs_dir >= _KIND_MISMATCH_DIRECTION_THRESHOLD:
+                continue
+            if cohens_d < _KIND_MISMATCH_COHENS_D_THRESHOLD:
+                continue
+
+            out.append({
+                "type": "kind_mismatch",
+                "dim_label": label,
+                "reason": (
+                    f"kind=gaussian declared but Fisher direction shows "
+                    f"|direction|={abs_dir:.3f} < "
+                    f"{_KIND_MISMATCH_DIRECTION_THRESHOLD} while raw "
+                    f"classes show cohens_d={cohens_d:.3f} >= "
+                    f"{_KIND_MISMATCH_COHENS_D_THRESHOLD} — likely "
+                    f"confounded with another dim"
+                ),
+                "advice": (
+                    "consider kind='bernoulli' / 'poisson' "
+                    "re-declaration, or split the dim into binary + "
+                    "continuous components"
+                ),
+                "evidence_value": abs_dir,
+                "threshold": _KIND_MISMATCH_DIRECTION_THRESHOLD,
             })
         return out
 
@@ -9336,6 +9684,203 @@ class GDSNavigator:
                 "coverage_gap and theta_ceiling checks require a full geometry scan"
                 " — use detect_data_quality_issues() for the complete diagnostic",
             ],
+        }
+
+    def audit_label_alignment(
+        self, pattern_id: str, *, top_n: int = 10
+    ) -> dict[str, Any]:
+        """Report Fisher LDA direction alignment as an AUROC against labels.
+
+        Sibling to the MCP-only ``audit_pattern_dims`` calibration audit:
+        ``audit_pattern_dims`` describes the per-dim moments and the Fisher
+        axis components; ``audit_label_alignment`` answers the orthogonal
+        question — "does the projection of polygons onto that axis actually
+        separate the two labelled classes?" — by computing AUROC of
+        ``delta_norm_signed`` against the binary label column declared in
+        ``sphere.yaml``'s ``label_audit:`` block.
+
+        Returns ``{pattern_id, auroc, n_pos, n_neg, top_dims,
+        label_aware_available, elapsed_ms}`` on the full-field path. The
+        ``top_dims`` list carries the ``top_n`` most label-discriminating
+        dims, sorted by ``|direction_component|`` desc, each row carrying
+        ``{dim_label, direction_component, abs_direction, cohens_d_pos_neg}``.
+
+        Returns a fallback shape with ``auroc: null`` /
+        ``label_aware_available: False`` / a top-level ``reason`` when:
+
+        - the pattern was built without a ``label_audit:`` block (no
+          ``label_aware_calibration`` on the Pattern), or
+        - the sphere has no top-level ``label_audit`` block (no labels to
+          join against), or
+        - the joined sample has zero positives or zero negatives
+          (degenerate label distribution).
+        """
+        t0 = datetime.now(UTC)
+        if top_n < 1:
+            raise ValueError("top_n must be >= 1")
+
+        sphere = self._storage.read_sphere()
+        pattern = sphere.patterns.get(pattern_id)
+        if pattern is None:
+            raise KeyError(f"unknown pattern_id '{pattern_id}'")
+
+        def _elapsed_ms() -> float:
+            return (datetime.now(UTC) - t0).total_seconds() * 1000.0
+
+        def _fallback(reason: str) -> dict[str, Any]:
+            return {
+                "pattern_id": pattern_id,
+                "auroc": None,
+                "n_pos": None,
+                "n_neg": None,
+                "top_dims": [],
+                "label_aware_available": False,
+                "reason": reason,
+                "elapsed_ms": _elapsed_ms(),
+            }
+
+        lac = getattr(pattern, "label_aware_calibration", None)
+        if not lac:
+            return _fallback(
+                "no label-aware calibration available — pattern was built "
+                "without the 'label_audit:' block in sphere.yaml"
+            )
+
+        label_audit = getattr(sphere, "label_audit", None)
+        if not isinstance(label_audit, dict):
+            return _fallback(
+                "sphere has no top-level label_audit block — labels "
+                "unavailable for AUROC computation"
+            )
+        label_column = label_audit.get("label_column")
+        label_positive_value = label_audit.get("label_positive_value")
+        if not label_column or label_positive_value is None:
+            return _fallback(
+                "label_audit block missing label_column / "
+                "label_positive_value"
+            )
+
+        entity_line_id = pattern.entity_line_id
+        if not entity_line_id:
+            return _fallback(
+                "pattern has no entity_line — cannot resolve label column"
+            )
+
+        version = self._manifest.pattern_version(pattern_id)
+        if version is None:
+            return _fallback(
+                f"pattern '{pattern_id}' has no active version in manifest"
+            )
+
+        # Read signed projection — keep nulls so we can drop them with the
+        # label-side join (patterns without label-aware calibration emit
+        # all-null even when the column exists).
+        geo = self._storage.read_geometry(
+            pattern_id, version, columns=["primary_key", "delta_norm_signed"],
+        )
+        if "delta_norm_signed" not in geo.schema.names:
+            return _fallback(
+                "geometry dataset has no 'delta_norm_signed' column — "
+                "sphere predates label-aware calibration support"
+            )
+
+        line_version = self._manifest.line_version(entity_line_id) or 1
+        try:
+            points = self._storage.read_points(
+                entity_line_id, line_version,
+                columns=["primary_key", label_column],
+            )
+        except (KeyError, FileNotFoundError, OSError, pa.ArrowInvalid) as exc:
+            return _fallback(
+                f"failed to read label column '{label_column}' from line "
+                f"'{entity_line_id}': {exc!r}"
+            )
+        if label_column not in points.schema.names:
+            return _fallback(
+                f"label column '{label_column}' not found on entity line "
+                f"'{entity_line_id}'"
+            )
+
+        # Join geometry signed projection ←→ labels on primary_key.
+        joined = geo.join(
+            points, keys="primary_key", join_type="inner",
+        )
+        if joined.num_rows == 0:
+            return _fallback(
+                "no rows after joining geometry to labels on primary_key"
+            )
+
+        signed_arr = joined["delta_norm_signed"]
+        label_arr = joined[label_column]
+        # Drop rows where either side is null (all-null signed → AUROC
+        # cannot be computed; null labels → no class to score against).
+        mask = pc.and_(
+            pc.is_valid(signed_arr), pc.is_valid(label_arr),
+        )
+        signed_arr = signed_arr.filter(mask)
+        label_arr = label_arr.filter(mask)
+        if len(signed_arr) == 0:
+            return _fallback(
+                "all delta_norm_signed values are null — pattern was not "
+                "calibrated label-aware (column populated requires the "
+                "build flag and the label_audit block)"
+            )
+
+        signed_np = signed_arr.to_numpy(zero_copy_only=False).astype(
+            np.float64, copy=False,
+        )
+        # Binarize against positive value via element-wise equality.
+        labels_list = label_arr.to_pylist()
+        labels_np = np.asarray(
+            [1 if v == label_positive_value else 0 for v in labels_list],
+            dtype=np.int32,
+        )
+        n_pos = int(labels_np.sum())
+        n_neg = int(len(labels_np) - n_pos)
+        if n_pos == 0 or n_neg == 0:
+            return _fallback(
+                f"degenerate label distribution: n_pos={n_pos}, "
+                f"n_neg={n_neg} after joining on primary_key"
+            )
+
+        auroc = _auroc_rank_sum(signed_np, labels_np)
+
+        # Top-N dims by |direction_component| desc; carry Cohen's d so
+        # the report stands alone without a second audit_pattern_dims call.
+        dim_labels = pattern.dim_labels
+        top_rows: list[dict[str, Any]] = []
+        for label in dim_labels:
+            dim_cal = lac.get(label) if isinstance(lac, dict) else None
+            if dim_cal is None:
+                continue
+            direction = float(dim_cal.direction)
+            mu_pos = float(dim_cal.mu_pos)
+            sigma_pos = float(dim_cal.sigma_pos)
+            mu_neg = float(dim_cal.mu_neg)
+            sigma_neg = float(dim_cal.sigma_neg)
+            denom_sq = (sigma_pos * sigma_pos + sigma_neg * sigma_neg) / 2.0
+            cohens_d = (
+                abs(mu_pos - mu_neg) / math.sqrt(denom_sq)
+                if denom_sq > 0.0
+                else 0.0
+            )
+            top_rows.append({
+                "dim_label": label,
+                "direction_component": direction,
+                "abs_direction": abs(direction),
+                "cohens_d_pos_neg": cohens_d,
+            })
+        top_rows.sort(key=lambda r: r["abs_direction"], reverse=True)
+        top_rows = top_rows[:top_n]
+
+        return {
+            "pattern_id": pattern_id,
+            "auroc": auroc,
+            "n_pos": n_pos,
+            "n_neg": n_neg,
+            "top_dims": top_rows,
+            "label_aware_available": True,
+            "elapsed_ms": _elapsed_ms(),
         }
 
     # -- private check helpers ------------------------------------------

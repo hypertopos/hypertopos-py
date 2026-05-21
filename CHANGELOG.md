@@ -7,6 +7,22 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.2] — 2026-05-21
+
+### Added
+- `GDSNavigator.π5_attract_anomaly` / `find_anomalies` accept `rank_by="signed_confidence"` — composes `delta_norm_signed`, the Fisher LDA alignment, and the reliability flags into one confidence-weighted score: `score = delta_norm_signed × |lda_alignment| × (1 − reliability_penalty)` where `reliability_penalty = 0.5 × single_dim_driven + 0.5 × low_confidence_bucket`. Survivors carry `signed_confidence_score`, `lda_alignment`, `reliability_penalty` per polygon. Pattern without `label_aware_calibration` raises `GDSNavigationError` — no silent fallback to `delta_norm` ranking.
+- New per-dim `kind_mismatch` warning class on `sphere_overview.dim_quality_warnings`. Fires when a `kind='gaussian'` dim shows `|direction_component| < 0.05` (LDA assigns near-zero weight) AND `cohens_d_pos_neg >= 0.3` (raw class stats separate) — the dim's variance is captured by another dim's Fisher axis, suggesting kind re-declaration or split. Composes with label-aware calibration; suppressed for dims already flagged `negative_space`. Pattern-level prerequisite: `Pattern.label_aware_calibration` must be non-None.
+- `GDSNavigator.audit_label_alignment(pattern_id, *, top_n=10)` — reports Fisher LDA direction's discrimination power as AUROC of `delta_norm_signed` against the binary label column declared in `sphere.yaml`'s `label_audit:` block. Returns `{pattern_id, auroc, n_pos, n_neg, top_dims}` where `top_dims` carries the `top_n` dims sorted by `|direction_component|` desc (most label-discriminating axes first). Returns fallback shape with `auroc: null` and `label_aware_available: False` on patterns built without `label_audit:`.
+- `Chain.to_dict()` carries an additional `edge_potentials: list[float | null]` field — one Euclidean distance `||delta(keys[i]) - delta(keys[i+1])||` per consecutive-pair hop, computed against a caller-supplied anchor pattern delta lookup. `null` on hops with missing polygon, mismatched delta shapes, or non-finite distance (NaN / inf strict-JSON sanitised). Length equals `len(keys) - 1` (empty list for single-entity chains). Surfaces high-distance behavioural jumps inside multi-hop chains for downstream chain investigation primitives.
+- `GDSNavigator.π3_dive_solid` accepts `counterfactual_frozen_population: bool = False` — when `True`, each `SolidSlice` on the returned solid carries an additional `delta_norm_frozen_pop` field reporting the per-slice L2 norm recomputed against the FIRST slice's raw shape as the entity-relative reference epoch (sigma stays at the current pattern's diagonal). Answers "is this entity's apparent normalization a real shift, or just population drift around a stationary entity?" — a stationary entity yields `delta_norm_frozen_pop = 0` across all slices. Default `False` preserves the existing return shape (`delta_norm_frozen_pop = None`).
+- `engine.counterfactual.recompute_delta_norm_against_frozen(shape, mu_frozen, sigma)` — pure-NumPy helper used by the frozen-trajectory path. Sigma-dead dims contribute zero (same convention as the per-edge counterfactual primitives).
+- `SolidSlice.delta_norm_frozen_pop: float | None` — new optional field on the model dataclass populated by the frozen-trajectory path; `None` for the default build path.
+- `docs/refutations.md` — record of tested-and-closed hypotheses: pattern-level σ-estimator swap, per-dim heuristic σ-swap, lazy-chain sampled calibration, Bregman-based `is_anomaly` flag, plus a methodology refutation on cycle-compression. Each entry states the hypothesis, dataset, numeric verdict, root cause, and closure rule.
+- `docs/patent-implementation-map.md` — descriptive map of nine architectural-claim clusters (per-entity geometric position, counterfactual closure, multi-resolution FDR, persistent-homology cycle persistence, declarative compliance, HMP detector composition, chain-coherent investigation, reliability triage, build-time dim quality auditing) to their shipped surfaces. No internal tracker IDs.
+
+### Changed
+- README adds CI test workflow badge linking to the public-mirror Actions run.
+
 ## [0.7.1] — 2026-05-20
 
 ### Added

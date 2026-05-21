@@ -87,6 +87,13 @@ class SolidSlice:
     changed_property: str | None
     changed_line_id: str | None
     added_edge: Edge | None
+    # Counterfactual frozen-population delta_norm. Populated only when the
+    # owning solid was built with ``counterfactual_frozen_population=True`` —
+    # in that case each slice's value is the L2 norm of the per-slice shape
+    # normalised against the FIRST slice's raw shape (treated as the
+    # entity-relative reference epoch) instead of the current pattern mu.
+    # ``None`` for the default path preserves the existing serialised shape.
+    delta_norm_frozen_pop: float | None = None
 
     def prop_column_states(self, pattern: Pattern) -> dict[str, bool]:
         """Inverse z-score: recover boolean property states from delta_snapshot."""

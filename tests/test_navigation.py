@@ -60,7 +60,9 @@ class _MockEngine:
     def build_polygon(self, bk, pid, manifest):
         return _make_polygon_with_edge("PROD-001", "products")
 
-    def build_solid(self, bk, pid, manifest, filters=None, timestamp=None):
+    def build_solid(
+        self, bk, pid, manifest, filters=None, timestamp=None, **kwargs
+    ):
         from hypertopos.model.objects import Solid
 
         return Solid(
@@ -497,7 +499,9 @@ class _SlicedEngine:
     def build_polygon(self, bk, pid, manifest):
         return _make_polygon_with_edge("PROD-001", "products")
 
-    def build_solid(self, bk, pid, manifest, filters=None, timestamp=None):
+    def build_solid(
+        self, bk, pid, manifest, filters=None, timestamp=None, **kwargs
+    ):
         base = _make_polygon_with_edge("PROD-001", "products")
         all_slices = [
             SolidSlice(
@@ -4795,7 +4799,9 @@ class _MockEngineKeyError:
     def build_polygon(self, bk, pid, manifest):
         raise KeyError(f"No geometry for {bk} in {pid} v1")
 
-    def build_solid(self, bk, pid, manifest, filters=None, timestamp=None):
+    def build_solid(
+        self, bk, pid, manifest, filters=None, timestamp=None, **kwargs
+    ):
         raise KeyError(f"No geometry for {bk} in {pid} v1")
 
 

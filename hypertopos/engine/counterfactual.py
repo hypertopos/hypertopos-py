@@ -26,6 +26,7 @@ __all__ = [
     "compute_per_edge_source_value_pvalues",
     "simulate_joint_edge_removal",
     "select_minimal_joint_removal",
+    "recompute_delta_norm_against_frozen",
 ]
 
 
@@ -823,3 +824,46 @@ def select_minimal_joint_removal(
         "target_reached": target_reached,
         "k_max_reached": k_max_reached,
     }
+
+
+def recompute_delta_norm_against_frozen(
+    *,
+    shape: np.ndarray,
+    mu_frozen: np.ndarray,
+    sigma: np.ndarray,
+) -> float:
+    """L2 norm of ``shape`` normalised against a frozen reference ``mu_frozen``.
+
+    Frozen-population trajectory primitive used by
+    ``GDSEngine.build_solid(counterfactual_frozen_population=True)``: for each
+    solid slice, recompute ``delta_norm`` using the FIRST slice's raw shape
+    (``mu_frozen``) as the population reference and the current pattern's
+    diagonal sigma as the scale. Sigma-dead dims (``sigma < 1e-10``) contribute
+    zero — same convention as the per-edge counterfactual primitives.
+
+    Args:
+        shape: per-slice raw shape vector, shape (D,).
+        mu_frozen: frozen reference mean (e.g. slice-0's raw shape), shape (D,).
+        sigma: current pattern's diagonal sigma, shape (D,).
+
+    Returns:
+        Float L2 norm. Returns ``0.0`` when ``shape == mu_frozen`` (stationary
+        entity in a drifting population) — the canonical signal that the
+        entity's apparent normalisation came from population drift, not
+        entity movement.
+    """
+    if shape.shape != mu_frozen.shape or shape.shape != sigma.shape:
+        raise ValueError(
+            f"shape / mu_frozen / sigma must have matching length; got "
+            f"{shape.shape} / {mu_frozen.shape} / {sigma.shape}",
+        )
+    shape = shape.astype(np.float64, copy=False)
+    mu_frozen = mu_frozen.astype(np.float64, copy=False)
+    sigma = sigma.astype(np.float64, copy=False)
+    sigma_dead_mask = sigma < _SIGMA_ZERO_FLOOR
+    sigma_safe = np.where(sigma_dead_mask, 1.0, sigma)
+    delta = np.where(sigma_dead_mask, 0.0, (shape - mu_frozen) / sigma_safe)
+    val = float(np.linalg.norm(delta))
+    if not np.isfinite(val):
+        return 0.0
+    return val

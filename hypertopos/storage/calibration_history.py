@@ -210,3 +210,83 @@ def reset_calibration_history(base: Path, pattern_id: str) -> None:
     pdir = history_dir(base, pattern_id)
     if pdir.exists():
         shutil.rmtree(pdir)
+
+
+# ---------------------------------------------------------------------------
+# Per-influencer μ-impact history — write-through cache
+# ---------------------------------------------------------------------------
+
+
+def _safe_pk_filename(primary_key: str) -> str:
+    """Filesystem-safe encoding of ``primary_key`` for use in a file name.
+
+    Uses ``urllib.parse.quote(..., safe='')`` so that path separators and
+    other reserved characters become percent-encoded. The original key is
+    always stored inside the JSON payload, so the encoding is one-way only
+    on disk.
+    """
+    from urllib.parse import quote
+    return quote(primary_key, safe="")
+
+
+def influencer_history_path(base: Path, pattern_id: str, primary_key: str) -> Path:
+    """Return the on-disk path for an influencer's per-epoch impact cache."""
+    return history_dir(base, pattern_id) / f"influencer_{_safe_pk_filename(primary_key)}.json"
+
+
+def read_influencer_history(
+    base: Path, pattern_id: str, primary_key: str,
+) -> list[dict[str, Any]]:
+    """Return the chronological list of epoch records for ``primary_key``.
+
+    Returns an empty list when the cache file does not exist.
+    """
+    path = influencer_history_path(base, pattern_id, primary_key)
+    if not path.exists():
+        return []
+    blob = _json.loads(path.read_text(encoding="utf-8"))
+    entries = blob.get("entries") or []
+    entries.sort(key=lambda r: r.get("epoch", 0))
+    return entries
+
+
+def upsert_influencer_history_entry(
+    base: Path,
+    pattern_id: str,
+    primary_key: str,
+    *,
+    epoch: int,
+    calibrated_at: str,
+    mu_impact: float,
+    delta_norm_impact: float,
+) -> Path:
+    """Upsert a single epoch record into ``influencer_<primary_key>.json``.
+
+    Idempotent within an epoch: a second call with the same ``epoch`` replaces
+    the prior record for that epoch. Returns the path written.
+    """
+    pdir = history_dir(base, pattern_id)
+    pdir.mkdir(parents=True, exist_ok=True)
+    out = influencer_history_path(base, pattern_id, primary_key)
+
+    if out.exists():
+        blob = _json.loads(out.read_text(encoding="utf-8"))
+    else:
+        blob = {"primary_key": primary_key, "pattern_id": pattern_id, "entries": []}
+
+    entries = [e for e in blob.get("entries", []) if e.get("epoch") != epoch]
+    entries.append({
+        "epoch": int(epoch),
+        "calibrated_at": calibrated_at,
+        "mu_impact": float(mu_impact),
+        "delta_norm_impact": float(delta_norm_impact),
+    })
+    entries.sort(key=lambda r: r["epoch"])
+    blob["entries"] = entries
+    blob["primary_key"] = primary_key
+    blob["pattern_id"] = pattern_id
+
+    tmp = out.with_suffix(".json.tmp")
+    tmp.write_text(_json.dumps(blob, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, out)
+    return out

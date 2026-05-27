@@ -24,10 +24,50 @@ import numpy as np
 import pyarrow as pa
 
 __all__ = [
+    "classify_trajectory",
     "find_topological_anomalies",
     "find_topological_trajectory_anomalies",
+    "local_trajectory_shape",
     "trajectory_continuous_score",
 ]
+
+
+def local_trajectory_shape(delta_norms: list[float]) -> str | None:
+    """Categorise an entity's own delta_norm time-series shape.
+
+    Operates on a single entity's per-slice delta_norm sequence — no
+    population reference. Returns one of:
+
+    - ``arch``   — series rises then falls (interior maximum, both endpoints lower)
+    - ``V``      — series falls then rises (interior minimum, both endpoints higher)
+    - ``linear`` — monotone (every consecutive diff has the same sign within tol)
+    - ``flat``   — range under 10% of mean (low variance around a positive mean)
+    - ``None``   — fewer than 3 samples (shape undefined)
+
+    Used by ``dive_solid`` to surface an entity's trajectory shape without
+    requiring a population scan. Tolerance for monotone classification is
+    ``1e-9`` on consecutive diffs.
+    """
+    if len(delta_norms) < 3:
+        return None
+    mean = sum(delta_norms) / len(delta_norms)
+    rng = max(delta_norms) - min(delta_norms)
+    if mean > 0 and rng < 0.1 * mean:
+        return "flat"
+    diffs = [b - a for a, b in zip(delta_norms[:-1], delta_norms[1:], strict=False)]
+    pos = sum(1 for d in diffs if d > 1e-9)
+    neg = sum(1 for d in diffs if d < -1e-9)
+    if pos > 0 and neg == 0:
+        return "linear"
+    if neg > 0 and pos == 0:
+        return "linear"
+    max_idx = delta_norms.index(max(delta_norms))
+    min_idx = delta_norms.index(min(delta_norms))
+    if 0 < max_idx < len(delta_norms) - 1:
+        return "arch"
+    if 0 < min_idx < len(delta_norms) - 1:
+        return "V"
+    return "linear"
 
 
 def _dtw_pair(seq_a: np.ndarray, seq_b: np.ndarray) -> float:
@@ -159,6 +199,148 @@ def trajectory_continuous_score(
         if not np.isfinite(score) or score < 0.0:
             score = 0.0
         out[pk] = float(score)
+    return out
+
+
+def _delta_norm_series(traj: np.ndarray) -> np.ndarray:
+    """Per-timestep L2 norm of a (T, D) trajectory of delta_snapshot vectors."""
+    if traj.ndim != 2 or traj.shape[0] == 0:
+        return np.zeros(0, dtype=np.float64)
+    return np.sqrt(np.einsum("ij,ij->i", traj, traj)).astype(np.float64)
+
+
+def _safe_slope(values: np.ndarray) -> float:
+    """First-derivative slope of `values` over uniform time index via linregress.
+
+    Returns 0.0 on degenerate input (n < 2, zero-variance x, or non-finite output).
+    """
+    from scipy.stats import linregress
+
+    n = int(values.shape[0])
+    if n < 2:
+        return 0.0
+    x = np.arange(n, dtype=np.float64)
+    try:
+        result = linregress(x, values)
+        slope = float(result.slope)
+    except (ValueError, FloatingPointError):
+        return 0.0
+    if not np.isfinite(slope):
+        return 0.0
+    return slope
+
+
+def classify_trajectory(
+    solid_table: pa.Table,
+    *,
+    sample_size: int = 10_000,
+) -> list[dict[str, Any]]:
+    """Categorise each entity's trajectory vs population reference.
+
+    Wraps `trajectory_continuous_score` (DTW vs population-median trajectory)
+    with a deterministic 4-way classifier that fuses the DTW magnitude with a
+    first-derivative slope comparison against the population median:
+
+    - ``outlier``    — DTW distance > 99th percentile of the population
+    - ``lagging``    — entity slope is meaningfully below population median slope
+    - ``leading``    — entity slope is meaningfully above population median slope
+    - ``typical``    — everything else
+
+    ``category_evidence`` is the signed deviation that drove the classification:
+    DTW distance for ``outlier``, slope delta (entity_slope - median_slope) for
+    ``lagging`` / ``leading`` (sign matches the category — negative for lagging,
+    positive for leading), and ``0.0`` for ``typical``.
+
+    Args:
+        solid_table: Arrow table with ``primary_key`` and ``delta_snapshot``
+            columns (rows for one entity in time order — same input as
+            ``trajectory_continuous_score``).
+        sample_size: Cap on trajectories used to estimate the population median
+            trajectory and the DTW threshold. Default 10 000.
+
+    Returns:
+        List of dicts ``{primary_key, dtw_distance, category, category_evidence}``,
+        one per entity in ``solid_table``. All floats are finite (no NaN/inf).
+    """
+    if solid_table.num_rows == 0:
+        return []
+    if "primary_key" not in solid_table.schema.names:
+        raise ValueError("solid_table must have a 'primary_key' column")
+    if "delta_snapshot" not in solid_table.schema.names:
+        raise ValueError("solid_table must have a 'delta_snapshot' column")
+
+    pks_col = solid_table["primary_key"].to_pylist()
+    snaps_col = solid_table["delta_snapshot"].to_pylist()
+
+    grouped: dict[str, list[list[float]]] = defaultdict(list)
+    for pk, snap in zip(pks_col, snaps_col, strict=False):
+        if pk is None or snap is None:
+            continue
+        grouped[pk].append(list(snap))
+
+    trajectories: dict[str, np.ndarray] = {}
+    for pk, frames in grouped.items():
+        if not frames:
+            continue
+        arr = np.asarray(frames, dtype=np.float64)
+        if arr.ndim != 2 or arr.shape[0] == 0:
+            continue
+        trajectories[pk] = arr
+
+    if not trajectories:
+        return []
+
+    dtw_scores = trajectory_continuous_score(solid_table, sample_size=sample_size)
+
+    # Population reference slope from per-entity delta_norm series (median).
+    entity_slopes: dict[str, float] = {}
+    for pk, traj in trajectories.items():
+        series = _delta_norm_series(traj)
+        entity_slopes[pk] = _safe_slope(series)
+
+    slopes_arr = np.fromiter(entity_slopes.values(), dtype=np.float64, count=len(entity_slopes))
+    median_slope = float(np.median(slopes_arr)) if slopes_arr.size else 0.0
+    # Magnitude scale for "meaningfully" — robust MAD of slope deviations.
+    slope_dev = np.abs(slopes_arr - median_slope)
+    slope_mad = float(np.median(slope_dev)) if slope_dev.size else 0.0
+    slope_band = max(slope_mad, 1e-6)
+
+    # DTW outlier threshold.
+    dtw_arr = np.fromiter(dtw_scores.values(), dtype=np.float64, count=len(dtw_scores))
+    dtw_outlier_threshold = (
+        float(np.percentile(dtw_arr, 99)) if dtw_arr.size else float("inf")
+    )
+
+    out: list[dict[str, Any]] = []
+    for pk in trajectories:
+        dtw = dtw_scores.get(pk, 0.0)
+        slope = entity_slopes.get(pk, 0.0)
+        slope_delta = slope - median_slope
+
+        if dtw > dtw_outlier_threshold:
+            category = "outlier"
+            evidence = dtw
+        elif slope_delta <= -slope_band:
+            category = "lagging"
+            evidence = slope_delta
+        elif slope_delta >= slope_band:
+            category = "leading"
+            evidence = slope_delta
+        else:
+            category = "typical"
+            evidence = 0.0
+
+        if not np.isfinite(dtw):
+            dtw = 0.0
+        if not np.isfinite(evidence):
+            evidence = 0.0
+
+        out.append({
+            "primary_key": pk,
+            "dtw_distance": float(dtw),
+            "category": category,
+            "category_evidence": float(evidence),
+        })
     return out
 
 

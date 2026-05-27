@@ -638,6 +638,18 @@ def aggregate(
                             f"with a '{group_by_line}' edge. "
                             f"Use anomaly_summary for population-wide totals."
                         )
+                # Per-group anomaly_rate enrichment also runs on the reversed-scan
+                # fast path so the field is uniformly present regardless of which
+                # execution branch produced the counts.
+                if _should_emit_per_group_anomaly_rate(
+                    False, metric, group_by_property, pivot_event_field,
+                    group_by_line_2, distinct, result,
+                ):
+                    _enrich_per_group_anomaly_rate(
+                        reader, event_pattern_id, pattern, group_by_line,
+                        edge_col="entity_keys",
+                        result=result,
+                    )
                 return result
             except Exception:
                 pass  # Fall through to read_geometry path
@@ -2185,4 +2197,105 @@ def aggregate(
                 row["total_events"] = total
                 row["anomaly_rate"] = round(row["count"] / total, 4) if total > 0 else 0.0
 
+    # --- Per-group anomaly_rate enrichment (inverse of _anomaly_rate_requested) ---
+    # When metric='count' without an is_anomaly filter, each row['count'] is the
+    # total event count for the group. Surface the share of anomalous events by
+    # doing a second read filtered to is_anomaly=True and dividing.
+    # Skipped when the existing block already wrote anomaly_rate (above), when
+    # the metric is not 'count' (rate is undefined for sum/avg/median), when
+    # composite keys are used (group_by_property / pivot_event_field /
+    # group_by_line_2 — the row key is not a single group_by_line edge target),
+    # and when no rows were returned.
+    if _should_emit_per_group_anomaly_rate(
+        _anomaly_rate_requested, metric, group_by_property, pivot_event_field,
+        group_by_line_2, distinct, result,
+    ):
+        _enrich_per_group_anomaly_rate(
+            reader, event_pattern_id, pattern, group_by_line,
+            edge_col=("entity_keys" if "entity_keys" in geo.schema.names else "edges"),
+            result=result,
+        )
+
     return result
+
+
+def _should_emit_per_group_anomaly_rate(
+    anomaly_rate_requested: bool,
+    metric: str,
+    group_by_property: str | None,
+    pivot_event_field: str | None,
+    group_by_line_2: str | None,
+    distinct: bool,
+    result: dict,
+) -> bool:
+    """Predicate for the inverse anomaly_rate enrichment.
+
+    Triggers when the row's ``count`` is the total event count for the group
+    (per-row composite keys excluded) and the existing "filter-by-is_anomaly"
+    block has not already attached ``anomaly_rate`` to each row.
+    """
+    return (
+        not anomaly_rate_requested
+        and metric == "count"
+        and not group_by_property
+        and not pivot_event_field
+        and not group_by_line_2
+        and not distinct
+        and bool(result.get("results"))
+    )
+
+
+def _enrich_per_group_anomaly_rate(
+    reader: Any,
+    event_pattern_id: str,
+    pattern: Any,
+    group_by_line: str,
+    *,
+    edge_col: str,
+    result: dict,
+) -> None:
+    """Attach ``anomaly_rate = n_anomalous_in_group / total_in_group`` per row.
+
+    Performs one extra geometry read scoped to two columns (``is_anomaly`` +
+    edge column) with a Lance ``is_anomaly = true`` filter pushed down via
+    the bitmap index so only anomalous rows materialise. Counts anomalous
+    edges per group and divides into the row's existing ``count``.
+    ``anomaly_rate`` is ``None`` when the group's total count is zero.
+    The field is omitted when the geometry on disk has no ``is_anomaly``
+    column (degraded / pre-schema spheres) — no zero-div crash, no
+    spurious value.
+    """
+    try:
+        raw = reader.read_geometry(
+            event_pattern_id, pattern.version,
+            columns=["is_anomaly", edge_col],
+            filter="is_anomaly = true",
+        )
+    except Exception:
+        # Reader rejected the filter syntax (mock / pre-Lance reader) — fall
+        # back to a no-filter read; the in-process predicate below still
+        # narrows to anomalous rows.
+        raw = reader.read_geometry(
+            event_pattern_id, pattern.version,
+            columns=["is_anomaly", edge_col],
+        )
+    if "is_anomaly" not in raw.schema.names:
+        # Column was projected out (degraded / pre-schema sphere) —
+        # cannot compute the rate. Leave rows unannotated.
+        return
+    import pyarrow.compute as pc
+    # Apply the predicate in-process too — Lance may or may not honour the
+    # pushed-down filter (mock readers silently ignore it). This guarantees
+    # ``anom_only`` is strictly the anomalous subset regardless.
+    anom_only = raw.filter(pc.equal(raw["is_anomaly"], True))
+    anom_per_group, _ = _vectorized_count_with_warning(
+        anom_only, group_by_line, geometry_filters=None, relations=pattern.relations,
+    )
+    for row in result.get("results", []):
+        key = row.get("key")
+        total = row.get("count")
+        if key is None or total is None or total == 0:
+            row["anomaly_rate"] = None
+            continue
+        n_anom = anom_per_group.get(key, 0)
+        row["anomaly_rate"] = round(n_anom / total, 4)

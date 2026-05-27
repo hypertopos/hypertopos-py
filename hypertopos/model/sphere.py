@@ -297,6 +297,24 @@ class Pattern:
     # patterns built without the block — readers and the MCP
     # ``audit_pattern_dims`` tool fall back to raw mu/sigma in that case.
     label_aware_calibration: dict[str, Any] | None = None
+    # Positive / negative labelled sample counts captured by
+    # ``calibrate_label_aware`` at build time. ``None`` on patterns without
+    # label-aware calibration; co-populated with ``label_aware_calibration``.
+    label_aware_n_pos: int | None = None
+    label_aware_n_neg: int | None = None
+    # Percentiles of ``delta_norm_signed`` over the pattern population,
+    # computed at build time when label-aware calibration fired. Six keys:
+    # ``p1``, ``p5``, ``p50``, ``p95``, ``p99``. ``None`` when label-aware
+    # is unavailable. Consumed by the ``signed_tail_concentration``
+    # dim_quality warning to detect one-sided extreme tails on the
+    # label-discriminating axis.
+    signed_percentiles: dict[str, float] | None = None
+    # Mean of the per-polygon decomposition of ``delta`` along the Fisher
+    # LDA direction (``intrinsic`` = magnitude along the label axis,
+    # ``extrinsic`` = orthogonal residual). ``None`` on patterns without
+    # label-aware calibration; co-populated with ``label_aware_calibration``.
+    intrinsic_displacement_mean: float | None = None
+    extrinsic_displacement_mean: float | None = None
 
     def delta_dim(self) -> int:
         base = (
@@ -746,7 +764,12 @@ class DimensionContribution:
 
 @dataclass(frozen=True)
 class InfluenceEntry:
-    """Per-entity influence record returned by find_calibration_influencers."""
+    """Per-entity influence record returned by find_calibration_influencers.
+
+    ``cluster_size`` and ``cluster_centroid_distance`` are populated only in
+    auto-discovery mode and identify the cluster the entity represents and
+    the entity's distance to its cluster centroid in delta-space.
+    """
     entity_key: str
     mu_impact: float
     sigma_impact: float
@@ -755,11 +778,18 @@ class InfluenceEntry:
     classification: str
     top_dim_contributions: list[DimensionContribution]
     cascading_flip_count: int | None = None
+    cluster_size: int | None = None
+    cluster_centroid_distance: float | None = None
 
 
 @dataclass(frozen=True)
 class InfluenceReport:
-    """Aggregate report from find_calibration_influencers."""
+    """Aggregate report from find_calibration_influencers.
+
+    ``auto_discovered`` is True when the report was produced by the
+    auto-discovery branch (k-means on the population followed by
+    leave-one-out ranking on the cluster representatives).
+    """
     pattern_id: str
     pattern_version: int
     population_size: int
@@ -769,6 +799,32 @@ class InfluenceReport:
     classify_filter: str
     cell_counts: dict[str, int]
     entries: list[InfluenceEntry]
+    auto_discovered: bool = False
+
+
+@dataclass(frozen=True)
+class InfluencerHistoryEntry:
+    """One epoch's recorded μ-impact for a known influencer."""
+    epoch: int
+    calibrated_at: str
+    mu_impact: float
+    delta_norm_impact: float
+
+
+@dataclass(frozen=True)
+class InfluencerHistoryReport:
+    """Per-epoch μ-impact history for a known influencer.
+
+    ``history`` is empty when no impact has yet been recorded for
+    ``primary_key`` in ``pattern_id``; consult ``hint`` for guidance on how
+    to populate the cache.
+    """
+    primary_key: str
+    pattern_id: str
+    history: list[InfluencerHistoryEntry]
+    n_epochs: int
+    elapsed_ms: float
+    hint: str | None = None
 
 
 @dataclass(frozen=True)

@@ -1418,6 +1418,116 @@ def test_find_similar_entities_event_pattern():
     assert results[0][1] == pytest.approx(0.05)
 
 
+def test_find_similar_entities_with_neighbor_anomaly_populates_map():
+    """with_neighbor_anomaly=True populates SimilarityResult.is_anomaly_map for neighbours."""
+
+    ref_poly = _make_polygon_with_edge("PROD-001", "products")
+    ref_poly.delta = np.array([0.1, 0.2], dtype=np.float32)
+    ref_poly.delta_norm = float(np.linalg.norm(ref_poly.delta))
+
+    class _NeighborAnomalyEngine:
+        def build_polygon(self, bk, pid, manifest):
+            return ref_poly
+
+        def build_solid(self, *a, **kw):
+            pass
+
+        def find_nearest(
+            self, ref_delta, pattern_id, version, top_n=5, exclude_keys=None,
+            filter_expr=None, dim_mask_indices=None, metric="L2",
+        ):
+            return [("CUST-002", 0.15), ("CUST-003", 0.42), ("CUST-004", 0.55)]
+
+    class _AnomalyStorage(_MockStorageWithDelta):
+        """Storage that returns a full (primary_key, is_anomaly) map for the cache load."""
+
+        def read_geometry(
+            self, pattern_id, version, primary_key=None, filters=None,
+            point_keys=None, columns=None, filter=None,
+        ):
+            import pyarrow as pa
+
+            if (
+                point_keys is None and primary_key is None and filter is None
+                and columns and set(columns) == {"primary_key", "is_anomaly"}
+            ):
+                flags = {"CUST-002": True, "CUST-003": False, "CUST-004": True}
+                return pa.table({
+                    "primary_key": list(flags),
+                    "is_anomaly": list(flags.values()),
+                })
+            return super().read_geometry(
+                pattern_id, version, primary_key=primary_key,
+                filters=filters, point_keys=point_keys, columns=columns, filter=filter,
+            )
+
+    manifest = Manifest(
+        manifest_id="test",
+        agent_id="a",
+        snapshot_time=datetime(2024, 1, 1, tzinfo=UTC),
+        status="active",
+        line_versions={"customers": 1, "products": 1},
+        pattern_versions={"customer_pattern": 1},
+    )
+    contract = Contract("test", ["customer_pattern"])
+    nav = GDSNavigator(
+        engine=_NeighborAnomalyEngine(),
+        storage=_AnomalyStorage(),
+        manifest=manifest,
+        contract=contract,
+    )
+
+    results = nav.find_similar_entities(
+        "CUST-001", "customer_pattern", top_n=3, with_neighbor_anomaly=True,
+    )
+
+    # Tuple iteration is unchanged — existing callers see 2-tuples.
+    assert len(results) == 3
+    assert results[0] == ("CUST-002", pytest.approx(0.15))
+    # New sidecar attribute populated.
+    assert results.is_anomaly_map == {"CUST-002": True, "CUST-003": False, "CUST-004": True}
+
+
+def test_find_similar_entities_without_neighbor_anomaly_leaves_map_none():
+    """Default (with_neighbor_anomaly=False) leaves is_anomaly_map as None."""
+
+    ref_poly = _make_polygon_with_edge("PROD-001", "products")
+    ref_poly.delta = np.array([0.1, 0.2], dtype=np.float32)
+    ref_poly.delta_norm = float(np.linalg.norm(ref_poly.delta))
+
+    class _Engine:
+        def build_polygon(self, bk, pid, manifest):
+            return ref_poly
+
+        def build_solid(self, *a, **kw):
+            pass
+
+        def find_nearest(
+            self, ref_delta, pattern_id, version, top_n=5, exclude_keys=None,
+            filter_expr=None, dim_mask_indices=None, metric="L2",
+        ):
+            return [("CUST-002", 0.15)]
+
+    manifest = Manifest(
+        manifest_id="test",
+        agent_id="a",
+        snapshot_time=datetime(2024, 1, 1, tzinfo=UTC),
+        status="active",
+        line_versions={"customers": 1, "products": 1},
+        pattern_versions={"customer_pattern": 1},
+    )
+    contract = Contract("test", ["customer_pattern"])
+    nav = GDSNavigator(
+        engine=_Engine(),
+        storage=_MockStorageWithDelta(),
+        manifest=manifest,
+        contract=contract,
+    )
+
+    results = nav.find_similar_entities("CUST-001", "customer_pattern", top_n=1)
+    assert results.is_anomaly_map is None
+
+
 def test_find_similar_entities_passes_filter_expr():
     """find_similar_entities forwards filter_expr to engine.find_nearest."""
 

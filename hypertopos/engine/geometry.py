@@ -178,6 +178,62 @@ class GDSEngine:
             delta = delta * pattern.dimension_weights
         return delta
 
+    @staticmethod
+    def decompose_displacement(
+        delta: np.ndarray,
+        label_direction: np.ndarray,
+    ) -> dict[str, float]:
+        """Decompose a single delta vector along the label-discriminating axis.
+
+        Splits ``delta`` into two scalar magnitudes:
+
+        - ``intrinsic`` = ``|delta . label_direction_unit|`` — magnitude of
+          the projection onto the unit-norm label direction. Captures how
+          far the entity moved along the axis that separates labelled
+          classes.
+        - ``extrinsic`` = ``sqrt(||delta||^2 - intrinsic^2)`` — magnitude of
+          the residual component orthogonal to the label axis.
+
+        Identity: ``intrinsic^2 + extrinsic^2 == ||delta||^2`` to floating
+        precision. ``label_direction`` is normalised internally — callers
+        may pass any non-zero vector.
+
+        This is the label-axis decomposition of a single polygon's delta
+        vector. It is NOT the calibration-drift intrinsic/extrinsic
+        decomposition (see ``_compute_intrinsic_extrinsic_decomposition``)
+        which splits drift between two calibration epochs into a
+        within-entity-shape component vs a coordinate-system component —
+        same vocabulary, different math.
+
+        Args:
+            delta: 1-D delta vector for one polygon.
+            label_direction: 1-D vector of the same length, must be
+                non-zero. Direction sense is irrelevant (``intrinsic``
+                is absolute-valued).
+
+        Returns:
+            ``{"intrinsic": float, "extrinsic": float}``. Both
+            non-negative. When ``label_direction`` is the zero vector
+            both values are 0.0 (no axis to project onto, no decomposition
+            defined).
+        """
+        d = np.asarray(delta, dtype=np.float64).ravel()
+        ld = np.asarray(label_direction, dtype=np.float64).ravel()
+        if d.shape != ld.shape:
+            raise ValueError(
+                f"delta and label_direction shape mismatch: "
+                f"{d.shape} vs {ld.shape}",
+            )
+        ld_norm = float(np.linalg.norm(ld))
+        if ld_norm <= 0.0:
+            return {"intrinsic": 0.0, "extrinsic": 0.0}
+        ld_unit = ld / ld_norm
+        intrinsic = float(abs(np.dot(d, ld_unit)))
+        d_sq = float(np.dot(d, d))
+        residual_sq = max(d_sq - intrinsic * intrinsic, 0.0)
+        extrinsic = float(np.sqrt(residual_sq))
+        return {"intrinsic": intrinsic, "extrinsic": extrinsic}
+
     def _polygon_to_shape_vector(
         self, polygon: Polygon, pattern: Pattern
     ) -> np.ndarray:

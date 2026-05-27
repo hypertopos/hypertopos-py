@@ -833,15 +833,39 @@ def compute_graph_features(
     # --- Graph algorithm features (computed on AdjacencyIndex) ---
     _ALGO_FEATURES = {
         "pagerank", "connected_component", "clustering_coefficient",
-        "community", "betweenness",
+        "community", "community_id", "betweenness",
     }
     needed_algos = _ALGO_FEATURES & set(features)
     if needed_algos:
-        from hypertopos.engine.graph_algorithms import compute_all_from_lists
-
         f_list = edges["_f"].to_pylist()
         t_list = edges["_t"].to_pylist()
-        algo_results = compute_all_from_lists(f_list, t_list, needed_algos)
+
+        # pagerank / community_id / connected_component go through engine.graph
+        # (pure-numpy / igraph→NetworkX fallback chain). Remaining algos
+        # (clustering_coefficient, betweenness, label-prop "community") stay
+        # on the igraph fast path in graph_algorithms.
+        algo_results: dict[str, dict] = {}
+        _GRAPH_HELPERS = {"pagerank", "community_id", "connected_component"}
+        helper_algos = _GRAPH_HELPERS & needed_algos
+        if helper_algos:
+            from hypertopos.engine.adjacency import AdjacencyIndex
+            from hypertopos.engine.graph import compute_from_adjacency
+            n_edges_lance = len(f_list)
+            adj_for_helpers = AdjacencyIndex.from_edge_lists(
+                f_list, t_list,
+                [0.0] * n_edges_lance, [0.0] * n_edges_lance,
+                [f"_e{i}" for i in range(n_edges_lance)],
+            )
+            algo_results.update(
+                compute_from_adjacency(adj_for_helpers, helper_algos),
+            )
+
+        remaining_algos = needed_algos - _GRAPH_HELPERS
+        if remaining_algos:
+            from hypertopos.engine.graph_algorithms import compute_all_from_lists
+            algo_results.update(
+                compute_all_from_lists(f_list, t_list, remaining_algos),
+            )
 
         _EDGE_MAX_OVERRIDES = {
             "clustering_coefficient": 1,
@@ -853,7 +877,7 @@ def compute_graph_features(
                 idx = key_to_idx.get(k)
                 if idx is not None:
                     vals[idx] = float(v)
-            if feat_name in ("connected_component", "community"):
+            if feat_name in ("connected_component", "community", "community_id"):
                 n_unique = len(set(scores.values())) if scores else 1
                 edge_max = max(n_unique - 1, 1)
             elif feat_name in _EDGE_MAX_OVERRIDES:
@@ -898,7 +922,7 @@ def compute_graph_features_temporal(
     # PageRank/betweenness is meaningless and extremely expensive)
     STATIC_ONLY_FEATURES = {
         "pagerank", "connected_component", "clustering_coefficient",
-        "community", "betweenness",
+        "community", "community_id", "betweenness",
     }
     fast_indices = [i for i, f in enumerate(features) if f in FAST_FEATURES]
     need_recip = "reciprocity" in features

@@ -359,6 +359,15 @@ class GDSReader:
             ),
             edge_dim_names=list(raw.get("edge_dim_names") or []),
             label_aware_calibration=label_aware_calibration,
+            label_aware_n_pos=raw.get("label_aware_n_pos"),
+            label_aware_n_neg=raw.get("label_aware_n_neg"),
+            signed_percentiles=raw.get("signed_percentiles"),
+            intrinsic_displacement_mean=raw.get(
+                "intrinsic_displacement_mean",
+            ),
+            extrinsic_displacement_mean=raw.get(
+                "extrinsic_displacement_mean",
+            ),
         )
 
     def _parse_alias(self, raw: dict[str, Any]) -> Alias:
@@ -517,6 +526,7 @@ class GDSReader:
         if point_keys is not None:
             table = self._read_lance_geometry_filtered(
                 lance_path, point_keys, columns=columns, lance_version=pinned,
+                pattern_id=pattern_id,
             )
         else:
             pk_filter: str | None = None
@@ -622,15 +632,19 @@ class GDSReader:
         point_keys: list[str],
         columns: list[str] | None = None,
         lance_version: int | None = None,
+        pattern_id: str | None = None,
     ) -> pa.Table:
         """Read geometry from Lance with entity_keys pushdown filter.
 
         Falls back to full scan + vectorized filter when entity_keys column
         is missing (legacy geometry).
         """
-        # Open the exact pinned version when supplied (MVCC isolation).
-        # Optimization: skip version= when pinned equals latest.
-        ds = _lance.dataset(lance_path)
+        if pattern_id is not None and pattern_id in self._lance_dataset_cache:
+            ds = self._lance_dataset_cache[pattern_id]
+        else:
+            ds = _lance.dataset(lance_path)
+            if pattern_id is not None:
+                self._lance_dataset_cache[pattern_id] = ds
         if lance_version is not None and lance_version != ds.latest_version:
             ds = ds.checkout_version(lance_version)
         # Check if entity_keys column exists in schema

@@ -624,6 +624,15 @@ class PatternBuildResult:
     # into sphere.json as ``label_aware_calibration`` and hydrated back
     # into ``Pattern.label_aware_calibration`` by the storage reader.
     label_aware_calibration: dict[str, Any] | None = None
+    # Co-populated with ``label_aware_calibration`` — positive / negative
+    # labelled sample counts and the percentiles + intrinsic / extrinsic
+    # displacement means computed from the signed delta projection. ``None``
+    # on patterns without label-aware calibration.
+    label_aware_n_pos: int | None = None
+    label_aware_n_neg: int | None = None
+    signed_percentiles: dict[str, float] | None = None
+    intrinsic_displacement_mean: float | None = None
+    extrinsic_displacement_mean: float | None = None
 
 
 @dataclass
@@ -822,7 +831,8 @@ class GDSBuilder:
     ) -> dict[str, Any] | None:
         """Fit label-aware per-dim calibration when the pattern opts in.
 
-        Returns the per-dim mapping ``{dim_label: DimCalibration}`` and
+        Returns a bundle ``{"per_dim": {dim_label: DimCalibration},
+        "n_pos": int, "n_neg": int, "direction": np.ndarray}`` and
         registers the global Fisher LDA direction in
         ``self._label_aware_directions[pat.pattern_id]`` so the downstream
         geometry pass can populate ``delta_norm_signed``. Returns ``None``
@@ -924,10 +934,16 @@ class GDSBuilder:
             )
             return None
 
-        self._label_aware_directions[pat.pattern_id] = np.asarray(
+        direction_vec = np.asarray(
             result.signed_direction_vector, dtype=np.float32,
         )
-        return dict(result.per_dim)
+        self._label_aware_directions[pat.pattern_id] = direction_vec
+        return {
+            "per_dim": dict(result.per_dim),
+            "n_pos": int(result.n_pos),
+            "n_neg": int(result.n_neg),
+            "direction": direction_vec,
+        }
 
     def add_line(
         self,
@@ -2916,6 +2932,105 @@ class GDSBuilder:
 
         return result
 
+    @staticmethod
+    def _unpack_lac_bundle(
+        lac_bundle: dict[str, Any] | None,
+        deltas: np.ndarray | None,
+    ) -> dict[str, Any]:
+        """Translate the ``_run_label_aware_calibration`` bundle into
+        PBR kwargs.
+
+        Returns a dict with keys ``label_aware_calibration``,
+        ``label_aware_n_pos``, ``label_aware_n_neg``,
+        ``signed_percentiles``, ``intrinsic_displacement_mean``,
+        ``extrinsic_displacement_mean`` — every value ``None`` when the
+        bundle is missing or the delta matrix is unavailable, ready to
+        splat into PatternBuildResult.
+        """
+        if lac_bundle is None or deltas is None or deltas.ndim != 2:
+            return {
+                "label_aware_calibration": None,
+                "label_aware_n_pos": None,
+                "label_aware_n_neg": None,
+                "signed_percentiles": None,
+                "intrinsic_displacement_mean": None,
+                "extrinsic_displacement_mean": None,
+            }
+        direction = lac_bundle.get("direction")
+        if direction is None or direction.shape[0] != deltas.shape[1]:
+            return {
+                "label_aware_calibration": lac_bundle.get("per_dim"),
+                "label_aware_n_pos": lac_bundle.get("n_pos"),
+                "label_aware_n_neg": lac_bundle.get("n_neg"),
+                "signed_percentiles": None,
+                "intrinsic_displacement_mean": None,
+                "extrinsic_displacement_mean": None,
+            }
+        signed_p, intr_mean, extr_mean = (
+            GDSBuilder._compute_signed_artefacts(deltas, direction)
+        )
+        return {
+            "label_aware_calibration": lac_bundle.get("per_dim"),
+            "label_aware_n_pos": lac_bundle.get("n_pos"),
+            "label_aware_n_neg": lac_bundle.get("n_neg"),
+            "signed_percentiles": signed_p or None,
+            "intrinsic_displacement_mean": intr_mean,
+            "extrinsic_displacement_mean": extr_mean,
+        }
+
+    @staticmethod
+    def _compute_signed_artefacts(
+        deltas: np.ndarray,
+        direction: np.ndarray,
+    ) -> tuple[dict[str, float], float, float]:
+        """Derive signed-projection artefacts from deltas + Fisher direction.
+
+        Computes:
+
+        - ``signed_percentiles``: dict with keys ``p1``, ``p5``, ``p50``,
+          ``p95``, ``p99`` of the signed projection
+          ``deltas @ direction_unit``. The LDA fit returns a unit-norm
+          direction so today's caller passes the same vector the
+          geometry pass uses to populate ``delta_norm_signed``; we still
+          normalise defensively so any future non-unit caller gets the
+          contract everyone else assumes.
+        - ``intrinsic_displacement_mean``: mean of
+          ``|delta . direction_unit|`` across rows. Magnitude of motion
+          along the label axis.
+        - ``extrinsic_displacement_mean``: mean of
+          ``sqrt(||delta||^2 - intrinsic^2)`` across rows. Magnitude of
+          motion orthogonal to the label axis.
+
+        Returns empty percentiles dict + (0.0, 0.0) when the delta matrix
+        is empty or the direction is the zero vector.
+        """
+        if deltas.ndim != 2 or deltas.shape[0] == 0:
+            return {}, 0.0, 0.0
+        d = deltas.astype(np.float64, copy=False)
+        v = direction.astype(np.float64, copy=False)
+        v_norm = float(np.linalg.norm(v))
+        if v_norm <= 0.0:
+            return {}, 0.0, 0.0
+        v = v / v_norm
+        projected = d @ v
+        percs = np.percentile(projected, [1, 5, 50, 95, 99])
+        signed_percentiles = {
+            "p1": round(float(percs[0]), 4),
+            "p5": round(float(percs[1]), 4),
+            "p50": round(float(percs[2]), 4),
+            "p95": round(float(percs[3]), 4),
+            "p99": round(float(percs[4]), 4),
+        }
+        intrinsic = np.abs(projected)
+        row_norms_sq = np.einsum("ij,ij->i", d, d)
+        residual_sq = np.maximum(row_norms_sq - intrinsic * intrinsic, 0.0)
+        extrinsic = np.sqrt(residual_sq)
+        return (
+            signed_percentiles,
+            float(intrinsic.mean()),
+            float(extrinsic.mean()),
+        )
+
     def _compute_dim_percentiles(
         self,
         entity_line_id: str,
@@ -3221,6 +3336,20 @@ class GDSBuilder:
                     }
                     for label, dc in pbr.label_aware_calibration.items()
                 }
+                if pbr.label_aware_n_pos is not None:
+                    pat_dict["label_aware_n_pos"] = int(pbr.label_aware_n_pos)
+                if pbr.label_aware_n_neg is not None:
+                    pat_dict["label_aware_n_neg"] = int(pbr.label_aware_n_neg)
+                if pbr.signed_percentiles:
+                    pat_dict["signed_percentiles"] = pbr.signed_percentiles
+                if pbr.intrinsic_displacement_mean is not None:
+                    pat_dict["intrinsic_displacement_mean"] = float(
+                        pbr.intrinsic_displacement_mean,
+                    )
+                if pbr.extrinsic_displacement_mean is not None:
+                    pat_dict["extrinsic_displacement_mean"] = float(
+                        pbr.extrinsic_displacement_mean,
+                    )
             if pat.description:
                 pat_dict["description"] = pat.description
             if pat.fdr_hierarchy:
@@ -3767,7 +3896,7 @@ class GDSBuilder:
                     edge_dim_agg_labels=ps.edge_dim_agg_labels,
                 ),
                 edge_dim_names=ps.edge_dim_names,
-                label_aware_calibration=lac,
+                **self._unpack_lac_bundle(lac, ps.deltas),
             )
             self._write_calibration_epoch_for_pattern(pat, pbr)
             return pat_id, pbr
@@ -4671,7 +4800,7 @@ class GDSBuilder:
                 edge_dim_agg_labels=ps.edge_dim_agg_labels,
             ),
             edge_dim_names=ps.edge_dim_names,
-            label_aware_calibration=lac,
+            **self._unpack_lac_bundle(lac, ps.deltas),
         )
 
     def _build_shape_chunk(

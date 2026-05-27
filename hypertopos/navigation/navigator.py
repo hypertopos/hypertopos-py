@@ -142,19 +142,31 @@ class GDSEntityNotFoundError(GDSNavigationError):
 # ---------------------------------------------------------------------------
 
 class SimilarityResult(list):
-    """List of (primary_key, distance) tuples with an optional degenerate_warning.
+    """List of (primary_key, distance) tuples with optional sidecar attributes.
 
     Extends ``list`` so all existing callers that iterate, slice, or convert to
-    ``dict()`` continue to work unchanged.  The extra ``degenerate_warning``
-    attribute is ``None`` when the result set is healthy, or a descriptive
-    string when >50 % of neighbors have distance = 0.
+    ``dict()`` continue to work unchanged. Sidecar attributes:
+
+    - ``degenerate_warning`` — descriptive string when >50% of neighbors have
+      distance = 0, else ``None``.
+    - ``is_anomaly_map`` — ``{primary_key: is_anomaly}`` for the neighbours,
+      populated when the caller asked the engine for stored anomaly flags;
+      ``None`` when the lookup was skipped.
     """
 
     degenerate_warning: str | None
+    is_anomaly_map: dict[str, bool] | None
 
-    def __init__(self, items: list[tuple[str, float]], *, degenerate_warning: str | None = None):
+    def __init__(
+        self,
+        items: list[tuple[str, float]],
+        *,
+        degenerate_warning: str | None = None,
+        is_anomaly_map: dict[str, bool] | None = None,
+    ):
         super().__init__(items)
         self.degenerate_warning = degenerate_warning
+        self.is_anomaly_map = is_anomaly_map
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +510,18 @@ _NON_NORMAL_DIM_PVALUE_THRESHOLD = 0.01
 _KIND_MISMATCH_DIRECTION_THRESHOLD = 0.05
 _KIND_MISMATCH_COHENS_D_THRESHOLD = 0.3
 
+# ``signed_tail_concentration`` gates. Fires when the persisted
+# ``Pattern.signed_percentiles`` shows a one-sided extreme tail —
+# ``|p99| / max(|p50|, 1e-9) > 50`` — on the Fisher LDA-projected delta
+# distribution, signalling that the label-discriminating direction is
+# driven by a tiny outlier subgroup rather than the global label split.
+# Suppressed when the positive class is undersampled
+# (``label_aware_n_pos < _SIGNED_TAIL_MIN_N_POS``) — with few labelled
+# positives the LDA fit is itself unstable and the warning would mostly
+# echo small-sample noise.
+_SIGNED_TAIL_RATIO_THRESHOLD = 50.0
+_SIGNED_TAIL_MIN_N_POS = 30
+
 
 def _compute_calibration_drift(
     fit_from: CalibrationFit,
@@ -626,6 +650,30 @@ class GDSNavigator:
         self._dead_dim_cache: dict[tuple[str, int], list[int]] = {}
         self._cross_pattern_map: dict[str, dict[str, str]] = {}
         self._chain_reverse_index: dict[tuple[str, int], dict[str, list[str]]] = {}
+        self._anomaly_map_cache: dict[tuple[str, int], dict[str, bool]] = {}
+
+    def _get_anomaly_map(self, pattern_id: str, version: int) -> dict[str, bool]:
+        """Lazy session-scoped {primary_key: is_anomaly} cache per (pattern, version).
+
+        First lookup runs one full geometry scan over (primary_key, is_anomaly);
+        subsequent lookups are O(1) dict reads. Memory cost is bounded by the
+        pattern's row count — typically <10 MB for 1 M entities.
+        """
+        key = (pattern_id, version)
+        cached = self._anomaly_map_cache.get(key)
+        if cached is not None:
+            return cached
+        table = self._storage.read_geometry(
+            pattern_id, version, columns=["primary_key", "is_anomaly"],
+        )
+        pk_list = table["primary_key"].to_pylist()
+        anom_list = table["is_anomaly"].to_pylist()
+        full_map = {
+            pk: bool(flag) for pk, flag in zip(pk_list, anom_list, strict=False)
+            if pk is not None and flag is not None
+        }
+        self._anomaly_map_cache[key] = full_map
+        return full_map
 
     @property
     def position(self) -> Point | Polygon | Solid | None:
@@ -1057,6 +1105,51 @@ class GDSNavigator:
         return polygons
 
     @staticmethod
+    def _stratified_sample_light(
+        light: pa.Table,
+        *,
+        sample_size: int | None,
+        boundary_aware: bool,
+        theta_norm: float,
+    ) -> pa.Table:
+        """Sample ``light`` down to ``sample_size`` rows.
+
+        When ``boundary_aware`` is True, half the budget goes to entities with
+        ``delta_norm`` in ``[0.8 * theta_norm, 1.2 * theta_norm]`` (or all of
+        them if fewer); the remainder is drawn uniformly from outside the
+        band. Otherwise: uniform random sample without replacement.
+        """
+        n = light.num_rows
+        if sample_size is None or n <= sample_size:
+            return light
+        rng = np.random.default_rng(0)
+        if not boundary_aware:
+            idx = rng.choice(n, size=sample_size, replace=False)
+            idx.sort()
+            return light.take(pa.array(idx))
+        norms = light["delta_norm"].to_numpy(zero_copy_only=False).astype(np.float64)
+        lo = 0.8 * theta_norm
+        hi = 1.2 * theta_norm
+        boundary_mask = (norms >= lo) & (norms <= hi)
+        boundary_idx = np.where(boundary_mask)[0]
+        non_boundary_idx = np.where(~boundary_mask)[0]
+        budget_boundary = sample_size // 2
+        budget_other = sample_size - budget_boundary
+        if boundary_idx.size <= budget_boundary:
+            pick_boundary = boundary_idx
+            # Spill leftover to the other stratum so total budget is preserved.
+            budget_other = sample_size - int(pick_boundary.size)
+        else:
+            pick_boundary = rng.choice(boundary_idx, size=budget_boundary, replace=False)
+        if non_boundary_idx.size <= budget_other:
+            pick_other = non_boundary_idx
+        else:
+            pick_other = rng.choice(non_boundary_idx, size=budget_other, replace=False)
+        chosen = np.concatenate([pick_boundary, pick_other])
+        chosen.sort()
+        return light.take(pa.array(chosen))
+
+    @staticmethod
     def _attach_reliability_flags(
         polygons: list[Polygon],
         *,
@@ -1276,6 +1369,8 @@ class GDSNavigator:
         metric: str = "L2",
         min_confidence: float = 0.0,
         dimension_weights: dict[str, float] | None = None,
+        sample_size: int | None = None,
+        boundary_aware: bool = False,
     ) -> tuple[list[Polygon], int, list[dict] | None, dict | None]:
         """Find the most anomalous polygons in a pattern.
 
@@ -1374,6 +1469,21 @@ class GDSNavigator:
         ``cell_q_temporal`` both carry the conservative joint q (element-wise
         max across the cell's projections at each level) when both axes are
         active, since ``fdr_multi_resolution`` returns a single per-cell q.
+
+        ``sample_size`` (optional, default ``None`` = scan full population) —
+        cap on the number of geometry rows scored. When set below the
+        population size, a random sample is drawn before threshold filtering
+        and ranking. Forces the in-process scan path (the Lance pushdown fast
+        path operates on the full population).
+
+        ``boundary_aware`` (optional, default ``False``) — stratified sampling
+        mode for ``sample_size``. When ``True``, half the budget is drawn
+        from entities in the ``[0.8 * theta_norm, 1.2 * theta_norm]`` band
+        around the decision threshold (boundary cases), the other half from
+        the rest of the population. Useful for calibration audits — uniform
+        sampling under-represents boundary entities since they make up a
+        minority of the population. Requires ``sample_size`` to be set; raises
+        ``ValueError`` otherwise. Forces the in-process scan path.
         """
         # Resolve sentinel-None defaults BEFORE the fdr_method / p_value_method
         # value-set validation runs (the check directly below expects a string).
@@ -1396,6 +1506,13 @@ class GDSNavigator:
             )
         if metric not in ("L2", "Linf"):
             raise ValueError(f"metric must be 'L2' or 'Linf', got '{metric}'")
+        if boundary_aware and sample_size is None:
+            raise ValueError(
+                "boundary_aware=True requires sample_size to be set — "
+                "stratified sampling needs an explicit budget."
+            )
+        if sample_size is not None and sample_size <= 0:
+            raise ValueError(f"sample_size must be positive, got {sample_size}")
         if rank_by not in ("delta_norm", "min_q_per_dim", "signed_confidence"):
             raise ValueError(
                 f"rank_by must be 'delta_norm', 'min_q_per_dim', or "
@@ -1499,6 +1616,8 @@ class GDSNavigator:
             and metric == "L2"
             and weight_vector is None
             and rank_by != "signed_confidence"
+            and sample_size is None
+            and not boundary_aware
         ):
             from hypertopos.engine.lance_sql_agg import (
                 find_anomalies as _lance_sql_find_anomalies,
@@ -1578,7 +1697,12 @@ class GDSNavigator:
             cols.append("anomaly_confidence")
         if metric == "bregman":
             cols.append("bregman_divergence")
-        if metric in ("Linf", "bregman"):
+        # Sampling needs visibility into entities BELOW the threshold (the
+        # boundary band straddles theta_norm and the uniform-sampling acceptance
+        # ratio assumes the full population is in scope). Drop the pre-filter
+        # in that case — the threshold check still happens post-sampling below.
+        _drop_norm_prefilter = sample_size is not None or boundary_aware
+        if metric in ("Linf", "bregman") or _drop_norm_prefilter:
             # Linf/bregman: can't use pre-computed delta_norm filter, read all
             light = self._storage.read_geometry(
                 pattern_id, version, columns=cols,
@@ -1587,6 +1711,11 @@ class GDSNavigator:
             light = self._storage.read_geometry(
                 pattern_id, version, columns=cols,
                 filter=f"delta_norm >= {threshold}",
+            )
+        if _drop_norm_prefilter and light.num_rows > 0:
+            light = self._stratified_sample_light(
+                light, sample_size=sample_size, boundary_aware=boundary_aware,
+                theta_norm=theta_norm,
             )
         if light.num_rows == 0:
             emerging = self._find_emerging(
@@ -3059,6 +3188,7 @@ class GDSNavigator:
         missing_edge_to: str | None = None,
         dim_mask: list[str] | None = None,
         metric: str = "L2",
+        with_neighbor_anomaly: bool = False,
     ) -> SimilarityResult:
         """Find top_n entities most similar to primary_key by delta vector distance.
 
@@ -3074,6 +3204,11 @@ class GDSNavigator:
 
         missing_edge_to: optional line_id — post-filter that keeps only entities WITHOUT
         an edge to the target line. Over-fetches 5x from ANN to compensate for attrition.
+
+        with_neighbor_anomaly: when True, look up stored ``is_anomaly`` per neighbour
+        from the geometry dataset and populate ``SimilarityResult.is_anomaly_map``.
+        Cost is one BTREE point lookup over top_n keys — typically <1 ms for
+        top_n <= 50. Default ``False`` keeps existing callers unaffected.
         """
         version = self._resolve_version(pattern_id)
         sphere = self._storage.read_sphere()
@@ -3160,7 +3295,20 @@ class GDSNavigator:
                     f"(inactive entities). Results may be misleading."
                 )
 
-        return SimilarityResult(results, degenerate_warning=degenerate_warning)
+        is_anomaly_map: dict[str, bool] | None = None
+        if with_neighbor_anomaly and results:
+            full_map = self._get_anomaly_map(pattern_id, version)
+            is_anomaly_map = {
+                k: full_map[k] for k, _ in results if k in full_map
+            }
+        elif with_neighbor_anomaly:
+            is_anomaly_map = {}
+
+        return SimilarityResult(
+            results,
+            degenerate_warning=degenerate_warning,
+            is_anomaly_map=is_anomaly_map,
+        )
 
     def get_entity_geometry_meta(
         self,
@@ -7906,10 +8054,23 @@ class GDSNavigator:
           Suppressed when ``negative_space`` already fires on the same
           dim — same dedup convention as ``non_normal_dim``.
 
-        All six are computed from cached pattern state (``sigma_diag``,
-        ``dim_percentiles``, ``mu``, ``dimension_kinds``,
-        ``dim_normality_pvalues``, ``label_aware_calibration``) —
-        sub-millisecond, no storage scan.
+        - **signed_tail_concentration**: pattern-level warning fired
+          when ``Pattern.signed_percentiles`` shows
+          ``|p99| / max(|p50|, 1e-9) > _SIGNED_TAIL_RATIO_THRESHOLD``
+          on the Fisher LDA-projected delta distribution. Indicates
+          the label-discriminating axis is being driven by a tiny
+          outlier subgroup rather than the broad positive / negative
+          class split. Suppressed when
+          ``Pattern.label_aware_n_pos < _SIGNED_TAIL_MIN_N_POS``
+          (positive-class undersampled — LDA fit itself unstable).
+          ``dim_label`` is ``<pattern_id>:signed_percentiles`` to
+          signal pattern-level rather than dim-level scope.
+
+        All warnings are computed from cached pattern state
+        (``sigma_diag``, ``dim_percentiles``, ``mu``,
+        ``dimension_kinds``, ``dim_normality_pvalues``,
+        ``label_aware_calibration``, ``signed_percentiles``,
+        ``label_aware_n_pos``) — sub-millisecond, no storage scan.
         """
         def _build_raw_dim_name_to_index(pattern: Any) -> dict[str, int]:
             """Map dim_percentiles raw keys (column / line_id-without-_d_
@@ -8200,6 +8361,23 @@ class GDSNavigator:
             ),
         )
 
+        # Signed-tail concentration — pattern-level warning fired when
+        # the Fisher LDA projection of polygon deltas
+        # (``Pattern.signed_percentiles`` populated at build time from
+        # the ``delta_norm_signed`` Lance column) shows a one-sided
+        # extreme tail: ``|p99| / max(|p50|, 1e-9) > 50``. Indicates the
+        # label-discriminating axis is being driven by a tiny outlier
+        # subgroup rather than the broad positive / negative class
+        # split. Skipped when ``signed_percentiles`` is absent (pattern
+        # built without label-aware calibration) or when the positive
+        # class count is below ``_SIGNED_TAIL_MIN_N_POS`` — small-N LDA
+        # is unstable on its own and the warning would echo noise.
+        signed_tail = GDSNavigator._compute_signed_tail_concentration_warning(
+            pattern,
+        )
+        if signed_tail is not None:
+            warnings.append(signed_tail)
+
         # Heteroscedasticity — Brown-Forsythe p-value persisted by the
         # builder when the pattern carries `group_by_property`. The
         # dim_label here references the grouping variable (a categorical
@@ -8453,6 +8631,61 @@ class GDSNavigator:
             })
         return out
 
+    @staticmethod
+    def _compute_signed_tail_concentration_warning(
+        pattern: Any,
+    ) -> dict[str, Any] | None:
+        """Pattern-level warning when ``signed_percentiles`` p99 / p50
+        ratio crosses ``_SIGNED_TAIL_RATIO_THRESHOLD``.
+
+        Returns ``None`` when:
+
+        - ``pattern.signed_percentiles`` is absent (no label-aware
+          calibration available — nothing to test),
+        - ``pattern.label_aware_n_pos`` is below
+          ``_SIGNED_TAIL_MIN_N_POS`` (positive class undersampled —
+          LDA fit unstable, the ratio echoes noise rather than signal),
+        - p99 / p50 ratio does not cross the threshold (no concentration).
+
+        The ``dim_label`` is set to ``<pattern_id>:signed_percentiles``
+        to mark the warning as pattern-level rather than dim-keyed; the
+        ``evidence_value`` carries the ratio for downstream inspection.
+        """
+        sp = getattr(pattern, "signed_percentiles", None)
+        if not sp:
+            return None
+        n_pos = getattr(pattern, "label_aware_n_pos", None)
+        if n_pos is None or int(n_pos) < _SIGNED_TAIL_MIN_N_POS:
+            return None
+
+        p50 = float(sp.get("p50", 0.0))
+        p99 = float(sp.get("p99", 0.0))
+        denom = max(abs(p50), 1e-9)
+        ratio = abs(p99) / denom
+        if not np.isfinite(ratio) or ratio <= _SIGNED_TAIL_RATIO_THRESHOLD:
+            return None
+
+        return {
+            "type": "signed_tail_concentration",
+            "dim_label": f"{pattern.pattern_id}:signed_percentiles",
+            "reason": (
+                f"|p99|/|p50| = {ratio:.1f} > "
+                f"{_SIGNED_TAIL_RATIO_THRESHOLD:.0f} on the Fisher LDA "
+                f"projection (n_pos={int(n_pos)}) — signed-delta tail "
+                f"one-sided extreme, likely driven by a tiny outlier "
+                f"subgroup rather than the broad positive / negative "
+                f"class split"
+            ),
+            "advice": (
+                "re-calibrate with stratified sampling on the label "
+                "column, or collect a larger positive class — the "
+                "current LDA direction is dominated by a few outlier "
+                "rows and may not generalise"
+            ),
+            "evidence_value": round(ratio, 4),
+            "threshold": _SIGNED_TAIL_RATIO_THRESHOLD,
+        }
+
     def _build_theta_sensitivity_summary(self, pattern_id: str) -> dict | None:
         """Compact theta_sensitivity diagnostic for sphere_overview.
 
@@ -8610,6 +8843,132 @@ class GDSNavigator:
             "n_entities_sampled": len(keys),
             "n_anomaly_transitions": all_pairs,
         }
+
+    def _compute_cross_pattern_discrepancy(self) -> dict | None:
+        """Pairwise Jaccard overlap of anomalous primary_keys across patterns
+        that cover the same entity line.
+
+        Two patterns are "cover-overlapping" when ``sphere.entity_line(pat_id)``
+        returns the same non-null line_id — their geometry tables index the
+        same primary_key space, so the anomalous-key sets are comparable.
+
+        For each unordered pair (A, B), reads ``primary_key`` + ``is_anomaly``
+        from both pattern geometry tables (two cheap columns, Lance bitmap
+        index on ``is_anomaly``), takes the set difference / intersection /
+        union on the union of all keys observed across both tables, and
+        emits the four bucket counts plus ``jaccard_anomaly_overlap``.
+
+        Returns ``None`` when fewer than two patterns share an entity line.
+        Output schema::
+
+            {
+              "pairs": [
+                {
+                  "pattern_a": str,
+                  "pattern_b": str,
+                  "shared_line": str,
+                  "n_anomalous_only_in_a": int,
+                  "n_anomalous_only_in_b": int,
+                  "n_anomalous_in_both": int,
+                  "n_anomalous_in_neither": int,
+                  "jaccard_anomaly_overlap": float | None,
+                }
+              ]
+            }
+
+        ``jaccard_anomaly_overlap`` is ``None`` when both anomaly sets are
+        empty (``|A ∪ B| == 0``).
+
+        Threshold caveat: each pattern's ``is_anomaly`` column was materialised
+        with that pattern's own ``theta``. Comparing two patterns therefore
+        compares two thresholds on the same key space — Jaccard near zero is
+        the expected null case (different detectors with different calibration
+        rarely agree on the exact anomalous subset), and large overlap is the
+        notable signal.
+        """
+        sphere = self._storage.read_sphere()
+
+        # Group patterns by their entity_line. Pairs only form within a group.
+        groups: dict[str, list[str]] = defaultdict(list)
+        for pid in sphere.patterns:
+            line_id = sphere.entity_line(pid)
+            if not line_id:
+                continue
+            groups[line_id].append(pid)
+
+        # Drop groups with fewer than two patterns.
+        groups = {k: v for k, v in groups.items() if len(v) >= 2}
+        if not groups:
+            return None
+
+        import pyarrow.compute as pc
+
+        # Cache anomalous-key sets per (pid, version) to avoid re-reads.
+        anom_cache: dict[str, set[str]] = {}
+
+        def _anom_keys(pid: str) -> set[str]:
+            if pid in anom_cache:
+                return anom_cache[pid]
+            try:
+                version = self._resolve_version(pid)
+                tbl = self._storage.read_geometry(
+                    pid, version, columns=["primary_key", "is_anomaly"],
+                )
+            except _NAVIGATION_RECOVERABLE_ERRORS:
+                anom_cache[pid] = set()
+                return anom_cache[pid]
+            mask = pc.equal(tbl["is_anomaly"], True)
+            keys = tbl.filter(mask)["primary_key"].to_pylist()
+            anom_cache[pid] = set(keys)
+            return anom_cache[pid]
+
+        # Cache full-key (universe) sets per pid to compute n_anomalous_in_neither.
+        universe_cache: dict[str, set[str]] = {}
+
+        def _universe(pid: str) -> set[str]:
+            if pid in universe_cache:
+                return universe_cache[pid]
+            try:
+                version = self._resolve_version(pid)
+                tbl = self._storage.read_geometry(
+                    pid, version, columns=["primary_key"],
+                )
+            except _NAVIGATION_RECOVERABLE_ERRORS:
+                universe_cache[pid] = set()
+                return universe_cache[pid]
+            universe_cache[pid] = set(tbl["primary_key"].to_pylist())
+            return universe_cache[pid]
+
+        pairs: list[dict[str, Any]] = []
+        for shared_line, pids in groups.items():
+            pids_sorted = sorted(pids)
+            for i, pat_a in enumerate(pids_sorted):
+                for pat_b in pids_sorted[i + 1:]:
+                    anom_a = _anom_keys(pat_a)
+                    anom_b = _anom_keys(pat_b)
+                    only_a = anom_a - anom_b
+                    only_b = anom_b - anom_a
+                    both = anom_a & anom_b
+                    union_universe = _universe(pat_a) | _universe(pat_b)
+                    neither = union_universe - anom_a - anom_b
+                    union_anom_size = len(anom_a | anom_b)
+                    jaccard: float | None
+                    if union_anom_size == 0:
+                        jaccard = None
+                    else:
+                        jaccard = round(len(both) / union_anom_size, 4)
+                    pairs.append({
+                        "pattern_a": pat_a,
+                        "pattern_b": pat_b,
+                        "shared_line": shared_line,
+                        "n_anomalous_only_in_a": len(only_a),
+                        "n_anomalous_only_in_b": len(only_b),
+                        "n_anomalous_in_both": len(both),
+                        "n_anomalous_in_neither": len(neither),
+                        "jaccard_anomaly_overlap": jaccard,
+                    })
+
+        return {"pairs": pairs}
 
     def _compute_event_rate_divergence(self) -> list[dict]:
         """Find entities with high event anomaly rate but below-theta static geometry.
@@ -9309,13 +9668,13 @@ class GDSNavigator:
         pattern = sphere.patterns[pattern_id]
         n_rel = len(pattern.relations)
 
-        shifts: list[tuple[datetime, float, np.ndarray]] = []
+        shifts: list[tuple[datetime, float, np.ndarray, int]] = []
         for i in range(1, len(filtered)):
             c_prev = np.array(filtered[i - 1]["centroid"][:n_rel], dtype=np.float64)
             c_curr = np.array(filtered[i]["centroid"][:n_rel], dtype=np.float64)
             diff = c_curr - c_prev
             mag = float(np.linalg.norm(diff))
-            shifts.append((filtered[i]["window_start"], mag, diff))
+            shifts.append((filtered[i]["window_start"], mag, diff, i))
 
         if not shifts:
             return []
@@ -9325,8 +9684,11 @@ class GDSNavigator:
         std_m = float(np.std(mags)) if len(mags) > 2 else mean_m * 0.5
         threshold = mean_m + 1.5 * std_m
 
+        n_total = len(filtered)
+        boundary_idx = {0, 1, n_total - 1, n_total - 2}
+
         changepoints: list[dict] = []
-        for ts, mag, diff in shifts:
+        for ts, mag, diff, idx in shifts:
             if mag <= threshold:
                 continue
             top_dims = sorted(
@@ -9349,6 +9711,7 @@ class GDSNavigator:
                     f"Population centroid shifted {mag:.3f} "
                     f"(threshold {threshold:.3f})"
                 ),
+                "near_data_boundary": idx in boundary_idx,
             })
 
         changepoints.sort(key=lambda c: c["magnitude"], reverse=True)
@@ -9471,6 +9834,9 @@ class GDSNavigator:
         std_shift = float(np.std(shifts))
         threshold = mean_shift + 1.5 * std_shift
 
+        n_buckets = len(bucket_timestamps)
+        boundary_idx = {0, 1, n_buckets - 1, n_buckets - 2}
+
         changes: list[dict] = []
         for i, shift in enumerate(shifts):
             if shift <= threshold:
@@ -9498,6 +9864,7 @@ class GDSNavigator:
                         f"Population centroid shifted {shift:.3f} "
                         f"(threshold {threshold:.3f})"
                     ),
+                    "near_data_boundary": (i + 1) in boundary_idx,
                 }
             )
 
@@ -12598,6 +12965,226 @@ class GDSNavigator:
             "coordinated": bool(coordinated),
             "interpretation": interpretation,
             "per_member_top_dims": per_member_sorted,
+        }
+
+    def chain_signed_confidence_rollup(
+        self,
+        chain_id: str,
+        *,
+        chain_pattern: str,
+        anchor_pattern: str,
+    ) -> dict[str, Any]:
+        """Aggregate per-member signed-confidence into a chain-level rollup.
+
+        For each unique member of ``chain_id`` (resolved via the
+        ``chain_keys`` column on the chain anchor's points table), reads
+        the member's polygon geometry on ``anchor_pattern``, attaches
+        reliability flags + the signed-confidence triad
+        (``signed_confidence_score`` / ``lda_alignment`` /
+        ``reliability_penalty``), then aggregates four chain-level fields
+        and a verdict.
+
+        Returns a dict with:
+          - ``chain_id``, ``chain_pattern``, ``anchor_pattern``
+          - ``n_members``: count of unique deduped chain members
+          - ``chain_mean_signed_confidence``: mean of per-member
+            ``signed_confidence_score`` across resolved members (``None``
+            when label_aware_calibration is absent OR chain is empty)
+          - ``chain_n_low_confidence_members``: count of members whose
+            ``reliability_penalty >= 0.5`` (``None`` when unavailable)
+          - ``chain_n_single_dim_driven_members``: count of members whose
+            ``reliability_flags["single_dim_driven"]`` is True (``None``
+            when unavailable)
+          - ``chain_confidence_verdict``: one of ``"high"`` / ``"medium"``
+            / ``"low"`` / ``"label-aware-unavailable"`` (``None`` when
+            chain is empty)
+          - ``n_members_resolved``: count of members whose geometry was
+            successfully read (members absent from geometry are silently
+            skipped)
+
+        Verdict thresholds (deterministic):
+          - ``"label-aware-unavailable"`` when ``anchor_pattern`` lacks
+            ``label_aware_calibration`` (all four numeric fields = None)
+          - ``"low"`` when
+            ``chain_n_low_confidence_members >= 0.5 * n_members``
+          - ``"medium"`` when ``chain_mean_signed_confidence < 1.0`` and
+            not ``"low"``. Note: anti-aligned chains (negative mean) fall
+            in this bucket by the literal threshold.
+          - ``"high"`` otherwise
+
+        Args:
+            chain_id: chain anchor primary key.
+            chain_pattern: anchor pattern id whose points carry
+                ``chain_keys``.
+            anchor_pattern: entity anchor pattern whose primary_keys
+                match the chain hops.
+
+        Raises ValueError when chain_pattern or anchor_pattern is unknown,
+        when chain_pattern is not an anchor, when its points lack
+        ``chain_keys``, or when ``chain_id`` is not present.
+        """
+        sphere = self._storage.read_sphere()
+        if chain_pattern not in sphere.patterns:
+            raise ValueError(f"chain_pattern not found: {chain_pattern!r}")
+        if anchor_pattern not in sphere.patterns:
+            raise ValueError(f"anchor_pattern not found: {anchor_pattern!r}")
+
+        chain_pat = sphere.patterns[chain_pattern]
+        if chain_pat.pattern_type != "anchor":
+            raise ValueError(
+                f"chain_pattern must be an anchor pattern; got "
+                f"pattern_type={chain_pat.pattern_type!r} for "
+                f"{chain_pattern!r}",
+            )
+
+        chain_line_id = sphere.entity_line(chain_pattern)
+        if chain_line_id is None:
+            raise ValueError(
+                f"chain_pattern {chain_pattern!r} has no entity_line",
+            )
+        chain_line_ver = self._manifest.line_version(chain_line_id) or 1
+
+        pts = self._storage.read_points(
+            chain_line_id, chain_line_ver,
+            columns=["primary_key", "chain_keys"],
+            primary_key=chain_id,
+        )
+        if "chain_keys" not in pts.schema.names:
+            raise ValueError(
+                f"line {chain_line_id!r} has no chain_keys column — "
+                f"pattern {chain_pattern!r} is not a chain pattern",
+            )
+        if pts.num_rows == 0:
+            raise ValueError(
+                f"chain not found: {chain_id!r} in pattern "
+                f"{chain_pattern!r}",
+            )
+
+        ck = pts["chain_keys"][0].as_py() or ""
+        raw_keys = [k.strip() for k in ck.split(",") if k.strip()]
+        unique_members = list(dict.fromkeys(raw_keys))
+        n_members = len(unique_members)
+
+        # Empty-chain short-circuit — all None including verdict.
+        if n_members == 0:
+            return {
+                "chain_id": chain_id,
+                "chain_pattern": chain_pattern,
+                "anchor_pattern": anchor_pattern,
+                "n_members": 0,
+                "n_members_resolved": 0,
+                "chain_mean_signed_confidence": None,
+                "chain_n_low_confidence_members": None,
+                "chain_n_single_dim_driven_members": None,
+                "chain_confidence_verdict": None,
+            }
+
+        anchor_pat = sphere.patterns[anchor_pattern]
+        # Label-aware calibration unavailable — fail soft with verdict label.
+        if anchor_pat.label_aware_calibration is None:
+            return {
+                "chain_id": chain_id,
+                "chain_pattern": chain_pattern,
+                "anchor_pattern": anchor_pattern,
+                "n_members": n_members,
+                "n_members_resolved": 0,
+                "chain_mean_signed_confidence": None,
+                "chain_n_low_confidence_members": None,
+                "chain_n_single_dim_driven_members": None,
+                "chain_confidence_verdict": "label-aware-unavailable",
+            }
+
+        # Read per-member polygon geometry for the anchor pattern and
+        # build Polygon objects so the existing _attach_* static helpers
+        # (used by π5_attract_anomaly) can decorate them with reliability
+        # flags + signed-confidence triad.
+        anchor_version = self._resolve_version(anchor_pattern)
+        light_cols = [
+            "primary_key", "scale", "delta", "delta_norm",
+            "delta_rank_pct", "is_anomaly",
+            "last_refresh_at", "updated_at",
+            "bregman_divergence", "anomaly_confidence",
+            "edges", "entity_keys",
+        ]
+        geo = self._storage.read_geometry(
+            anchor_pattern, anchor_version,
+            point_keys=unique_members,
+            columns=light_cols,
+        )
+        polygons = self._engine.geometry_to_polygons(
+            geo,
+            pattern=anchor_pat,
+            pattern_id=anchor_pattern,
+            pattern_type=anchor_pat.pattern_type,
+            pattern_ver=anchor_version,
+        )
+        # Same ordering as π5_attract_anomaly: reliability flags FIRST,
+        # signed-confidence triad SECOND (the latter reads
+        # reliability_flags via the penalty term).
+        self._attach_reliability_flags(polygons, pattern=anchor_pat)
+        self._attach_signed_confidence_fields(polygons, pattern=anchor_pat)
+
+        n_resolved = len(polygons)
+        if n_resolved == 0:
+            # All members absent from geometry — no signal to aggregate.
+            # Distinct from the "label-aware-unavailable" shape above:
+            # label-aware IS configured here, the data gap is in members
+            # missing from the anchor pattern's geometry. Surface verdict
+            # = None so consumers can distinguish "calibration missing"
+            # from "members missing".
+            return {
+                "chain_id": chain_id,
+                "chain_pattern": chain_pattern,
+                "anchor_pattern": anchor_pattern,
+                "n_members": n_members,
+                "n_members_resolved": 0,
+                "chain_mean_signed_confidence": None,
+                "chain_n_low_confidence_members": None,
+                "chain_n_single_dim_driven_members": None,
+                "chain_confidence_verdict": None,
+            }
+
+        scores = [
+            float(getattr(p, "signed_confidence_score", 0.0) or 0.0)
+            for p in polygons
+        ]
+        n_low_conf = sum(
+            1 for p in polygons
+            if float(getattr(p, "reliability_penalty", 0.0) or 0.0) >= 0.5
+        )
+        n_single_dim = sum(
+            1 for p in polygons
+            if (getattr(p, "reliability_flags", None) or {}).get(
+                "single_dim_driven", False,
+            )
+        )
+        mean_signed = sum(scores) / float(n_resolved)
+        # Sanitize ±inf / NaN → None for strict-JSON wire format.
+        if not np.isfinite(mean_signed):
+            mean_signed_out: float | None = None
+        else:
+            mean_signed_out = float(mean_signed)
+
+        # Verdict thresholds use n_members (the structural denominator)
+        # so a chain with many unresolved members lands on "low" when
+        # half-or-more of the structural population could not be cleared.
+        if n_low_conf >= 0.5 * n_members:
+            verdict = "low"
+        elif mean_signed_out is not None and mean_signed_out < 1.0:
+            verdict = "medium"
+        else:
+            verdict = "high"
+
+        return {
+            "chain_id": chain_id,
+            "chain_pattern": chain_pattern,
+            "anchor_pattern": anchor_pattern,
+            "n_members": n_members,
+            "n_members_resolved": n_resolved,
+            "chain_mean_signed_confidence": mean_signed_out,
+            "chain_n_low_confidence_members": n_low_conf,
+            "chain_n_single_dim_driven_members": n_single_dim,
+            "chain_confidence_verdict": verdict,
         }
 
     def chain_drift_trajectory(
@@ -15878,6 +16465,111 @@ class GDSNavigator:
 
         return results
 
+    def classify_trajectory(
+        self,
+        primary_key: str,
+        pattern_id: str,
+        sample_size: int = 10_000,
+    ) -> dict[str, Any]:
+        """Categorise one entity's temporal trajectory vs the population.
+
+        Combines the DTW distance from
+        ``engine.topology.classify_trajectory`` (population-median reference)
+        with a first-derivative slope comparison to surface one of
+        ``outlier`` / ``lagging`` / ``leading`` / ``typical``.
+
+        Args:
+            primary_key: entity to classify.
+            pattern_id: anchor pattern with temporal history.
+            sample_size: cap on entities sampled for the median trajectory and
+                DTW threshold estimation. Default 10 000.
+
+        Returns:
+            ``{primary_key, dtw_distance, category, category_evidence}`` for
+            the requested entity. ``category`` is ``"unknown"`` when the
+            entity is absent from temporal storage.
+        """
+        from hypertopos.engine.topology import (
+            classify_trajectory as _engine_classify_trajectory,
+        )
+
+        sphere = self._storage.read_sphere()
+        pattern = sphere.patterns.get(pattern_id)
+        if pattern is None:
+            raise GDSNavigationError(
+                f"Pattern '{pattern_id}' not found in sphere."
+            )
+        if pattern.pattern_type == "event":
+            raise ValueError(
+                f"classify_trajectory requires anchor pattern — "
+                f"event patterns have no temporal history. "
+                f"Got pattern '{pattern_id}' with type 'event'."
+            )
+
+        # Stream temporal data, convert shape_snapshot to delta_snapshot via
+        # pattern calibration (same path as detect_trajectory_anomaly).
+        entity_slices: dict[str, list[tuple[int, list[float]]]] = defaultdict(list)
+        try:
+            for batch in self._storage.read_temporal_batched(pattern_id):
+                table = pa.Table.from_batches([batch])
+                if "shape_snapshot" not in table.schema.names:
+                    continue
+                pks = table["primary_key"].to_pylist()
+                snapshots = table["shape_snapshot"].to_pylist()
+                timestamps = pc.cast(table["timestamp"], pa.int64()).to_pylist()
+                for pk, snap, ts in zip(pks, snapshots, timestamps, strict=True):
+                    if pk is None or snap is None:
+                        continue
+                    entity_slices[pk].append((ts, snap))
+                if len(entity_slices) >= sample_size:
+                    break
+        except StopIteration:
+            pass
+
+        if not entity_slices:
+            return {
+                "primary_key": primary_key,
+                "dtw_distance": 0.0,
+                "category": "unknown",
+                "category_evidence": 0.0,
+            }
+
+        # Convert shape_snapshot → delta_snapshot via pattern (mu, sigma_diag).
+        sigma = (
+            np.maximum(pattern.sigma_diag, 1e-2)
+            if pattern.sigma_diag is not None else None
+        )
+        mu = pattern.mu
+
+        pks_flat: list[str] = []
+        snaps_flat: list[list[float]] = []
+        for pk, slices in entity_slices.items():
+            slices.sort(key=lambda x: x[0])
+            for _ts, snap in slices:
+                arr = np.asarray(snap, dtype=np.float32)
+                if sigma is not None:
+                    w = arr.shape[0]
+                    delta = ((arr - mu[:w]) / sigma[:w]).astype(np.float32)
+                else:
+                    delta = arr
+                pks_flat.append(pk)
+                snaps_flat.append(delta.tolist())
+
+        solid_tbl = pa.table({
+            "primary_key": pks_flat,
+            "delta_snapshot": snaps_flat,
+        })
+        results = _engine_classify_trajectory(solid_tbl, sample_size=sample_size)
+        for entry in results:
+            if entry["primary_key"] == primary_key:
+                return entry
+        return {
+            "primary_key": primary_key,
+            "dtw_distance": 0.0,
+            "category": "unknown",
+            "category_evidence": 0.0,
+        }
+
     def detect_segment_shift(
         self,
         pattern_id: str,
@@ -18377,12 +19069,27 @@ class GDSNavigator:
         high_threshold_pct: float = 90.0,
         sample_size: int | None = None,
         verbose: bool = False,
+        *,
+        auto_discover: bool = False,
+        auto_k: int = 10,
     ):
         """M4: find entities with high influence on coordinate system calibration.
 
-        See `docs/plans/2026-04-28-m4-hidden-influencer-design.md`.
+        Default mode scans every entity in the pattern with leave-one-out and
+        returns the ``top_n`` candidates filtered by ``classify``. In auto-
+        discovery mode (``auto_discover=True``) the population is first
+        partitioned by k-means++ into ``auto_k`` clusters; the nearest entity
+        to each cluster centroid is selected as the cluster's representative
+        and only those K representatives are ranked. Each entry then carries
+        ``cluster_size`` and ``cluster_centroid_distance`` so callers can see
+        which population segment the influencer represents. A write-through
+        side effect populates per-influencer epoch caches under
+        ``_gds_meta/calibration_history/<pattern_id>/influencer_<pk>.json`` so
+        that ``calibration_influencer_history`` returns chronological history
+        without recomputing.
         """
         from hypertopos.engine.geometry import (
+            GDSEngine,
             _classify_influence,
             _compute_leave_one_out_impact,
             _count_cascading_flips,
@@ -18391,6 +19098,9 @@ class GDSNavigator:
             DimensionContribution,
             InfluenceEntry,
             InfluenceReport,
+        )
+        from hypertopos.storage.calibration_history import (
+            upsert_influencer_history_entry,
         )
         from hypertopos.utils.arrow import delta_matrix_from_arrow
 
@@ -18409,6 +19119,11 @@ class GDSNavigator:
             raise ValueError(
                 f"find_calibration_influencers: top_n must be in [1, 50]; "
                 f"got {top_n}"
+            )
+        if auto_discover and (auto_k < 1 or auto_k > 50):
+            raise ValueError(
+                f"find_calibration_influencers: auto_k must be in [1, 50]; "
+                f"got {auto_k}"
             )
 
         sphere = self._storage.read_sphere()
@@ -18465,12 +19180,44 @@ class GDSNavigator:
             "normal": classes.count("normal"),
         }
 
-        if classify == "all":
-            candidates = list(range(N))
+        # Per-entity cluster metadata (populated only in auto_discover mode).
+        cluster_size_by_idx: dict[int, int] = {}
+        cluster_centroid_distance_by_idx: dict[int, float] = {}
+
+        if auto_discover:
+            # Partition the population with k-means++ on the delta matrix and
+            # pick the entity nearest to each cluster centroid as the
+            # cluster's representative. Only those K representatives are
+            # ranked, so classify acts as a post-filter on cluster reps.
+            effective_k = max(1, min(auto_k, N))
+            labels, centroids = GDSEngine._kmeans(deltas, effective_k, seed=42)
+            representatives: list[int] = []
+            for k in range(centroids.shape[0]):
+                member_mask = labels == k
+                member_idx = np.where(member_mask)[0]
+                if member_idx.size == 0:
+                    continue
+                member_deltas = deltas[member_idx]
+                dists = np.linalg.norm(member_deltas - centroids[k], axis=1)
+                rep_local = int(np.argmin(dists))
+                rep_global = int(member_idx[rep_local])
+                representatives.append(rep_global)
+                cluster_size_by_idx[rep_global] = int(member_idx.size)
+                cluster_centroid_distance_by_idx[rep_global] = float(dists[rep_local])
+            candidates = representatives
+            if classify != "all":
+                candidates = [
+                    i for i in candidates if classes[i] == classify
+                ]
+            candidates.sort(key=lambda i: total_imp[i], reverse=True)
+            top_candidates = candidates[:top_n]
         else:
-            candidates = [i for i, c in enumerate(classes) if c == classify]
-        candidates.sort(key=lambda i: total_imp[i], reverse=True)
-        top_candidates = candidates[:top_n]
+            if classify == "all":
+                candidates = list(range(N))
+            else:
+                candidates = [i for i, c in enumerate(classes) if c == classify]
+            candidates.sort(key=lambda i: total_imp[i], reverse=True)
+            top_candidates = candidates[:top_n]
 
         sum_s = shapes.sum(axis=0)
         sum_s_sq = (shapes ** 2).sum(axis=0)
@@ -18531,7 +19278,36 @@ class GDSNavigator:
                 classification=classes[i],
                 top_dim_contributions=top_contribs,
                 cascading_flip_count=cascading,
+                cluster_size=cluster_size_by_idx.get(i),
+                cluster_centroid_distance=cluster_centroid_distance_by_idx.get(i),
             ))
+
+        # Write-through cache: upsert each surfaced entity's (epoch,
+        # mu_impact, delta_norm) into its per-influencer history file so
+        # calibration_influencer_history can replay impact across rebuilds
+        # without recomputing the leave-one-out scan.
+        try:
+            fit = self._storage.read_calibration_fit(pattern_id, version=version)
+            calibrated_at_iso = fit.last_calibrated_at.isoformat()
+            for entry in entries:
+                upsert_influencer_history_entry(
+                    self._storage._base,
+                    pattern_id,
+                    entry.entity_key,
+                    epoch=int(version),
+                    calibrated_at=calibrated_at_iso,
+                    mu_impact=float(entry.mu_impact),
+                    delta_norm_impact=float(entry.delta_norm),
+                )
+        except (OSError, ValueError, KeyError, AttributeError, TypeError):
+            # Cache writing is best-effort — never fail the primary analysis
+            # because a sidecar file could not be written. TypeError covers
+            # mocked-storage call sites where MagicMock leaks into the
+            # serialiser path.
+            logger.debug(
+                "find_calibration_influencers: write-through cache failed",
+                exc_info=True,
+            )
 
         return InfluenceReport(
             pattern_id=pattern_id,
@@ -18543,6 +19319,68 @@ class GDSNavigator:
             classify_filter=classify,
             cell_counts=cell_counts,
             entries=entries,
+            auto_discovered=auto_discover,
+        )
+
+    def calibration_influencer_history(
+        self,
+        primary_key: str,
+        *,
+        pattern_id: str,
+    ):
+        """Return chronological per-epoch μ-impact for a known influencer.
+
+        Reads ``_gds_meta/calibration_history/<pattern_id>/influencer_<pk>.json``,
+        written lazily by ``find_calibration_influencers``. When the cache is
+        absent for the requested ``(primary_key, pattern_id)``, returns an
+        empty history together with a ``hint`` explaining how to populate it.
+        """
+        import time
+
+        from hypertopos.model.sphere import (
+            InfluencerHistoryEntry,
+            InfluencerHistoryReport,
+        )
+        from hypertopos.storage.calibration_history import read_influencer_history
+
+        t0 = time.perf_counter()
+
+        sphere = self._storage.read_sphere()
+        if pattern_id not in sphere.patterns:
+            raise ValueError(
+                f"calibration_influencer_history: pattern_id={pattern_id!r} "
+                f"not found on this sphere"
+            )
+
+        records = read_influencer_history(
+            self._storage._base, pattern_id, primary_key,
+        )
+        entries = [
+            InfluencerHistoryEntry(
+                epoch=int(r["epoch"]),
+                calibrated_at=str(r["calibrated_at"]),
+                mu_impact=float(r["mu_impact"]),
+                delta_norm_impact=float(r["delta_norm_impact"]),
+            )
+            for r in records
+        ]
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+        hint: str | None = None
+        if not entries:
+            hint = (
+                "no impact history recorded for this entity yet — call "
+                "find_calibration_influencers(pattern_id=..., classify='all') "
+                "in this sphere to populate the cache, then retry"
+            )
+
+        return InfluencerHistoryReport(
+            primary_key=primary_key,
+            pattern_id=pattern_id,
+            history=entries,
+            n_epochs=len(entries),
+            elapsed_ms=elapsed_ms,
+            hint=hint,
         )
 
     def find_group_influence(

@@ -199,12 +199,14 @@ def test_find_drifting_similar_raises_without_index(
 
 def test_build_trajectory_uses_ivf_flat(fixture_sphere_path: Path) -> None:
     """Index type should be IVF_FLAT, not IVF_PQ."""
+    from hypertopos.storage.writer import _ivf_index_worthwhile
+
     pattern_id = _get_anchor_pattern_with_temporal(fixture_sphere_path)
     if pattern_id is None:
         pytest.skip("No anchor pattern with temporal data in fixture")
     writer = GDSWriter(str(fixture_sphere_path))
     n = writer.build_trajectory_index(pattern_id)
-    if n < 256:
+    if not _ivf_index_worthwhile(n):
         pytest.skip("Too few entities for index creation")
     traj_path = fixture_sphere_path / "_gds_meta" / "trajectory" / f"{pattern_id}.lance"
     ds = _lance.dataset(str(traj_path))
@@ -259,3 +261,97 @@ def test_trajectory_vectorized_correctness(
 
         np.testing.assert_allclose(actual_mean, expected_mean, rtol=1e-4, atol=1e-6)
         np.testing.assert_allclose(actual_std, expected_std, rtol=1e-4, atol=1e-6)
+
+
+def _make_subthreshold_traj_sphere(
+    fixture_sphere_path: Path,
+    dst: Path,
+    n_entities: int,
+) -> tuple[str, list[str]]:
+    """Build a minimal sphere whose trajectory dataset is below the IVF
+    KMeans training threshold, written via the real build path
+    (``write_trajectory_from_tensor``).
+
+    Returns (pattern_id, ordered primary keys). Entity i sits at mean shape
+    [i, 0] held constant across buckets (std == 0), so nearest-neighbour in
+    trajectory-vector space is deterministic: entity i's nearest is i±1.
+    """
+    import shutil
+
+    pattern_id = "customer_pattern"
+    meta = dst / "_gds_meta"
+    meta.mkdir(parents=True)
+    shutil.copy2(
+        str(fixture_sphere_path / "_gds_meta" / "sphere.json"),
+        str(meta / "sphere.json"),
+    )
+
+    n_buckets = 3
+    d = 2
+    shape_tensor = np.zeros((n_entities, n_buckets, d), dtype=np.float32)
+    for i in range(n_entities):
+        shape_tensor[i, :, 0] = float(i)  # distinct mean per entity, std 0
+    pks = [f"E-{i:03d}" for i in range(n_entities)]
+    bucket_ts = [datetime(2024, 1, 1 + b, tzinfo=UTC) for b in range(n_buckets)]
+
+    writer = GDSWriter(str(dst))
+    n = writer.write_trajectory_from_tensor(
+        pattern_id, shape_tensor, pks, bucket_timestamps=bucket_ts,
+    )
+    assert n == n_entities
+    return pattern_id, pks
+
+
+def test_subthreshold_trajectory_skips_ivf_index(
+    fixture_sphere_path: Path, tmp_path: Path
+) -> None:
+    """Below the KMeans training threshold, no IVF index is created."""
+    from hypertopos.storage.writer import _ivf_index_worthwhile
+
+    n_entities = 50  # << num_partitions * 256 (>= 4096)
+    assert not _ivf_index_worthwhile(n_entities)
+
+    mini = tmp_path / "sphere"
+    pattern_id, _pks = _make_subthreshold_traj_sphere(
+        fixture_sphere_path, mini, n_entities,
+    )
+
+    traj_path = mini / "_gds_meta" / "trajectory" / f"{pattern_id}.lance"
+    assert traj_path.exists()  # dataset is written — only the index is skipped
+    ds = _lance.dataset(str(traj_path))
+    assert ds.count_rows() == n_entities
+    assert ds.describe_indices() == [], (
+        "sub-threshold trajectory dataset must carry no IVF vector index"
+    )
+
+
+def test_subthreshold_trajectory_query_uses_full_scan_fallback(
+    fixture_sphere_path: Path, tmp_path: Path
+) -> None:
+    """Without an IVF index, π10 still returns the geometrically correct
+    nearest trajectory via Lance's brute-force scan."""
+    n_entities = 50
+    mini = tmp_path / "sphere"
+    pattern_id, pks = _make_subthreshold_traj_sphere(
+        fixture_sphere_path, mini, n_entities,
+    )
+
+    traj_path = mini / "_gds_meta" / "trajectory" / f"{pattern_id}.lance"
+    assert _lance.dataset(str(traj_path)).describe_indices() == []
+
+    nav = _build_nav(mini)
+
+    # Query a middle entity: its two equidistant nearest neighbours are i±1.
+    query_idx = 25
+    results = nav.π10_attract_trajectory(pks[query_idx], pattern_id, top_n=3)
+    assert isinstance(results, list)
+    assert len(results) >= 1
+    assert all(r["primary_key"] != pks[query_idx] for r in results)  # excludes self
+    # Closest by Euclidean distance over [mean, std] is the adjacent index.
+    nearest = {pks[query_idx - 1], pks[query_idx + 1]}
+    assert results[0]["primary_key"] in nearest, (
+        f"flat-scan nearest should be an adjacent entity, got "
+        f"{results[0]['primary_key']}"
+    )
+    # Distances are sorted ascending and match the known geometry (|Δmean|=1).
+    assert results[0]["distance"] == pytest.approx(1.0, abs=1e-4)

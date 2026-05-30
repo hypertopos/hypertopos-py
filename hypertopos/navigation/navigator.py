@@ -8,6 +8,7 @@ import dataclasses
 import logging
 import math
 from collections import defaultdict, deque
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -9981,6 +9982,166 @@ class GDSNavigator:
         return result
 
     # ===================================================================
+    # vector_index_health — ANN index staleness observability
+    # ===================================================================
+
+    def vector_index_health(
+        self,
+        pattern_id: str,
+        line_id: str | None = None,
+        *,
+        stale_threshold: float = 0.1,
+    ) -> dict[str, Any]:
+        """Report ANN (IVF) vector-index health for a pattern's geometry.
+
+        Reads Lance index *metadata* only — never scans the delta column — so
+        the call is cheap even on multi-million-row spheres. Surfaces whether
+        the IVF index on the geometry ``delta`` vectors currently covers every
+        row, or whether incrementally-appended rows landed outside the index
+        (which makes ANN-backed tools such as ``pi10_attract_trajectory`` blind
+        to those rows until the next reindex).
+
+        ``line_id`` is accepted for call-site symmetry with the other navigator
+        methods but is informational only: geometry IVF indices are keyed by
+        ``pattern_id`` alone (one ``geometry/{pattern_id}/data.lance`` dataset),
+        so the line does not change which index is inspected.
+
+        Returns::
+
+            {
+                "pattern_id": str,
+                "line_id": str | None,
+                "index_present": bool,
+                "index_type": str | None,
+                "num_indexed_rows": int,
+                "num_unindexed_rows": int,
+                "total_rows": int,
+                "indexed_fraction": float,
+                "num_partitions": int | None,
+                "is_stale": bool,
+                "stale_threshold": float,
+                "recommendation": str,
+            }
+
+        ``is_stale`` is True when the unindexed fraction exceeds
+        ``stale_threshold`` (default 0.1). When the geometry dataset is absent
+        or empty, ``index_present`` is False, counts are 0, and the
+        recommendation explains the absence.
+        """
+        import lance as _lance_local
+
+        geo_path = (
+            self._storage._base.resolve()
+            / "geometry" / pattern_id / "data.lance"
+        )
+        base = {
+            "pattern_id": pattern_id,
+            "line_id": line_id,
+            "index_present": False,
+            "index_type": None,
+            "num_indexed_rows": 0,
+            "num_unindexed_rows": 0,
+            "total_rows": 0,
+            "indexed_fraction": 0.0,
+            "num_partitions": None,
+            "is_stale": False,
+            "stale_threshold": float(stale_threshold),
+            "recommendation": "",
+        }
+        if not geo_path.exists():
+            base["recommendation"] = (
+                f"no geometry dataset for pattern '{pattern_id}' — nothing to "
+                "index"
+            )
+            return base
+
+        ds = _lance_local.dataset(str(geo_path))
+        total_rows = ds.count_rows()
+        base["total_rows"] = total_rows
+        if total_rows == 0:
+            base["recommendation"] = "geometry dataset is empty"
+            return base
+
+        index_type: str | None = None
+        num_partitions: int | None = None
+        indexed_rows = 0
+        index_present = False
+        index_name: str | None = None
+        for idx in ds.describe_indices():
+            if "delta" in getattr(idx, "field_names", []):
+                index_present = True
+                index_type = getattr(idx, "index_type", None)
+                index_name = getattr(idx, "name", None)
+                raw_indexed = getattr(idx, "num_rows_indexed", None)
+                indexed_rows = (
+                    int(raw_indexed) if raw_indexed is not None else total_rows
+                )
+                break
+
+        # index_statistics exposes the authoritative unindexed-row count and
+        # the IVF partition count directly (cheap manifest read — no column
+        # scan). describe_indices alone carries neither, so source them here.
+        stats_unindexed: int | None = None
+        if index_present and index_name is not None:
+            with suppress(Exception):
+                stats = ds.stats.index_stats(index_name)
+                raw_unindexed = stats.get("num_unindexed_rows")
+                if raw_unindexed is not None:
+                    stats_unindexed = int(raw_unindexed)
+                indices_meta = stats.get("indices") or []
+                if indices_meta:
+                    np_raw = indices_meta[0].get("num_partitions")
+                    num_partitions = (
+                        int(np_raw) if np_raw is not None else None
+                    )
+
+        # No vector index → every row is unindexed (ANN tools fall back to a
+        # full scan). With an index, prefer the index_statistics unindexed
+        # count; fall back to total − indexed (clamped at 0 against drift).
+        if not index_present:
+            indexed_rows = 0
+        indexed_rows = max(0, min(indexed_rows, total_rows))
+        if stats_unindexed is not None:
+            unindexed_rows = max(0, min(stats_unindexed, total_rows))
+            indexed_rows = total_rows - unindexed_rows
+        else:
+            unindexed_rows = total_rows - indexed_rows
+        indexed_fraction = indexed_rows / total_rows
+        unindexed_fraction = unindexed_rows / total_rows
+        # No IVF index means ANN tools fall back to a full flat scan, which
+        # sees every row — nothing is missed, so the index is NOT stale. Only
+        # an index that is PRESENT but under-covering rows is stale.
+        is_stale = index_present and unindexed_fraction > float(stale_threshold)
+
+        if not index_present:
+            recommendation = (
+                f"no IVF index on geometry delta for '{pattern_id}' — "
+                "ANN tools (e.g. pi10_attract_trajectory) use a full scan; "
+                "rebuild the sphere or run incremental_update(reindex=True)"
+            )
+        elif is_stale:
+            recommendation = (
+                f"{unindexed_rows} of {total_rows} rows "
+                f"({unindexed_fraction:.1%}) are outside the IVF index — "
+                "ANN tools miss them; run incremental_update(reindex=True) "
+                "or finalize_incremental() to reindex"
+            )
+        else:
+            recommendation = "index covers all rows — ANN tools see the full population"
+
+        base.update({
+            "index_present": index_present,
+            "index_type": index_type,
+            "num_indexed_rows": indexed_rows,
+            "num_unindexed_rows": unindexed_rows,
+            "indexed_fraction": indexed_fraction,
+            "num_partitions": num_partitions,
+            "is_stale": is_stale,
+            "recommendation": recommendation,
+        })
+        return base
+
+    # ===================================================================
     # check_alerts — implicit geometric health checks
     # ===================================================================
 
@@ -10041,6 +10202,7 @@ class GDSNavigator:
                 self._check_regime_changepoint(pid, current_stats)
             )
             all_alerts.extend(self._check_calibration_staleness(pid))
+            all_alerts.extend(self._check_stale_vector_index(pid))
 
         severity_order = {"HIGH": 0, "MEDIUM": 1}
         all_alerts.sort(key=lambda a: severity_order.get(a["severity"], 2))
@@ -10590,6 +10752,43 @@ class GDSNavigator:
                 },
             })
         return alerts
+
+    def _check_stale_vector_index(
+        self, pattern_id: str,
+    ) -> list[dict[str, Any]]:
+        """Emit a MEDIUM alert when the geometry IVF index is stale.
+
+        Metadata-only (delegates to ``vector_index_health``). A stale index
+        means incrementally-added rows sit outside the ANN index, so trajectory
+        / similarity tools silently miss them until the next reindex.
+        """
+        health = self.vector_index_health(pattern_id)
+        if not health.get("index_present"):
+            # No index at all is the build-time default for small patterns
+            # (< 256 rows) — not an actionable staleness alert.
+            return []
+        if not health.get("is_stale"):
+            return []
+        unindexed = health["num_unindexed_rows"]
+        total = health["total_rows"]
+        frac = health["num_unindexed_rows"] / total if total else 0.0
+        return [{
+            "severity": "MEDIUM",
+            "check_type": "stale_vector_index",
+            "pattern_id": pattern_id,
+            "message": (
+                f"Vector index stale: {unindexed} of {total} geometry rows "
+                f"({frac:.1%}) are outside the IVF index. ANN tools (e.g. "
+                f"pi10_attract_trajectory) miss them. Run "
+                f"incremental_update(reindex=True) or finalize_incremental()."
+            ),
+            "details": {
+                "num_unindexed_rows": unindexed,
+                "total_rows": total,
+                "indexed_fraction": round(health["indexed_fraction"], 4),
+                "stale_threshold": health["stale_threshold"],
+            },
+        }]
 
     # ------------------------------------------------------------------
     # Aggregation (delegates to engine.aggregation)

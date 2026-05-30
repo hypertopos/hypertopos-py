@@ -15,7 +15,7 @@ gds_{sphere_id}/
 ├── _gds_meta/
 │   ├── sphere.json              # central config (lines, patterns, aliases, storage)
 │   ├── geometry_stats/          # precomputed population summaries
-│   ├── trajectory/              # ANN index for trajectory similarity search
+│   ├── trajectory/              # per-entity trajectory summary vectors (optional IVF_FLAT ANN index — skipped for too-few-entity patterns, which then use a brute-force scan)
 │   ├── temporal_centroids/      # cached population centroids per time window
 │   ├── edge_stats/              # per-event-pattern edge table summary cache (row count, unique from/to, ts/amount range)
 │   ├── edge_features/           # per-edge derived dim sidecar (event patterns with edge_dimensions: in YAML)

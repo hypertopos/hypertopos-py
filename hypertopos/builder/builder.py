@@ -338,12 +338,20 @@ def compute_entity_geometry(
     event_dimensions_meta: list[dict] | None = None,
     dimension_weights: np.ndarray | None = None,
     prop_columns: list[str] | None = None,
+    edge_dim_agg_labels: list[str] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute deltas, norms, and shape vectors for entities using existing pattern stats.
 
     Builds shape vectors from entity_table columns based on relations, event
-    dimensions, and prop_columns metadata (from sphere.json), then z-scores
-    against the provided mu/sigma to produce delta vectors.
+    dimensions, edge_dim_aggregation, and prop_columns metadata (from
+    sphere.json), then z-scores against the provided mu/sigma to produce delta
+    vectors.
+
+    Block layout matches the full-build concatenation order: relations →
+    event_dimensions → edge_dim_aggregations → prop_columns. The aggregated
+    edge-dim values are read directly from ``entity_table`` columns named by
+    ``edge_dim_agg_labels`` (the caller-supplied precomputed ``{dim}_{agg}``
+    columns) and z-scored against mu/sigma like any other precomputed feature.
 
     Returns:
         (deltas, delta_norms, shape_vectors) all as float32 arrays.
@@ -351,9 +359,12 @@ def compute_entity_geometry(
     n = len(entity_table)
     D_rel = len(relations_meta)
     D_event = len(event_dimensions_meta) if event_dimensions_meta else 0
+    D_agg = len(edge_dim_agg_labels) if edge_dim_agg_labels else 0
     D_prop = len(prop_columns) if prop_columns else 0
 
-    shape_vectors = np.zeros((n, D_rel + D_event + D_prop), dtype=np.float32)
+    shape_vectors = np.zeros(
+        (n, D_rel + D_event + D_agg + D_prop), dtype=np.float32,
+    )
 
     for j, rel in enumerate(relations_meta):
         direction = rel.get("direction", "in")
@@ -400,9 +411,25 @@ def compute_entity_geometry(
                 if isinstance(em, (int, float)) and em > 0:
                     shape_vectors[:, D_rel + k] = np.clip(raw_arr / em, 0.0, 3.0)
 
+    # Edge-dim aggregation block — raw precomputed values read by label.
+    # The full build appends these AFTER event_dims and BEFORE prop fill
+    # (builder._compute_population_stats concatenation order). Values are
+    # stored unscaled; mu/sigma carry the scale, so the global z-score below
+    # normalizes them like any other precomputed feature.
+    if edge_dim_agg_labels:
+        D_base = D_rel + D_event
+        for k, label in enumerate(edge_dim_agg_labels):
+            if label in entity_table.schema.names:
+                col = entity_table[label]
+                shape_vectors[:, D_base + k] = pc.fill_null(col, 0).to_numpy(
+                    zero_copy_only=False,
+                ).astype(np.float32)
+            # Missing column → stays 0.0 (no contribution, consistent with
+            # absent FK relations above).
+
     # Prop columns — binary fill (0/1 based on is_valid)
     if prop_columns:
-        D_base = D_rel + D_event
+        D_base = D_rel + D_event + D_agg
         for k, prop in enumerate(prop_columns):
             if prop in entity_table.schema.names:
                 col = entity_table[prop]
@@ -427,6 +454,28 @@ def compute_entity_geometry(
     ).astype(np.float32)
 
     return deltas, delta_norms, shape_vectors
+
+
+def _edge_dim_aggregation_labels(eda_meta: dict | None) -> list[str]:
+    """Reconstruct ``{source_dim}_{aggregate}`` labels in build order from the
+    serialized ``edge_dim_aggregations`` sphere.json node.
+
+    Mirrors ``Pattern._edge_dim_aggregation_names``: one label per aggregate
+    per source dim, in ``dims`` insertion order. Returns ``[]`` when the
+    pattern declares no aggregations.
+    """
+    if not eda_meta:
+        return []
+    dims = eda_meta.get("dims") or []
+    per_dim = eda_meta.get("aggregates_per_dim")
+    if per_dim is None:
+        from hypertopos.engine.edge_features import AGGREGATE_NAMES
+        per_dim = {d: list(AGGREGATE_NAMES) for d in dims}
+    labels: list[str] = []
+    for d in dims:
+        for agg_name in per_dim.get(d, ()):
+            labels.append(f"{d}_{agg_name}")
+    return labels
 
 
 def _classify_changed_keys(
@@ -4389,6 +4438,8 @@ class GDSBuilder:
         changed_entities: pa.Table | None = None,
         deleted_keys: list[str] | None = None,
         recalibrate: str = "auto",
+        reindex: bool = False,
+        recompute_ranks: bool = True,
     ) -> IncrementalUpdateResult:
         """Update geometry incrementally for changed/deleted entities.
 
@@ -4403,6 +4454,25 @@ class GDSBuilder:
             deleted_keys: Primary keys to remove from geometry.
             recalibrate: "auto" (recalibrate if drift exceeds soft threshold),
                 "force" (always recalibrate), or "never".
+            reindex: When True, force a rebuild of the ANN (IVF_FLAT) vector
+                index so the appended rows are immediately visible to
+                ANN-dependent navigation (e.g. π10_attract_trajectory).
+                When False (default) the index is rebuilt only once the
+                unindexed fraction crosses the standard 10% threshold — except
+                that a ``recompute_ranks=True`` call drops the index as a side
+                effect (its merge_insert invalidates it), so the default path
+                then rebuilds on every call. In the ``recompute_ranks=False``
+                deferred path the index is preserved and the 10% threshold
+                genuinely gates rebuilds; call ``finalize_incremental`` to force
+                a final rebuild at session end.
+            recompute_ranks: When True (default), recompute the global
+                delta_rank_pct percentile for the whole population on every
+                call, so each call is standalone-correct. When False, defer the
+                O(N) recompute — existing rows keep their prior (now stale)
+                delta_rank_pct until ``finalize_incremental`` is called, while
+                new rows carry a batch-local rank. Use False for batched
+                ingestion of many small appends, then call
+                ``finalize_incremental`` once at the end of the session.
         """
         import lance as _lance
 
@@ -4490,11 +4560,33 @@ class GDSBuilder:
                 enriched_relations.append(enriched)
 
             prop_cols = pat_meta.get("prop_columns", [])
+            edge_dim_agg_labels = _edge_dim_aggregation_labels(
+                pat_meta.get("edge_dim_aggregations"),
+            )
             deltas, delta_norms, shape_vectors = compute_entity_geometry(
                 changed_entities, mu, sigma,
                 enriched_relations, event_dims_meta, dim_weights,
                 prop_columns=prop_cols,
+                edge_dim_agg_labels=edge_dim_agg_labels,
             )
+
+            # Hard-guard against a silent width mismatch. compute_entity_geometry
+            # supports the relations + event_dimensions + edge_dim_aggregations +
+            # prop_columns blocks; a pattern that also carries generalized
+            # dimension blocks (geo / metric / semantic) would produce a
+            # narrower delta than mu and otherwise fail with a cryptic Lance
+            # append error. Surface the unsupported case truthfully instead.
+            if deltas.shape[1] != len(mu):
+                raise ValueError(
+                    f"incremental_update cannot reconstruct full geometry for "
+                    f"pattern {pattern_id!r}: computed {deltas.shape[1]}-wide "
+                    f"deltas but the pattern mu is {len(mu)}-wide. Incremental "
+                    f"ingest supports patterns whose dimensions are relations, "
+                    f"event_dimensions, edge_dim_aggregations, and "
+                    f"prop_columns; generalized dimension blocks "
+                    f"(geo / metric / semantic) are not yet supported and "
+                    f"require a full rebuild.",
+                )
 
             # 7. Build geometry rows
             n_new = len(changed_entities)
@@ -4604,9 +4696,28 @@ class GDSBuilder:
                 tracker.update(shape_vectors)
                 tracker.update_norms(delta_norms)
 
-        # 10. Recompute delta_rank_pct (O(N) global)
         writer = GDSWriter(str(self.output_path))
-        writer.recompute_delta_rank_pct(pattern_id)
+
+        # 10. Recompute delta_rank_pct (O(N) global population percentile).
+        # delta_rank_pct is a whole-population rank, so adding rows shifts the
+        # percentile of every existing row — there is no correct sub-O(N) fast
+        # path. recompute_ranks=False defers it (existing rows keep stale ranks
+        # until finalize_incremental); the new rows still carry their
+        # batch-local rank from step 6. The default recomputes every call so
+        # each call is standalone-correct for all delta_rank_pct consumers.
+        if recompute_ranks:
+            writer.recompute_delta_rank_pct(pattern_id)
+
+        # 10b. Maybe rebuild the ANN index so appended rows are visible to
+        # ANN-dependent navigation. Runs AFTER recompute_delta_rank_pct: the
+        # rank recompute's merge_insert rewrites matched rows into new
+        # fragments, dropping them out of any pre-existing index — reindexing
+        # first would leave the index covering zero current rows. reindex=True
+        # forces a rebuild; otherwise the 10% unindexed-fraction threshold
+        # gates it.
+        writer._maybe_reindex_geometry(
+            pattern_id, threshold=0.0 if reindex else 0.1, version=version,
+        )
 
         # 11. Compute new population size
         ds = _lance.dataset(lance_path)
@@ -4650,6 +4761,27 @@ class GDSBuilder:
             theta_norm=theta_norm,
             population_size=new_pop,
         )
+
+    def finalize_incremental(self, pattern_id: str) -> None:
+        """Finalize a batched incremental-ingest session for one pattern.
+
+        Recomputes the global ``delta_rank_pct`` percentile once across the
+        whole population (making every row standalone-correct again after a run
+        of ``incremental_update(recompute_ranks=False)`` calls) and rebuilds the
+        ANN (IVF_FLAT) vector index so all appended rows are indexed. Call once
+        at the end of an ingestion session instead of paying the O(N) rank
+        recompute on every individual append.
+
+        Idempotent and safe to call after ``recompute_ranks=True`` updates too.
+        """
+        from hypertopos.storage.writer import GDSWriter
+
+        writer = GDSWriter(str(self.output_path))
+        writer.recompute_delta_rank_pct(pattern_id)
+        # Reindex AFTER the rank recompute — the recompute's merge_insert
+        # rewrites matched rows into new fragments, dropping them out of any
+        # pre-existing index.
+        writer._maybe_reindex_geometry(pattern_id, threshold=0.0, version=1)
 
     @staticmethod
     def _compute_incremental_bregman(
@@ -5725,7 +5857,12 @@ class GDSBuilder:
         """
         from contextlib import suppress
 
-        from hypertopos.storage.writer import _write_lance
+        from hypertopos.storage.writer import (
+            _IVF_MIN_ROWS_PER_PARTITION,
+            _ivf_index_worthwhile,
+            _ivf_num_partitions,
+            _write_lance,
+        )
 
         relations_meta = pat_meta.get("relations", [])
         prop_columns = pat_meta.get("prop_columns", [])
@@ -5949,17 +6086,28 @@ class GDSBuilder:
                 tp.parent.mkdir(parents=True, exist_ok=True)
                 _write_lance(ct_traj, str(tp), mode="overwrite")
                 nt = ct_traj.num_rows
-                if nt >= 256:
+                # Below num_partitions * 256 rows the IVF KMeans training is
+                # starved and the index is degenerate; skip it so the build
+                # stays short — trajectory search falls back to a correct
+                # brute-force scan (zero recall loss).
+                if _ivf_index_worthwhile(nt):
                     import lance as _ltr
 
                     tds = _ltr.dataset(str(tp))
-                    np_ = min(64, max(16, int(nt ** 0.5)))
+                    np_ = _ivf_num_partitions(nt)
                     with suppress(Exception):
                         tds.create_index(
                             "trajectory_vector",
                             index_type="IVF_FLAT",
                             num_partitions=np_,
                         )
+                elif nt > 0:
+                    logger.info(
+                        "trajectory %s: %d rows below ANN training "
+                        "threshold (%d) — using full-scan fallback",
+                        pat_id, nt,
+                        _ivf_num_partitions(nt) * _IVF_MIN_ROWS_PER_PARTITION,
+                    )
 
         if slices_written > 0:
             writer.compact_temporal(pat_id)

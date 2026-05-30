@@ -2730,16 +2730,75 @@ class TestReadPointsBatch:
         result = reader.read_points_batch("customers", 1, ["NOPE-999"])
         assert result.num_rows == 0
 
-    def test_batch_runtime_error_propagates_in_large_key_fast_path(
+    def test_batch_partial_missing_keys_returns_only_present(self, _points_path):
+        """A mix of present and absent keys returns only the present rows —
+        the IN-filter scan naturally drops misses without per-key bookkeeping."""
+        reader = GDSReader(base_path=str(_points_path))
+        result = reader.read_points_batch(
+            "customers", 1, ["C-003", "NOPE-1", "C-001", "NOPE-2"]
+        )
+        assert set(result["primary_key"].to_pylist()) == {"C-001", "C-003"}
+
+    def test_batch_result_keyed_by_primary_key_not_input_order(self, _points_path):
+        """Discriminator: request keys in reverse of storage order. The output
+        contract is 'every requested present key appears', keyed by
+        primary_key — never positional alignment with the input list. This
+        catches any caller that wrongly zips output against input order."""
+        reader = GDSReader(base_path=str(_points_path))
+        # Storage order is C-001, C-002, C-003; request reversed.
+        requested = ["C-003", "C-002", "C-001"]
+        result = reader.read_points_batch("customers", 1, requested)
+        by_key = {
+            row["primary_key"]: row["name"]
+            for row in result.to_pylist()
+        }
+        assert by_key == {"C-001": "Alice", "C-002": "Bob", "C-003": "Carol"}
+
+    def test_batch_column_projection(self, _points_path):
+        reader = GDSReader(base_path=str(_points_path))
+        result = reader.read_points_batch(
+            "customers", 1, ["C-001"], columns=["name"]
+        )
+        # primary_key is always included even when only 'name' is requested.
+        assert set(result.column_names) == {"primary_key", "name"}
+
+    def test_handle_cache_reuses_open_dataset_across_calls(self, _points_path):
+        """Repeated batch reads of the same line/version reuse one open handle:
+        the first call is a miss, subsequent calls are hits."""
+        reader = GDSReader(base_path=str(_points_path))
+        reader.read_points_batch("customers", 1, ["C-001"])
+        reader.read_points_batch("customers", 1, ["C-002"])
+        reader.read_points_batch("customers", 1, ["C-003"])
+        stats = reader.points_cache_stats()
+        assert stats["points_handle_cache_misses"] == 1
+        assert stats["points_handle_cache_hits"] == 2
+
+    def test_handle_cache_counts_empty_keylist_path(self, _points_path):
+        """The empty-keys schema path also goes through the cached handle."""
+        reader = GDSReader(base_path=str(_points_path))
+        reader.read_points_batch("customers", 1, [])  # miss (first open)
+        reader.read_points_batch("customers", 1, [])  # hit
+        stats = reader.points_cache_stats()
+        assert stats["points_handle_cache_misses"] == 1
+        assert stats["points_handle_cache_hits"] == 1
+
+    def test_batch_runtime_error_propagates_from_in_filter_scan(
         self, _points_path, monkeypatch
     ):
-        """Unexpected scanner errors should not be swallowed by the IN-filter fallback."""
+        """Unexpected scanner errors must not be swallowed by the per-key fallback."""
 
         class FakeScanner:
             def to_table(self):
                 raise RuntimeError("boom")
 
+        class FakeIndex:
+            index_type = "BTree"
+            columns = ["primary_key"]
+
         class FakeDataset:
+            def describe_indices(self):
+                return [FakeIndex()]
+
             def scanner(self, *args, **kwargs):
                 return FakeScanner()
 

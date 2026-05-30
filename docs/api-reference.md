@@ -218,7 +218,8 @@ is the always-available primary path.
 | `anomaly_summary(pattern_id, max_clusters)` | Anomaly population breakdown with geometric clustering |
 | `aggregate_anomalies(pattern_id, group_by)` | Group anomalies by a property column with per-group rates |
 | `aggregate(event_pattern_id, group_by_line)` | Aggregate event polygons by group with metric computation |
-| `check_alerts(pattern_id=None)` | Implicit health checks: anomaly rate spikes, population shocks, calibration staleness |
+| `check_alerts(pattern_id=None)` | Implicit health checks: anomaly rate spikes, population shocks, calibration staleness, stale ANN vector index |
+| `vector_index_health(pattern_id, line_id=None)` | ANN (IVF) index staleness for a pattern's geometry: indexed/unindexed row counts, `is_stale`, recommendation (metadata-only read) |
 | `hub_score_stats(pattern_id)` | Hub score distribution statistics |
 | `check_anomaly_batch(pattern_id, primary_keys)` | Batch anomaly status check for multiple entities |
 | `temporal_quality_summary(pattern_id)` | Temporal anomaly persistence metrics |
@@ -256,7 +257,8 @@ builder = GDSBuilder(
 | `add_chain_line(line_id, chains, features)` | Create anchor line from extracted chain dicts |
 | `add_alias(alias_id, base_pattern_id, cutting_plane_dimension, cutting_plane_threshold)` | Register an alias with a cutting plane for sub-population analysis |
 | `build(temporal_configs=None)` | Validate, compute statistics, write all files. Pass `temporal_configs` to run geometry→temporal pipeline per pattern. Returns output path |
-| `incremental_update(pattern_id, changed_entities, deleted_keys)` | Update geometry incrementally with drift tracking |
+| `incremental_update(pattern_id, changed_entities, deleted_keys, recalibrate, reindex, recompute_ranks)` | Add/modify/delete entities without a full rebuild; new entities are immediately visible to anomaly search. Supports patterns whose dimensions are relations, event dimensions, edge-dim aggregations, and tracked properties. `reindex=True` rebuilds the ANN index immediately; `recompute_ranks=False` defers the global `delta_rank_pct` recompute for batched ingestion |
+| `finalize_incremental(pattern_id)` | Recompute the global `delta_rank_pct` percentile once and rebuild the ANN index. Call at the end of a batched ingestion session that used `recompute_ranks=False` |
 | `build_temporal(time_col, time_window)` | Generate temporal snapshots from time-windowed event data. Call after `build()` when not using pipeline mode |
 
 ### RelationSpec

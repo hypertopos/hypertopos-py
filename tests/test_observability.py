@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -91,6 +92,11 @@ def _make_navigator(sphere=None, geo_stats=None, geo_rows=0, geo_anomalies=0):
     storage.read_sphere.return_value = sphere
     storage.read_geometry_stats.return_value = geo_stats
     storage.read_temporal_centroids.return_value = None
+    # check_alerts' stale-vector-index check resolves a geometry Lance path;
+    # point _base at a non-existent dir so the metadata read short-circuits
+    # (no IVF index on a mocked storage) rather than passing a MagicMock into
+    # lance.dataset().
+    storage._base = Path("/__nonexistent_gds_base__")
     storage.count_geometry_rows.side_effect = lambda pid, filter=None: (
         geo_anomalies if filter is not None else geo_rows
     )

@@ -60,6 +60,77 @@ Print summary of a built sphere.
 hypertopos info my_sphere/
 ```
 
+### `hypertopos sphere` — cloud-ops verbs
+
+Cloud-ops checks over a **built** sphere directory (the one `info` reads),
+shaped for CI gates and pre-deploy pipelines. Each verb supports `--json`
+for machine-readable output; in JSON mode stdout carries only the JSON
+document (diagnostics and errors go to stderr).
+
+#### `hypertopos sphere health`
+
+```bash
+hypertopos sphere health my_sphere/ [--json] [--exit-code-on-critical]
+```
+
+Composes the population summary (per-pattern entity count, anomaly rate,
+calibration health) with the geometric health checks. The derived `status`
+is `critical` when any HIGH-severity alert is present, `warning` for
+MEDIUM-only, else `ok`. With `--exit-code-on-critical` the process exits `2`
+on a critical status (and `0` otherwise) so a `set -e` shell gate can fail a
+deploy. JSON payload: `{status, sphere_path, overview, alerts}`.
+
+#### `hypertopos sphere validate`
+
+```bash
+hypertopos sphere validate my_sphere/ [--strict] [--json]
+```
+
+Structural integrity check over a built sphere: `sphere.json` parses, each
+materialized line has a `points/` directory, each pattern has a `geometry/`
+directory. `--strict` additionally promotes calibration-health (`suspect` /
+`poor`) and dimension-quality warnings to errors. Exits `0` when valid, `1`
+when invalid. JSON payload: `{valid, strict, errors, warnings}`.
+
+> This validates a **built** sphere on disk; `hypertopos validate --config`
+> validates a `sphere.yaml` before building. They are distinct commands.
+
+#### `hypertopos sphere diff`
+
+```bash
+hypertopos sphere diff old_sphere/ new_sphere/ [--json]
+```
+
+Pre-deploy diff between two built spheres: pattern-inventory delta (`added` /
+`removed` / `common` pattern ids) and per-shared-pattern calibration drift
+(`overall_drift_rms` plus the top-drifted dimensions, comparing each sphere's
+latest calibration epoch). Patterns whose calibration schema differs between
+the two spheres are marked `not_comparable` rather than crashing. Identical
+paths yield `identical: true`.
+
+#### `hypertopos sphere ingest`
+
+```bash
+hypertopos sphere ingest my_sphere/ --points changed.arrow \
+  [--pattern ID] [--recalibrate {auto,force,never}] \
+  [--reindex] [--finalize] [--json]
+```
+
+Incrementally appends a new-/changed-entities table to one pattern's geometry
+without a full rebuild. The points table may be Arrow IPC (`.arrow` /
+`.arrows`), Parquet (`.parquet` / `.pq`), or CSV (`.csv` / `.csv.gz`) and must
+carry a `primary_key` column plus the columns the pattern's dimensions
+reconstruct from (relations, event dimensions, edge-dim aggregations, or
+property columns). `--pattern` is optional when the sphere has a single
+pattern and required otherwise. `--reindex` forces an ANN index rebuild so the
+appended rows are immediately searchable; `--finalize` recomputes the global
+`delta_rank_pct` and rebuilds the ANN index once at the end of a batched
+ingest session. JSON payload: `{pattern_id, added, modified, deleted,
+population_size, drift_pct, geometry_version_before, geometry_version_after,
+reindexed, finalized}`. Patterns carrying generalized dimension blocks (geo /
+metric / semantic) cannot be reconstructed incrementally and exit 1 with a
+clear message directing you to a full rebuild.
+
 ---
 
 ## YAML Reference — `sphere.yaml`

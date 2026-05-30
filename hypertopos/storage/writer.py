@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import warnings
 from contextlib import suppress
@@ -16,6 +17,8 @@ import numpy as np
 import pyarrow as pa
 
 from hypertopos.model.objects import SolidSlice
+
+logger = logging.getLogger(__name__)
 
 # Lance write defaults — applied to ALL write_dataset calls via _write_lance().
 # data_storage_version="2.2" pins the explicit format version. The "stable"
@@ -36,6 +39,35 @@ _LANCE_WRITE_DEFAULTS: dict[str, Any] = {
     "data_storage_version": "2.2",
     "max_rows_per_group": 8192,
 }
+
+# Lance trains the IVF KMeans on at least this many vectors per partition.
+# Below num_partitions * this, KMeans runs on under-filled (in the limit,
+# empty) clusters: the build still costs time but the resulting ANN index is
+# degenerate and offers no recall benefit over the brute-force scan the query
+# path already falls back to when no index is present.
+_IVF_MIN_ROWS_PER_PARTITION = 256
+
+
+def _ivf_num_partitions(n_rows: int) -> int:
+    """IVF partition count for an n-row vector dataset.
+
+    Single source of truth for the ``num_partitions`` passed to every
+    trajectory ``create_index`` call, so the sub-threshold guard
+    (:func:`_ivf_index_worthwhile`) is computed against the exact value the
+    index would be built with.
+    """
+    return min(64, max(16, int(n_rows ** 0.5)))
+
+
+def _ivf_index_worthwhile(n_rows: int) -> bool:
+    """True when an n-row dataset has enough vectors to train a useful IVF index.
+
+    KMeans needs ~``_IVF_MIN_ROWS_PER_PARTITION`` samples per partition; below
+    ``num_partitions * _IVF_MIN_ROWS_PER_PARTITION`` the index is degenerate
+    and adds only build cost. The query path falls back to a correct
+    brute-force scan when the index is absent, so skipping is zero recall loss.
+    """
+    return n_rows >= _ivf_num_partitions(n_rows) * _IVF_MIN_ROWS_PER_PARTITION
 
 
 def _write_lance(
@@ -643,16 +675,25 @@ class GDSWriter:
         traj_path.parent.mkdir(parents=True, exist_ok=True)
         _write_lance(traj_table, str(traj_path), mode="overwrite")
 
-        # IVF_FLAT index
-        if n >= 256:
+        # IVF_FLAT index. Below num_partitions * 256 rows the KMeans training is
+        # starved and the index is degenerate; skip it so the build stays short
+        # — trajectory search falls back to a correct brute-force scan.
+        if _ivf_index_worthwhile(n):
             traj_ds = _lance.dataset(str(traj_path))
-            n_partitions = min(64, max(16, int(n ** 0.5)))
+            n_partitions = _ivf_num_partitions(n)
             with suppress(Exception):
                 traj_ds.create_index(
                     "trajectory_vector",
                     index_type="IVF_FLAT",
                     num_partitions=n_partitions,
                 )
+        elif n > 0:
+            logger.info(
+                "trajectory %s: %d rows below ANN training threshold "
+                "(%d) — using full-scan fallback",
+                pattern_id, n,
+                _ivf_num_partitions(n) * _IVF_MIN_ROWS_PER_PARTITION,
+            )
 
         return n
 
@@ -816,9 +857,12 @@ class GDSWriter:
         # IVF_FLAT index — O(N) build vs O(N×P×iters) for IVF_PQ.
         # 150K entities: IVF_FLAT builds in <1s, IVF_PQ takes 3-5 min.
         # Query latency is comparable (4ms vs 25ms flat scan at 150K).
-        if n >= 256:
+        # Below num_partitions * 256 rows the KMeans training is starved and
+        # the index is degenerate, so skip it — trajectory search falls back to
+        # a correct brute-force scan (zero recall loss, pure build-time shrink).
+        if _ivf_index_worthwhile(n):
             traj_ds = _lance.dataset(str(traj_path))
-            n_partitions = min(64, max(16, int(n ** 0.5)))
+            n_partitions = _ivf_num_partitions(n)
             try:
                 traj_ds.create_index(
                     "trajectory_vector",
@@ -831,6 +875,13 @@ class GDSWriter:
                     "Sphere is functional but trajectory search will use full scan.",
                     stacklevel=2,
                 )
+        elif n > 0:
+            logger.info(
+                "trajectory %s: %d rows below ANN training threshold "
+                "(%d) — using full-scan fallback",
+                pattern_id, n,
+                _ivf_num_partitions(n) * _IVF_MIN_ROWS_PER_PARTITION,
+            )
         return n
 
     def write_temporal_centroids(

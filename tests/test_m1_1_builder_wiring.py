@@ -286,7 +286,25 @@ def test_audit_pattern_dims_returns_full_field_path_end_to_end(tmp_path):
         # exposes the Pattern dict on `.patterns` via the inner attribute.
         sphere_wrapper = MagicMock()
         sphere_wrapper._sphere = SimpleNamespace(patterns=sphere.patterns)
-        _state["navigator"] = MagicMock()
+        nav = MagicMock()
+        # audit_pattern_dims appends a vector_index_health block (thin
+        # passthrough to the navigator); return a real dict so json.dumps
+        # works (block behaviour covered in test_vector_index_health.py).
+        nav.vector_index_health.return_value = {
+            "pattern_id": "tx_pattern",
+            "line_id": None,
+            "index_present": True,
+            "index_type": "IVF_FLAT",
+            "num_indexed_rows": 300,
+            "num_unindexed_rows": 0,
+            "total_rows": 300,
+            "indexed_fraction": 1.0,
+            "num_partitions": None,
+            "is_stale": False,
+            "stale_threshold": 0.1,
+            "recommendation": "index covers all rows",
+        }
+        _state["navigator"] = nav
         _state["sphere"] = sphere_wrapper
 
         body = audit_pattern_dims(pattern_id="tx_pattern", top_k=10)

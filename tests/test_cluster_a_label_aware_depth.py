@@ -66,7 +66,26 @@ def _call_audit_pattern_dims(pattern: object, *, pattern_id: str = "synth_pat", 
     try:
         sphere_wrapper = MagicMock()
         sphere_wrapper._sphere = SimpleNamespace(patterns={pattern_id: pattern})
-        _state["navigator"] = MagicMock()
+        nav = MagicMock()
+        # audit_pattern_dims appends a vector_index_health block (thin
+        # passthrough to the navigator); return a real dict so json.dumps
+        # works (the block's own behaviour is covered in
+        # test_vector_index_health.py).
+        nav.vector_index_health.return_value = {
+            "pattern_id": pattern_id,
+            "line_id": None,
+            "index_present": True,
+            "index_type": "IVF_FLAT",
+            "num_indexed_rows": 300,
+            "num_unindexed_rows": 0,
+            "total_rows": 300,
+            "indexed_fraction": 1.0,
+            "num_partitions": None,
+            "is_stale": False,
+            "stale_threshold": 0.1,
+            "recommendation": "index covers all rows",
+        }
+        _state["navigator"] = nav
         _state["sphere"] = sphere_wrapper
         body = audit_pattern_dims(pattern_id=pattern_id, top_k=top_k)
         return json.loads(body)

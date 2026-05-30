@@ -7,6 +7,23 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-05-30
+
+### Added
+
+- `hypertopos sphere health <path>` — composes the population summary with the geometric health checks into a single status (`ok` / `warning` / `critical`); `--exit-code-on-critical` exits `2` on a critical status so a CI shell gate can fail a deploy, and `--json` emits a `{status, sphere_path, overview, alerts}` document.
+- `hypertopos sphere validate <path> [--strict] [--json]` — structural integrity check over a built sphere (sphere.json parses, each materialized line has a points directory, each pattern has a geometry directory); `--strict` promotes calibration-health and dimension-quality warnings to errors, exiting `1` when invalid.
+- `hypertopos sphere diff <old> <new> [--json]` — pre-deploy diff reporting the pattern-inventory delta (added / removed / common) and per-shared-pattern calibration drift between two built spheres; patterns whose calibration schema differs are marked `not_comparable`.
+- `hypertopos sphere ingest <sphere> --points <file>` — incremental ingest CLI: append a new-/changed-entities table (Arrow IPC, Parquet, or CSV) to one pattern's geometry without a full rebuild. `--pattern` selects the target pattern (optional when the sphere has a single one); `--reindex` forces an immediate ANN index rebuild; `--finalize` recomputes the global rank percentile and rebuilds the ANN index once at the end of a batched ingest session; `--json` emits an `{added, modified, deleted, population_size, drift_pct, geometry_version_before, geometry_version_after, reindexed, finalized}` summary for pipeline consumption.
+- Production-ready incremental ingest: `GDSBuilder.incremental_update` adds, modifies, and deletes entities on an existing sphere without a full rebuild, and newly added entities are immediately visible to anomaly search. Patterns whose dimensions are relations, event dimensions, edge-dim aggregations, and tracked properties are now fully supported (previously such patterns raised a width-mismatch error). The appended rows now also enter the ANN vector index — pass `reindex=True` to rebuild it immediately. For batched ingestion of many small appends, pass `recompute_ranks=False` to defer the population percentile recompute and call the new `GDSBuilder.finalize_incremental` once at the end of the session.
+
+### Changed
+
+- Per-tag calibration-epoch timestamps now resolve directly from the dataset tag listing (a single lookup) instead of scanning version history, with read-side fallback for spheres written by older tooling.
+- Batch point reads (`read_points_batch`) issue a single indexed lookup over the whole key set on a reused dataset handle, replacing the per-key access loop — repeated lookups of the same entities are dramatically faster.
+- `pylance` dependency floor bumped to 7.x — Lance dataset reads, writes, scalar-index builds, and `merge_insert` upsert behavior verified equivalent to the prior 6.x floor.
+- Builder skips the trajectory ANN index when a pattern has too few rows to train it, shortening sphere builds for patterns with few entities; `attract_trajectory` (π10) and `find_drifting_similar` still return correct nearest-trajectory results via an exact full-scan fallback when no index is present.
+
 ## [0.7.3] — 2026-05-27
 
 ### Added

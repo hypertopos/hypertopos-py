@@ -95,9 +95,16 @@ class GDSReader:
         # Tracks which points Lance datasets already have a BTREE index on primary_key.
         # Used by read_points_batch to lazily build the index on pre-existing spheres.
         self._points_btree_built: set[str] = set()
-        # Cache of row IDs discovered by per-key BTREE equality scans.
-        # Key: (line_id, version, primary_key) → Lance internal row ID.
-        self._points_row_id_cache: dict[tuple, int] = {}
+        # Cached points Lance dataset handles, keyed by (line_id, version).
+        # read_points_batch reuses the open handle across calls instead of
+        # re-opening per call — re-opening reloads the scalar-index pages cold.
+        self._points_dataset_cache: dict[tuple[str, int], Any] = {}
+        # Handle-cache hit/miss counters (hypertopos-owned, not a Lance metric):
+        # a hit is a reused open handle, a miss is a fresh open. Surfaced via
+        # get_session_stats so an agent can see whether warm reads are reusing
+        # the dataset handle.
+        self._points_cache_hits = 0
+        self._points_cache_misses = 0
         self._adjacency_cache: dict[str, Any] = {}
 
     def get_adjacency(self, pattern_id: str) -> Any:
@@ -573,6 +580,12 @@ class GDSReader:
         self, pattern_id: str, filter: str | None = None
     ) -> int:
         lance_path = self._base / "geometry" / pattern_id / "data.lance"
+        # Mirror geometry_column_names / read_edge_features: a declared pattern
+        # whose geometry/<pid>/data.lance is absent (corrupt or partially built
+        # sphere) yields 0 rows rather than crashing the caller — keeps
+        # sphere validate / health able to emit their JSON report.
+        if not lance_path.exists():
+            return 0
         if pattern_id not in self._lance_dataset_cache:
             self._lance_dataset_cache[pattern_id] = _lance.dataset(str(lance_path))
         ds = self._lance_dataset_cache[pattern_id]
@@ -984,20 +997,17 @@ class GDSReader:
         columns: optional column projection — read only these columns.
         Always includes primary_key even if not listed.
 
-        If the full table is already cached, filters from it in-memory (O(n)).
-        Otherwise uses per-key BTREE equality scans — O(log n) per key.
-        For large key sets (>100), uses a single IN-filter scan instead of
-        per-key loops for better throughput.
-        Row IDs are cached after the first scan so subsequent calls for the same
-        key are O(1) via ds.take().
-        """
-        if not primary_keys:
-            base = self._base / "points" / line_id / f"v={version}"
-            lance_path = base / "data.lance"
-            ds = _lance.dataset(str(lance_path))
-            schema = ds.schema
-            return pa.table({f.name: pa.array([], type=f.type) for f in schema})
+        If the full table is already cached in memory, filters from it (O(n)).
+        Otherwise issues a single BTREE-pushed IN-filter scan over the whole key
+        set — one scan regardless of key count, on a cached dataset handle (the
+        handle is reused across calls; re-opening would reload scalar-index
+        pages cold).
 
+        Output row order is NOT guaranteed to match the input key order (Lance
+        returns rows in storage order); keys with no matching row are simply
+        absent. Every caller keys results by primary_key, so order is not part
+        of the contract.
+        """
         def _project(table: pa.Table) -> pa.Table:
             if columns is None:
                 return table
@@ -1005,89 +1015,100 @@ class GDSReader:
             available = [c for c in cols if c in table.column_names]
             return table.select(available)
 
-        cache_key = (line_id, version)
-        cached = self._points_cache.get(cache_key)
+        if not primary_keys:
+            ds = self._points_dataset(line_id, version)
+            if ds is None:
+                return pa.table({})
+            return pa.table(
+                {f.name: pa.array([], type=f.type) for f in ds.schema}
+            )
+
+        cached = self._points_cache.get((line_id, version))
         if cached is not None:
             mask = pc.is_in(cached["primary_key"], pa.array(primary_keys, type=pa.string()))
             return _project(cached.filter(mask))
 
-        lance_path = self._base / "points" / line_id / f"v={version}" / "data.lance"
-        if not lance_path.exists():
+        ds = self._points_dataset(line_id, version)
+        if ds is None:
             return pa.table({})
 
-        # Fast path: batch IN-filter for large key sets (>100 keys)
-        if len(primary_keys) > 100:
-            ds = _lance.dataset(str(lance_path))
-            escaped = [k.replace("'", "''") for k in primary_keys]
-            pk_in = ", ".join(f"'{k}'" for k in escaped)
-            proj_cols = None
-            if columns:
-                proj_cols = list(dict.fromkeys(["primary_key"] + columns))
-            try:
-                result = ds.scanner(
-                    filter=f"primary_key IN ({pk_in})",
-                    columns=proj_cols,
-                ).to_table()
-                return result
-            except _RECOVERABLE_READ_ERRORS:
-                pass  # fall through to per-key path
+        self._ensure_points_btree(ds, line_id, version)
 
-        ds = _lance.dataset(str(lance_path))
-
-        # Lazy BTREE build for existing spheres that predate the write-time index
-        btree_key = str(lance_path)
-        if btree_key not in self._points_btree_built:
-            try:
-                has_btree = any(
-                    getattr(idx, "index_type", "").lower() in ("btree",)
-                    and "primary_key" in getattr(idx, "columns", [])
-                    for idx in ds.describe_indices()
-                )
-                if not has_btree:
-                    ds.create_scalar_index("primary_key", index_type="BTREE")
-            except _RECOVERABLE_READ_ERRORS:
-                pass
-            self._points_btree_built.add(btree_key)
-
-        # Per-key equality scans — each uses BTREE (O(log n)); cache row IDs for O(1) future access
-        tables: list[pa.Table] = []
-        for key in primary_keys:
-            row_cache_key = (line_id, version, key)
-            if row_cache_key in self._points_row_id_cache:
+        proj_cols = None
+        if columns:
+            proj_cols = list(dict.fromkeys(["primary_key"] + columns))
+        escaped = [k.replace("'", "''") for k in primary_keys]
+        pk_in = ", ".join(f"'{k}'" for k in escaped)
+        try:
+            return ds.scanner(
+                filter=f"primary_key IN ({pk_in})",
+                columns=proj_cols,
+            ).to_table()
+        except _RECOVERABLE_READ_ERRORS:
+            # Per-key equality fallback for the rare case where the IN-filter
+            # scan is unsupported (corrupt/legacy index). One scan per key.
+            tables: list[pa.Table] = []
+            for key in primary_keys:
+                esc = key.replace("'", "''")
                 try:
-                    row = ds.take([self._points_row_id_cache[row_cache_key]])
-                    if row.num_rows == 1 and row["primary_key"][0].as_py() == key:
-                        if "_rowid" in row.schema.names:
-                            row = row.drop(["_rowid"])
-                        tables.append(row)
-                        continue
+                    res = ds.scanner(filter=f"primary_key = '{esc}'").to_table()
                 except _RECOVERABLE_READ_ERRORS:
-                    pass
-                del self._points_row_id_cache[row_cache_key]
-            escaped = key.replace("'", "''")
-            try:
-                result = ds.scanner(
-                    filter=f"primary_key = '{escaped}'", with_row_id=True
-                ).to_table()
-            except _RECOVERABLE_READ_ERRORS:
-                # Fallback: without row_id (older Lance versions)
-                escaped2 = key.replace("'", "''")
-                result = ds.scanner(filter=f"primary_key = '{escaped2}'").to_table()
-                if result.num_rows > 0:
-                    tables.append(result)
-                continue
-            if result.num_rows > 0:
-                if "_rowid" in result.schema.names:
-                    row_id = result["_rowid"][0].as_py()
-                    self._points_row_id_cache[row_cache_key] = row_id
-                    tables.append(result.drop(["_rowid"]))
-                else:
-                    tables.append(result)
+                    continue
+                if res.num_rows > 0:
+                    tables.append(res)
+            if not tables:
+                return pa.table(
+                    {f.name: pa.array([], type=f.type) for f in ds.schema}
+                )
+            return _project(pa.concat_tables(tables))
 
-        if not tables:
-            schema = ds.schema
-            return pa.table({f.name: pa.array([], type=f.type) for f in schema})
-        return _project(pa.concat_tables(tables))
+    def _points_dataset(self, line_id: str, version: int) -> Any | None:
+        """Return a cached open handle for a line's points Lance dataset.
+
+        Returns None when the dataset does not exist. Reuse is counted as a
+        cache hit, a fresh open as a miss (surfaced via get_session_stats).
+        """
+        key = (line_id, version)
+        ds = self._points_dataset_cache.get(key)
+        if ds is not None:
+            self._points_cache_hits += 1
+            return ds
+        lance_path = self._base / "points" / line_id / f"v={version}" / "data.lance"
+        if not lance_path.exists():
+            return None
+        ds = _lance.dataset(str(lance_path))
+        self._points_dataset_cache[key] = ds
+        self._points_cache_misses += 1
+        return ds
+
+    def _ensure_points_btree(self, ds: Any, line_id: str, version: int) -> None:
+        """Lazily build the primary_key BTREE for spheres that predate the
+        write-time index. No-op once verified for this (line_id, version)."""
+        btree_key = f"{line_id}:{version}"
+        if btree_key in self._points_btree_built:
+            return
+        try:
+            has_btree = any(
+                getattr(idx, "index_type", "").lower() in ("btree",)
+                and "primary_key" in getattr(idx, "columns", [])
+                for idx in ds.describe_indices()
+            )
+            if not has_btree:
+                ds.create_scalar_index("primary_key", index_type="BTREE")
+        except _RECOVERABLE_READ_ERRORS:
+            pass
+        self._points_btree_built.add(btree_key)
+
+    def points_cache_stats(self) -> dict[str, int]:
+        """Return points-handle cache hit/miss counters.
+
+        These are hypertopos-owned counters (handle reuse vs fresh open), not a
+        Lance-provided metric. Surfaced via the MCP get_session_stats tool.
+        """
+        return {
+            "points_handle_cache_hits": self._points_cache_hits,
+            "points_handle_cache_misses": self._points_cache_misses,
+        }
 
     def has_fts_index(self, line_id: str, version: int) -> bool:
         """Return True if the line's Lance dataset has at least one INVERTED (FTS) index."""

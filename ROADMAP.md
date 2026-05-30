@@ -1,17 +1,24 @@
 # hypertopos — Roadmap
 
 > Planned direction. Priorities may change based on feedback.
+> See [CHANGELOG](CHANGELOG.md) for the full feature list per release.
+
+## 0.8.0
+
+Lance 7.0 single-process performance, incremental ingest, agent-correctness composers, and operations tooling — on the existing sphere format 3.x, no rebuild required.
+
+- **0.8.0** — Lance 7.0 storage with native batched reads; incremental sphere ingest (`hypertopos sphere ingest`) without a full rebuild; agent-correctness composers (`assess_anomaly_certainty`, `consensus_classification`, `calibration_drift_report`, `diverse_explanations`, `theta_sensitivity_report`); vector-index health in `audit_pattern_dims`; cloud-ops CLI (`sphere health` / `validate` / `diff`); trajectory ANN index auto-skipped on small populations.
+
+---
 
 ## 0.7.0
 
 Detector composition and counterfactual primitives on native Lance MVCC — multi-detector consensus, per-edge / joint / per-counterparty influence math, topological cycle persistence, multi-resolution FDR, and the entity-side investigation orchestrator land on a modernized Lance 6.0 storage substrate with sphere format 3.0.
 
-- **0.7.0** — Lance 4.0 → 6.0 bump; sphere format 2.4 → 3.0 (breaking — single Lance dataset per pattern, calibration epochs tagged `epoch_<N>`, no migration tool); Wilson HMP combiner + `combine_anomaly_pvalues` + `classify_detector_consensus` over five orthogonal anomaly axes; counterfactual family (`simulate_edge_removal`, `select_minimal_joint_edge_removal`, `simulate_counterparty_removal`); `find_topological_anomalies` H_1 cycle persistence + `find_topological_trajectory_anomalies`; `find_graph_geometry_tension` 2×2 behavioural-vs-graph cross-tab; multi-resolution FDR with `Pattern.fdr_hierarchy` + `fdr_temporal_hierarchy`; per-dim FDR axis + `rank_by="min_q_per_dim"`; `investigate_entity` orchestrator; `edge_curvature_frc` Forman-Ricci edge dimension; `reliability_flags` triage on five primitive outputs; `composite_risk` switches Fisher → HMP.
-- **0.7.1** — label-aware calibration foundation: `label_audit:` YAML block, per-class μ/σ + Cohen's d + Fisher LDA direction on `Pattern`, `delta_norm_signed` Lance column, `audit_pattern_dims` full per-class field path, Levene's test homoscedasticity diagnostic in `dim_quality_warnings`.
-- **0.7.2** — composition orchestrators on the 0.7.1 foundation: `find_anomalies(rank_by="signed_confidence")`, `chain_full_loop_summary` chain-side mirror of `investigate_entity`, `audit_label_alignment` Fisher LDA AUROC sibling to `audit_pattern_dims`, `kind_mismatch` warning + `recommended_action="kind_mismatch_review"`, `dive_solid(counterfactual_frozen_population=True)`, `Chain.to_dict() edge_potentials`, `changelog.d/` per-PR fragments convention.
-- **0.7.3** — detector-composition continuation + investigation-orchestrator surface: per-dim AUROC + intrinsic / extrinsic decomposition on `audit_pattern_dims`, `signed_tail_concentration` warning, chain reliability rollup on `chain_full_loop_summary`, `find_anomalies(sample_size, boundary_aware)`, `classify_trajectory` + `local_trajectory_shape`, `sphere_overview.cross_pattern_discrepancy` + per-row `anomaly_rate`, `community_id` graph feature + pure-NumPy `pagerank` / `connected_component`, `find_calibration_influencers(auto_discover=True)` + `calibration_influencer_history`, `π12_attract_regime_change.near_data_boundary` flag, `find_similar_entities(with_neighbor_anomaly=True)`, `passive_scan` interpretation hint, `dive_solid.trajectory_shape`.
-
-See [CHANGELOG](CHANGELOG.md) for the full feature list.
+- **0.7.0** — Lance 6.0 + sphere format 3.0; detector consensus (Wilson HMP), counterfactual family, topological cycle persistence, multi-resolution FDR, `investigate_entity` orchestrator.
+- **0.7.1** — label-aware calibration foundation: `label_audit:` YAML, per-class Cohen's d + Fisher LDA on `Pattern`, `delta_norm_signed` Lance column.
+- **0.7.2** — composition orchestrators: `find_anomalies(rank_by="signed_confidence")`, `chain_full_loop_summary`, `audit_label_alignment`, counterfactual frozen-population on `dive_solid`.
+- **0.7.3** — investigation-orchestrator surface: per-dim AUROC, intrinsic/extrinsic decomposition, chain reliability rollup, DTW trajectory classifier, Louvain `community_id`, calibration-influencer auto-discovery, MCP ergonomics on `passive_scan` / `find_similar_entities` / `dive_solid`.
 
 ---
 
@@ -27,8 +34,6 @@ Architecture-emergent analytics, properly enabled — calibration is now version
 - **0.6.5** — chain anchor pattern gains `cross_bank_count` and `amount_monotone_decreasing`; `extract_chains` strict-prefix dedup.
 - **0.6.6** — agent-side close of the chain investigative loop: smart-mode chain routing, `sphere_overview.suggested_queries` entry-point, R9 cheatsheet; `theta_sensitivity` calibration introspection; length- and volume-stratified correlation gates.
 - **0.6.7** — close the investigation→SAR pipeline: `dimension_weights` runtime override on `find_anomalies`, `chain_investigation_summary` triage, `investigate_chain` one-shot R9 orchestrator, `generate_sar_rationale` template-based SAR narrative draft; `dim_quality_warnings` (dead / sparse dim) on `sphere_overview`; external-chains-as-anchor-line cookbook.
-
-See [CHANGELOG](CHANGELOG.md) for the full feature list.
 
 ---
 
@@ -80,12 +85,19 @@ First public release — full GDS stack, π1–π12, builder, MCP server, valida
 
 ## Future
 
+> Next major direction (planned): **0.9.0 — cloud foundations**, making hypertopos hostable. Priorities may change based on feedback.
+
+**Cloud foundations (0.9.0 direction)**
+- Session-keyed MCP server state with per-session isolation, so concurrent HTTP clients and multi-tenant hosting are safe.
+- URI-addressable object storage (S3 / ADLS / GCS) for spheres, with a credential profile and a read-path prefetch cache.
+- Cold-open scalar-index caches for faster first-query latency, with no on-disk format change.
+- Production-path architecture decision records (data freshness, multi-tenancy, permission passthrough) and a committed surface model: MCP for agents, library API for embedding, CLI for ops / batch / cloud-compute.
+
+**Adoption & product**
+- `scan <file>` auto-builder for one-command onboarding, plus a deterministic (no-LLM) interpretation layer producing human-readable, audit-ready anomaly explanations.
+
 **Detection quality**
 - Robust estimators, multi-scale resolution — trimmed means / MAD-based σ, hierarchical build at daily/weekly/full granularity.
-- Chains as first-class geometric entities — external chains declared as anchor lines with a membership table, plus chain-aware geometric primitives (anomaly propagation inside a chain, coherent-anomaly filter, chain drift trajectory).
-
-**Builder evolution**
-- Incremental rebuild — geometry-only without `--force` wipe.
 
 **PassiveScanner evolution**
 - Native temporal source support for direct temporal inputs, without requiring manual dataset plumbing in benchmark scripts.
@@ -93,7 +105,7 @@ First public release — full GDS stack, π1–π12, builder, MCP server, valida
 - **SphereProfiler** — autonomous sphere scanner that profiles all patterns, runs calibration sweeps across source combinations, proposes optimal PassiveScanner composition for Layer 1 surveillance.
 
 **Code refactoring**
-- Break up oversized modules into smaller, domain-focused components (post-0.5.0 `navigator.py` is over 11k lines and is the obvious first target; per-pattern parallelism and AdjacencyIndex reuse in 0.4.0/0.5.0 reduced some coupling but the module itself did not shrink).
+- Break up oversized modules into smaller, domain-focused components — `navigator.py` is now well over 20k lines and is the primary target for a mixin-based split that preserves the public single-class API.
 - Consolidate repeated orchestration logic into shared helpers.
 
 **Cross-sphere capabilities**

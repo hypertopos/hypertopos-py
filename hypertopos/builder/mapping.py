@@ -13,6 +13,7 @@ import pyarrow.csv as pa_csv
 import pyarrow.parquet as pq
 import yaml
 
+from hypertopos._file_formats import normalized_suffix
 from hypertopos.builder.builder import GDSBuilder, RelationSpec
 from hypertopos.engine.edge_features import EDGE_DIM_KINDS
 
@@ -423,7 +424,7 @@ def _load_source(source: str, base_dir: Path) -> pa.Table:
     if not p.is_absolute():
         p = base_dir / p
 
-    suffix = "".join(p.suffixes).lower()
+    suffix = normalized_suffix(p)
     if suffix in (".csv", ".csv.gz"):
         return pa_csv.read_csv(str(p))
     if suffix in (".parquet", ".pq"):

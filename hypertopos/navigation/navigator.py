@@ -3941,7 +3941,7 @@ class GDSNavigator:
 
         When ``timestamp_cutoff`` is set, forwards it to each per-entity
         contagion_score call so that only edges with
-        ``timestamp < timestamp_cutoff`` are considered.
+        ``timestamp <= timestamp_cutoff`` are considered.
 
         Returns per-entity scores plus a summary with mean/max.
         """
@@ -4610,6 +4610,7 @@ class GDSNavigator:
         from_key: str,
         to_key: str,
         pattern_id: str,
+        include_ranking: bool = True,
     ) -> dict[str, Any]:
         """Geometric anomaly score for the edge (from_key → to_key).
 
@@ -4621,6 +4622,12 @@ class GDSNavigator:
         two "extreme" accounts are usually legitimate (e.g. corporate payroll),
         while a single transaction between two geometrically divergent accounts
         is the classic layering signature.
+
+        When ``include_ranking`` is True (default) the score is normalised
+        against the full-population edge ranking to fill ``score_rank_pct`` and
+        ``is_high_potential`` — a full-population pass (cached after the first
+        call). Pass ``include_ranking=False`` for the fast single-edge path,
+        which skips that pass and leaves those two fields ``None``.
 
         Raises GDSNavigationError when either endpoint is missing from the
         anchor pattern's geometry.
@@ -4694,19 +4701,20 @@ class GDSNavigator:
         # only the first call pays the full-population scoring cost.
         score_rank_pct: float | None = None
         is_high_potential: bool | None = None
-        try:
-            full_ranking = self.attract_edge_potential(
-                pattern_id, top_n=10**9, min_pair_count=1,
-            )
-            if full_ranking:
-                better = sum(1 for r in full_ranking if r["score"] > score)
-                n = len(full_ranking)
-                score_rank_pct = round(100.0 * (n - better) / n, 2)
-                p95_idx = max(0, int(n * 0.05) - 1)
-                p95_threshold = full_ranking[p95_idx]["score"] if p95_idx < n else full_ranking[0]["score"]
-                is_high_potential = bool(score >= p95_threshold)
-        except (*_NAVIGATION_RECOVERABLE_ERRORS, GDSError):
-            pass
+        if include_ranking:
+            try:
+                full_ranking = self.attract_edge_potential(
+                    pattern_id, top_n=10**9, min_pair_count=1,
+                )
+                if full_ranking:
+                    better = sum(1 for r in full_ranking if r["score"] > score)
+                    n = len(full_ranking)
+                    score_rank_pct = round(100.0 * (n - better) / n, 2)
+                    p95_idx = max(0, int(n * 0.05) - 1)
+                    p95_threshold = full_ranking[p95_idx]["score"] if p95_idx < n else full_ranking[0]["score"]
+                    is_high_potential = bool(score >= p95_threshold)
+            except (*_NAVIGATION_RECOVERABLE_ERRORS, GDSError):
+                pass
 
         return {
             "from_key": from_key,
@@ -6964,6 +6972,9 @@ class GDSNavigator:
 
             # Round to int for alive_edge_count
             edge_counts = np.rint(scores).astype(int)
+            # Full-population scores for FDR rank percentiles, captured before
+            # the top_n truncation below so p-values stay population-relative.
+            full_scores = scores
             n = min(top_n, len(scores))
             top_indices = np.argpartition(scores, -n)[-n:]
             top_indices = top_indices[np.argsort(scores[top_indices])[::-1]]
@@ -6985,6 +6996,7 @@ class GDSNavigator:
                 )
                 results.append((bk, count, float(count)))
             results.sort(key=lambda r: r[2], reverse=True)
+            full_scores = np.array([r[2] for r in results], dtype=np.float64)
             results = results[:top_n]
         else:
             # --- entity_keys fallback: reconstruct from relations ---
@@ -7000,18 +7012,27 @@ class GDSNavigator:
                 )
                 results.append((bk, count, float(count)))
             results.sort(key=lambda r: r[2], reverse=True)
+            full_scores = np.array([r[2] for r in results], dtype=np.float64)
             results = results[:top_n]
 
         # --- FDR filtering (opt-in) ---
         if fdr_alpha is not None and len(results) > 0:
             from hypertopos.engine.fdr import (
                 benjamini_hochberg,
+                empirical_p_values_from_rank,
             )
-            N = len(results)
-            # p-value from hub_score ranking: rank 1 (highest) → lowest p
-            p_values = np.array(
-                [(N - i) / N for i in range(N)], dtype=np.float64,
+            # Population rank percentile from the full scores array (same
+            # right-tail convention as π7_attract_hub_and_stats): the strongest
+            # hub sits at the top of the population → smallest p. The earlier
+            # inline (N-i)/N was inverted (strongest hub at index 0 → p=1.0) and
+            # capped at best-p = 1/top_n, so it could not pass BH at a small alpha.
+            total = len(full_scores)
+            rank_pcts = np.array(
+                [float(np.sum(full_scores <= r[2])) / total * 100
+                 for r in results],
+                dtype=np.float64,
             )
+            p_values = empirical_p_values_from_rank(rank_pcts)
             rejected, q_values = benjamini_hochberg(p_values, fdr_alpha, method=fdr_method)
             results = [
                 r for r, keep in zip(results, rejected) if keep
@@ -15179,7 +15200,36 @@ class GDSNavigator:
                             bwd[k].sort(key=lambda x: x[1])
                     for neighbor, ts, amt in adj.get(current, []):
                         if ts >= last_ts and ts <= last_ts + window_secs:
-                            if neighbor not in set(path):  # no revisit
+                            if neighbor == path[0]:
+                                # Cycle closes back to the origin (A→…→A round
+                                # trip — a core AML typology). Emit the closed
+                                # chain as a TERMINAL node: it returns to start,
+                                # so it must not be re-queued (the revisit guard
+                                # below would block it anyway, and re-queuing
+                                # would loop forever). Mirrors the build-time
+                                # extractor's to_key==start branch in
+                                # engine/chains.py. Honour the same min_hops /
+                                # seen_chains / max_chains gates as the main
+                                # recording path above.
+                                closed = path + [neighbor]
+                                if len(closed) - 1 >= min_hops and len(chains) < max_chains:
+                                    closed_key = tuple(closed)
+                                    if closed_key not in seen_chains:
+                                        seen_chains.add(closed_key)
+                                        chain_id_counter += 1
+                                        cyc_span = ts - first_ts
+                                        chains.append({
+                                            "chain_id": f"chain_{chain_id_counter:05d}",
+                                            "keys": closed,
+                                            "hop_count": len(closed) - 1,
+                                            "is_cyclic": True,
+                                            "time_span_hours": (
+                                                round(cyc_span / 3600.0, 2)
+                                                if cyc_span else 0.0
+                                            ),
+                                            "total_amount": round(total_amt + amt, 2),
+                                        })
+                            elif neighbor not in set(path):  # no revisit
                                 queue.append((
                                     neighbor,
                                     path + [neighbor],
@@ -15986,8 +16036,10 @@ class GDSNavigator:
                         cp_sev_hint = "moderate"
                     edge_pot_evidence: dict[str, Any] | None = None
                     try:
+                        # Only score / delta_distance / pair_tx_count are consumed
+                        # below, so skip the full-population ranking pass.
                         edge_pot_evidence = self.edge_potential(
-                            entity_key, cp_key, pattern_id,
+                            entity_key, cp_key, pattern_id, include_ranking=False,
                         )
                     except (*_NAVIGATION_RECOVERABLE_ERRORS, GDSError):
                         edge_pot_evidence = None
@@ -17888,9 +17940,11 @@ class GDSNavigator:
 
         Surfaces entities whose local geometric neighborhood carries a cycle
         signature that the population-level delta_norm rank misses. Results
-        are cached per ``(pattern_id, pattern_version)`` in a sidecar Lance
-        store under ``_gds_meta/topology_cache/anomalies/{pid}/v={N}.lance``;
-        a pattern re-calibration writes a fresh version file and the stale
+        are cached per ``(pattern_id, pattern_version, scoring params)`` in a
+        sidecar Lance store under
+        ``_gds_meta/topology_cache/anomalies/{pid}/v={N}{params}.lance``; a
+        pattern re-calibration, or a change to ``k_neighbors`` / ``pca_dim`` /
+        ``sample_size`` / ``homology_dim``, writes a fresh file and the stale
         one is collected by the sphere GC pass.
 
         Args:
@@ -17904,7 +17958,7 @@ class GDSNavigator:
             pca_dim: PCA target dim when geometry dim is larger.
 
         Returns:
-            ``top_n`` entries sorted by ``topo_score`` descending, each with
+            ``top_n`` entries sorted by ``h1_max_persistence`` descending, each with
             ``primary_key``, ``topo_score``, ``h1_max_persistence``,
             ``h0_mean_death``, ``n_h1_features``, ``computed_at``.
         """
@@ -17913,6 +17967,7 @@ class GDSNavigator:
         )
         from hypertopos.storage.topology_cache import (
             ANOMALIES_SCHEMA,
+            anomalies_params_key,
             cache_path,
             read_cache,
             write_cache,
@@ -17924,6 +17979,10 @@ class GDSNavigator:
         version = self._resolve_version(scoring_pattern)
         cpath = cache_path(
             self._storage._base, "anomalies", scoring_pattern, version,
+            anomalies_params_key(
+                k_neighbors=k_neighbors, pca_dim=pca_dim,
+                sample_size=sample_size, homology_dim=homology_dim,
+            ),
         )
 
         if not force:
@@ -17968,7 +18027,7 @@ class GDSNavigator:
         top_n: int = 5,
         edge_ids: list[str] | None = None,
         max_edges_loaded: int = 2000,
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
         """Per-edge counterfactual: rank the entity's edges by their
         contribution to ``delta_norm``.
 
@@ -17986,6 +18045,14 @@ class GDSNavigator:
         unchanged-by-design (no per-edge contribution by construction —
         event_dim is scalar-per-event, prop_columns are static entity
         attributes).
+
+        Returns a dict envelope ``{edges, edges_total, edges_evaluated,
+        truncated}``. ``edges`` is the ``top_n`` ranked list (the previous
+        return value). The candidate set is capped at ``max_edges_loaded``
+        in adjacency order BEFORE ranking; when ``truncated`` is True the
+        ranking reflects only the ``edges_evaluated`` subset, NOT the
+        entity's full ``edges_total`` edges — so a partial counterfactual on
+        a high-degree hub is never mistaken for a complete one.
         """
         from hypertopos.engine.counterfactual import (
             simulate_edge_removal_with_aggregations,
@@ -18039,6 +18106,11 @@ class GDSNavigator:
         )
         event_source_values: dict[str, dict[str, float]] = {}
         edges_for_engine: list[dict[str, Any]] = []
+        # Truncation accounting — surfaced to the caller so a partial ranking
+        # (candidate edges capped at max_edges_loaded) is never mistaken for a
+        # complete one. Set at each cap site below.
+        edges_total = 0
+        edges_truncated = False
 
         if pattern.edge_dim_aggregations is not None:
             agg = pattern.edge_dim_aggregations
@@ -18083,8 +18155,10 @@ class GDSNavigator:
             # Truncate BEFORE the sidecar IN-clause — for a hub entity with
             # 168 k transactions the sidecar SQL `event_key IN (...)` string
             # alone is multi-megabyte and Lance's filter parser bogs down.
-            if len(edges_for_engine) > max_edges_loaded:
+            edges_total = len(edges_for_engine)
+            if edges_total > max_edges_loaded:
                 edges_for_engine = edges_for_engine[:max_edges_loaded]
+                edges_truncated = True
 
             # Read per-event source-dim values from edge_features sidecar +
             # compute per-source-dim population p95 thresholds for the
@@ -18209,13 +18283,22 @@ class GDSNavigator:
         # transactions in the AML HI-small sphere; without this cap the
         # downstream Lance sidecar IN-clause and engine evaluation each
         # scale O(n_edges) and push the call past several minutes).
+        # ``edges_total`` may already be set by the edge_dim_aggregations cap
+        # above; only (re)measure here when this is the line_id-fallback path
+        # (agg branch collected nothing, so edges_total is still 0).
+        if edges_total == 0:
+            edges_total = len(edges_for_engine)
         if len(edges_for_engine) > max_edges_loaded:
             edges_for_engine = edges_for_engine[:max_edges_loaded]
+            edges_truncated = True
 
-        # Evaluate ALL candidate edges in the engine — the navigator-side
-        # tie-break by min_pvalue needs the full result set, not just the
-        # engine's |drop_pct|-truncated top_n. Truncation happens after
-        # the tie-break sort below.
+        # Evaluate every candidate edge that survived the max_edges_loaded cap
+        # in the engine — the navigator-side tie-break by min_pvalue needs the
+        # full surviving set, not just the engine's |drop_pct|-truncated top_n.
+        # NOTE: when edges_truncated is True the candidate set was capped at
+        # max_edges_loaded in adjacency order BEFORE this point, so the ranking
+        # reflects that subset, not the entity's full edge set. Truncation of
+        # the *ranked* output to top_n happens after the tie-break sort below.
         rows = simulate_edge_removal_with_aggregations(
             shape=shape_full,
             mu=mu_full,
@@ -18301,7 +18384,13 @@ class GDSNavigator:
                 return -abs_drop  # one factor zero → fall back to drop only
             return -2.0 * abs_drop * extremeness / (abs_drop + extremeness)
         rows.sort(key=_composite_score)
-        return rows[:top_n]
+        ranked = rows[:top_n]
+        return {
+            "edges": ranked,
+            "edges_total": edges_total,
+            "edges_evaluated": len(edges_for_engine),
+            "truncated": edges_truncated,
+        }
 
     def simulate_dimension_change(
         self,
@@ -18736,7 +18825,7 @@ class GDSNavigator:
             pattern_id=pattern_id,
             line_id=line_id,
             top_n=edge_top_n if edge_top_n is not None else 10**9,
-        )
+        )["edges"]
         return aggregate_edge_removals_by_counterparty(per_edge, top_n=top_n)
 
     def find_graph_geometry_tension(
@@ -19014,7 +19103,7 @@ class GDSNavigator:
                 lambda: self.simulate_edge_removal(
                     primary_key, pattern_id=pattern_id, line_id=line_id,
                     top_n=top_n_edges,
-                ),
+                )["edges"],
             )
 
         out["steps_status"] = steps_status

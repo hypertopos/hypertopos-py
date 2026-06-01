@@ -362,6 +362,41 @@ def compute_entity_geometry(
     D_agg = len(edge_dim_agg_labels) if edge_dim_agg_labels else 0
     D_prop = len(prop_columns) if prop_columns else 0
 
+    # Guard: a declared edge_dim_aggregation / event_dimension source column
+    # that is ABSENT from entity_table would silently stay 0.0, and the z-score
+    # below turns that 0.0 into delta = (0 - mu) / sigma — non-zero whenever the
+    # dim's population mu is non-zero (which it is for an aggregated edge feature
+    # like a transaction-amount mean). That injects a spurious delta and can flip
+    # is_anomaly with no diagnostic. Relations / prop_columns are exempt: an
+    # absent FK or prop legitimately means "no contribution" (binary presence /
+    # near-zero mu), so 0.0 is correct for them. Fail loud and specific instead
+    # of producing wrong geometry — symmetric with the width guard in
+    # incremental_update. The caller (e.g. `hypertopos sphere ingest`) must
+    # supply every declared {dim}_{agg} / event-dimension column.
+    schema_names = set(entity_table.schema.names)
+    missing_value_cols: list[str] = []
+    if edge_dim_agg_labels:
+        missing_value_cols += [
+            label for label in edge_dim_agg_labels if label not in schema_names
+        ]
+    if event_dimensions_meta:
+        missing_value_cols += [
+            edim["column"]
+            for edim in event_dimensions_meta
+            if edim["column"] not in schema_names
+        ]
+    if missing_value_cols:
+        raise ValueError(
+            "compute_entity_geometry: the entity table is missing "
+            f"{len(missing_value_cols)} declared value column(s) whose "
+            "population mean is non-zero: "
+            f"{sorted(missing_value_cols)}. Leaving them absent would z-score a "
+            "0.0 shape into a spurious (0 - mu)/sigma delta and corrupt the "
+            "entity's anomaly geometry. Supply every declared edge-dim-"
+            "aggregation ({dim}_{agg}) and event-dimension column in the "
+            "ingested points table, or rebuild the sphere."
+        )
+
     shape_vectors = np.zeros(
         (n, D_rel + D_event + D_agg + D_prop), dtype=np.float32,
     )
@@ -1434,6 +1469,30 @@ class GDSBuilder:
         self, pat: _PatternReg,
     ) -> PopulationStats:
         """Compute shape vectors and population statistics for a pattern."""
+        # Dimension-order guard. The geometry concat below places edge_dimensions
+        # / edge_dim_aggregations BEFORE tracked-property dims, but the dim-label
+        # layer (model/sphere.py Pattern.dim_index / dim_labels / delta_dim)
+        # places tracked properties BEFORE edge_dim_aggregations, and the prop
+        # sigma-floor offset assumes properties immediately follow the event
+        # block. A pattern carrying BOTH a tracked-property block AND an edge
+        # dimension / edge-dim-aggregation block would therefore mis-attribute
+        # per-dimension statistics (dim_index resolves prop/agg labels to the
+        # wrong delta slot) and floor the wrong sigma columns. No shipped sphere
+        # pairs these blocks; refuse the combination rather than silently corrupt
+        # the geometry. Unifying the order behind one source of truth is a 0.9.0
+        # task.
+        if pat.tracked_properties and (
+            pat.edge_dimensions is not None
+            or pat.edge_dim_aggregations is not None
+        ):
+            raise ValueError(
+                f"pattern {pat.pattern_id!r} declares tracked_properties together "
+                f"with edge_dimensions / edge_dim_aggregations. The geometry build "
+                f"and the dim-label layer order these blocks differently, so "
+                f"per-dimension statistics would be mis-attributed. This "
+                f"combination is not yet supported — declare one block type per "
+                f"pattern, or split into separate patterns."
+            )
         from hypertopos.builder._stats import compute_conformal_p, compute_stats
 
         entity_line = self._lines[pat.entity_line]
@@ -4570,6 +4629,32 @@ class GDSBuilder:
                 edge_dim_agg_labels=edge_dim_agg_labels,
             )
 
+            # Incremental ingest reconstructs geometry from the GLOBAL
+            # mu/sigma/theta in sphere.json. Patterns calibrated per-group
+            # (group_by_property / GMM) or carrying build-time FDR hierarchy
+            # columns cannot be reproduced on this path: the global stats would
+            # write delta / delta_norm / is_anomaly that disagree with build(),
+            # and the appended rows would lack the FDR carrier columns the stored
+            # dataset has. Refuse loudly instead of corrupting the sphere.
+            _unsupported = [
+                name
+                for name, declared in (
+                    ("group_by_property", pat_meta.get("group_by_property")),
+                    ("gmm", pat_meta.get("gmm_n_components")),
+                    ("fdr_hierarchy", pat_meta.get("fdr_hierarchy")),
+                    ("fdr_temporal_hierarchy", pat_meta.get("fdr_temporal_hierarchy")),
+                )
+                if declared
+            ]
+            if _unsupported:
+                raise ValueError(
+                    f"incremental_update cannot reconstruct geometry for pattern "
+                    f"{pattern_id!r}: it declares {', '.join(_unsupported)}, which "
+                    f"require per-group / per-cluster calibration or build-time FDR "
+                    f"carrier columns that the incremental path computes against the "
+                    f"global population only. Re-run a full build for this pattern.",
+                )
+
             # Hard-guard against a silent width mismatch. compute_entity_geometry
             # supports the relations + event_dimensions + edge_dim_aggregations +
             # prop_columns blocks; a pattern that also carries generalized
@@ -4594,10 +4679,18 @@ class GDSBuilder:
                 (theta_norm > 0.0) & (delta_norms >= theta_norm)
             )
 
-            # Conformal p-values (simplified — rank within batch)
+            # Conformal p-values. Use the right-tail population contract
+            # (p = fraction with delta_norm >= this row's norm, so lower = more
+            # anomalous) to match _stats.compute_conformal_p — NOT a left-rank,
+            # which would invert the polarity. This batch-local value is a
+            # provisional placeholder; recompute_conformal_p rewrites it against
+            # the full population on the default path / at finalize_incremental,
+            # exactly like delta_rank_pct. delta_rank_pcts keeps its own
+            # higher = more anomalous convention (left-rank × 100).
             sorted_norms = np.sort(delta_norms)
             ranks = np.searchsorted(sorted_norms, delta_norms, side="left")
-            conformal_p = ((ranks + 1) / (n_new + 1)).astype(np.float32)
+            right_ranks = n_new - ranks
+            conformal_p = (right_ranks / max(n_new, 1)).astype(np.float32)
             delta_rank_pcts = (ranks / max(n_new, 1) * 100).astype(np.float32)
 
             # Per-dimension anomaly count
@@ -4706,7 +4799,7 @@ class GDSBuilder:
         # batch-local rank from step 6. The default recomputes every call so
         # each call is standalone-correct for all delta_rank_pct consumers.
         if recompute_ranks:
-            writer.recompute_delta_rank_pct(pattern_id)
+            writer.recompute_rank_stats(pattern_id)
 
         # 10b. Maybe rebuild the ANN index so appended rows are visible to
         # ANN-dependent navigation. Runs AFTER recompute_delta_rank_pct: the
@@ -4777,7 +4870,7 @@ class GDSBuilder:
         from hypertopos.storage.writer import GDSWriter
 
         writer = GDSWriter(str(self.output_path))
-        writer.recompute_delta_rank_pct(pattern_id)
+        writer.recompute_rank_stats(pattern_id)
         # Reindex AFTER the rank recompute — the recompute's merge_insert
         # rewrites matched rows into new fragments, dropping them out of any
         # pre-existing index.

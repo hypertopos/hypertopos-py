@@ -8,6 +8,7 @@
 Lance 7.0 single-process performance, incremental ingest, agent-correctness composers, and operations tooling — on the existing sphere format 3.x, no rebuild required.
 
 - **0.8.0** — Lance 7.0 storage with native batched reads; incremental sphere ingest (`hypertopos sphere ingest`) without a full rebuild; agent-correctness composers (`assess_anomaly_certainty`, `consensus_classification`, `calibration_drift_report`, `diverse_explanations`, `theta_sensitivity_report`); vector-index health in `audit_pattern_dims`; cloud-ops CLI (`sphere health` / `validate` / `diff`); trajectory ANN index auto-skipped on small populations.
+- **0.8.1** — incremental-ingest correctness (population-relative `conformal_p`, complete `{line, key}` polygon filtering, missing edge-dim-aggregation column guard); `π7_attract_hub` FDR polarity fix; `discover_chains` cyclic round-trip detection; build-time guards refusing grouped/GMM/FDR incremental ingest and `tracked_properties` + edge-block patterns; parameter-aware topological anomaly cache; single-pass population-statistic recompute.
 
 ---
 
@@ -90,18 +91,17 @@ First public release — full GDS stack, π1–π12, builder, MCP server, valida
 **Cloud foundations (0.9.0 direction)**
 - Session-keyed MCP server state with per-session isolation, so concurrent HTTP clients and multi-tenant hosting are safe.
 - URI-addressable object storage (S3 / ADLS / GCS) for spheres, with a credential profile and a read-path prefetch cache.
-- Cold-open scalar-index caches for faster first-query latency, with no on-disk format change.
+- Serializable cold-open caches over the existing on-disk scalar indices, cutting first-query latency with no format change.
 - Production-path architecture decision records (data freshness, multi-tenancy, permission passthrough) and a committed surface model: MCP for agents, library API for embedding, CLI for ops / batch / cloud-compute.
 
 **Adoption & product**
-- `scan <file>` auto-builder for one-command onboarding, plus a deterministic (no-LLM) interpretation layer producing human-readable, audit-ready anomaly explanations.
+- `scan <file>` auto-builder for one-command onboarding, plus a deterministic (no-LLM) interpretation layer that consolidates today's per-method explanations into a single standalone, audit-ready API.
 
 **Detection quality**
-- Robust estimators, multi-scale resolution — trimmed means / MAD-based σ, hierarchical build at daily/weekly/full granularity.
+- Multi-scale resolution — hierarchical build at daily/weekly/full granularity.
 
 **PassiveScanner evolution**
 - Native temporal source support for direct temporal inputs, without requiring manual dataset plumbing in benchmark scripts.
-- Optional weighted scoring mode that uses continuous intensity instead of binary counts.
 - **SphereProfiler** — autonomous sphere scanner that profiles all patterns, runs calibration sweeps across source combinations, proposes optimal PassiveScanner composition for Layer 1 surveillance.
 
 **Code refactoring**
@@ -110,10 +110,9 @@ First public release — full GDS stack, π1–π12, builder, MCP server, valida
 
 **Cross-sphere capabilities**
 - Cross-sphere comparison — dimensionless metrics across independently calibrated coordinate spaces.
-- What-if analysis — hypothetical edge changes producing modified coordinate vectors.
 
 **Enterprise / governance**
 - Dimension access control — per-agent visibility constraints on delta dimensions.
 
 **Tooling**
-- Runtime latency benchmarks in package docs.
+- Runtime-latency reference tables in package docs, beyond the currently-documented `elapsed_ms` response field.

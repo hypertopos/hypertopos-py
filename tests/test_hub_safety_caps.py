@@ -228,7 +228,7 @@ def test_simulate_edge_removal_max_edges_loaded_truncates_to_prefix():
 
     cf_module.simulate_edge_removal_with_aggregations = _spy
     try:
-        nav.simulate_edge_removal(
+        envelope = nav.simulate_edge_removal(
             "SEED", pattern_id="P", line_id="L0",
             top_n=5, max_edges_loaded=250,
         )
@@ -240,3 +240,10 @@ def test_simulate_edge_removal_max_edges_loaded_truncates_to_prefix():
     assert len(received) == 250, (
         f"engine must see the truncated prefix (250), got {len(received)}"
     )
+
+    # The return envelope must surface the truncation so the agent never
+    # mistakes a partial ranking for a complete one.
+    assert envelope["truncated"] is True
+    assert envelope["edges_total"] == n_total_edges
+    assert envelope["edges_evaluated"] == 250
+    assert isinstance(envelope["edges"], list)

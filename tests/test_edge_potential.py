@@ -174,6 +174,43 @@ class TestEdgePotentialScoring:
         with pytest.raises(GDSNavigationError, match="not found"):
             nav.edge_potential("A", "B", "account_pattern")
 
+    def test_include_ranking_false_skips_full_population_pass(self):
+        """include_ranking=False = fast path: ranking fields stay None and the
+        full-population scorer is never called; score still computes."""
+        nav = self._make_nav_with_geometry(
+            deltas={
+                "A": np.array([10.0, 0.0, 0.0]),
+                "B": np.array([0.0, 10.0, 0.0]),
+            },
+            edges=[("A", "B")],
+        )
+        nav.attract_edge_potential = MagicMock(
+            side_effect=AssertionError("attract_edge_potential must NOT be called when include_ranking=False")
+        )
+        result = nav.edge_potential("A", "B", "account_pattern", include_ranking=False)
+        assert result["score_rank_pct"] is None
+        assert result["is_high_potential"] is None
+        assert result["score"] > 0
+        nav.attract_edge_potential.assert_not_called()
+
+    def test_include_ranking_true_populates_percentile(self):
+        """Default include_ranking=True runs the full-population pass and fills
+        score_rank_pct / is_high_potential."""
+        nav = self._make_nav_with_geometry(
+            deltas={
+                "A": np.array([10.0, 0.0, 0.0]),
+                "B": np.array([0.0, 10.0, 0.0]),
+            },
+            edges=[("A", "B")],
+        )
+        nav.attract_edge_potential = MagicMock(
+            return_value=[{"from_key": "A", "to_key": "B", "score": 1.0}]
+        )
+        result = nav.edge_potential("A", "B", "account_pattern")
+        assert result["score_rank_pct"] is not None
+        assert result["is_high_potential"] is not None
+        nav.attract_edge_potential.assert_called_once()
+
 
 class TestAttractEdgePotential:
     def _nav(

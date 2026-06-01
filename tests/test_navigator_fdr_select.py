@@ -500,6 +500,73 @@ class TestPi7FdrSelect:
                 "test_pattern", top_n=5, fdr_method="bogus",
             )
 
+    def test_pi7_fdr_keeps_strongest_hubs_and_matches_and_stats(self, engine):
+        """FDR must keep the STRONGEST hubs (population right-tail), and the
+        standalone π7_attract_hub must agree with π7_attract_hub_and_stats.
+
+        Regression: π7_attract_hub computed FDR p-values inline as ``(N-i)/N``
+        over the truncated result list — inverted polarity (the strongest hub,
+        at index 0, got p=1.0 and was rejected first) and capped at best-p =
+        1/top_n, so it could not pass BH at a small alpha. The sibling
+        π7_attract_hub_and_stats was already fixed to use the population rank
+        percentile; this asserts the standalone now matches it."""
+        # Distinct, non-saturating hub scores so polarity is actually exercised
+        # (the shared pi7 fixture saturates every shape to 1.0 → equal scores).
+        class _SpreadStorage(_MockStoragePi7):
+            def __init__(self_):
+                super().__init__(n=10)
+                deltas = [[0.02 + 0.05 * i, 0.02 + 0.05 * i] for i in range(10)]
+                norms = [float(np.linalg.norm(np.array(d))) for d in deltas]
+                self_._table = pa.table({
+                    "primary_key": [f"H-{i:03d}" for i in range(10)],
+                    "scale": [1] * 10,
+                    "delta": deltas,
+                    "delta_norm": pa.array(norms, type=pa.float32()),
+                    "is_anomaly": [True] * 10,
+                    "delta_rank_pct": pa.array(
+                        [float(i) / 10 * 100 for i in range(10)], type=pa.float64()
+                    ),
+                    "last_refresh_at": [_DT] * 10,
+                    "updated_at": [_DT] * 10,
+                })
+
+            def read_sphere(self_):
+                sphere = Sphere("s", "s", ".")
+                sphere.patterns["test_pattern"] = Pattern(
+                    pattern_id="test_pattern",
+                    entity_type="test",
+                    pattern_type="anchor",
+                    relations=[
+                        RelationDef(line_id="line_a", direction="in", required=True),
+                        RelationDef(line_id="line_b", direction="in", required=True),
+                    ],
+                    mu=np.zeros(2, dtype=np.float32),  # mu=0 → shape=delta, distinct scores
+                    sigma_diag=np.ones(2, dtype=np.float32),
+                    theta=np.array([0.0, 3.0], dtype=np.float32),
+                    population_size=10,
+                    computed_at=_DT,
+                    version=1,
+                    status="production",
+                    edge_max=np.array([10.0, 10.0], dtype=np.float32),
+                )
+                return sphere
+
+        nav = GDSNavigator(engine, _SpreadStorage(), _MANIFEST, _CONTRACT)
+        alpha = 0.3
+        strongest_key = nav.π7_attract_hub("test_pattern", top_n=10)[0][0]
+        hubs = nav.π7_attract_hub("test_pattern", top_n=10, fdr_alpha=alpha)
+        # The strongest hub (right-tail) must survive; the inverted formula
+        # rejected it (p=1.0) and could not pass BH at all (empty result).
+        assert len(hubs) > 0, "strongest hubs must pass FDR"
+        assert strongest_key in {h[0] for h in hubs}, (
+            "the strongest hub must survive FDR (right-tail polarity)"
+        )
+        # Sibling agreement: standalone == π7_attract_hub_and_stats survivors.
+        stats_hubs, _ = nav.π7_attract_hub_and_stats(
+            "test_pattern", top_n=10, fdr_alpha=alpha,
+        )
+        assert {h[0] for h in hubs} == {h[0] for h in stats_hubs}
+
 
 # ======================================================================
 # π9 attract_drift

@@ -23,6 +23,7 @@ import pyarrow.csv as pa_csv
 import pyarrow.ipc as pa_ipc
 import pyarrow.parquet as pq
 
+from hypertopos._file_formats import normalized_suffix
 from hypertopos.cli.schema import SourceConfig, TransformSpec
 
 # ── type cast mapping ────────────────────────────────────────────────
@@ -89,7 +90,7 @@ def _load_file(
     if not p.exists():
         raise FileNotFoundError(f"Source file not found: {p}")
 
-    suffix = "".join(p.suffixes).lower()
+    suffix = normalized_suffix(p)
     fmt = (config.format if config else None) or ""
 
     if fmt == "csv" or suffix in (".csv", ".csv.gz", ".tsv"):

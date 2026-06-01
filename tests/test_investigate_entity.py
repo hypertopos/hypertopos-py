@@ -179,12 +179,20 @@ def test_per_edge_counterfactual_opt_in_calls_simulate_edge_removal(nav):
         {"edge_id": "E1", "drop_pct": 12.5, "delta_norm_after": 3.1},
         {"edge_id": "E2", "drop_pct": 8.0, "delta_norm_after": 3.4},
     ]
+    # simulate_edge_removal returns the {edges, edges_total, edges_evaluated,
+    # truncated} envelope; investigate_entity extracts ["edges"].
+    sim_envelope = {
+        "edges": expected_rows,
+        "edges_total": 2,
+        "edges_evaluated": 2,
+        "truncated": False,
+    }
     with patch.object(nav, "explain_anomaly", return_value={"top_witness_dims": []}), \
          patch.object(nav, "find_witness_cohort", return_value={"members": []}), \
          patch.object(nav, "find_chains_for_entity", return_value=[]), \
          patch.object(nav, "trace_root_cause", return_value={"steps": []}), \
          patch.object(nav, "find_graph_geometry_tension", return_value={"tension_score": 0.0}), \
-         patch.object(nav, "simulate_edge_removal", return_value=expected_rows) as mock_sim, \
+         patch.object(nav, "simulate_edge_removal", return_value=sim_envelope) as mock_sim, \
          patch.object(nav, "_resolve_version", return_value=1):
         result = nav.investigate_entity(
             "A", pattern_id="p", line_id="l",

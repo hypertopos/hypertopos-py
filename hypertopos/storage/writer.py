@@ -502,6 +502,77 @@ class GDSWriter:
         })
         ds.merge_insert("primary_key").when_matched_update_all().execute(updates)
 
+    def recompute_conformal_p(self, pattern_id: str) -> None:
+        """Recompute conformal_p globally across all entities in the pattern geometry.
+
+        The conformal p-value is a whole-population right-tail statistic
+        (``p = fraction of the population with delta_norm >= this entity's``,
+        so *lower = more anomalous*). Incremental appends write a batch-local
+        value, so — exactly like ``recompute_delta_rank_pct`` — it must be
+        recomputed against the full population after an append, or freshly
+        ingested rows carry a p-value relative only to their ingest batch.
+        Same O(N) cost profile and call sites as ``recompute_delta_rank_pct``.
+        """
+        from hypertopos.builder._stats import compute_conformal_p
+
+        lance_path = self._base / "geometry" / pattern_id / "data.lance"
+        if not lance_path.exists():
+            return
+        ds = _lance.dataset(str(lance_path))
+        if "conformal_p" not in {f.name for f in ds.schema}:
+            return
+        tbl = ds.to_table(columns=["primary_key", "delta_norm"])
+        delta_norms = tbl["delta_norm"].to_numpy(zero_copy_only=False)
+        if len(delta_norms) == 0:
+            return
+        new_cp = compute_conformal_p(delta_norms)
+        updates = pa.table({
+            "primary_key": tbl["primary_key"],
+            "conformal_p": pa.array(new_cp, type=pa.float32()),
+        })
+        ds.merge_insert("primary_key").when_matched_update_all().execute(updates)
+
+    def recompute_rank_stats(self, pattern_id: str) -> None:
+        """Recompute the population-relative geometry stats — ``delta_rank_pct``
+        and ``conformal_p`` — in a single pass.
+
+        Both are O(N) whole-population statistics over ``delta_norm``. Computing
+        them together reads the geometry once and issues one ``merge_insert``,
+        halving the append-path recompute I/O versus calling
+        ``recompute_delta_rank_pct`` and ``recompute_conformal_p`` back to back.
+        Recomputes whichever of the two columns the geometry actually carries.
+        """
+        from hypertopos.builder._stats import compute_conformal_p
+
+        lance_path = self._base / "geometry" / pattern_id / "data.lance"
+        if not lance_path.exists():
+            return
+        ds = _lance.dataset(str(lance_path))
+        field_names = {f.name for f in ds.schema}
+        has_rank = "delta_rank_pct" in field_names
+        has_cp = "conformal_p" in field_names
+        if not (has_rank or has_cp):
+            return
+        tbl = ds.to_table(columns=["primary_key", "delta_norm"])
+        delta_norms = tbl["delta_norm"].to_numpy(zero_copy_only=False)
+        n = len(delta_norms)
+        if n == 0:
+            return
+        cols: dict[str, Any] = {"primary_key": tbl["primary_key"]}
+        if has_rank:
+            sorted_norms = np.sort(delta_norms)
+            ranks = np.searchsorted(sorted_norms, delta_norms, side="left")
+            cols["delta_rank_pct"] = pa.array(
+                (ranks / n * 100).astype(np.float32), type=pa.float32()
+            )
+        if has_cp:
+            cols["conformal_p"] = pa.array(
+                compute_conformal_p(delta_norms), type=pa.float32()
+            )
+        ds.merge_insert("primary_key").when_matched_update_all().execute(
+            pa.table(cols)
+        )
+
     def append_geometry(self, table: pa.Table, pattern_id: str) -> None:
         """Append new geometry rows to an existing Lance geometry dataset.
 
@@ -537,7 +608,7 @@ class GDSWriter:
         else:
             _write_lance(table, str(lance_path), mode="create")
         self._maybe_reindex_geometry(pattern_id)
-        self.recompute_delta_rank_pct(pattern_id)
+        self.recompute_rank_stats(pattern_id)
 
     def _build_indices_on_lance_path(
         self, lance_path: Path, n_rows: int, list_size: int | None,

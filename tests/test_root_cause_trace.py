@@ -1151,7 +1151,7 @@ class TestTraceRootCauseQualityFixes:
         )
         monkeypatch.setattr(GDSNavigator, "π7_attract_hub", lambda self, pid, top_n=10, **kw: [])
         monkeypatch.setattr(GDSNavigator, "edge_potential",
-            lambda self, fk, tk, pid: {
+            lambda self, fk, tk, pid, **kw: {
                 "score": 12.5, "delta_distance": 5.0,
                 "pair_tx_count": 1, "effective_weight": 1.0,
                 "from_key": fk, "to_key": tk, "pattern_id": pid,
@@ -1189,7 +1189,7 @@ class TestTraceRootCauseQualityFixes:
         )
         monkeypatch.setattr(GDSNavigator, "π7_attract_hub", lambda self, pid, top_n=10, **kw: [])
         monkeypatch.setattr(GDSNavigator, "edge_potential",
-            lambda self, fk, tk, pid: {
+            lambda self, fk, tk, pid, **kw: {
                 "score": 8.0, "delta_distance": 4.0,
                 "pair_tx_count": 1, "effective_weight": 1.0,
                 "from_key": fk, "to_key": tk, "pattern_id": pid,
@@ -1243,7 +1243,7 @@ class TestTraceRootCauseQualityFixes:
         )
         monkeypatch.setattr(GDSNavigator, "π7_attract_hub", lambda self, pid, top_n=10, **kw: [])
         monkeypatch.setattr(GDSNavigator, "edge_potential",
-            lambda self, fk, tk, pid: {
+            lambda self, fk, tk, pid, **kw: {
                 "score": 1.0, "delta_distance": 1.0,
                 "pair_tx_count": 1, "effective_weight": 1.0,
                 "from_key": fk, "to_key": tk, "pattern_id": pid,

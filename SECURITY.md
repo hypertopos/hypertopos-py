@@ -1,6 +1,6 @@
 # Security
 
-## Current version: 0.8.0
+## Current version: 0.8.1
 
 hypertopos runs locally. No network services, no auth layer, no multi-tenancy.
 

@@ -106,7 +106,7 @@ with sphere.session("agent-1") as session:
 | π5 | `π5_attract_anomaly(pattern_id, radius, top_n, fdr_alpha, fdr_method, p_value_method, select, min_confidence)` | Find most anomalous polygons | `(list[Polygon], int, list, dict)` |
 | π6 | `π6_attract_boundary(alias_id, pattern_id, direction, top_n, fdr_alpha, fdr_method, p_value_method, select)` | Find entities nearest to alias cutting plane | `list[(Polygon, float)]` |
 | π7 | `π7_attract_hub(pattern_id, top_n, line_id_filter, fdr_alpha, fdr_method, p_value_method, select)` | Find entities with highest connectivity | `list[(str, int, float)]` |
-| π7+ | `π7_attract_hub_and_stats(pattern_id, top_n, line_id_filter)` | Hub ranking + population hub score statistics in one scan | `(list, dict)` |
+| π7+ | `π7_attract_hub_and_stats(pattern_id, top_n, line_id_filter, fdr_alpha, fdr_method, p_value_method, select)` | Hub ranking + population hub score statistics in one scan | `(list, dict)` |
 | π8 | `π8_attract_cluster(pattern_id, n_clusters, top_n, sample_size)` | Discover geometric archetypes via k-means++ | `list[dict]` |
 
 **Temporal** — population and trajectory analysis over time:
@@ -257,7 +257,7 @@ builder = GDSBuilder(
 | `add_chain_line(line_id, chains, features)` | Create anchor line from extracted chain dicts |
 | `add_alias(alias_id, base_pattern_id, cutting_plane_dimension, cutting_plane_threshold)` | Register an alias with a cutting plane for sub-population analysis |
 | `build(temporal_configs=None)` | Validate, compute statistics, write all files. Pass `temporal_configs` to run geometry→temporal pipeline per pattern. Returns output path |
-| `incremental_update(pattern_id, changed_entities, deleted_keys, recalibrate, reindex, recompute_ranks)` | Add/modify/delete entities without a full rebuild; new entities are immediately visible to anomaly search. Supports patterns whose dimensions are relations, event dimensions, edge-dim aggregations, and tracked properties. `reindex=True` rebuilds the ANN index immediately; `recompute_ranks=False` defers the global `delta_rank_pct` recompute for batched ingestion |
+| `incremental_update(pattern_id, changed_entities, deleted_keys, recalibrate, reindex, recompute_ranks)` | Add/modify/delete entities without a full rebuild; new entities are immediately visible to anomaly search. Supports patterns whose dimensions are relations, event dimensions, edge-dim aggregations, and tracked properties; group-calibrated (`group_by_property`), GMM, and FDR-hierarchy patterns are rejected and must be rebuilt. `reindex=True` rebuilds the ANN index immediately; `recompute_ranks=False` defers the global `delta_rank_pct` recompute for batched ingestion |
 | `finalize_incremental(pattern_id)` | Recompute the global `delta_rank_pct` percentile once and rebuild the ANN index. Call at the end of a batched ingestion session that used `recompute_ranks=False` |
 | `build_temporal(time_col, time_window)` | Generate temporal snapshots from time-windowed event data. Call after `build()` when not using pipeline mode |
 

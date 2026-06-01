@@ -39,12 +39,40 @@ TRAJECTORY_SCHEMA = pa.schema([
 ])
 
 
-def cache_path(sphere_root: Path, kind: str, pattern_id: str, version: int) -> Path:
+def cache_path(
+    sphere_root: Path,
+    kind: str,
+    pattern_id: str,
+    version: int,
+    params_key: str = "",
+) -> Path:
     """Resolve the sidecar Lance path for one (kind, pattern_id, version) tuple.
 
     ``kind`` is ``"anomalies"`` or ``"trajectory"`` and selects the subfolder.
+    ``params_key`` distinguishes cache files computed with different scoring
+    parameters (e.g. ``k_neighbors`` / ``pca_dim``): distinct parameter sets get
+    distinct sidecar files at the same version, so a re-score with changed
+    parameters never reads a cache built under different ones. Empty by default
+    (back-compatible ``v={version}.lance``).
     """
-    return sphere_root / "_gds_meta" / "topology_cache" / kind / pattern_id / f"v={version}.lance"
+    return (
+        sphere_root / "_gds_meta" / "topology_cache" / kind / pattern_id
+        / f"v={version}{params_key}.lance"
+    )
+
+
+def anomalies_params_key(
+    *,
+    k_neighbors: int,
+    pca_dim: int,
+    sample_size: int,
+    homology_dim: int,
+) -> str:
+    """Cache-key suffix encoding the ``find_topological_anomalies`` scoring
+    parameters. The H_1 persistence scores depend on every one of these, so two
+    calls that differ in any must not share a cache file.
+    """
+    return f"_k{k_neighbors}_pca{pca_dim}_s{sample_size}_h{homology_dim}"
 
 
 def read_cache(path: Path) -> pa.Table | None:

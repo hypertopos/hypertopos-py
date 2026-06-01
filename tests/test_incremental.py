@@ -296,6 +296,63 @@ def agg_sphere(tmp_path):
     return _build_agg_sphere(tmp_path / "gds_inc_agg")
 
 
+def test_build_refuses_tracked_properties_with_edge_blocks(tmp_path):
+    """A pattern declaring BOTH tracked_properties and an edge_dimensions /
+    edge_dim_aggregations block is refused at build: the geometry concat and the
+    dim-label layer order these blocks differently, so per-dimension stats would
+    be silently mis-attributed (dim_index resolves prop/agg labels to the wrong
+    delta slot). No shipped sphere pairs the blocks — guard until the dimension
+    order is unified."""
+    from hypertopos.builder import GDSBuilder, RelationSpec
+    from hypertopos.builder.builder import EdgeTableConfig
+    from hypertopos.builder.mapping import (
+        EdgeDimAggregationsConfig,
+        EdgeDimensionsConfig,
+    )
+
+    b = GDSBuilder("test_guard", str(tmp_path / "gds_guard"))
+    b.add_line(
+        "accounts",
+        [
+            {"acct_id": "A", "name": "alpha"},
+            {"acct_id": "B", "name": "beta"},
+            {"acct_id": "C", "name": "gamma"},
+            {"acct_id": "D", "name": "delta"},
+        ],
+        key_col="acct_id", source_id="t",
+    )
+    b.add_line(
+        "transactions",
+        [
+            {"tx_id": f"ek{i}", "from_acct": "A", "to_acct": "B",
+             "ts": float(i), "amount": 100.0}
+            for i in range(6)
+        ],
+        key_col="tx_id", source_id="t",
+    )
+    b.add_pattern(
+        "tx_pattern", pattern_type="event", entity_line="transactions",
+        relations=[
+            RelationSpec("accounts", fk_col="from_acct", direction="in", required=True),
+        ],
+        edge_table=EdgeTableConfig(
+            from_col="from_acct", to_col="to_acct",
+            timestamp_col="ts", amount_col="amount",
+        ),
+        edge_dimensions=EdgeDimensionsConfig(dims={"pair_edge_count": {}}),
+    )
+    b.add_pattern(
+        "account_pattern", pattern_type="anchor", entity_line="accounts",
+        relations=[],
+        tracked_properties=["name"],  # prop block ...
+        edge_dim_aggregations=EdgeDimAggregationsConfig(  # ... + edge-agg block
+            from_event_pattern="tx_pattern", dims=("pair_edge_count",),
+        ),
+    )
+    with pytest.raises(ValueError, match="tracked_properties"):
+        b.build()
+
+
 def test_incremental_update_edge_dim_aggregation_pattern(agg_sphere):
     """incremental_update on an anchor pattern with an edge_dim_aggregations
     block must NOT raise the (N, n_relations) (mu_width,) broadcast error.
@@ -455,6 +512,113 @@ def _read_rank(sphere_path, key, pattern_id="cust_pattern"):
     return float(row["delta_rank_pct"][0].as_py())
 
 
+def _read_conformal_p(sphere_path, key, pattern_id="cust_pattern"):
+    reader = GDSReader(sphere_path)
+    geo = reader.read_geometry(pattern_id, version=1)
+    row = geo.filter(pc.equal(geo["primary_key"], key))
+    assert row.num_rows == 1
+    return float(row["conformal_p"][0].as_py())
+
+
+def test_incremental_conformal_p_is_population_relative_not_batch_local(tmp_path):
+    """An entity ingested via incremental_update must get a population-relative
+    conformal_p (right-tail: lower = more anomalous), not the old batch-local /
+    polarity-inverted value.
+
+    Regression: incremental_update wrote conformal_p = (rank+1)/(n_new+1) over
+    the ingest batch only, with left-rank polarity — so the most-anomalous
+    ingested row got the LARGEST p (looked benign) and a single-entity append
+    always got exactly 0.5, contradicting the documented 'lower = more
+    anomalous' contract that assess_anomaly_certainty / composite_risk rely on.
+    The fix recomputes conformal_p globally (recompute_conformal_p), mirroring
+    delta_rank_pct."""
+    sphere = _build_anchor_sphere(tmp_path / "gds_cp", 300)
+
+    # Append ONE extreme outlier: event_count far above the population.
+    outlier = pa.table({
+        "primary_key": pa.array(["C_OUTLIER"], type=pa.string()),
+        "event_count": pa.array([99999.0], type=pa.float64()),
+    })
+    b = GDSBuilder("test_inc_perf", sphere)
+    b.incremental_update("cust_pattern", changed_entities=outlier, recalibrate="never")
+
+    cp = _read_conformal_p(sphere, "C_OUTLIER")
+    # Right-tail population p: an extreme outlier sits at the top of the
+    # population, so very few rows have a >= norm → p near 1/N (small).
+    # The old bug gave ~0.5 (single-batch (0+1)/(1+1)) or an inverted-large p.
+    assert cp < 0.05, (
+        f"extreme ingested outlier must get a small (population-relative) "
+        f"conformal_p, got {cp} — batch-local/inverted regression"
+    )
+    # Sanity: it must NOT be the tell-tale single-batch 0.5.
+    assert abs(cp - 0.5) > 0.01
+
+    # And it agrees with the population oracle on the full post-ingest set.
+    from hypertopos.builder._stats import compute_conformal_p
+    geo = GDSReader(sphere).read_geometry("cust_pattern", version=1)
+    norms = geo["delta_norm"].to_numpy(zero_copy_only=False)
+    keys = geo["primary_key"].to_pylist()
+    oracle = compute_conformal_p(norms)
+    idx = keys.index("C_OUTLIER")
+    assert abs(cp - float(oracle[idx])) < 1e-3, (
+        f"stored conformal_p {cp} must match the full-population oracle "
+        f"{float(oracle[idx])}"
+    )
+
+
+def test_recompute_rank_stats_matches_separate_recomputes(tmp_path):
+    """recompute_rank_stats (single-pass) produces the same delta_rank_pct and
+    conformal_p as calling recompute_delta_rank_pct + recompute_conformal_p
+    separately — at half the append-path scan/merge I/O. Corrupts both columns
+    first so the recompute is observably doing work, not a no-op."""
+    import lance
+    from pathlib import Path
+
+    from hypertopos.storage.writer import GDSWriter
+
+    sphere = _build_anchor_sphere(tmp_path / "gds_fuse", 300)
+    extra = pa.table({
+        "primary_key": pa.array([f"C_X{i}" for i in range(5)], type=pa.string()),
+        "event_count": pa.array([10.0, 50.0, 99999.0, 1.0, 500.0], type=pa.float64()),
+    })
+    GDSBuilder("test_inc_perf", sphere).incremental_update(
+        "cust_pattern", changed_entities=extra, recalibrate="never",
+    )
+
+    geo_path = str(Path(sphere) / "geometry" / "cust_pattern" / "data.lance")
+    pks = lance.dataset(geo_path).to_table(columns=["primary_key"])["primary_key"]
+    sentinel = pa.array([-1.0] * len(pks), type=pa.float32())
+
+    def _corrupt():
+        lance.dataset(geo_path).merge_insert(
+            "primary_key"
+        ).when_matched_update_all().execute(pa.table({
+            "primary_key": pks,
+            "delta_rank_pct": sentinel,
+            "conformal_p": sentinel,
+        }))
+
+    def _read():
+        geo = GDSReader(sphere).read_geometry("cust_pattern", version=1)
+        return {
+            r["primary_key"]: (r["delta_rank_pct"], r["conformal_p"])
+            for r in geo.to_pylist()
+        }
+
+    writer = GDSWriter(str(sphere))
+    _corrupt()
+    writer.recompute_rank_stats("cust_pattern")
+    fused = _read()
+    _corrupt()
+    writer.recompute_delta_rank_pct("cust_pattern")
+    writer.recompute_conformal_p("cust_pattern")
+    separate = _read()
+
+    assert fused == separate
+    # The fused recompute actually ran — no sentinel survived.
+    assert all(rank != -1.0 and cp != -1.0 for rank, cp in fused.values())
+
+
 def test_incremental_recompute_ranks_false_defers_then_finalize(tmp_path):
     """recompute_ranks=False keeps existing rows' delta_rank_pct stale during
     batched ingestion; finalize_incremental restores them to the same values
@@ -513,6 +677,29 @@ def test_incremental_recompute_ranks_false_defers_then_finalize(tmp_path):
         f"finalize_incremental must restore correct population percentile; "
         f"got {rank_deferred_final}, reference {rank_ref}"
     )
+
+
+def test_incremental_update_rejects_grouped_pattern(tmp_path):
+    """incremental_update must refuse a group_by_property / GMM / FDR pattern
+    rather than silently recomputing its geometry against the GLOBAL (not
+    per-group) mu/sigma/theta — which would write delta_norm / is_anomaly that
+    disagree with build() and drop the FDR carrier columns the dataset carries."""
+    import json as _json
+
+    sphere = _build_anchor_sphere(tmp_path / "gds_grouped", 300)
+    sj_path = Path(sphere) / "_gds_meta" / "sphere.json"
+    sj = _json.loads(sj_path.read_text())
+    sj["patterns"]["cust_pattern"]["group_by_property"] = "region"
+    sj_path.write_text(_json.dumps(sj))
+
+    extra = pa.table({
+        "primary_key": pa.array(["C_NEW"], type=pa.string()),
+        "event_count": pa.array([5.0], type=pa.float64()),
+    })
+    with pytest.raises(ValueError, match="group_by_property"):
+        GDSBuilder("test_inc_grouped", sphere).incremental_update(
+            "cust_pattern", changed_entities=extra, recalibrate="never",
+        )
 
 
 def test_incremental_reindex_covers_all_rows_after_recompute(tmp_path):
@@ -690,3 +877,45 @@ def test_compute_entity_geometry_basic():
     assert shapes[0, 0] == 1.0
     assert shapes[1, 0] == 0.0
     assert shapes[2, 0] == 1.0
+
+
+def test_compute_entity_geometry_raises_on_absent_edge_dim_agg_column():
+    """A declared edge_dim_aggregation column absent from the ingested table
+    must RAISE, not silently zero-fill.
+
+    Regression for the silent-wrong-result: an absent {dim}_{agg} column left
+    the shape at 0.0, and the z-score turned that into delta = (0 - mu)/sigma —
+    non-zero for any aggregation whose population mean is non-zero (e.g. a
+    transaction-amount mean), inflating delta_norm and able to flip is_anomaly
+    with no diagnostic. The guard now fails loud instead.
+    """
+    entity_table = pa.table({"primary_key": pa.array(["A"], type=pa.string())})
+    mu = np.array([50.0], dtype=np.float32)   # nonzero population mean
+    sigma = np.array([10.0], dtype=np.float32)
+
+    with pytest.raises(ValueError, match="declared value column"):
+        compute_entity_geometry(
+            entity_table, mu, sigma, [],
+            edge_dim_agg_labels=["amount_mean"],
+        )
+
+
+def test_compute_entity_geometry_absent_edge_dim_agg_would_corrupt_geometry():
+    """Pin the underlying divergence the guard prevents: WITHOUT the guard an
+    absent column produces a spurious delta, whereas the same entity carrying
+    the column at the population mean produces delta 0. Asserting the present-
+    column path is correct (delta_norm == 0 at mu) documents what the absent
+    path would otherwise have wrongly reported as anomalous (delta_norm == 5)."""
+    mu = np.array([50.0], dtype=np.float32)
+    sigma = np.array([10.0], dtype=np.float32)
+    present = pa.table(
+        {
+            "primary_key": pa.array(["A"], type=pa.string()),
+            "amount_mean": pa.array([50.0], type=pa.float64()),
+        }
+    )
+    _d, norms, _s = compute_entity_geometry(
+        present, mu, sigma, [], edge_dim_agg_labels=["amount_mean"],
+    )
+    # Entity at the population mean is NOT anomalous: delta_norm ~ 0.
+    assert float(norms[0]) == pytest.approx(0.0, abs=1e-6)

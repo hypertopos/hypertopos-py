@@ -1402,8 +1402,9 @@ class GDSReader:
         """Resolve primary keys via geometry entity_keys LABEL_LIST index.
 
         Returns list of primary_keys whose entity_keys contain *point_key*.
-        When *line_id* is given, further filters to rows where the entity_key
-        at the relation index matching *line_id* equals *point_key*.
+        When *line_id* is given, further filters to rows where *point_key*
+        occupies any of *line_id*'s relation slots (a line may be referenced by
+        more than one relation, e.g. an account as both sender and receiver).
 
         Returns None if the geometry dataset doesn't exist or lacks
         entity_keys column (caller should fall back to full scan).
@@ -1433,21 +1434,27 @@ class GDSReader:
                 filter=filter_expr, columns=["primary_key"],
             ).to_table()
             return tbl.column("primary_key").to_pylist()
-        rel_idx = None
-        for i, rel in enumerate(pattern.relations):
-            if rel.line_id == line_id:
-                rel_idx = i
-                break
-        if rel_idx is None:
+        rel_indices = [
+            i for i, rel in enumerate(pattern.relations)
+            if rel.line_id == line_id
+        ]
+        if not rel_indices:
             return []
-        # Read matching rows and post-filter by positional entity_keys[rel_idx]
+        # Read matching rows and post-filter: keep rows where point_key sits in
+        # ANY of line_id's relation slots. A line can appear in more than one
+        # relation (e.g. an account as both transaction sender and receiver),
+        # so a single rel_idx would silently drop polygons where point_key
+        # occupies a non-first slot — the array_contains pre-filter already
+        # matched it in any slot, and the full-scan fallback is any-slot too.
         tbl = ds.scanner(
             filter=filter_expr, columns=["primary_key", "entity_keys"],
         ).to_table()
         results = []
         for i in range(tbl.num_rows):
             ek = tbl["entity_keys"][i].as_py()
-            if ek and rel_idx < len(ek) and ek[rel_idx] == point_key:
+            if ek and any(
+                idx < len(ek) and ek[idx] == point_key for idx in rel_indices
+            ):
                 results.append(tbl["primary_key"][i].as_py())
         return results
 

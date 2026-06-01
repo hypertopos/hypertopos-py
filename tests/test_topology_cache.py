@@ -9,6 +9,7 @@ import pyarrow as pa
 from hypertopos.storage.topology_cache import (
     ANOMALIES_SCHEMA,
     TRAJECTORY_SCHEMA,
+    anomalies_params_key,
     cache_path,
     read_cache,
     write_cache,
@@ -18,6 +19,27 @@ from hypertopos.storage.topology_cache import (
 def test_cache_path_layout(tmp_path: Path):
     p = cache_path(tmp_path, "anomalies", "account_pattern", 3)
     assert p == tmp_path / "_gds_meta" / "topology_cache" / "anomalies" / "account_pattern" / "v=3.lance"
+
+
+def test_cache_path_params_key_distinct(tmp_path: Path):
+    """Distinct scoring params get distinct cache files at the same version;
+    the empty default stays back-compatible with the bare v=N.lance name."""
+    base = cache_path(tmp_path, "anomalies", "acct", 1)
+    k50 = cache_path(
+        tmp_path, "anomalies", "acct", 1,
+        anomalies_params_key(
+            k_neighbors=50, pca_dim=10, sample_size=50_000, homology_dim=1,
+        ),
+    )
+    k5 = cache_path(
+        tmp_path, "anomalies", "acct", 1,
+        anomalies_params_key(
+            k_neighbors=5, pca_dim=10, sample_size=50_000, homology_dim=1,
+        ),
+    )
+    assert base.name == "v=1.lance"
+    assert k50.name == "v=1_k50_pca10_s50000_h1.lance"
+    assert k50 != k5 and k50 != base and k5 != base
 
 
 def test_read_returns_none_when_missing(tmp_path: Path):

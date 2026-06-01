@@ -697,3 +697,65 @@ class TestDiscoverChains:
             min_hops=2, max_chains=20,
         )
         assert result["summary"]["total"] >= 0  # may be 0 if timestamps don't align
+
+    @staticmethod
+    def _cyclic_nav(edges):
+        """A navigator whose adjacency is a hand-built temporal edge map
+        ``{key: [(target, ts, amount), ...]}``, with geometric scoring
+        neutralised so chain-shape logic is tested in isolation."""
+        from unittest.mock import MagicMock
+
+        adj = MagicMock()
+        adj.neighbors_out = MagicMock(
+            side_effect=lambda k: [
+                (t, ts, amt, f"e_{k}_{t}") for (t, ts, amt) in edges.get(k, [])
+            ]
+        )
+        adj.neighbors_in = MagicMock(side_effect=lambda k: [])
+        storage = MagicMock()
+        storage.has_edge_table = MagicMock(return_value=True)
+        storage.get_adjacency = MagicMock(return_value=adj)
+        nav = GDSNavigator(MagicMock(), storage, MagicMock(), MagicMock())
+        nav._resolve_anchor_pattern_for_scoring = lambda pid: pid
+        nav._prefetch_deltas = lambda keys, pat: None
+        nav._score_hop = lambda a, b, pat, mode, **kw: 0.0
+        return nav
+
+    def test_cyclic_chain_detected(self):
+        """Regression: a round trip A→B→C→A must surface as a cyclic chain.
+
+        The BFS seeds path=[start, neighbor] and a revisit guard blocks
+        re-appending any path member — including `start` — so the closing
+        hop back to the origin was silently dropped and is_cyclic was
+        structurally always False (summary.cyclic always 0). A funds-return
+        round trip is a core AML laundering typology; the fix emits the
+        closing hop as a terminal cyclic chain (mirroring the build-time
+        chain extractor)."""
+        nav = self._cyclic_nav({
+            "A": [("B", 1.0, 10.0)],
+            "B": [("C", 2.0, 10.0)],
+            "C": [("A", 3.0, 10.0)],
+        })
+        res = nav.discover_chains(
+            "A", "tx_pattern", time_window_hours=168,
+            max_hops=5, min_hops=2, direction="forward",
+        )
+        assert res["summary"]["cyclic"] >= 1
+        closed = [c for c in res["chains"] if c["is_cyclic"]]
+        assert closed, "expected at least one cyclic chain"
+        for c in closed:
+            assert c["keys"][0] == c["keys"][-1] == "A"
+
+    def test_acyclic_chain_not_flagged_cyclic(self):
+        """An open chain A→B→C must NOT be reported cyclic (no false positive
+        from the cycle-closing branch)."""
+        nav = self._cyclic_nav({
+            "A": [("B", 1.0, 10.0)],
+            "B": [("C", 2.0, 10.0)],
+        })
+        res = nav.discover_chains(
+            "A", "tx_pattern", time_window_hours=168,
+            max_hops=5, min_hops=2, direction="forward",
+        )
+        assert res["summary"]["cyclic"] == 0
+        assert all(not c["is_cyclic"] for c in res["chains"])

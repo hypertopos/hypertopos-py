@@ -380,7 +380,7 @@ def find_topological_anomalies(
         top_n: number of top-score entities returned.
 
     Returns:
-        List of ``top_n`` dicts (sorted by topo_score descending) with fields
+        List of ``top_n`` dicts (sorted by h1_max_persistence descending) with fields
         ``primary_key``, ``topo_score``, ``h1_max_persistence``,
         ``h0_mean_death``, ``n_h1_features``, ``computed_at``.
 

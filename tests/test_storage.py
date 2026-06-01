@@ -2919,6 +2919,92 @@ class TestResolveByEntityKeys:
         assert pks is not None
         assert pks == []
 
+    def _build_multi_relation_fixture(self, tmp_path: Path) -> GDSReader:
+        """Geometry whose event pattern references one line in TWO relations
+        (transactions: accounts as both sender and receiver)."""
+        from hypertopos.storage.writer import _write_lance
+
+        sphere_json = {
+            "sphere_id": "test",
+            "format_version": "3.0",
+            "name": "test",
+            "lines": {
+                "accounts": {
+                    "line_id": "accounts",
+                    "entity_type": "account",
+                    "line_role": "anchor",
+                    "pattern_id": "acct_pattern",
+                    "partitioning": {"mode": "static", "columns": []},
+                    "versions": [1],
+                },
+            },
+            "patterns": {
+                "tx_pattern": {
+                    "pattern_id": "tx_pattern",
+                    "entity_type": "transaction",
+                    "pattern_type": "event",
+                    "version": 1,
+                    "status": "production",
+                    "relations": [
+                        {"line_id": "accounts", "direction": "out", "required": True},
+                        {"line_id": "accounts", "direction": "in", "required": True},
+                    ],
+                    "mu": [0.0, 0.0],
+                    "sigma_diag": [1.0, 1.0],
+                    "theta": [0.0, 0.0],
+                    "population_size": 3,
+                    "computed_at": "2024-01-01T00:00:00+00:00",
+                },
+            },
+            "aliases": {},
+        }
+        meta_dir = tmp_path / "_gds_meta"
+        meta_dir.mkdir(parents=True, exist_ok=True)
+        (meta_dir / "sphere.json").write_text(_json.dumps(sphere_json))
+        # entity_keys[0] = sender account, entity_keys[1] = receiver account
+        geo_table = pa.table(
+            {
+                "primary_key": ["TX-001", "TX-002", "TX-003"],
+                "delta": pa.array(
+                    [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]],
+                    type=pa.list_(pa.float32(), 2),
+                ),
+                "delta_norm": pa.array([0.2, 0.5, 0.8], type=pa.float32()),
+                "is_anomaly": [False, True, False],
+                "delta_rank_pct": pa.array([20.0, 70.0, 90.0], type=pa.float32()),
+                "entity_keys": [
+                    ["ACC-1", "ACC-2"],   # ACC-1 sends (slot 0)
+                    ["ACC-3", "ACC-1"],   # ACC-1 receives (slot 1)
+                    ["ACC-2", "ACC-3"],   # ACC-1 absent
+                ],
+            }
+        )
+        geo_path = tmp_path / "geometry" / "tx_pattern" / "data.lance"
+        geo_path.parent.mkdir(parents=True, exist_ok=True)
+        ds = _write_lance(geo_table, str(geo_path))
+        ds.create_scalar_index("entity_keys", index_type="LABEL_LIST")
+        return GDSReader(base_path=str(tmp_path))
+
+    def test_resolve_by_line_matches_all_relation_slots(self, tmp_path):
+        """When a line appears in MULTIPLE relations (accounts as both sender
+        and receiver), filtering by (line, key) must return polygons where the
+        key sits in ANY of that line's slots — not only the first.
+
+        Regression: resolve_primary_keys_by_edge stopped at the first matching
+        relation index and post-filtered entity_keys[first_idx] == key, so a
+        transaction where ACC-1 is only the receiver (slot 1) was silently
+        dropped even though array_contains matched it. This made the fast
+        entity_keys index path disagree with the (correct, any-slot) full-scan
+        fallback in event_polygons_for, and on a sphere with sender/receiver
+        relations dropped every polygon where the queried account was
+        receiver-only."""
+        reader = self._build_multi_relation_fixture(tmp_path)
+        pks = reader.resolve_primary_keys_by_edge("tx_pattern", 1, "accounts", "ACC-1")
+        assert pks is not None
+        # TX-001 (ACC-1 sender, slot 0) AND TX-002 (ACC-1 receiver, slot 1).
+        # The buggy first-slot-only code returned just ["TX-001"].
+        assert sorted(pks) == ["TX-001", "TX-002"]
+
 
 class TestAppendGeometry:
     """Tests for GDSWriter.append_geometry and _maybe_reindex_geometry."""

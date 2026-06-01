@@ -33,6 +33,8 @@ from typing import Any
 
 import numpy as np
 
+from hypertopos._file_formats import normalized_suffix
+
 
 def _sanitize_for_json(obj: Any) -> Any:
     """Replace non-finite floats (``±inf`` / ``NaN``) with ``None`` recursively.
@@ -383,7 +385,7 @@ def _load_points_table(points_path: str) -> Any:
         print(f"error: points file not found: {p}", file=sys.stderr)
         sys.exit(1)
 
-    suffix = "".join(p.suffixes).lower()
+    suffix = normalized_suffix(p)
     if suffix in (".arrow", ".arrows"):
         import pyarrow.feather as feather
 

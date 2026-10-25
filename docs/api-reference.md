@@ -11,6 +11,9 @@ classDiagram
     class HyperSphere {
         +open(path) HyperSphere$
         +session(agent_id) HyperSession
+        +create_branch(name) BranchInfo
+        +branches() list
+        +delete_branch(name)
     }
     class HyperSession {
         +navigator() GDSNavigator
@@ -45,15 +48,24 @@ classDiagram
 
 | Method | Description |
 |--------|-------------|
-| `HyperSphere.open(base_path)` | Open a sphere from disk. Returns `HyperSphere` |
-| `sphere.session(agent_id)` | Create an isolated session with MVCC-pinned versions |
+| `HyperSphere.open(base_path, branch=None)` | Open a sphere from disk. Returns `HyperSphere`. With `branch`, sessions default to that branch; a missing or partly deleted branch raises `GDSError` naming the dataset |
+| `sphere.session(agent_id, branch=None)` | Create an isolated session that pins the data versions and the sphere metadata it reads. With `branch` (or the branch the sphere was opened on), the session reads the branch: its own geometry and temporal centroids, the other datasets at the versions recorded when the branch was created, and the branch's copy of the metadata. Caches the session writes (topological anomalies, influencer history) stay in the branch directory |
+| `sphere.create_branch(name, *, created_by="", purpose="")` | Create a branch from the current state without copying data: geometry and temporal centroids get a Lance branch, every other dataset is pinned at its current version, and the metadata files are copied to `_gds_meta/branches/<name>/`. Returns `BranchInfo` |
+| `sphere.branches()` | `list[BranchInfo]` sorted by name: `name`, `created_at`, `created_by`, `purpose`, `replayable`, `n_recipes`, `parent_versions`, `stale` (main geometry moved past the branch's parent version), `complete` (`False` when branch creation was interrupted) |
+| `sphere.promote_branch(name, *, agent_id="_promote")` | Make main equal to the branch by replaying its recipes on main. Refused (`GDSError`) while an open session in the same process reads the branch, when main moved since the branch was created, when a branch commit is not recorded by a recipe, or while another promotion holds the lock. Each replayed recalibration must reproduce the branch's fit exactly (sha256 of mu); otherwise main's datasets and metadata are restored and the branch is kept. On success the branch is deleted. Returns `PromoteReport` (`name`, `recipes_replayed`, `versions_before`, `versions_after`) |
+| `sphere.delete_branch(name)` | Delete the branch's Lance branches and its metadata directory; also removes a partly deleted branch or one whose creation was interrupted. Refused (`GDSError`) while an open session in the same process reads the branch |
+
+While a sphere has branches, `GDSBuilder.build()` into its directory raises `GDSError` naming them, and `sphere build --force` exits with an error: a full build would rewrite the datasets the branches are pinned to.
 
 ### HyperSession
 
 | Method | Description |
 |--------|-------------|
 | `session.navigator()` | Create a `GDSNavigator` bound to this session's manifest |
-| `session.recalibrate(pattern_id)` | Full recalibration: recompute mu/sigma/theta, rebuild geometry, reset drift tracker |
+| `session.recalibrate(pattern_id, soft_threshold=None, hard_threshold=None, *, branch=None, exclude_keys=None)` | Full recalibration: recompute mu/sigma/theta, rebuild geometry, reset drift tracker. The session sees the result immediately. `exclude_keys` leaves those entities out of the fit (every entity is still scored; an unknown key raises `ValueError`). On a branch session it writes only the branch. `branch=` on a main session runs it on that branch, creating it when absent, and leaves main and the session untouched. A recalibration on a branch is appended to the branch's recipe log in `branch.json`. The result adds `n_excluded` and `branch` |
+| `session.sphere()` | Sphere metadata of the session's snapshot |
+| `session.refresh()` | Move the session (and its navigators) to the sphere's latest state |
+| `session.is_stale()` | `SnapshotStatus`: `stale`, `metadata_changed`, `pinned_versions`, `latest_versions`, `pinned_at` — whether the sphere changed after the session opened |
 | `session.set_forecast_provider(provider)` | Plug in an external forecast provider (or `None` for built-in) |
 | `session.close(purge_temporal=False)` | Expire the manifest. Optional: purge agent temporal data |
 
@@ -105,15 +117,15 @@ with sphere.session("agent-1") as session:
 |-----------|--------|--------------|---------|
 | π5 | `π5_attract_anomaly(pattern_id, radius, top_n, fdr_alpha, fdr_method, p_value_method, select, min_confidence)` | Find most anomalous polygons | `(list[Polygon], int, list, dict)` |
 | π6 | `π6_attract_boundary(alias_id, pattern_id, direction, top_n, fdr_alpha, fdr_method, p_value_method, select)` | Find entities nearest to alias cutting plane | `list[(Polygon, float)]` |
-| π7 | `π7_attract_hub(pattern_id, top_n, line_id_filter, fdr_alpha, fdr_method, p_value_method, select)` | Find entities with highest connectivity | `list[(str, int, float)]` |
-| π7+ | `π7_attract_hub_and_stats(pattern_id, top_n, line_id_filter, fdr_alpha, fdr_method, p_value_method, select)` | Hub ranking + population hub score statistics in one scan | `(list, dict)` |
+| π7 | `π7_attract_hub(pattern_id, top_n, line_id_filter, select)` | Find entities with highest connectivity | `list[(str, int, float)]` |
+| π7+ | `π7_attract_hub_and_stats(pattern_id, top_n, line_id_filter, select)` | Hub ranking + population hub score statistics in one scan | `(list, dict)` |
 | π8 | `π8_attract_cluster(pattern_id, n_clusters, top_n, sample_size)` | Discover geometric archetypes via k-means++ | `list[dict]` |
 
 **Temporal** — population and trajectory analysis over time:
 
 | Primitive | Method | What it does | Returns |
 |-----------|--------|--------------|---------|
-| π9 | `π9_attract_drift(pattern_id, top_n, sample_size, fdr_alpha, fdr_method, p_value_method, select)` | Find entities with highest temporal drift | `list[dict]` |
+| π9 | `π9_attract_drift(pattern_id, top_n, sample_size, select)` | Find entities with highest temporal drift | `list[dict]` |
 | π10 | `π10_attract_trajectory(primary_key, pattern_id, top_n)` | Find entities with similar temporal trajectory | `list[dict]` |
 | π11 | `π11_attract_population_compare(pattern_id, window_a_from, window_a_to, window_b_from, window_b_to)` | Compare population geometry between two time windows | `dict` |
 | π12 | `π12_attract_regime_change(pattern_id, timestamp_from, timestamp_to)` | Detect population geometry regime shifts | `list[dict]` |
@@ -123,7 +135,8 @@ with sphere.session("agent-1") as session:
 | Method | Description |
 |--------|-------------|
 | `find_geometric_path(from_key, to_key, pattern_id, max_depth=5, beam_width=50, scoring="geometric")` | Bidirectional BFS for paths between two entities via the edge table, scored by geometric coherence. Scoring modes: `"geometric"` (witness overlap + delta alignment + anomaly preservation), `"amount"` (geometric score modulated by log(transaction amount)), `"anomaly"` (prefer paths through anomalous entities), `"shortest"` (plain BFS, no geometric scoring). Returns top `beam_width` paths by score |
-| `discover_chains(primary_key, pattern_id, time_window_hours=168, max_hops=10, min_hops=2, max_chains=100, direction="forward")` | Runtime temporal BFS on the edge table to discover entity chains from a starting point. Unlike `find_chains_for_entity()` which queries pre-computed chains, this performs live traversal -- works without build-time chain extraction |
+| `extract_chains(event_pattern_id, from_col=None, to_col=None, time_col=None, ..., seed_nodes=None, bidirectional=False, anchor_pattern_id=None)` | Extract chains from an event line's from/to columns. With `seed_nodes=[key]` the traversal starts from specific entities and uses every event (exact chains). Without `seed_nodes`, start nodes are sampled for population-wide extraction. No edge table required. `bidirectional=True` treats edges as undirected. With `anchor_pattern_id`, each chain carries per-hop `edge_potentials`. |
+| `extract_chains(event_pattern_id, from_col=None, to_col=None, time_col=None, category_col=None, amount_col=None, ..., seed_nodes=None, bidirectional=False, anchor_pattern_id=None)` | Extract chains from an event line. `from_col`/`to_col`/`time_col`/`amount_col` default to the pattern's edge-table configuration. With `seed_nodes=[key]`, uses every event (exact chains from those entities). Without `seed_nodes`, start nodes are sampled. `bidirectional=True` treats edges as undirected. With `anchor_pattern_id`, each chain carries per-hop `edge_potentials`. |
 | `entity_flow(primary_key, pattern_id, top_n=20, *, timestamp_cutoff=None)` | Net flow analysis per counterparty via edge table. Two edge lookups (outgoing + incoming), sum amounts, compute per-counterparty net flow. `timestamp_cutoff` (Unix seconds) restricts to edges with `timestamp <= cutoff`. Returns outgoing/incoming totals, net_flow, flow_direction, counterparties sorted by abs(net_flow) |
 | `contagion_score(primary_key, pattern_id, *, timestamp_cutoff=None)` | Score how many of an entity's counterparties are anomalous via edge table + geometry check. `timestamp_cutoff` enables as-of contagion reconstruction. Returns score (0.0–1.0), total/anomalous counterparty counts |
 | `contagion_score_batch(primary_keys, pattern_id, max_keys=200, *, timestamp_cutoff=None)` | Batch contagion scoring for multiple entities — forwards `timestamp_cutoff` to each per-entity call. Returns per-entity scores plus summary (mean, max, high_contagion_count) |
@@ -145,16 +158,15 @@ with sphere.session("agent-1") as session:
 
 | Method | Description |
 |--------|-------------|
-| `explain_anomaly(primary_key, pattern_id)` | Structured investigation: severity, witness set, repair set, conformal p-value, reputation, Bregman contributions under `top_dimensions[]` (fields: `dim`, `kind`, `bregman`, `pct_of_total`), and `reliability_flags` (per-polygon triage: `single_dim_driven`, `dominant_dim`, `dominant_dim_share`, `low_confidence_bucket`, `confidence`, `flags`). `dominant_dim` agrees with `top_dimensions[0]["dim"]` for the same polygon |
+| `explain_anomaly(primary_key, pattern_id)` | Structured investigation: severity, witness set, repair set, conformal p-value, reputation, per-dim attribution under `top_dimensions[]` (fields: `dim`, `kind`, `delta`, `pct_of_total` — the dim's share of `delta_norm²`, sorted descending), and `reliability_flags` (per-polygon triage: `single_dim_driven`, `dominant_dim`, `dominant_dim_share`, `low_confidence_bucket`, `confidence`, `flags`). `dominant_dim` agrees with `top_dimensions[0]["dim"]` for the same polygon |
 | `trace_root_cause(primary_key, pattern_id, max_depth, max_branches)` | Multi-hop root-cause DAG: composes `explain_anomaly` + `find_counterparties` + `contagion_score` + `π7_attract_hub` into one bounded tree. Returns `{root, summary, hop_count, branches_explored, truncated}`. Replaces `explain_anomaly_chain` |
 | `find_similar_entities(primary_key, pattern_id, top_n, dim_mask, metric)` | ANN search for nearest entities in delta-space. `dim_mask`: list of dimension names to restrict distance. `metric`: `"L2"` or `"cosine"`. Returns `SimilarityResult` |
 | `contrast_populations(pattern_id, group_a, group_b)` | Dimension-by-dimension comparison of two entity groups (Cohen's d) |
 | `composite_risk(primary_key, line_id, *, include_reliability_flags=True)` | Wilson harmonic-mean p-value (HMP) combination of conformal p-values across patterns. Robust under positive dependence between patterns. Returns `combined_p`, `n_patterns`, `per_pattern{}`, and (when `include_reliability_flags=True` and the entity has a direct anchor pattern) `reliability_flags` for the home polygon. `chi2` / `df` fields removed (HMP has no chi-squared statistic) |
 | `composite_risk_batch(primary_keys, line_id, *, include_reliability_flags=False)` | Batch HMP combination for multiple entities. `include_reliability_flags` defaults `False` on the bulk path — every per-entity attachment triggers an extra polygon build, so 200 entities × one build is bounded by opt-in. Investigators who need per-entity reliability metadata in bulk call `composite_risk` individually |
-| `combine_anomaly_pvalues(pattern_id, *, detectors, weights, sample_size, top_n)` | Multi-detector anomaly consensus via HMP across five orthogonal detectors (`delta_norm`, `neighbor_contamination`, `segment_shift`, `trajectory_continuous`, `density_gap`). `density_gap` contributes no per-entity p-value (structurally aggregate — findings describe missing population, not per-entity attribution) so is silently skipped. Returns ranked list of `{primary_key, hmp, p_per_detector, rank, reliability_flags}` ascending by `hmp` — `reliability_flags` is attached post-truncation only |
+| `combine_anomaly_pvalues(pattern_id, *, detectors, weights, sample_size, top_n)` | Multi-detector anomaly consensus via HMP across five orthogonal detectors (`delta_norm`, `neighbor_contamination`, `segment_shift`, `trajectory_continuous` (opt-in), `density_gap`). `density_gap` contributes no per-entity p-value (structurally aggregate — findings describe missing population, not per-entity attribution) so is silently skipped. Returns ranked list of `{primary_key, hmp, p_per_detector, rank, reliability_flags}` ascending by `hmp` — `reliability_flags` is attached post-truncation only |
 | `cross_pattern_profile(primary_key, line_id)` | Anomaly status from all patterns the entity participates in |
 | `find_chains_for_entity(primary_key, pattern_id, top_n)` | Find chains involving a specific entity |
-| `find_neighborhood(primary_key, pattern_id, max_hops)` | BFS through polygon edges to find reachable entities |
 | `find_counterparties(primary_key, line_id, from_col, to_col, pattern_id, top_n, use_edge_table=True, *, timestamp_cutoff=None)` | Discover counterparty entities from event data. When pattern_id is given and edge table exists, uses BTREE fast path with amount_sum/amount_max per counterparty. `timestamp_cutoff` applies to the edge-table fast path only; raises `GDSNavigationError` when supplied without an edge-table-eligible configuration |
 | `assess_false_positive(primary_key, pattern_id)` | Evaluate likelihood of false positive anomaly classification |
 
@@ -202,8 +214,8 @@ and inflated combined significance whenever inputs co-fired.
 |----------|---------------|-------------------|
 | `delta_norm` | population-relative geometry deviation | `1 − anomaly_confidence` (chi² survival fallback when null) |
 | `neighbor_contamination` | k-neighbour anomaly density | hypergeometric upper-tail |
-| `segment_shift` | categorical-segment anomaly rate | Fisher exact 2×2 back-projected per entity |
-| `trajectory_continuous` | DTW distance vs population-median trajectory (`engine/topology.py`) | ECDF survival |
+| `segment_shift` | categorical-segment anomaly rate | one-sided Fisher exact 2×2 (in-segment rate higher than out-of-segment), back-projected per entity |
+| `trajectory_continuous` | DTW distance vs population-median trajectory (`engine/topology.py`); opt-in — not in the default `detectors`, reads the temporal history of the sampled entities | ECDF survival |
 | `density_gap` | local density-gap detector findings | structurally aggregate — emits `{}` per entity (findings describe missing population, no per-entity attribution) |
 
 Detectors that fail to produce a value for a given entity are silently
@@ -217,10 +229,9 @@ is the always-available primary path.
 | `sphere_overview(pattern_id=None)` | Population summary for one or all patterns (rates, calibration health, dimension stats) |
 | `anomaly_summary(pattern_id, max_clusters)` | Anomaly population breakdown with geometric clustering |
 | `aggregate_anomalies(pattern_id, group_by)` | Group anomalies by a property column with per-group rates |
-| `aggregate(event_pattern_id, group_by_line)` | Aggregate event polygons by group with metric computation |
+| `aggregate(event_pattern_id, group_by_line, group_by_relation=None)` | Aggregate event polygons by group with metric computation. When the event pattern relates to `group_by_line` more than once (e.g. sender and receiver accounts), `group_by_relation` names the relation to group by (its `display_name`); without it the call raises and lists the valid names. With a relation selected, `group_by_property='<group_by_line>:<col>'` reads the grouped entity, while `filters`, `count_distinct:<group_by_line>` and `group_by_line_2=<group_by_line>` refer to the other relation(s) to that line (e.g. distinct receivers per sender). `group_by_property='<event_line>:<col>'` groups by a column of the event itself |
 | `check_alerts(pattern_id=None)` | Implicit health checks: anomaly rate spikes, population shocks, calibration staleness, stale ANN vector index |
 | `vector_index_health(pattern_id, line_id=None)` | ANN (IVF) index staleness for a pattern's geometry: indexed/unindexed row counts, `is_stale`, recommendation (metadata-only read) |
-| `hub_score_stats(pattern_id)` | Hub score distribution statistics |
 | `check_anomaly_batch(pattern_id, primary_keys)` | Batch anomaly status check for multiple entities |
 | `temporal_quality_summary(pattern_id)` | Temporal anomaly persistence metrics |
 | `line_geometry_stats(pattern_id)` | Per-relation-line entity count breakdown from geometry |
@@ -257,8 +268,8 @@ builder = GDSBuilder(
 | `add_chain_line(line_id, chains, features)` | Create anchor line from extracted chain dicts |
 | `add_alias(alias_id, base_pattern_id, cutting_plane_dimension, cutting_plane_threshold)` | Register an alias with a cutting plane for sub-population analysis |
 | `build(temporal_configs=None)` | Validate, compute statistics, write all files. Pass `temporal_configs` to run geometry→temporal pipeline per pattern. Returns output path |
-| `incremental_update(pattern_id, changed_entities, deleted_keys, recalibrate, reindex, recompute_ranks)` | Add/modify/delete entities without a full rebuild; new entities are immediately visible to anomaly search. Supports patterns whose dimensions are relations, event dimensions, edge-dim aggregations, and tracked properties; group-calibrated (`group_by_property`), GMM, and FDR-hierarchy patterns are rejected and must be rebuilt. `reindex=True` rebuilds the ANN index immediately; `recompute_ranks=False` defers the global `delta_rank_pct` recompute for batched ingestion |
-| `finalize_incremental(pattern_id)` | Recompute the global `delta_rank_pct` percentile once and rebuild the ANN index. Call at the end of a batched ingestion session that used `recompute_ranks=False` |
+| `incremental_update(pattern_id, changed_entities, deleted_keys, recalibrate, reindex, recompute_ranks, branch=None)` | Add/modify/delete entities without a full rebuild; new entities are immediately visible to anomaly search. Supports patterns whose dimensions are relations, event dimensions, edge-dim aggregations, and tracked properties; group-calibrated (`group_by_property`), GMM, and FDR-hierarchy patterns are rejected and must be rebuilt. `reindex=True` rebuilds the ANN index immediately; `recompute_ranks=False` defers the global `delta_rank_pct` recompute for batched ingestion. `branch=` applies the update to that sphere branch only and records it in the branch's recipe log (with a copy of the rows); an automatic recalibration is recorded as its own recipe |
+| `finalize_incremental(pattern_id, branch=None)` | Recompute the global `delta_rank_pct` percentile once and rebuild the ANN index. Call at the end of a batched ingestion session that used `recompute_ranks=False`. With `branch=` it finalizes that branch and is recorded in its recipe log |
 | `build_temporal(time_col, time_window)` | Generate temporal snapshots from time-windowed event data. Call after `build()` when not using pipeline mode |
 
 ### RelationSpec
@@ -277,6 +288,8 @@ class RelationSpec:
 ---
 
 ## Storage -- GDSReader / GDSWriter
+
+Every read path (reader, navigator, aggregation pushdown) opens Lance datasets through one process-wide `lance.Session` with bounded caches (1 GiB index, 256 MiB metadata). Scalar-index pages and manifests stay warm across calls and across spheres open in the same process; a re-open still sees the latest committed version, and pinned versions are unaffected. Write paths (builder, writer) open datasets without it.
 
 ### Edge Table (GDSReader)
 
@@ -315,7 +328,7 @@ nav.find_motif_by_hops(
 ) -> dict
 ```
 
-Declarative motif API — power-user escape hatch from the closed-vocab `find_motif` registry. Caller passes a list of `HopPredicate`s describing per-hop constraints (`amount_min`, `amount_max`, `time_delta_max_hours`, `amount_ratio_to_prev`, `direction` (`"forward"` / `"reverse"` / `"any"`), `edge_dim_predicates: dict[str, tuple[op, value]]`); the navigator walks the in-memory `AdjacencyIndex` for matching chains via level-synchronous BFS. `seed_keys=None` enumerates from all `from_key` nodes (capped at `max_results`). `time_window_hours` (optional, default `None`) caps the total chain span: when set, every hop after the first must satisfy `abs(current_edge_ts - first_edge_ts) <= time_window_hours`; independent of per-hop `time_delta_max_hours`, both apply when both are set. When `score=True`, the navigator resolves the event pattern's anchor companion via `_resolve_anchor_pattern_for_scoring` and scores each motif as the product of event-aware `edge_potential` (`delta_distance × (1/effective_pair_count) × (1 + event_norm)`) across its edges. The `event_norm` factor (norm of the event pattern's per-transaction polygon for each edge's `event_key`) breaks ties between motifs that share a node sequence but use different transactions. Scored motifs gain `score`, `score_breakdown` (per-edge entries carry `edge_potential`, `delta_distance`, `pair_tx_count`, `effective_weight`, `event_factor`), and `anchor_pattern_id` fields together (sorted descending on score, unscored motifs at tail). Returns `{pattern_id, n_results, motifs}` with each motif carrying `nodes`, `edges` (event_keys), `timestamps`, `amounts`, `dim_values_per_hop` (only when `edge_dim_predicates` were used), and the score triple when `score=True` succeeds. Raises on anchor pattern (event-only), unknown pattern, empty hops, hop count outside `1..8`, non-positive `time_window_hours`, `max_results<1`, or `score=True` with no anchor companion configured for the pattern.
+Declarative motif API — power-user escape hatch from the closed-vocab motif registry (`score_motif`, `find_high_potential_motifs`). Caller passes a list of `HopPredicate`s describing per-hop constraints (`amount_min`, `amount_max`, `time_delta_max_hours`, `amount_ratio_to_prev`, `direction` (`"forward"` / `"reverse"` / `"any"`), `edge_dim_predicates: dict[str, tuple[op, value]]`); the navigator walks the in-memory `AdjacencyIndex` for matching chains via level-synchronous BFS. `seed_keys=None` enumerates from all `from_key` nodes (capped at `max_results`). `time_window_hours` (optional, default `None`) caps the total chain span: when set, every hop after the first must satisfy `abs(current_edge_ts - first_edge_ts) <= time_window_hours`; independent of per-hop `time_delta_max_hours`, both apply when both are set. When `score=True`, the navigator resolves the event pattern's anchor companion via `_resolve_anchor_pattern_for_scoring` and scores each motif as the product of event-aware `edge_potential` (`delta_distance × (1/effective_pair_count) × (1 + event_norm)`) across its edges. The `event_norm` factor (norm of the event pattern's per-transaction polygon for each edge's `event_key`) breaks ties between motifs that share a node sequence but use different transactions. Scored motifs gain `score`, `score_breakdown` (per-edge entries carry `edge_potential`, `delta_distance`, `pair_tx_count`, `effective_weight`, `event_factor`), and `anchor_pattern_id` fields together (sorted descending on score, unscored motifs at tail). Returns `{pattern_id, n_results, motifs}` with each motif carrying `nodes`, `edges` (event_keys), `timestamps`, `amounts`, `dim_values_per_hop` (only when `edge_dim_predicates` were used), and the score triple when `score=True` succeeds. Raises on anchor pattern (event-only), unknown pattern, empty hops, hop count outside `1..8`, non-positive `time_window_hours`, `max_results<1`, or `score=True` with no anchor companion configured for the pattern.
 
 ### `HopPredicate` (dataclass, frozen)
 
@@ -328,7 +341,7 @@ Fields: `amount_min`, `amount_max`, `time_delta_max_hours`, `amount_ratio_to_pre
 | `ECDFEntry(sorted_values)` | Frozen dataclass with `transform(x)` (raw → uniform `[0, 1]`) and `inverse(u)` (uniform → raw). Constructed via `ECDFEntry.from_values(x)` |
 | `is_usable_for_gap(col)` | `(bool, reason)` admissibility check — rejects `too_sparse` (<30 finite), `degenerate` (σ≈0), `bernoulli_like` (≤2 unique) |
 | `select_pairs_by_corr(corr, *, r_min, r_max, top_k)` | Pick top-`top_k` dim pairs with Pearson `|r| ∈ [r_min, r_max]`, sorted by `|r|` desc |
-| `compute_density_gaps_for_pair(u_i, u_j, *, n, bins, alpha)` | Per-cell chi² residuals against uniform-independence expectation, Benjamini-Hochberg correction. Returns under-populated cells with `p_value`, `q_value`, `is_gap` |
+| `compute_density_gaps_for_pair(u_i, u_j, *, n, bins, alpha)` | Per-cell chi² residuals against the independence expectation (product of the observed marginals, so tied dims such as zero-inflated counts do not produce gaps in bins they cannot fill), Benjamini-Hochberg correction. Returns under-populated cells with `p_value`, `q_value`, `is_gap` |
 
 ### `GDSNavigator.find_density_gaps`
 
@@ -402,6 +415,25 @@ Fields: `pattern_id`, `calibration_epoch`, `schema_version`, `schema_hash`,
 Extends `GDSError`. Raised by `read_calibration_fit` when the requested epoch
 is not on disk.
 
+### Branch comparison
+
+#### `GDSNavigator.compare_branches(pattern_id, branch, other=None, top_n=20) -> BranchDiffReport`
+
+Compares one pattern between `branch` and main, or between `branch` and branch `other`. Each side is read at its current state. Fields:
+
+- `n_from` / `n_to`: entity counts.
+- `anomalies_from` / `anomalies_to`: anomaly counts, using the rule `anomaly_summary` and `find_anomalies` count by: `delta_norm` at or above that side's global threshold.
+- `flipped_in` / `flipped_out`: among entities present on both sides, those that became, or stopped being, anomalous in `branch`. Counts are per entity: a key with duplicate rows counts once, at its highest `delta_norm`.
+- `jaccard`: overlap of the two anomaly sets (1.0 when both are empty).
+- `top_movers`: the `top_n` entities by relative `delta_norm` change, each with both sides' `delta_norm`, `relative_change`, `is_anomaly` and rank percentile.
+- `flipped_in_top` / `flipped_out_top`: up to `top_n` flipped entities each, furthest past the threshold on the side where they are anomalous. Each carries `cause`: `threshold` (the threshold moved past the entity's unchanged score), `score` (the score crossed the unchanged threshold) or `both`.
+- `theta_from` / `theta_to`: the two global thresholds.
+- `only_in_from` / `only_in_to`: keys present on one side only.
+- `calibration_drift`: a `CalibrationDriftReport` between the two current fits, `None` when the schemas differ.
+- `recipe`: the branch's recipe log.
+
+An unknown branch or pattern raises `GDSError`.
+
 ### Calibration drift
 
 #### `GDSNavigator.compare_calibrations(pattern_id, v_from=None, v_to=None, top_n=10, verbose=False) -> CalibrationDriftReport`
@@ -470,7 +502,7 @@ Fields: `dim_index`, `dim_kind`, `dim_label`, `total` (delta_b - delta_a),
 Detect entities with high influence on coordinate system calibration. Classifies
 into the 4-cell influence × anomaly matrix (hidden / distorter /
 standard_anomaly / normal); default `classify="hidden"` returns top_n entities
-with high `total_impact` but low anomaly score (the patent's primary detection
+with high `total_impact` but low anomaly score (the primary detection
 cell — entities defining what 'normal' means without being detected as anomalous).
 
 Math: exact leave-one-out via rolling Σs/Σs². For each entity E:
@@ -782,7 +814,7 @@ Or use the navigator shortcut: `nav.passive_scan(home_line_id)`.
 |-------|------|-------------|
 | `home_line_id` | `str` | Line being screened |
 | `total_entities` | `int` | Population size |
-| `total_flagged` | `int` | Entities above threshold |
+| `total_flagged` | `int` | Entities above threshold, counted before the `top_n` cut |
 | `hits` | `list[ScanHit]` | Per-entity results sorted by score descending |
 | `elapsed_ms` | `float` | Wall-clock time |
 

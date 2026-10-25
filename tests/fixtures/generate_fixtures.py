@@ -264,14 +264,11 @@ def generate_temporal() -> None:
     )
     _write_lance(BASE / "temporal" / "customer_pattern" / "data.lance", table)
 
-    # Build trajectory ANN index for customer_pattern
-    # Pass mu/sigma_diag so trajectory vectors use z-scored deltas
-    mu = np.array([0.7, 0.4], dtype=np.float32)
-    sigma_diag = np.array([0.2, 0.3], dtype=np.float32)
+    # Build trajectory ANN index for customer_pattern (pattern metric from sphere.json)
     from hypertopos.storage.writer import GDSWriter
 
     writer = GDSWriter(base_path=str(BASE))
-    writer.build_trajectory_index("customer_pattern", mu=mu, sigma_diag=sigma_diag)
+    writer.build_trajectory_index("customer_pattern")
 
 
 if __name__ == "__main__":

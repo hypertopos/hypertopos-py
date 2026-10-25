@@ -54,7 +54,8 @@ Checks:
 
 ### `hypertopos info`
 
-Print summary of a built sphere.
+Print summary of a built sphere: each line's role, row count and column
+count, and each pattern's type, entity line and dimension count.
 
 ```bash
 hypertopos info my_sphere/
@@ -113,8 +114,23 @@ paths yield `identical: true`.
 ```bash
 hypertopos sphere ingest my_sphere/ --points changed.arrow \
   [--pattern ID] [--recalibrate {auto,force,never}] \
-  [--reindex] [--finalize] [--json]
+  [--reindex] [--finalize] [--branch NAME] [--json]
 ```
+
+`--branch NAME` ingests into that sphere branch only; main is not touched and
+the reported geometry versions are the branch's.
+
+#### `hypertopos sphere branch`
+
+```bash
+hypertopos sphere branch {list,create,delete,promote} my_sphere/ [NAME] \
+  [--purpose TEXT] [--json]
+```
+
+Lists, creates, deletes or promotes sphere branches. `promote` replays the
+branch's recipes on main, requires the replayed result to match the branch
+exactly, and deletes the branch on success; it exits 1 when main moved since
+the branch was created or the replay diverged (main is restored).
 
 Incrementally appends a new-/changed-entities table to one pattern's geometry
 without a full rebuild. The points table may be Arrow IPC (`.arrow` /
@@ -149,9 +165,9 @@ lines: { ... }                # Required. Entity line definitions.
 patterns: { ... }             # Required. Pattern (anomaly model) definitions.
 composite_lines: { ... }      # Optional. Composite anchor lines from event co-occurrence.
 temporal: [ ... ]              # Optional. Temporal snapshot configurations.
-calibration_history_policy:    # Optional. Multi-epoch calibration retention.
-  last_k: 5                    #   Number of historical epochs to retain (default 5).
 ```
+
+A key the parser does not recognise, at the top level or inside any section below, is ignored with a warning that names it and, for a likely typo, the field it was probably meant to be: `'tiemstamp_col' (did you mean 'timestamp_col'?)`.
 
 ---
 
@@ -440,7 +456,7 @@ patterns:
 | `gmm_n_components` | int | `null` | Gaussian mixture components for multi-modal calibration. |
 | `group_by_property` | string | `null` | Column for per-group calibration (e.g. per-country theta). |
 | `tracked_properties` | list | `null` | Entity properties tracked as fill/no-fill dimensions. |
-| `use_mahalanobis` | bool | `false` | Use Mahalanobis distance for anomaly detection (accounts for correlations). |
+| `use_mahalanobis` | bool | `false` | Use Mahalanobis distance for anomaly detection (accounts for correlations). Cannot be combined with `group_by_property` (grouped calibration is per-dimension); the config is rejected if both are set. An explicit `dimension_weights` list used with it must be all > 0 (a zero weight would erase information the whitened coordinates depend on). |
 | `precomputed_dimensions` | list | `null` | Columns already on entity table to use as geometry dimensions. |
 | `graph_features` | dict | `null` | Auto-compute graph structural features from event from/to columns. |
 | `description` | string | `null` | Human-readable description. Stored in sphere.json — visible to agents via `get_sphere_info`. |
@@ -452,7 +468,7 @@ patterns:
 
 ### Edge Table
 
-An edge table is a flat Lance dataset linking anchor entities through an event pattern. It enables runtime graph traversal (`find_geometric_path`, `discover_chains`) without pre-computed chain extraction.
+An edge table is a flat Lance dataset linking anchor entities through an event pattern. It enables runtime graph traversal (`find_geometric_path`, `extract_chains`) without pre-computed chain extraction.
 
 **Auto-detection:** When an event pattern has 2+ relations pointing to the same anchor line (e.g. `from_entity` and `to_entity` both referencing the same anchor line), the builder emits an edge table automatically. No YAML config needed.
 
@@ -477,7 +493,7 @@ patterns:
 |-------|------|---------|-------------|
 | `from_col` | string | — | **Required.** FK column for source anchor entity. |
 | `to_col` | string | — | **Required.** FK column for target anchor entity. |
-| `timestamp_col` | string | `null` | Timestamp column (epoch seconds). Enables temporal BFS in `discover_chains`. |
+| `timestamp_col` | string | `null` | Timestamp column (epoch seconds). Enables temporal ordering of hops in `extract_chains`. |
 | `amount_col` | string | `null` | Numeric column carried on edges. Enables amount-weighted scoring in `find_geometric_path`. |
 
 To skip edge table emission entirely (e.g. for faster iterative builds), use the `--no-edges` CLI flag.
@@ -608,7 +624,7 @@ dimensions.
 | `direction` | string | `"in"` | `"in"` (FK points from event to anchor) or `"out"`. |
 | `key_on_entity` | string | `null` | FK column name on the entity line. Auto-resolved if null. |
 | `required` | bool | `true` | Whether every entity must have this edge. |
-| `display_name` | string | `null` | Human-readable dimension label. Defaults to line ID. |
+| `display_name` | string | `null` | Name of the relation (e.g. `sender`, `receiver`). Selects it in `aggregate(group_by_relation=...)` and is accepted wherever a dimension name is taken. It becomes the dimension label only when the pattern has several relations to the same line; otherwise the label is the line ID (rename labels with `semantics.json`). |
 | `edge_max` | int | `null` | Continuous mode cap: `null` = binary (0/1), integer = count capped at this value. |
 
 ### Event dimension fields
@@ -627,7 +643,7 @@ Features are specified as `dimension_name: metric_spec`:
 | `name: count` | Row count per anchor entity | `tx_count: count` |
 | `name: sum:col` | Sum of column | `total_spend: sum:amount` |
 | `name: avg:col` | Mean of column | `avg_amount: avg:amount` |
-| `name: std:col` | Standard deviation | `amount_std: std:amount` |
+| `name: std:col` | Population standard deviation (exactly 0 for a group of identical values) | `amount_std: std:amount` |
 | `name: max:col` | Maximum value | `max_amount: max:amount` |
 | `name: count_distinct:col` | Distinct value count | `n_cats: count_distinct:category` |
 | `name: "count:window=Xd:agg=Y"` | Windowed count (burst) | `burst_daily: "count:window=1d:agg=max"` |
@@ -780,7 +796,6 @@ patterns:
 | `edge_max` | int or `"auto"` | `"auto"` | Fixed normalization cap, or auto-compute from percentile. |
 | `percentile` | float | `99.0` | Percentile for auto edge_max computation. |
 | `display_name` | string | `null` | Human-readable dimension label. |
-| `kind` | string | auto | Distribution family for Bregman scoring: `"gaussian"`, `"poisson"`, or `"bernoulli"`. Auto-detected when omitted. |
 
 ---
 
@@ -805,7 +820,7 @@ patterns:
 - `counterpart_overlap` — Jaccard similarity of in/out counterparty sets
 - `pagerank` — network centrality (igraph C backend)
 - `betweenness` — bridge score between communities (edge-sampled on large graphs)
-- `community` — community ID via label propagation
+- `community` — community ID via label propagation (seeded, so the same data gives the same communities on every build)
 - `clustering_coefficient` — local triangle density
 - `connected_component` — isolated subgraph membership
 
@@ -850,21 +865,24 @@ Automatically creates an anchor line + pattern (`{line_id}_pattern`).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `event_line` | string | — | **Required.** Event line with from/to columns. |
-| `from_col` | string | — | **Required.** Source entity FK column. |
+| `event_line` | string | — | **Required.** Event line whose source table the chains are extracted from. |
+| `from_col` | string | — | **Required.** Source entity FK column. Events with a null `from_col` or `to_col` are skipped. |
 | `to_col` | string | — | **Required.** Destination entity FK column. |
 | `features` | list | 4 default | Chain features to use as geometry dimensions. |
 | `seed_percentile_fan_out` | float | `95.0` | Fan-out percentile for seed selection. |
-| `seed_percentile_cross_bank` | float | `90.0` | Cross-category activity percentile for seed selection. |
+| `seed_percentile_cross_bank` | float | `90.0` | Accepted but not used by seed selection. |
 | `seed_multi_currency` | int | `2` | Min distinct categories for seed selection. |
 | `seed_pass_through` | bool | `true` | Include pass-through entities as seeds. |
 | `time_window_hours` | int | `168` | Max time span for a chain (hours). |
 | `max_hops` | int | `15` | Max chain length. |
 | `min_hops` | int | `2` | Min chain length. |
 | `max_chains` | int | `300000` | Max chains to extract. |
-| `bidirectional` | bool | `true` | Follow edges in both directions. |
+| `bidirectional` | bool | `true` | Follow edges in both directions. The runtime `extract_chains` defaults to `false`, so the two surfaces give different chains for the same events unless this is set explicitly. With `true` a hop may run against the transaction direction, so `is_cyclic`, `amount_decay` and `amount_monotone_decreasing` describe a walk over the transaction graph rather than a flow of funds; set `false` when those features should follow the money. |
 | `anomaly_percentile` | float | `95.0` | Theta for the auto-created chain pattern. |
 | `description` | string | `null` | Description for chain line + pattern. |
+| `timestamp_col` | string | `null` | Event time column of the source table. When omitted: the `timestamp_col` of the event pattern's `edge_table` on this `event_line`, then the first of `timestamp`, `date`, `orderdate`, then the first timestamp-typed column. |
+| `amount_col` | string | `null` | Event amount column of the source table. When omitted: the `amount_col` of the event pattern's `edge_table` on this `event_line`, then the first of `amount_received`, `amount`, `extendedprice`, `fare_amount`, `total_amount`. |
+| `category_col` | string | `null` | Event category column of the source table (feeds `n_distinct_categories` and the multi-category seed rule). When omitted: the first of `receiving_currency`, `category`, `k_symbol`, `type`. |
 | `edge_dim_aggregations` | dict | `null` | Aggregate per-edge sidecar dims of an event pattern up to per-chain aggregated columns baked into the chain anchor polygon. `from: <event_pid>` is required and must reference an event pattern that declares `edge_dimensions:` and whose `edge_table.event_line` matches this `chain_lines.<id>.event_line` (validated at parse time). `dims:` is required and accepts either a list of source dim names (each dim emits all five canonical aggregates: `mean` / `max` / `std` / `p95` / `count_above_threshold`) or a mapping `{dim: [agg, …]}` for an explicit per-dim subset. The chain anchor pattern's polygon shape grows by the total number of selected aggregates; downstream primitives (`find_anomalies`, `explain_anomaly`, `find_clusters`) surface the new dims transparently. |
 
 **Example with edge-dim aggregation on chain anchor (list form — all five aggregates per dim):**
@@ -1122,10 +1140,9 @@ directory next to the `sphere.yaml` file.
 | Cache | What | Invalidation |
 |-------|------|-------------|
 | **Tier 3 script results** | `prepare()` output saved as `.cache/{script}.parquet` | Script file modification time (mtime) changes |
-| **Chain extraction** | Extracted chains saved as `.cache/chains_{id}_{hash}.pkl` | YAML chain parameters change (hash of all config fields + event count) |
 
 **First build** runs everything from scratch. **Subsequent builds** (with `--force`) skip
-Tier 3 scripts and chain extraction if inputs haven't changed.
+Tier 3 scripts if inputs haven't changed. Chain extraction runs on every build.
 
 To force a full rebuild without cache, delete the `.cache/` directory:
 ```bash
@@ -1169,8 +1186,6 @@ hypertopos build --config sphere.yaml --force --verbose --no-chains
 hypertopos build --config sphere.yaml --force --verbose
 ```
 
-**Security note:** chain pickle files (`.cache/chains_*.pkl`) should not be shared across trust boundaries — pickle deserialization can execute arbitrary code.
-
 ### Reference benchmarks
 
 | Sphere | First run | Cached run |
@@ -1187,9 +1202,9 @@ hypertopos build --config sphere.yaml --force --verbose
 | NYC Taxi | auto-detected (trip_pattern: pu_zone → do_zone) | none | 2 patterns (7d) | none | NB-Split (zones_pickup + zones_dropoff), 6 event dims, 2 anchor patterns |
 | AML HI-Small | explicit (tx_pattern: from_account → to_account, timestamp, amount) | 300K (seeded BFS) | 3 patterns (2d) | account pairs | graph_features, precomputed ratios, IET metrics, Mahalanobis |
 
-### Parallel chain extraction
+### Chain extraction
 
-Chain BFS runs on 4 parallel workers via `ProcessPoolExecutor`. The adjacency graph is serialized to a temp file once; workers load from disk independently. Post-merge dedup via frozenset ensures no duplicate chains across workers.
+Chain BFS runs in a single process and is deterministic: the same events and chain settings always yield the same chains. A seed never emits the same set of events twice, and a chain whose entity path is a strict prefix of a longer chain is dropped.
 
 ---
 

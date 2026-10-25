@@ -4,6 +4,7 @@ Per-entity solid-PH on (T x D) trajectory matrices. Tested geometry:
 - circular trajectory: T points completing a closed loop → high H_1 → high score
 - monotonic trajectory: T points drifting linearly → no H_1 → low score
 """
+
 from __future__ import annotations
 
 import numpy as np
@@ -40,10 +41,12 @@ def _build_solid_table(trajectories: dict[str, np.ndarray]) -> pa.Table:
         for t in range(traj.shape[0]):
             pks.append(pk)
             snaps.append(traj[t].tolist())
-    return pa.table({
-        "primary_key": pa.array(pks, type=pa.string()),
-        "delta_snapshot": pa.array(snaps, type=pa.list_(pa.float64())),
-    })
+    return pa.table(
+        {
+            "primary_key": pa.array(pks, type=pa.string()),
+            "delta_snapshot": pa.array(snaps, type=pa.list_(pa.float64())),
+        }
+    )
 
 
 def test_circular_trajectory_dominates_top_n():
@@ -57,15 +60,18 @@ def test_circular_trajectory_dominates_top_n():
 
     solid_table = _build_solid_table(trajectories)
     result = find_topological_trajectory_anomalies(
-        solid_table, top_n=30, min_timesteps=8, pca_dim=5, sample_size=100,
+        solid_table,
+        top_n=30,
+        min_timesteps=8,
+        pca_dim=5,
+        sample_size=100,
     )
 
     top_pks = {r["primary_key"] for r in result}
     circular_pks = {f"C{i}" for i in range(30)}
     overlap = len(top_pks & circular_pks)
     assert overlap >= 25, (
-        f"only {overlap}/30 top entities are circular trajectories; "
-        f"top: {sorted(top_pks)[:10]}"
+        f"only {overlap}/30 top entities are circular trajectories; top: {sorted(top_pks)[:10]}"
     )
 
 
@@ -80,7 +86,9 @@ def test_entity_below_min_timesteps_excluded():
     solid_table = _build_solid_table(trajectories)
 
     result = find_topological_trajectory_anomalies(
-        solid_table, top_n=5, min_timesteps=8,
+        solid_table,
+        top_n=5,
+        min_timesteps=8,
     )
     top_pks = {r["primary_key"] for r in result}
     assert "TINY" not in top_pks
@@ -90,20 +98,25 @@ def test_entity_below_min_timesteps_excluded():
 def test_return_shape_and_fields():
     from hypertopos.engine.topology import find_topological_trajectory_anomalies
 
-    trajectories = {
-        f"E{i}": _circular_trajectory(T=20, seed=i) for i in range(10)
-    }
+    trajectories = {f"E{i}": _circular_trajectory(T=20, seed=i) for i in range(10)}
     solid_table = _build_solid_table(trajectories)
 
     result = find_topological_trajectory_anomalies(
-        solid_table, top_n=5, min_timesteps=8, pca_dim=5,
+        solid_table,
+        top_n=5,
+        min_timesteps=8,
+        pca_dim=5,
     )
     assert isinstance(result, list)
     assert len(result) == 5
     required = {
-        "primary_key", "trajectory_topo_score", "n_timesteps",
-        "h1_total_persistence", "dominant_feature_birth",
-        "dominant_feature_death", "computed_at",
+        "primary_key",
+        "trajectory_topo_score",
+        "n_timesteps",
+        "h1_total_persistence",
+        "dominant_feature_birth",
+        "dominant_feature_death",
+        "computed_at",
     }
     for row in result:
         assert required.issubset(row.keys()), f"missing: {required - row.keys()}"
@@ -116,8 +129,10 @@ def test_return_shape_and_fields():
 def test_empty_table_returns_empty():
     from hypertopos.engine.topology import find_topological_trajectory_anomalies
 
-    empty = pa.table({
-        "primary_key": pa.array([], type=pa.string()),
-        "delta_snapshot": pa.array([], type=pa.list_(pa.float64())),
-    })
+    empty = pa.table(
+        {
+            "primary_key": pa.array([], type=pa.string()),
+            "delta_snapshot": pa.array([], type=pa.list_(pa.float64())),
+        }
+    )
     assert find_topological_trajectory_anomalies(empty, top_n=10) == []

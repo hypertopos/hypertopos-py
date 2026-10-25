@@ -2,11 +2,13 @@
 ``dominant_dim_mass`` and ``negative_space``. Both ride along on
 ``_compute_dim_quality_warnings`` so the existing dead_dim / sparse_dim
 warnings continue to fire unchanged when the new auditors apply."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
 
 import numpy as np
+
 from hypertopos.model.sphere import Pattern, RelationDef
 from hypertopos.navigation.navigator import GDSNavigator
 
@@ -22,17 +24,12 @@ def _make_pattern(
     """Build a minimal Pattern whose ``dim_labels`` property matches the
     supplied label list. Each label becomes a relation's ``line_id`` so
     the property returns it verbatim."""
-    relations = [
-        RelationDef(line_id=label, direction="in", required=True)
-        for label in dim_labels
-    ]
+    relations = [RelationDef(line_id=label, direction="in", required=True) for label in dim_labels]
     n = len(dim_labels)
-    mu_arr = (
-        np.asarray(mu, dtype=np.float32) if mu is not None
-        else np.zeros(n, dtype=np.float32)
-    )
+    mu_arr = np.asarray(mu, dtype=np.float32) if mu is not None else np.zeros(n, dtype=np.float32)
     sigma_arr = (
-        np.asarray(sigma_diag, dtype=np.float32) if sigma_diag is not None
+        np.asarray(sigma_diag, dtype=np.float32)
+        if sigma_diag is not None
         else np.ones(n, dtype=np.float32)
     )
     return Pattern(
@@ -208,10 +205,18 @@ def test_existing_dead_dim_and_sparse_dim_still_fire_unchanged():
             # sparse + drives the p99-tail mass on the surviving-sigma
             # dims (dead dim is excluded from the dominant-mass denom).
             "sparse_or_dom": {
-                "p25": 0.0, "p50": 0.0, "p75": 0.0, "p99": 100.0, "max": 200.0,
+                "p25": 0.0,
+                "p50": 0.0,
+                "p75": 0.0,
+                "p99": 100.0,
+                "max": 200.0,
             },
             "uniform": {
-                "p25": 0.5, "p50": 1.0, "p75": 1.5, "p99": 2.0, "max": 4.0,
+                "p25": 0.5,
+                "p50": 1.0,
+                "p75": 1.5,
+                "p99": 2.0,
+                "max": 4.0,
             },
         },
         dimension_kinds=["gaussian", "gaussian", "gaussian"],

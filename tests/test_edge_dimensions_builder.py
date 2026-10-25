@@ -1,12 +1,11 @@
 """Builder integration: edge_dimensions on an event pattern produces sidecar + grown shape."""
+
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
 import lance
-import pyarrow as pa
-import pyarrow.dataset as ds
 
 from hypertopos.builder import GDSBuilder, RelationSpec
 from hypertopos.builder.builder import EdgeTableConfig
@@ -24,38 +23,37 @@ def _make_event_sphere(out_root: Path, *, with_edge_dims: bool) -> GDSBuilder:
             {"acct_id": "C", "name": "gamma"},
             {"acct_id": "D", "name": "delta"},
         ],
-        key_col="acct_id", source_id="t",
+        key_col="acct_id",
+        source_id="t",
     )
     # Six transactions: a structuring chain A→B→C→D + two unrelated.
     b.add_line(
         "transactions",
         [
-            {"tx_id": "ek1", "from_acct": "A", "to_acct": "B",
-             "ts": 0.0,    "amount": 20000.0},
-            {"tx_id": "ek2", "from_acct": "B", "to_acct": "C",
-             "ts": 100.0,  "amount": 5000.0},
-            {"tx_id": "ek3", "from_acct": "C", "to_acct": "D",
-             "ts": 200.0,  "amount": 5000.0},
-            {"tx_id": "ek4", "from_acct": "A", "to_acct": "B",
-             "ts": 1000.0, "amount": 1000.0},
-            {"tx_id": "ek5", "from_acct": "C", "to_acct": "D",
-             "ts": 5000.0, "amount": 2000.0},
-            {"tx_id": "ek6", "from_acct": "D", "to_acct": "A",
-             "ts": 8000.0, "amount": 3000.0},
+            {"tx_id": "ek1", "from_acct": "A", "to_acct": "B", "ts": 0.0, "amount": 20000.0},
+            {"tx_id": "ek2", "from_acct": "B", "to_acct": "C", "ts": 100.0, "amount": 5000.0},
+            {"tx_id": "ek3", "from_acct": "C", "to_acct": "D", "ts": 200.0, "amount": 5000.0},
+            {"tx_id": "ek4", "from_acct": "A", "to_acct": "B", "ts": 1000.0, "amount": 1000.0},
+            {"tx_id": "ek5", "from_acct": "C", "to_acct": "D", "ts": 5000.0, "amount": 2000.0},
+            {"tx_id": "ek6", "from_acct": "D", "to_acct": "A", "ts": 8000.0, "amount": 3000.0},
         ],
-        key_col="tx_id", source_id="t",
+        key_col="tx_id",
+        source_id="t",
     )
 
     edge_dims = (
-        EdgeDimensionsConfig(dims={
-            "pair_edge_count": {},
-            "find_motif_structuring": {
-                "time_window_hours": 1.0,
-                "amt1_min": 10000.0,
-                "amt2_max": 10000.0,
-            },
-        })
-        if with_edge_dims else None
+        EdgeDimensionsConfig(
+            dims={
+                "pair_edge_count": {},
+                "find_motif_structuring": {
+                    "time_window_hours": 1.0,
+                    "amt1_min": 10000.0,
+                    "amt2_max": 10000.0,
+                },
+            }
+        )
+        if with_edge_dims
+        else None
     )
 
     b.add_pattern(
@@ -64,12 +62,17 @@ def _make_event_sphere(out_root: Path, *, with_edge_dims: bool) -> GDSBuilder:
         entity_line="transactions",
         relations=[
             RelationSpec(
-                "accounts", fk_col="from_acct", direction="in", required=True,
+                "accounts",
+                fk_col="from_acct",
+                direction="in",
+                required=True,
             ),
         ],
         edge_table=EdgeTableConfig(
-            from_col="from_acct", to_col="to_acct",
-            timestamp_col="ts", amount_col="amount",
+            from_col="from_acct",
+            to_col="to_acct",
+            timestamp_col="ts",
+            amount_col="amount",
         ),
         edge_dimensions=edge_dims,
     )
@@ -81,29 +84,44 @@ def test_event_pattern_with_edge_dimensions_emits_sidecar(tmp_path: Path):
     builder = _make_event_sphere(out_root, with_edge_dims=True)
     builder.build()
 
-    sidecar = (
-        out_root / "_gds_meta" / "edge_features" / "tx_pattern" / "data.lance"
-    )
+    sidecar = out_root / "_gds_meta" / "edge_features" / "tx_pattern" / "data.lance"
     assert sidecar.exists(), f"sidecar missing at {sidecar}"
     table = lance.dataset(str(sidecar)).to_table()
     assert "event_key" in table.column_names
     assert "pair_edge_count" in table.column_names
     assert "find_motif_structuring" in table.column_names
     # ek1, ek2, ek3 are part of structuring → flag=1; others 0.
-    rows = {
-        ek: ec
-        for ek, ec in zip(
+    rows = dict(
+        zip(
             table["event_key"].to_pylist(),
             table["find_motif_structuring"].to_pylist(),
             strict=False,
         )
-    }
+    )
     assert rows["ek1"] == 1.0
     assert rows["ek2"] == 1.0
     assert rows["ek3"] == 1.0
     assert rows["ek4"] == 0.0
     assert rows["ek5"] == 0.0
     assert rows["ek6"] == 0.0
+
+
+def test_failed_sidecar_write_stops_the_build(tmp_path: Path, monkeypatch):
+    import pytest
+
+    import hypertopos.storage.writer as writer
+
+    real_write = writer._write_lance
+
+    def failing_write(table, path, *args, **kwargs):
+        if "edge_features" in str(path):
+            raise OSError("disk full")
+        return real_write(table, path, *args, **kwargs)
+
+    monkeypatch.setattr(writer, "_write_lance", failing_write)
+    builder = _make_event_sphere(tmp_path / "gds_test_s1", with_edge_dims=True)
+    with pytest.raises(RuntimeError, match="edge_features sidecar.*tx_pattern.*disk full"):
+        builder.build()
 
 
 def test_event_pattern_polygon_shape_grows_by_edge_dim_count(tmp_path: Path):
@@ -139,7 +157,5 @@ def test_event_pattern_no_edge_dimensions_no_sidecar(tmp_path: Path):
     out_root = tmp_path / "gds_no_ed"
     builder = _make_event_sphere(out_root, with_edge_dims=False)
     builder.build()
-    sidecar = (
-        out_root / "_gds_meta" / "edge_features" / "tx_pattern" / "data.lance"
-    )
+    sidecar = out_root / "_gds_meta" / "edge_features" / "tx_pattern" / "data.lance"
     assert not sidecar.exists()

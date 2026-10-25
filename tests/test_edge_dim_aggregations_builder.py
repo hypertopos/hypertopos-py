@@ -1,5 +1,6 @@
 """Builder integration: edge_dim_aggregations on an anchor pattern bakes
 mean/max aggregates of per-edge sidecar dims into the anchor polygon."""
+
 from __future__ import annotations
 
 import json
@@ -28,35 +29,33 @@ def _make_sphere(
             {"acct_id": "C", "name": "gamma"},
             {"acct_id": "D", "name": "delta"},
         ],
-        key_col="acct_id", source_id="t",
+        key_col="acct_id",
+        source_id="t",
     )
     b.add_line(
         "transactions",
         [
-            {"tx_id": "ek1", "from_acct": "A", "to_acct": "B",
-             "ts": 0.0,    "amount": 20000.0},
-            {"tx_id": "ek2", "from_acct": "B", "to_acct": "C",
-             "ts": 100.0,  "amount": 5000.0},
-            {"tx_id": "ek3", "from_acct": "C", "to_acct": "D",
-             "ts": 200.0,  "amount": 5000.0},
-            {"tx_id": "ek4", "from_acct": "A", "to_acct": "B",
-             "ts": 1000.0, "amount": 1000.0},
-            {"tx_id": "ek5", "from_acct": "C", "to_acct": "D",
-             "ts": 5000.0, "amount": 2000.0},
-            {"tx_id": "ek6", "from_acct": "D", "to_acct": "A",
-             "ts": 8000.0, "amount": 3000.0},
+            {"tx_id": "ek1", "from_acct": "A", "to_acct": "B", "ts": 0.0, "amount": 20000.0},
+            {"tx_id": "ek2", "from_acct": "B", "to_acct": "C", "ts": 100.0, "amount": 5000.0},
+            {"tx_id": "ek3", "from_acct": "C", "to_acct": "D", "ts": 200.0, "amount": 5000.0},
+            {"tx_id": "ek4", "from_acct": "A", "to_acct": "B", "ts": 1000.0, "amount": 1000.0},
+            {"tx_id": "ek5", "from_acct": "C", "to_acct": "D", "ts": 5000.0, "amount": 2000.0},
+            {"tx_id": "ek6", "from_acct": "D", "to_acct": "A", "ts": 8000.0, "amount": 3000.0},
         ],
-        key_col="tx_id", source_id="t",
+        key_col="tx_id",
+        source_id="t",
     )
 
-    edge_dims = EdgeDimensionsConfig(dims={
-        "pair_edge_count": {},
-        "find_motif_structuring": {
-            "time_window_hours": 1.0,
-            "amt1_min": 10000.0,
-            "amt2_max": 10000.0,
-        },
-    })
+    edge_dims = EdgeDimensionsConfig(
+        dims={
+            "pair_edge_count": {},
+            "find_motif_structuring": {
+                "time_window_hours": 1.0,
+                "amt1_min": 10000.0,
+                "amt2_max": 10000.0,
+            },
+        }
+    )
 
     # Event pattern declared FIRST so its sidecar is built before the
     # anchor pattern that aggregates from it.
@@ -66,12 +65,17 @@ def _make_sphere(
         entity_line="transactions",
         relations=[
             RelationSpec(
-                "accounts", fk_col="from_acct", direction="in", required=True,
+                "accounts",
+                fk_col="from_acct",
+                direction="in",
+                required=True,
             ),
         ],
         edge_table=EdgeTableConfig(
-            from_col="from_acct", to_col="to_acct",
-            timestamp_col="ts", amount_col="amount",
+            from_col="from_acct",
+            to_col="to_acct",
+            timestamp_col="ts",
+            amount_col="amount",
         ),
         edge_dimensions=edge_dims,
     )
@@ -81,7 +85,8 @@ def _make_sphere(
             from_event_pattern="tx_pattern",
             dims=("pair_edge_count",),
         )
-        if with_aggregations else None
+        if with_aggregations
+        else None
     )
 
     b.add_pattern(
@@ -124,7 +129,11 @@ def test_account_pattern_with_aggregations_extends_dimension_kinds(
     # to poisson (count of edges above the per-dim threshold).
     assert len(new_kinds) == base_dim + 5
     assert new_kinds[-5:] == [
-        "gaussian", "gaussian", "gaussian", "gaussian", "poisson",
+        "gaussian",
+        "gaussian",
+        "gaussian",
+        "gaussian",
+        "poisson",
     ]
 
 
@@ -173,9 +182,7 @@ def test_anomaly_summary_works_on_aggregated_pattern(tmp_path: Path):
     assert "top_driving_dimensions" in summary
     sphere = nav._storage.read_sphere()
     pat = sphere.patterns["account_pattern"]
-    assert pat.delta_dim() > len(pat.relations), (
-        "delta_dim must include aggregated edge-dim count"
-    )
+    assert pat.delta_dim() > len(pat.relations), "delta_dim must include aggregated edge-dim count"
     assert any("_mean" in lbl or "_max" in lbl for lbl in pat.dim_labels), (
         f"dim_labels must include aggregated names; got {pat.dim_labels}"
     )
@@ -207,23 +214,20 @@ def _make_sphere_with_pair_anchor(out_root: Path) -> GDSBuilder:
             {"acct_id": "B", "name": "beta"},
             {"acct_id": "C", "name": "gamma"},
         ],
-        key_col="acct_id", source_id="t",
+        key_col="acct_id",
+        source_id="t",
     )
     b.add_line(
         "transactions",
         [
-            {"tx_id": "ek1", "from_acct": "A", "to_acct": "B",
-             "ts": 0.0,    "amount": 1000.0},
-            {"tx_id": "ek2", "from_acct": "A", "to_acct": "B",
-             "ts": 100.0,  "amount": 1500.0},
-            {"tx_id": "ek3", "from_acct": "A", "to_acct": "B",
-             "ts": 200.0,  "amount": 2000.0},
-            {"tx_id": "ek4", "from_acct": "A", "to_acct": "C",
-             "ts": 300.0,  "amount": 500.0},
-            {"tx_id": "ek5", "from_acct": "B", "to_acct": "A",
-             "ts": 400.0,  "amount": 800.0},
+            {"tx_id": "ek1", "from_acct": "A", "to_acct": "B", "ts": 0.0, "amount": 1000.0},
+            {"tx_id": "ek2", "from_acct": "A", "to_acct": "B", "ts": 100.0, "amount": 1500.0},
+            {"tx_id": "ek3", "from_acct": "A", "to_acct": "B", "ts": 200.0, "amount": 2000.0},
+            {"tx_id": "ek4", "from_acct": "A", "to_acct": "C", "ts": 300.0, "amount": 500.0},
+            {"tx_id": "ek5", "from_acct": "B", "to_acct": "A", "ts": 400.0, "amount": 800.0},
         ],
-        key_col="tx_id", source_id="t",
+        key_col="tx_id",
+        source_id="t",
     )
 
     edge_dims = EdgeDimensionsConfig(dims={"pair_edge_count": {}})
@@ -234,12 +238,17 @@ def _make_sphere_with_pair_anchor(out_root: Path) -> GDSBuilder:
         entity_line="transactions",
         relations=[
             RelationSpec(
-                "accounts", fk_col="from_acct", direction="in", required=True,
+                "accounts",
+                fk_col="from_acct",
+                direction="in",
+                required=True,
             ),
         ],
         edge_table=EdgeTableConfig(
-            from_col="from_acct", to_col="to_acct",
-            timestamp_col="ts", amount_col="amount",
+            from_col="from_acct",
+            to_col="to_acct",
+            timestamp_col="ts",
+            amount_col="amount",
         ),
         edge_dimensions=edge_dims,
     )
@@ -284,20 +293,23 @@ def test_chain_or_unknown_anchor_kind_raises_not_implemented(tmp_path: Path):
     b.add_line(
         "accounts",
         [{"acct_id": "A"}, {"acct_id": "B"}],
-        key_col="acct_id", source_id="t",
+        key_col="acct_id",
+        source_id="t",
     )
     b.add_line(
         "transactions",
         [
-            {"tx_id": "ek1", "from_acct": "A", "to_acct": "B",
-             "ts": 0.0, "amount": 100.0},
+            {"tx_id": "ek1", "from_acct": "A", "to_acct": "B", "ts": 0.0, "amount": 100.0},
         ],
-        key_col="tx_id", source_id="t",
+        key_col="tx_id",
+        source_id="t",
     )
     b.add_line(
         "tx_chains",
         [{"chain_id": "c1", "hop_count": 1}],
-        key_col="chain_id", source_id="t", role="anchor",
+        key_col="chain_id",
+        source_id="t",
+        role="anchor",
     )
     b.add_pattern(
         "tx_pattern",
@@ -305,12 +317,17 @@ def test_chain_or_unknown_anchor_kind_raises_not_implemented(tmp_path: Path):
         entity_line="transactions",
         relations=[
             RelationSpec(
-                "accounts", fk_col="from_acct", direction="in", required=True,
+                "accounts",
+                fk_col="from_acct",
+                direction="in",
+                required=True,
             ),
         ],
         edge_table=EdgeTableConfig(
-            from_col="from_acct", to_col="to_acct",
-            timestamp_col="ts", amount_col="amount",
+            from_col="from_acct",
+            to_col="to_acct",
+            timestamp_col="ts",
+            amount_col="amount",
         ),
         edge_dimensions=EdgeDimensionsConfig(dims={"pair_edge_count": {}}),
     )
@@ -389,13 +406,8 @@ def test_edge_dim_thresholds_persisted_into_calibration_history(
     out = tmp_path / "gds_persist"
     _make_sphere(out, with_aggregations=True).build()
 
-    epoch_path = (
-        out / "_gds_meta" / "calibration_history" / "account_pattern"
-        / "v=1.json"
-    )
-    assert epoch_path.exists(), (
-        f"calibration epoch JSON missing at {epoch_path}"
-    )
+    epoch_path = out / "_gds_meta" / "calibration_history" / "account_pattern" / "v=1.json"
+    assert epoch_path.exists(), f"calibration epoch JSON missing at {epoch_path}"
     blob = json.loads(epoch_path.read_text())
 
     assert "edge_dim_thresholds" in blob, (
@@ -415,6 +427,7 @@ def test_edge_dim_thresholds_persisted_into_calibration_history(
     # NaN/Inf guard: threshold MUST be finite — degenerate sidecars are
     # mapped to 0.0 by `_resolve_count_above_thresholds`.
     import math
+
     assert math.isfinite(pec_thr)
 
 
@@ -427,10 +440,7 @@ def test_edge_dim_thresholds_absent_when_pattern_has_no_aggregations(
     out = tmp_path / "gds_no_agg"
     _make_sphere(out, with_aggregations=False).build()
 
-    epoch_path = (
-        out / "_gds_meta" / "calibration_history" / "account_pattern"
-        / "v=1.json"
-    )
+    epoch_path = out / "_gds_meta" / "calibration_history" / "account_pattern" / "v=1.json"
     assert epoch_path.exists()
     blob = json.loads(epoch_path.read_text())
     # Either key absent OR explicitly null — both shapes deserialize as None.
@@ -453,31 +463,31 @@ def _make_sphere_with_per_dim_aggregates(
             {"acct_id": "C", "name": "gamma"},
             {"acct_id": "D", "name": "delta"},
         ],
-        key_col="acct_id", source_id="t",
+        key_col="acct_id",
+        source_id="t",
     )
     b.add_line(
         "transactions",
         [
-            {"tx_id": "ek1", "from_acct": "A", "to_acct": "B",
-             "ts": 0.0,    "amount": 20000.0},
-            {"tx_id": "ek2", "from_acct": "B", "to_acct": "C",
-             "ts": 100.0,  "amount": 5000.0},
-            {"tx_id": "ek3", "from_acct": "C", "to_acct": "D",
-             "ts": 200.0,  "amount": 5000.0},
-            {"tx_id": "ek4", "from_acct": "A", "to_acct": "B",
-             "ts": 1000.0, "amount": 1000.0},
+            {"tx_id": "ek1", "from_acct": "A", "to_acct": "B", "ts": 0.0, "amount": 20000.0},
+            {"tx_id": "ek2", "from_acct": "B", "to_acct": "C", "ts": 100.0, "amount": 5000.0},
+            {"tx_id": "ek3", "from_acct": "C", "to_acct": "D", "ts": 200.0, "amount": 5000.0},
+            {"tx_id": "ek4", "from_acct": "A", "to_acct": "B", "ts": 1000.0, "amount": 1000.0},
         ],
-        key_col="tx_id", source_id="t",
+        key_col="tx_id",
+        source_id="t",
     )
 
-    edge_dims = EdgeDimensionsConfig(dims={
-        "pair_edge_count": {},
-        "find_motif_structuring": {
-            "time_window_hours": 1.0,
-            "amt1_min": 10000.0,
-            "amt2_max": 10000.0,
-        },
-    })
+    edge_dims = EdgeDimensionsConfig(
+        dims={
+            "pair_edge_count": {},
+            "find_motif_structuring": {
+                "time_window_hours": 1.0,
+                "amt1_min": 10000.0,
+                "amt2_max": 10000.0,
+            },
+        }
+    )
 
     b.add_pattern(
         "tx_pattern",
@@ -485,12 +495,17 @@ def _make_sphere_with_per_dim_aggregates(
         entity_line="transactions",
         relations=[
             RelationSpec(
-                "accounts", fk_col="from_acct", direction="in", required=True,
+                "accounts",
+                fk_col="from_acct",
+                direction="in",
+                required=True,
             ),
         ],
         edge_table=EdgeTableConfig(
-            from_col="from_acct", to_col="to_acct",
-            timestamp_col="ts", amount_col="amount",
+            from_col="from_acct",
+            to_col="to_acct",
+            timestamp_col="ts",
+            amount_col="amount",
         ),
         edge_dimensions=edge_dims,
     )
@@ -538,8 +553,7 @@ def test_per_dim_subset_emits_only_selected_aggregate_columns(tmp_path: Path):
     kinds = pat.dimension_kinds or []
     # 1 derived (tx_out_count) + (1 + 2) per-dim aggregates = 4 dims
     assert len(kinds) == 4, (
-        f"expected 4 polygon dims (1 derived + 3 selected aggregates), "
-        f"got {len(kinds)}"
+        f"expected 4 polygon dims (1 derived + 3 selected aggregates), got {len(kinds)}"
     )
     labels = pat.dim_labels
     assert labels[-3:] == [
@@ -589,10 +603,8 @@ def test_per_dim_subset_flips_schema_hash_vs_all_five(tmp_path: Path):
     _make_sphere_with_per_dim_aggregates(
         out_full,
         aggregates_per_dim={
-            "pair_edge_count": ("mean", "max", "std", "p95",
-                                "count_above_threshold"),
-            "find_motif_structuring": ("mean", "max", "std", "p95",
-                                        "count_above_threshold"),
+            "pair_edge_count": ("mean", "max", "std", "p95", "count_above_threshold"),
+            "find_motif_structuring": ("mean", "max", "std", "p95", "count_above_threshold"),
         },
     ).build()
 
@@ -620,12 +632,8 @@ def test_per_dim_subset_flips_schema_hash_vs_all_five(tmp_path: Path):
     )
 
     # Sanity: dimension_kinds length reflects the selector difference.
-    kinds_full = (
-        sj_full["patterns"]["account_pattern"].get("dimension_kinds") or []
-    )
-    kinds_subset = (
-        sj_subset["patterns"]["account_pattern"].get("dimension_kinds") or []
-    )
+    kinds_full = sj_full["patterns"]["account_pattern"].get("dimension_kinds") or []
+    kinds_subset = sj_subset["patterns"]["account_pattern"].get("dimension_kinds") or []
     # full: 1 derived + 2 dims × 5 aggs = 11; subset: 1 derived + 1 + 2 = 4
     assert len(kinds_full) == 11
     assert len(kinds_subset) == 4
@@ -669,8 +677,7 @@ def test_dim_percentiles_cover_aggregated_edge_dims(tmp_path: Path):
     expected_keys = {"min", "p25", "p50", "p75", "p99", "max"}
     for label in agg_names:
         assert set(dp[label]) == expected_keys, (
-            f"dim_percentiles[{label!r}] schema {set(dp[label])} != "
-            f"expected {expected_keys}"
+            f"dim_percentiles[{label!r}] schema {set(dp[label])} != expected {expected_keys}"
         )
         # Percentile invariants: monotone non-decreasing, finite.
         entry = dp[label]

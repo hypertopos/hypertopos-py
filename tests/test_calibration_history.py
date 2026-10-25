@@ -4,11 +4,12 @@ Covers: CalibrationFit dataclass, CalibrationNotFoundError, schema_hash helpers,
 JSON serialization helpers, history-write/GC helpers. Integration tests against
 real builder runs live in test_calibration_history_builder.py.
 """
+
 from __future__ import annotations
 
 import dataclasses
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import numpy as np
 import pytest
@@ -32,8 +33,8 @@ def test_calibration_fit_construction_and_frozen():
         group_stats=None,
         gmm_components=None,
         edge_max=None,
-        computed_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc),
-        last_calibrated_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc),
+        computed_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=UTC),
+        last_calibrated_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=UTC),
     )
     assert fit.pattern_id == "account_pattern"
     assert fit.calibration_epoch == 1
@@ -133,7 +134,9 @@ def test_schema_hash_2_3_reconstructor_agrees_with_compute():
         "prop_columns": ["country"],
         "dimension_kinds": ["gaussian", "gaussian", "bernoulli"],
     }
-    assert _compute_schema_hash_from_pattern_node(pattern_node) == compute_pattern_schema_hash(payload)
+    assert _compute_schema_hash_from_pattern_node(pattern_node) == compute_pattern_schema_hash(
+        payload
+    )
 
 
 def test_calibration_fit_json_round_trip():
@@ -152,11 +155,18 @@ def test_calibration_fit_json_round_trip():
         dimension_weights=np.array([1.0, 0.5], dtype=np.float32),
         dimension_kinds=["gaussian", "poisson"],
         dim_percentiles={"0": [0.0, 0.5, 1.0]},
-        group_stats={"US": {"mu": [0.1, 0.2], "sigma_diag": [0.05, 0.06], "theta": [3.0, 3.0], "population_size": 500}},
+        group_stats={
+            "US": {
+                "mu": [0.1, 0.2],
+                "sigma_diag": [0.05, 0.06],
+                "theta": [3.0, 3.0],
+                "population_size": 500,
+            }
+        },
         gmm_components=[{"weight": 1.0, "mu": [0.1, 0.2], "sigma_diag": [0.05, 0.06]}],
         edge_max=np.array([10.0, 20.0], dtype=np.float32),
-        computed_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc),
-        last_calibrated_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc),
+        computed_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=UTC),
+        last_calibrated_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=UTC),
     )
 
     blob = serialize_fit(original)
@@ -199,8 +209,8 @@ def test_calibration_fit_round_trip_with_optionals_none():
         group_stats=None,
         gmm_components=None,
         edge_max=None,
-        computed_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc),
-        last_calibrated_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc),
+        computed_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=UTC),
+        last_calibrated_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=UTC),
     )
     restored = deserialize_fit(json.loads(json.dumps(serialize_fit(original))))
     assert restored.dimension_weights is None
@@ -230,8 +240,8 @@ def test_calibration_fit_round_trip_with_edge_dim_thresholds():
         group_stats=None,
         gmm_components=None,
         edge_max=None,
-        computed_at=datetime(2026, 5, 5, 12, 0, 0, tzinfo=timezone.utc),
-        last_calibrated_at=datetime(2026, 5, 5, 12, 0, 0, tzinfo=timezone.utc),
+        computed_at=datetime(2026, 5, 5, 12, 0, 0, tzinfo=UTC),
+        last_calibrated_at=datetime(2026, 5, 5, 12, 0, 0, tzinfo=UTC),
         edge_dim_thresholds={
             "pair_edge_count": 7.5,
             "find_motif_structuring": 0.92,
@@ -298,8 +308,8 @@ def test_write_calibration_history_epoch_creates_file(tmp_path):
         group_stats=None,
         gmm_components=None,
         edge_max=None,
-        computed_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc),
-        last_calibrated_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc),
+        computed_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=UTC),
+        last_calibrated_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=UTC),
     )
     write_calibration_history_epoch(base, fit, last_k=5)
 
@@ -333,8 +343,8 @@ def test_write_calibration_history_epoch_gc_trims_oldest(tmp_path):
             group_stats=None,
             gmm_components=None,
             edge_max=None,
-            computed_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc),
-            last_calibrated_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc),
+            computed_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=UTC),
+            last_calibrated_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=UTC),
         )
 
     for n in range(1, 7):
@@ -373,8 +383,8 @@ def test_write_calibration_history_epoch_last_k_one_is_replace(tmp_path):
             group_stats=None,
             gmm_components=None,
             edge_max=None,
-            computed_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc),
-            last_calibrated_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc),
+            computed_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=UTC),
+            last_calibrated_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=UTC),
         )
         write_calibration_history_epoch(base, fit, last_k=1)
 
@@ -400,8 +410,8 @@ def test_write_calibration_history_epoch_rejects_invalid_last_k(tmp_path):
         group_stats=None,
         gmm_components=None,
         edge_max=None,
-        computed_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc),
-        last_calibrated_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc),
+        computed_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=UTC),
+        last_calibrated_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=UTC),
     )
     with pytest.raises(ValueError, match="last_k must be >= 1"):
         write_calibration_history_epoch(tmp_path, fit, last_k=0)

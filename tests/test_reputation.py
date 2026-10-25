@@ -5,6 +5,7 @@
 """Tests for geometric reputation (Beta distribution anomaly history)."""
 
 import numpy as np
+
 from hypertopos.engine.geometry import GDSEngine
 
 

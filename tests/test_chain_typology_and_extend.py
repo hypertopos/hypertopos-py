@@ -6,18 +6,17 @@ the chain reverse index. Tests use AML HI-small fixture and a unique
 chain_id to avoid the chain extraction collision regression (pre-fix
 spheres expose duplicates).
 """
+
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
+
 from hypertopos import HyperSphere
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-AML_PATH = (
-    PROJECT_ROOT / "benchmark" / "ibm-aml" / "hi_small_sphere"
-    / "gds_aml_hi_small"
-)
+AML_PATH = PROJECT_ROOT / "benchmark" / "ibm-aml" / "hi_small_sphere" / "gds_aml_hi_small"
 
 
 def _aml_sphere_unavailable() -> bool:
@@ -25,12 +24,13 @@ def _aml_sphere_unavailable() -> bool:
     if not sphere_json.exists():
         return True
     import json
-    return json.loads(sphere_json.read_text()).get("format_version") != "3.0"
+
+    return json.loads(sphere_json.read_text()).get("format_version", "").split(".")[0] != "3"
 
 
 pytestmark = pytest.mark.skipif(
     _aml_sphere_unavailable(),
-    reason="AML HI-small sphere not built at format 3.0",
+    reason="AML HI-small sphere not built (format 3.x)",
 )
 
 
@@ -52,7 +52,9 @@ def unique_anomalous_chain_id(aml_nav):
     )
     line_ver = aml_nav._manifest.line_version("tx_chains") or 1
     pts = aml_nav._storage.read_points(
-        "tx_chains", line_ver, columns=["primary_key"],
+        "tx_chains",
+        line_ver,
+        columns=["primary_key"],
     )
     pks = pts["primary_key"].to_pylist()
     counts: dict[str, int] = {}
@@ -77,16 +79,30 @@ def test_classify_returns_typology_block(aml_nav, unique_anomalous_chain_id):
     assert "typology" in out
     typ = out["typology"]
     assert typ["shape"] in (
-        "monotone-rising", "monotone-falling", "peak-in-middle",
-        "peak-at-start", "peak-at-end", "flat", "single-hop",
+        "monotone-rising",
+        "monotone-falling",
+        "peak-in-middle",
+        "peak-at-start",
+        "peak-at-end",
+        "flat",
+        "single-hop",
         "no-anomalous-run",
     )
     assert typ["peak_position"] in (
-        "at-start", "early", "middle", "late", "at-end",
-        "single-hop", "no-run",
+        "at-start",
+        "early",
+        "middle",
+        "late",
+        "at-end",
+        "single-hop",
+        "no-run",
     )
     assert typ["position_in_chain"] in (
-        "leading", "transit", "terminal", "full-chain", "no-run",
+        "leading",
+        "transit",
+        "terminal",
+        "full-chain",
+        "no-run",
     )
     assert "extension_signals" in typ
     assert "backward" in typ["extension_signals"]
@@ -94,7 +110,8 @@ def test_classify_returns_typology_block(aml_nav, unique_anomalous_chain_id):
 
 
 def test_classify_run_length_matches_sweep(
-    aml_nav, unique_anomalous_chain_id,
+    aml_nav,
+    unique_anomalous_chain_id,
 ):
     """The typology classifier's run_length must match what
     find_chains_with_coherent_anomaly reports for the same chain
@@ -106,8 +123,7 @@ def test_classify_run_length_matches_sweep(
         max_results=200,
     )
     swept = next(
-        (c for c in sweep["chains"]
-         if c["chain_id"] == unique_anomalous_chain_id),
+        (c for c in sweep["chains"] if c["chain_id"] == unique_anomalous_chain_id),
         None,
     )
     assert swept is not None
@@ -121,7 +137,8 @@ def test_classify_run_length_matches_sweep(
 
 
 def test_extend_forward_returns_candidates(
-    aml_nav, unique_anomalous_chain_id,
+    aml_nav,
+    unique_anomalous_chain_id,
 ):
     out = aml_nav.extend_chain(
         unique_anomalous_chain_id,
@@ -142,10 +159,13 @@ def test_extend_forward_returns_candidates(
             assert "n_source_chains" in cand
         # Sorted: anomalous first, then by delta_norm desc
         for a, b in zip(
-            out["candidates"], out["candidates"][1:], strict=False,
+            out["candidates"],
+            out["candidates"][1:],
+            strict=False,
         ):
             assert (a["is_anomaly"], a["delta_norm"]) >= (
-                b["is_anomaly"], b["delta_norm"],
+                b["is_anomaly"],
+                b["delta_norm"],
             )
 
 
@@ -162,7 +182,8 @@ def test_extend_backward_runs(aml_nav, unique_anomalous_chain_id):
 
 
 def test_extend_invalid_direction_raises(
-    aml_nav, unique_anomalous_chain_id,
+    aml_nav,
+    unique_anomalous_chain_id,
 ):
     with pytest.raises(ValueError, match="direction"):
         aml_nav.extend_chain(
@@ -174,11 +195,13 @@ def test_extend_invalid_direction_raises(
 
 
 def test_extend_warm_call_under_budget(
-    aml_nav, unique_anomalous_chain_id,
+    aml_nav,
+    unique_anomalous_chain_id,
 ):
     """extend_chain reads chain reverse index + filtered anchor geometry.
     Warm call must be sub-second (typical ~100-500ms after warmup)."""
     import time
+
     aml_nav.extend_chain(
         unique_anomalous_chain_id,
         "tx_chains_pattern",

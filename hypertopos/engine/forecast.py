@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 
@@ -23,21 +23,22 @@ from hypertopos.model.sphere import CuttingPlane
 # Result dataclasses
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class ForecastResult:
     horizon: int
-    predicted_delta: np.ndarray       # d_{n+h}
-    predicted_delta_norm: float       # ||d_{n+h}||
-    reliability: str                  # "high" / "medium" / "low"
-    r_squared: float                  # goodness of fit
+    predicted_delta: np.ndarray  # d_{n+h}
+    predicted_delta_norm: float  # ||d_{n+h}||
+    reliability: str  # "high" / "medium" / "low"
+    r_squared: float  # goodness of fit
 
 
 @dataclass
 class AnomalyForecast:
     horizon: int
     predicted_delta_norm: float
-    forecast_is_anomaly: bool         # theta_norm > 0 and predicted_delta_norm >= theta_norm
-    current_is_anomaly: bool          # theta_norm > 0 and current_delta_norm >= theta_norm
+    forecast_is_anomaly: bool  # theta_norm > 0 and predicted_delta_norm >= theta_norm
+    current_is_anomaly: bool  # theta_norm > 0 and current_delta_norm >= theta_norm
     reliability: str
 
 
@@ -46,24 +47,25 @@ class SegmentCrossing:
     cutting_plane_id: str
     current_signed_dist: float
     predicted_signed_dist: float
-    crosses_boundary: bool            # sign change
-    time_to_boundary: int | None      # versions until crossing (None if not converging)
+    crosses_boundary: bool  # sign change
+    time_to_boundary: int | None  # versions until crossing (None if not converging)
     reliability: str
 
 
 @dataclass
 class PopulationForecast:
-    metric: str                       # "anomaly_rate", "mean_delta_norm", "entity_count"
+    metric: str  # "anomaly_rate", "mean_delta_norm", "entity_count"
     current_value: float
     forecast_value: float
     horizon: int
-    direction: str                    # "rising", "falling", "stable"
+    direction: str  # "rising", "falling", "stable"
     reliability: str
 
 
 # ---------------------------------------------------------------------------
 # Reliability helper
 # ---------------------------------------------------------------------------
+
 
 def reliability_label(n_slices: int, r_squared: float) -> str:
     """Classify forecast reliability based on data quantity and fit quality.
@@ -100,7 +102,7 @@ def _weighted_linear_regression(
     y_mean = np.dot(w, y)
     t_centered = t - t_mean
     y_centered = y - y_mean
-    ss_tt = np.dot(w, t_centered ** 2)
+    ss_tt = np.dot(w, t_centered**2)
     ss_ty = np.dot(w, t_centered * y_centered)
 
     if ss_tt < 1e-15:
@@ -113,7 +115,7 @@ def _weighted_linear_regression(
     # Weighted R²
     y_pred = slope * t + intercept
     ss_res = np.dot(w, (y - y_pred) ** 2)
-    ss_tot = np.dot(w, y_centered ** 2)
+    ss_tot = np.dot(w, y_centered**2)
     r_squared = (
         1.0 if ss_tot < 1e-15 else max(0.0, 1.0 - ss_res / ss_tot)
     )  # constant data, perfect fit
@@ -176,6 +178,7 @@ def extrapolate_trajectory(
 # Anomaly forecast
 # ---------------------------------------------------------------------------
 
+
 def forecast_anomaly_status(
     deltas: list[np.ndarray],
     theta_norm: float,
@@ -214,6 +217,7 @@ def forecast_anomaly_status(
 # Segment crossing forecast
 # ---------------------------------------------------------------------------
 
+
 def forecast_segment_crossing(
     deltas: list[np.ndarray],
     cutting_planes: dict[str, CuttingPlane],
@@ -241,9 +245,7 @@ def forecast_segment_crossing(
 
     for cp_id, cp in cutting_planes.items():
         # Compute signed distances for each delta
-        signed_dists = np.array(
-            [cp.signed_distance(d) for d in deltas], dtype=np.float64
-        )
+        signed_dists = np.array([cp.signed_distance(d) for d in deltas], dtype=np.float64)
 
         current_sd = float(signed_dists[-1])
 
@@ -263,14 +265,16 @@ def forecast_segment_crossing(
                 time_to_boundary = max(1, int(np.ceil(t_cross - n)))
             # If t_cross <= n, the crossing is in the past or already at boundary
 
-        results.append(SegmentCrossing(
-            cutting_plane_id=cp_id,
-            current_signed_dist=current_sd,
-            predicted_signed_dist=float(predicted_sd),
-            crosses_boundary=crosses,
-            time_to_boundary=time_to_boundary,
-            reliability=reliability_label(n, r_sq),
-        ))
+        results.append(
+            SegmentCrossing(
+                cutting_plane_id=cp_id,
+                current_signed_dist=current_sd,
+                predicted_signed_dist=float(predicted_sd),
+                crosses_boundary=crosses,
+                time_to_boundary=time_to_boundary,
+                reliability=reliability_label(n, r_sq),
+            )
+        )
 
     return results
 
@@ -278,6 +282,7 @@ def forecast_segment_crossing(
 # ---------------------------------------------------------------------------
 # ForecastProvider protocol — pluggable forecast backend
 # ---------------------------------------------------------------------------
+
 
 @runtime_checkable
 class ForecastProvider(Protocol):
@@ -312,8 +317,8 @@ _STALE_THRESHOLD_DAYS = 180
 
 def check_stale_forecast(
     last_timestamp: datetime,
-    forecast: dict,
-) -> dict:
+    forecast: dict[str, Any],
+) -> dict[str, Any]:
     """Override reliability to 'low' and add stale_warning if temporal data is old."""
     from datetime import UTC
 

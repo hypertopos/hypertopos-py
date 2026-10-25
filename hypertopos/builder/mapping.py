@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 import pyarrow as pa
 import pyarrow.csv as pa_csv
@@ -23,19 +23,18 @@ _VALID_DIRECTIONS: frozenset[str] = frozenset({"in", "out", "self"})
 
 
 _EDGE_DIM_DEFAULTS: dict[str, dict[str, Any]] = {
-    "pair_edge_count":           {},
-    "position_in_chain":         {"min_position": 5},
-    "time_since_pair_last_edge": {"burst_seconds": 60.0,
-                                  "dormant_seconds": "auto"},
-    "pair_amount_zscore":        {"cv_threshold": 0.05, "min_count": 3},
-    "find_motif_structuring":    {"time_window_hours": 1.0,
-                                  "amt1_min": 10000.0, "amt2_max": 10000.0},
+    "pair_edge_count": {},
+    "position_in_chain": {"min_position": 5},
+    "time_since_pair_last_edge": {"burst_seconds": 60.0, "dormant_seconds": "auto"},
+    "pair_amount_zscore": {"cv_threshold": 0.05, "min_count": 3},
+    "find_motif_structuring": {"time_window_hours": 1.0, "amt1_min": 10000.0, "amt2_max": 10000.0},
 }
 
 
 @dataclass(frozen=True)
 class EdgeDimensionsConfig:
     """Parsed edge_dimensions: block from a pattern YAML stanza."""
+
     dims: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
@@ -74,7 +73,9 @@ def _validate_dim_params(name: str, params: dict[str, Any]) -> None:
 
 
 def parse_edge_dimensions(
-    raw: list[Any], *, pattern_type: str,
+    raw: list[Any],
+    *,
+    pattern_type: str,
 ) -> EdgeDimensionsConfig:
     """Parse the YAML edge_dimensions: list and validate.
 
@@ -87,12 +88,12 @@ def parse_edge_dimensions(
         )
     if not isinstance(raw, list):
         raise ValueError(
-            f"edge_dimensions must be a list of dim entries; "
-            f"got {type(raw).__name__}",
+            f"edge_dimensions must be a list of dim entries; got {type(raw).__name__}",
         )
 
     out: dict[str, dict[str, Any]] = {}
     for entry in raw:
+        override: dict[str, Any]
         if isinstance(entry, str):
             name, override = entry, {}
         elif isinstance(entry, dict) and len(entry) == 1:
@@ -105,14 +106,12 @@ def parse_edge_dimensions(
                 )
         else:
             raise ValueError(
-                f"edge_dimensions entries must be a string or single-key dict; "
-                f"got {entry!r}",
+                f"edge_dimensions entries must be a string or single-key dict; got {entry!r}",
             )
 
         if name not in EDGE_DIM_KINDS:
             raise ValueError(
-                f"unknown edge dimension: {name!r}; "
-                f"valid: {sorted(EDGE_DIM_KINDS)}",
+                f"unknown edge dimension: {name!r}; valid: {sorted(EDGE_DIM_KINDS)}",
             )
         if name in out:
             raise ValueError(f"edge dimension {name!r} declared twice")
@@ -138,14 +137,18 @@ class EdgeDimAggregationsConfig:
         # contract the YAML list form provides.
         if not self.aggregates_per_dim:
             from hypertopos.engine.edge_features import AGGREGATE_NAMES
+
             object.__setattr__(
-                self, "aggregates_per_dim",
+                self,
+                "aggregates_per_dim",
                 {d: tuple(AGGREGATE_NAMES) for d in self.dims},
             )
 
 
 def parse_edge_dim_aggregations(
-    raw: Any, *, pattern_type: str,
+    raw: Any,
+    *,
+    pattern_type: str,
 ) -> EdgeDimAggregationsConfig:
     from hypertopos.engine.edge_features import AGGREGATE_NAMES
 
@@ -156,8 +159,7 @@ def parse_edge_dim_aggregations(
         )
     if not isinstance(raw, dict):
         raise ValueError(
-            f"edge_dim_aggregations must be a YAML mapping; "
-            f"got {type(raw).__name__}",
+            f"edge_dim_aggregations must be a YAML mapping; got {type(raw).__name__}",
         )
     src = raw.get("from")
     if not src or not isinstance(src, str):
@@ -188,13 +190,11 @@ def parse_edge_dim_aggregations(
         for d in raw_dims:
             if not isinstance(d, str):
                 raise ValueError(
-                    f"edge_dim_aggregations.dims entries must be strings; "
-                    f"got {type(d).__name__}",
+                    f"edge_dim_aggregations.dims entries must be strings; got {type(d).__name__}",
                 )
             if d not in EDGE_DIM_KINDS:
                 raise ValueError(
-                    f"unknown edge dimension: {d!r}; "
-                    f"valid: {sorted(EDGE_DIM_KINDS)}",
+                    f"unknown edge dimension: {d!r}; valid: {sorted(EDGE_DIM_KINDS)}",
                 )
         dims = tuple(raw_dims)
         aggregates_per_dim = {d: tuple(AGGREGATE_NAMES) for d in dims}
@@ -208,13 +208,11 @@ def parse_edge_dim_aggregations(
         for d, agg_list in raw_dims.items():
             if not isinstance(d, str):
                 raise ValueError(
-                    f"edge_dim_aggregations.dims keys must be strings; "
-                    f"got {type(d).__name__}",
+                    f"edge_dim_aggregations.dims keys must be strings; got {type(d).__name__}",
                 )
             if d not in EDGE_DIM_KINDS:
                 raise ValueError(
-                    f"unknown edge dimension: {d!r}; "
-                    f"valid: {sorted(EDGE_DIM_KINDS)}",
+                    f"unknown edge dimension: {d!r}; valid: {sorted(EDGE_DIM_KINDS)}",
                 )
             if not isinstance(agg_list, list):
                 raise ValueError(
@@ -229,20 +227,16 @@ def parse_edge_dim_aggregations(
             for agg in agg_list:
                 if agg not in AGGREGATE_NAMES:
                     raise ValueError(
-                        f"unknown aggregate {agg!r} for dim {d!r}; "
-                        f"valid: {list(AGGREGATE_NAMES)}",
+                        f"unknown aggregate {agg!r} for dim {d!r}; valid: {list(AGGREGATE_NAMES)}",
                     )
             # Canonical-order materialisation: filter AGGREGATE_NAMES by user
             # selection so polygon-dim layout is insensitive to YAML order.
             user_set = set(agg_list)
-            aggregates_per_dim[d] = tuple(
-                a for a in AGGREGATE_NAMES if a in user_set
-            )
+            aggregates_per_dim[d] = tuple(a for a in AGGREGATE_NAMES if a in user_set)
         dims = tuple(raw_dims.keys())
     else:
         raise ValueError(
-            f"edge_dim_aggregations.dims must be a list or mapping; "
-            f"got {type(raw_dims).__name__}",
+            f"edge_dim_aggregations.dims must be a list or mapping; got {type(raw_dims).__name__}",
         )
     return EdgeDimAggregationsConfig(
         from_event_pattern=src,
@@ -255,7 +249,7 @@ def parse_edge_dim_aggregations(
 class RelationMapping:
     line_id: str
     fk_col: str | None = None
-    direction: str = "in"
+    direction: Literal["in", "out", "self"] = "in"
     required: bool = True
     display_name: str | None = None
     edge_max: int | None = None
@@ -273,13 +267,13 @@ class LineMapping:
 
 @dataclass
 class PatternMapping:
-    pattern_type: str
+    pattern_type: Literal["anchor", "event"]
     entity_line: str
     relations: list[RelationMapping] = field(default_factory=list)
     anomaly_percentile: float = 95.0
     tracked_properties: list[str] = field(default_factory=list)
-    edge_dimensions: "EdgeDimensionsConfig | None" = None
-    edge_dim_aggregations: "EdgeDimAggregationsConfig | None" = None
+    edge_dimensions: EdgeDimensionsConfig | None = None
+    edge_dim_aggregations: EdgeDimAggregationsConfig | None = None
 
 
 @dataclass
@@ -358,10 +352,7 @@ def _parse_patterns(
                 f"Pattern '{pattern_id}' references unknown entity_line '{entity_line}'. "
                 f"Available lines: {list(lines)}"
             )
-        relations = [
-            _parse_relation(pattern_id, r)
-            for r in (spec.get("relations") or [])
-        ]
+        relations = [_parse_relation(pattern_id, r) for r in (spec.get("relations") or [])]
         pattern_type = str(spec.get("type", "event"))
         if pattern_type not in _VALID_PATTERN_TYPES:
             raise ValueError(
@@ -381,7 +372,7 @@ def _parse_patterns(
             else None
         )
         result[pattern_id] = PatternMapping(
-            pattern_type=pattern_type,
+            pattern_type=cast(Literal["anchor", "event"], pattern_type),  # validated above
             entity_line=str(entity_line),
             relations=relations,
             anomaly_percentile=float(spec.get("anomaly_percentile", 95.0)),
@@ -407,7 +398,7 @@ def _parse_relation(pattern_id: str, spec: Any) -> RelationMapping:
     return RelationMapping(
         line_id=str(spec["line_id"]),
         fk_col=spec.get("fk_col"),
-        direction=direction,
+        direction=cast(Literal["in", "out", "self"], direction),  # validated above
         required=bool(spec.get("required", True)),
         display_name=spec.get("display_name"),
         edge_max=int(raw_em) if raw_em is not None else None,

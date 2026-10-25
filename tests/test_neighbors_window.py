@@ -1,4 +1,5 @@
 """Tests for AdjacencyIndex.neighbors_out_window / neighbors_in_window."""
+
 from __future__ import annotations
 
 import random
@@ -11,7 +12,8 @@ from hypertopos.engine.adjacency import AdjacencyIndex
 def _synth_5() -> AdjacencyIndex:
     """5-edge fixture: A->B@10, A->C@11, B->C@12, C->D@13, A->D@14."""
     return AdjacencyIndex.from_edge_lists(
-        ["A", "A", "B", "C", "A"], ["B", "C", "C", "D", "D"],
+        ["A", "A", "B", "C", "A"],
+        ["B", "C", "C", "D", "D"],
         [10.0, 11.0, 12.0, 13.0, 14.0],
         [100.0, 200.0, 50.0, 300.0, 400.0],
         ["e1", "e2", "e3", "e4", "e5"],

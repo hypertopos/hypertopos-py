@@ -15,7 +15,10 @@ A confidence value close to 1.0 means the entity is robustly anomalous across
 nearly all plausible realisations of the population statistics.  A value close
 to 0.0 means it is rarely anomalous — i.e. its apparent deviation is fragile.
 """
+
 from __future__ import annotations
+
+from typing import cast
 
 import numpy as np
 
@@ -98,7 +101,8 @@ def compute_bootstrap_confidence(
             ]
             sample_idx = np.concatenate(parts)
         else:
-            sample_idx = rng.choice(N, size=N, replace=True)
+            # size= is given, so choice returns an index array, not a scalar
+            sample_idx = cast(np.ndarray, rng.choice(N, size=N, replace=True))
 
         sample = X[sample_idx]  # (N, D)
 

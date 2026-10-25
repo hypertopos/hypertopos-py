@@ -19,6 +19,7 @@ runs functions top-to-bottom, and this repo has no ``pytest-randomly`` /
 ``pytest-order`` plugin (verified against ``pyproject.toml``), so the order
 is stable.
 """
+
 from __future__ import annotations
 
 import inspect
@@ -31,7 +32,7 @@ from hypertopos.navigation.navigator import GDSNavigator
 
 def test_a_replaces_navigator_method_with_magicmock_then_raises() -> None:
     """Phase 1 — install a MagicMock at the class level and short-circuit."""
-    setattr(GDSNavigator, "anomaly_summary", MagicMock(return_value=None))
+    GDSNavigator.anomaly_summary = MagicMock(return_value=None)
     with pytest.raises(RuntimeError):
         raise RuntimeError("simulate a test failure inside the patched context")
 

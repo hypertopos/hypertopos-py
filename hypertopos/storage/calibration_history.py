@@ -7,6 +7,7 @@ JSON serialization for CalibrationFit, and history write/GC helpers.
 
 On-disk layout: `_gds_meta/calibration_history/{pattern_id}/v={N}.json`
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -15,11 +16,14 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from hypertopos.storage.exceptions import GDSError
+
+if TYPE_CHECKING:
+    from hypertopos.model.sphere import CalibrationFit
 
 
 class CalibrationNotFoundError(GDSError):
@@ -75,11 +79,11 @@ def _compute_schema_hash_from_pattern_node(pattern_node: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _opt_list(arr: np.ndarray | None) -> list | None:
+def _opt_list(arr: np.ndarray | None) -> list[float] | None:
     return None if arr is None else arr.astype(np.float32).tolist()
 
 
-def _opt_array(value: list | None) -> np.ndarray | None:
+def _opt_array(value: list[float] | None) -> np.ndarray | None:
     return None if value is None else np.asarray(value, dtype=np.float32)
 
 
@@ -116,7 +120,7 @@ def serialize_fit(fit: Any) -> dict[str, Any]:
     }
 
 
-def deserialize_fit(blob: dict[str, Any]) -> Any:
+def deserialize_fit(blob: dict[str, Any]) -> CalibrationFit:
     """Reconstruct a CalibrationFit from a JSON-loaded dict."""
     from hypertopos.model.sphere import CalibrationFit
 
@@ -207,6 +211,7 @@ def reset_calibration_history(base: Path, pattern_id: str) -> None:
     or future subdirectories.
     """
     import shutil
+
     pdir = history_dir(base, pattern_id)
     if pdir.exists():
         shutil.rmtree(pdir)
@@ -226,6 +231,7 @@ def _safe_pk_filename(primary_key: str) -> str:
     on disk.
     """
     from urllib.parse import quote
+
     return quote(primary_key, safe="")
 
 
@@ -235,7 +241,9 @@ def influencer_history_path(base: Path, pattern_id: str, primary_key: str) -> Pa
 
 
 def read_influencer_history(
-    base: Path, pattern_id: str, primary_key: str,
+    base: Path,
+    pattern_id: str,
+    primary_key: str,
 ) -> list[dict[str, Any]]:
     """Return the chronological list of epoch records for ``primary_key``.
 
@@ -275,12 +283,14 @@ def upsert_influencer_history_entry(
         blob = {"primary_key": primary_key, "pattern_id": pattern_id, "entries": []}
 
     entries = [e for e in blob.get("entries", []) if e.get("epoch") != epoch]
-    entries.append({
-        "epoch": int(epoch),
-        "calibrated_at": calibrated_at,
-        "mu_impact": float(mu_impact),
-        "delta_norm_impact": float(delta_norm_impact),
-    })
+    entries.append(
+        {
+            "epoch": int(epoch),
+            "calibrated_at": calibrated_at,
+            "mu_impact": float(mu_impact),
+            "delta_norm_impact": float(delta_norm_impact),
+        }
+    )
     entries.sort(key=lambda r: r["epoch"])
     blob["entries"] = entries
     blob["primary_key"] = primary_key

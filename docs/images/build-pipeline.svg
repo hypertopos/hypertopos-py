@@ -1,83 +1,52 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 160" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#0a0e27"/>
-      <stop offset="100%" stop-color="#1a1a3e"/>
-    </linearGradient>
-  </defs>
-
-  <rect width="760" height="160" fill="url(#bg)" rx="12"/>
-
-  <!-- Title -->
-  <text x="380" y="24" fill="#ccd6f6" font-size="12" font-weight="600" text-anchor="middle" letter-spacing="2">BUILD PIPELINE</text>
-
-  <!-- All boxes on one row, y=45 -->
-
-  <!-- sphere.yaml -->
-  <g transform="translate(15, 45)">
-    <rect x="0" y="0" width="85" height="55" rx="8" fill="#2a1040" stroke="#c084fc" stroke-width="1.5"/>
-    <text x="42" y="22" fill="#c084fc" font-size="11" font-weight="700" text-anchor="middle">sphere</text>
-    <text x="42" y="38" fill="#c084fc" font-size="11" font-weight="700" text-anchor="middle">.yaml</text>
-  </g>
-
-  <!-- Arrow -->
-  <line x1="108" y1="72" x2="130" y2="72" stroke="#8892b0" stroke-width="2"/>
-  <polygon points="130,67 140,72 130,77" fill="#8892b0"/>
-
-  <!-- Sources -->
-  <g transform="translate(148, 45)">
-    <rect x="0" y="0" width="90" height="55" rx="8" fill="#1a1a3e" stroke="#8892b0" stroke-width="1.5"/>
-    <text x="45" y="22" fill="#ccd6f6" font-size="12" font-weight="700" text-anchor="middle">Sources</text>
-    <text x="45" y="40" fill="#8892b0" font-size="8" text-anchor="middle">CSV · Parquet · Py</text>
-  </g>
-
-  <!-- Arrow -->
-  <line x1="246" y1="72" x2="268" y2="72" stroke="#8892b0" stroke-width="2"/>
-  <polygon points="268,67 278,72 268,77" fill="#8892b0"/>
-
-  <!-- Lines -->
-  <g transform="translate(286, 45)">
-    <rect x="0" y="0" width="80" height="55" rx="8" fill="#0f2040" stroke="#22d3ee" stroke-width="1.5"/>
-    <text x="40" y="22" fill="#22d3ee" font-size="12" font-weight="700" text-anchor="middle">Lines</text>
-    <text x="40" y="40" fill="#67e8f9" font-size="8" text-anchor="middle">entity tables</text>
-  </g>
-
-  <!-- Arrow -->
-  <line x1="374" y1="72" x2="396" y2="72" stroke="#8892b0" stroke-width="2"/>
-  <polygon points="396,67 406,72 396,77" fill="#8892b0"/>
-
-  <!-- Patterns -->
-  <g transform="translate(414, 45)">
-    <rect x="0" y="0" width="90" height="55" rx="8" fill="#0f2040" stroke="#3b82f6" stroke-width="1.5"/>
-    <text x="45" y="22" fill="#60a5fa" font-size="12" font-weight="700" text-anchor="middle">Patterns</text>
-    <text x="45" y="38" fill="#93c5fd" font-size="8" text-anchor="middle">relations + dims</text>
-    <text x="45" y="48" fill="#4a6fa5" font-size="7" text-anchor="middle">μ, σ, θ</text>
-  </g>
-
-  <!-- Arrow -->
-  <line x1="512" y1="72" x2="534" y2="72" stroke="#60a5fa" stroke-width="2"/>
-  <polygon points="534,67 544,72 534,77" fill="#60a5fa"/>
-
-  <!-- Aliases -->
-  <g transform="translate(552, 45)">
-    <rect x="0" y="0" width="75" height="55" rx="8" fill="#1a1000" stroke="#fbbf24" stroke-width="1.5"/>
-    <text x="37" y="22" fill="#fbbf24" font-size="12" font-weight="700" text-anchor="middle">Aliases</text>
-    <text x="37" y="40" fill="#fcd34d" font-size="8" text-anchor="middle">cutting planes</text>
-  </g>
-
-  <!-- Arrow -->
-  <line x1="635" y1="72" x2="657" y2="72" stroke="#60a5fa" stroke-width="2"/>
-  <polygon points="657,67 667,72 657,77" fill="#60a5fa"/>
-
-  <!-- Output Sphere -->
-  <g transform="translate(675, 38)">
-    <rect x="0" y="0" width="70" height="68" rx="10" fill="#0f2040" stroke="#60a5fa" stroke-width="2"/>
-    <text x="35" y="20" fill="#60a5fa" font-size="11" font-weight="700" text-anchor="middle">Sphere</text>
-    <text x="35" y="34" fill="#ccd6f6" font-size="7" text-anchor="middle">sphere.json</text>
-    <text x="35" y="46" fill="#8892b0" font-size="7" text-anchor="middle">points/</text>
-    <text x="35" y="56" fill="#8892b0" font-size="7" text-anchor="middle">geometry/</text>
-  </g>
-
-  <!-- Subtitle -->
-  <text x="380" y="130" fill="#4a6fa5" font-size="9" text-anchor="middle">sphere.yaml → Sources → Lines → Patterns → Aliases → navigable sphere on disk</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 180" font-family="'Segoe UI', system-ui, -apple-system, sans-serif" role="img" aria-labelledby="bldp-title bldp-desc">
+<title id="bldp-title">Build pipeline</title>
+<desc id="bldp-desc">hypertopos build reads sphere.yaml, loads sources, writes lines, fits each pattern's calibration and delta vectors with its edge tables, adds optional temporal snapshots, and writes sphere.json with aliases: one directory of Lance datasets.</desc>
+<defs>
+<linearGradient id="bldp-bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#0a0e27"/><stop offset="100%" stop-color="#1a1a3e"/></linearGradient>
+<radialGradient id="bldp-glow"><stop offset="0%" stop-color="#4808FC" stop-opacity="0.55"/><stop offset="100%" stop-color="#4808FC" stop-opacity="0"/></radialGradient>
+</defs>
+<rect width="920" height="180" rx="14" fill="url(#bldp-bg)" stroke="#230C7C" stroke-width="1.5"/>
+<text x="460" y="26" font-size="11" fill="#FFFFFF" fill-opacity="0.55" font-weight="600" text-anchor="middle" letter-spacing="2">BUILD PIPELINE</text>
+<rect x="22" y="44" width="80" height="66" rx="9" fill="#0f2040" stroke="#230C7C" stroke-width="1"/>
+<text x="62" y="64" font-size="11.5" fill="#DACEFE" font-weight="700" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">sphere.yaml</text>
+<text x="62" y="80" font-size="8.5" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">declarative config</text>
+<line x1="105" y1="77" x2="118.2" y2="77" stroke="#885EFD" stroke-width="1.8"/>
+<polygon points="123,77 117,73.7 117,80.3" fill="#885EFD"/>
+<rect x="126" y="44" width="108" height="66" rx="9" fill="#0f2040" stroke="#230C7C" stroke-width="1"/>
+<text x="180" y="64" font-size="12.5" fill="#FFFFFF" font-weight="700" text-anchor="middle">Sources</text>
+<text x="180" y="80" font-size="8.5" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">CSV · Parquet</text>
+<text x="180" y="91" font-size="8.5" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">joins · Python script</text>
+<line x1="237" y1="77" x2="250.2" y2="77" stroke="#885EFD" stroke-width="1.8"/>
+<polygon points="255,77 249,73.7 249,80.3" fill="#885EFD"/>
+<rect x="258" y="44" width="104" height="66" rx="9" fill="#0f2040" stroke="#230C7C" stroke-width="1"/>
+<text x="310" y="64" font-size="12.5" fill="#FFFFFF" font-weight="700" text-anchor="middle">Lines</text>
+<text x="310" y="80" font-size="8.5" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">entity tables</text>
+<text x="310" y="91" font-size="8.5" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">chain · composite lines</text>
+<line x1="365" y1="77" x2="378.2" y2="77" stroke="#885EFD" stroke-width="1.8"/>
+<polygon points="383,77 377,73.7 377,80.3" fill="#885EFD"/>
+<rect x="386" y="44" width="128" height="66" rx="9" fill="#0f2040" stroke="#6D39FD" stroke-width="2"/>
+<text x="450" y="64" font-size="12.5" fill="#DACEFE" font-weight="700" text-anchor="middle">Patterns</text>
+<text x="450" y="80" font-size="8.5" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">μ, σ, θ calibration</text>
+<text x="450" y="91" font-size="8.5" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">delta vectors · edge tables</text>
+<line x1="517" y1="77" x2="530.2" y2="77" stroke="#885EFD" stroke-width="1.8"/>
+<polygon points="535,77 529,73.7 529,80.3" fill="#885EFD"/>
+<rect x="538" y="44" width="98" height="66" rx="9" fill="#0f2040" stroke="#230C7C" stroke-width="1"/>
+<text x="587" y="64" font-size="12.5" fill="#FFFFFF" font-weight="700" text-anchor="middle">Temporal</text>
+<text x="587" y="80" font-size="8.5" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">snapshots per window</text>
+<text x="587" y="91" font-size="8.5" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">optional</text>
+<line x1="639" y1="77" x2="652.2" y2="77" stroke="#885EFD" stroke-width="1.8"/>
+<polygon points="657,77 651,73.7 651,80.3" fill="#885EFD"/>
+<rect x="660" y="44" width="104" height="66" rx="9" fill="#0f2040" stroke="#230C7C" stroke-width="1"/>
+<text x="712" y="64" font-size="11.5" fill="#DACEFE" font-weight="700" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">sphere.json</text>
+<text x="712" y="80" font-size="8.5" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">lines · patterns</text>
+<text x="712" y="91" font-size="8.5" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">aliases (cutting planes)</text>
+<line x1="767" y1="77" x2="780.2" y2="77" stroke="#885EFD" stroke-width="1.8"/>
+<polygon points="785,77 779,73.7 779,80.3" fill="#885EFD"/>
+<rect x="788" y="44" width="110" height="66" rx="9" fill="#0f2040" stroke="#230C7C" stroke-width="1"/>
+<text x="843" y="64" font-size="12.5" fill="#FFFFFF" font-weight="700" text-anchor="middle">Sphere</text>
+<text x="843" y="80" font-size="8.5" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">Lance datasets</text>
+<text x="843" y="91" font-size="8.5" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">points · geometry</text>
+<text x="843" y="102" font-size="8.5" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">edges · temporal</text>
+<text x="460" y="140" font-size="10" fill="#A484FE" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">hypertopos build --config sphere.yaml</text>
+<text x="460" y="158" font-size="9.5" fill="#FFFFFF" fill-opacity="0.55" text-anchor="middle">writes one directory, ready for HyperSphere.open(path) or the MCP open_sphere(path)</text>
 </svg>

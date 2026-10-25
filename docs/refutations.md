@@ -14,7 +14,7 @@ The point is not to celebrate failures. It is to leave a record so the same idea
 
 **Verdict.** AUROC and top-K precision differences across the four estimators sat inside the bootstrap noise band (±0.005 on AUROC). MAD and IQR did not deliver any robustness lift on this distribution. The "robust σ" line of work was closed.
 
-**Why it failed.** Account-level features are already log-transformed or rank-normalised upstream of calibration. Outliers no longer drive σ when the input is approximately normal post-transform. The σ-swap intervention had no surface to act on.
+**Why it failed.** Not because the inputs were normalised: account-level features reach calibration as raw aggregates — neither the builder nor the benchmark preparation applies a log or rank transform. The ranking at the top is dominated by a few heavy-tailed raw aggregates, and swapping the scale estimator rescales those dimensions without changing which entities sit in the tail. A different σ does not tame a heavy tail; a change of coordinates (quantile or copula transform of the dimension itself) is the open question this result points to.
 
 **Citation.** PR #435 retrospective + `MEMORY.md` entry `project_population_robust_sigma_refuted`.
 
@@ -28,9 +28,9 @@ The point is not to celebrate failures. It is to leave a record so the same idea
 
 **Verdict.** Same outcome — ΔAUROC < 0.005, inside bootstrap noise. The heuristic dispatcher added complexity without measurable lift.
 
-**Why it failed.** Same root cause as PR #435 — when upstream features are normalised, σ-estimator choice does not materially change the calibration. The dispatcher was solving a problem that did not exist on this data shape.
+**Why it failed.** Same cause as above (#435): the inputs are raw, heavy-tailed aggregates, and choosing a different scale estimator per dimension still only rescales them — the tail that drives the ranking is unchanged. The dispatcher changed the estimator where the problem is the coordinate.
 
-**Closure rule.** The entire "calibration robustness via σ-estimator swap" theme is closed for the project unless a new dataset surfaces with un-normalised, heavy-tailed inputs where the assumption is testable from scratch. The closure rule is enforced via the session memory `project_population_robust_sigma_refuted` — re-opening requires a different dataset or methodology.
+**Closure rule.** The entire "calibration robustness via σ-estimator swap" theme is closed: scale-estimator choice alone does not move detection on heavy-tailed raw inputs. Work on heavy tails continues as coordinate changes (per-dimension quantile or copula transforms), not as another σ estimator. The closure rule is enforced via the session memory `project_population_robust_sigma_refuted` — re-opening requires a different dataset or methodology.
 
 ---
 

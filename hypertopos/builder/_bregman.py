@@ -19,9 +19,11 @@ All functions operate on float64 arrays and return float64.  The module has
 no dependencies beyond NumPy and is intended to be a pure-computation leaf
 that higher-level builder stages call.
 """
+
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 import numpy as np
 
@@ -37,6 +39,7 @@ _EPS: float = 1e-7  # clamping epsilon for bernoulli boundaries
 # ---------------------------------------------------------------------------
 # Single-entity divergence
 # ---------------------------------------------------------------------------
+
 
 def bregman_divergence(
     x: np.ndarray,
@@ -90,9 +93,7 @@ def _divergence_scalar(x: float, mu: float, sigma: float, kind: str) -> float:
     if kind == "bernoulli":
         x_c = max(_EPS, min(1.0 - _EPS, x))
         mu_c = max(_EPS, min(1.0 - _EPS, mu))
-        return x_c * math.log(x_c / mu_c) + (1.0 - x_c) * math.log(
-            (1.0 - x_c) / (1.0 - mu_c)
-        )
+        return x_c * math.log(x_c / mu_c) + (1.0 - x_c) * math.log((1.0 - x_c) / (1.0 - mu_c))
 
     raise ValueError(f"Unknown Bregman kind: {kind!r}. Expected one of {BREGMAN_KINDS}.")
 
@@ -100,6 +101,7 @@ def _divergence_scalar(x: float, mu: float, sigma: float, kind: str) -> float:
 # ---------------------------------------------------------------------------
 # Batch divergence (vectorized, no Python loops over entities)
 # ---------------------------------------------------------------------------
+
 
 def bregman_divergence_batch(
     X: np.ndarray,
@@ -142,16 +144,16 @@ def bregman_divergence_batch(
     # --- gaussian -----------------------------------------------------------
     if gaussian_cols:
         gc = np.array(gaussian_cols)
-        diff = X[:, gc] - mu[gc]          # (N, |gc|)
-        s = np.maximum(sigma[gc], _EPS)   # guard against sigma=0
-        s2 = s ** 2                        # (|gc|,)
-        result[:, gc] = (diff ** 2) / (2.0 * s2)
+        diff = X[:, gc] - mu[gc]  # (N, |gc|)
+        s = np.maximum(sigma[gc], _EPS)  # guard against sigma=0
+        s2 = s**2  # (|gc|,)
+        result[:, gc] = (diff**2) / (2.0 * s2)
 
     # --- poisson ------------------------------------------------------------
     if poisson_cols:
         pc = np.array(poisson_cols)
-        xp = X[:, pc]                      # (N, |pc|)
-        mup = np.maximum(mu[pc], _EPS)     # (|pc|,) clamp to avoid log(0)
+        xp = X[:, pc]  # (N, |pc|)
+        mup = np.maximum(mu[pc], _EPS)  # (|pc|,) clamp to avoid log(0)
         # x=0 edge-case: result = mu
         zero_mask = xp <= 0.0
         # Safe log: replace 0 with 1 temporarily (result overwritten below)
@@ -165,10 +167,7 @@ def bregman_divergence_batch(
         bc = np.array(bernoulli_cols)
         xb = np.clip(X[:, bc], _EPS, 1.0 - _EPS)
         mub = np.clip(mu[bc], _EPS, 1.0 - _EPS)
-        result[:, bc] = (
-            xb * np.log(xb / mub)
-            + (1.0 - xb) * np.log((1.0 - xb) / (1.0 - mub))
-        )
+        result[:, bc] = xb * np.log(xb / mub) + (1.0 - xb) * np.log((1.0 - xb) / (1.0 - mub))
 
     return result
 
@@ -176,6 +175,7 @@ def bregman_divergence_batch(
 # ---------------------------------------------------------------------------
 # Bregman norms — total divergence per entity
 # ---------------------------------------------------------------------------
+
 
 def bregman_norms(
     X: np.ndarray,
@@ -200,12 +200,14 @@ def bregman_norms(
     if weights is not None:
         weights = np.asarray(weights, dtype=np.float64)
         per_dim = per_dim * weights  # broadcast over N
-    return per_dim.sum(axis=1)
+    total: np.ndarray = per_dim.sum(axis=1)
+    return total
 
 
 # ---------------------------------------------------------------------------
 # Kind auto-detection
 # ---------------------------------------------------------------------------
+
 
 def detect_kind_for_column(values: np.ndarray) -> str:
     """Auto-detect the Bregman kind for a column of observed values.
@@ -240,9 +242,9 @@ def detect_kind_for_column(values: np.ndarray) -> str:
 
 
 def detect_kinds_for_pattern(
-    relation_edge_maxes: list,
+    relation_edge_maxes: Sequence[int | None],
     derived_metrics: list[str],
-    precomputed_edge_maxes: list,
+    precomputed_edge_maxes: Sequence[int | None],
     prop_count: int,
     dim_block_count: int,
     event_column_values: list[np.ndarray] | None = None,
@@ -368,6 +370,7 @@ def format_kinds_summary(kinds: list[str]) -> str:
 # Per-dimension anomaly threshold
 # ---------------------------------------------------------------------------
 
+
 def per_dim_theta(
     X: np.ndarray,
     mu: np.ndarray,
@@ -391,7 +394,6 @@ def per_dim_theta(
         (D,) float64 — per-dimension anomaly thresholds.
     """
     per_dim = bregman_divergence_batch(X, mu, sigma, kinds)  # (N, D)
-    D = per_dim.shape[1]
 
     empirical = np.percentile(per_dim, anomaly_percentile, axis=0)  # (D,)
 
@@ -399,4 +401,5 @@ def per_dim_theta(
     # Per-dim thresholds use empirical percentiles — the Chernoff bound
     # -log(alpha/D) is a concentration inequality on the total divergence,
     # not meaningful as a per-dimension floor.
-    return empirical.astype(np.float64)
+    per_dim_thresholds: np.ndarray = empirical.astype(np.float64)
+    return per_dim_thresholds

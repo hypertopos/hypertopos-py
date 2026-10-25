@@ -3,6 +3,7 @@
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
 """Tests for edge table storage layer (Lance-based)."""
+
 from __future__ import annotations
 
 import pyarrow as pa
@@ -81,7 +82,9 @@ class TestReadEdgesFilters:
         ts_from = 1_000_000.0 + 10 * 3600.0
         ts_to = 1_000_000.0 + 20 * 3600.0
         result = self.reader.read_edges(
-            "tx_pattern", timestamp_from=ts_from, timestamp_to=ts_to,
+            "tx_pattern",
+            timestamp_from=ts_from,
+            timestamp_to=ts_to,
         )
         timestamps = result["timestamp"].to_pylist()
         assert all(ts_from <= t <= ts_to for t in timestamps)
@@ -98,7 +101,8 @@ class TestReadEdgesFilters:
 
     def test_column_projection(self):
         result = self.reader.read_edges(
-            "tx_pattern", columns=["from_key", "to_key"],
+            "tx_pattern",
+            columns=["from_key", "to_key"],
         )
         assert set(result.schema.names) == {"from_key", "to_key"}
         assert result.num_rows == 100
@@ -134,7 +138,7 @@ class TestEdgeTableStats:
         assert stats is not None
         assert stats["row_count"] == 100
         assert stats["unique_from"] == 10  # A000-A009
-        assert stats["unique_to"] == 10    # B000-B009
+        assert stats["unique_to"] == 10  # B000-B009
         assert stats["avg_out_degree"] == 10.0
 
     def test_stats_nonexistent(self, tmp_path):

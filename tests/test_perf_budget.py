@@ -26,6 +26,7 @@ zero-result early-bail from a real scan. The asserted ceilings are loose
 (generous multiples of the PD3 baseline) and exist only to fail a gross
 regression, never to flake on a busy machine.
 """
+
 from __future__ import annotations
 
 import gc
@@ -108,10 +109,7 @@ def test_read_points_batch_budget(perf_ctx, capsys):
     import lance
 
     ctx = perf_ctx
-    pts = (
-        ctx["base"] / "points" / ctx["entity_line"]
-        / f"v={ctx['version']}" / "data.lance"
-    )
+    pts = ctx["base"] / "points" / ctx["entity_line"] / f"v={ctx['version']}" / "data.lance"
     keys = (
         lance.dataset(str(pts))
         .scanner(columns=["primary_key"], limit=100)
@@ -175,8 +173,7 @@ def test_sphere_overview_budget(perf_ctx, capsys):
     cold, warm_p50, out = _measure(call)
     with capsys.disabled():
         print(
-            f"\n[perf] sphere_overview cold={cold:.1f}ms warm_p50={warm_p50:.1f}ms "
-            f"count={len(out)}"
+            f"\n[perf] sphere_overview cold={cold:.1f}ms warm_p50={warm_p50:.1f}ms count={len(out)}"
         )
     assert cold < _COLD_CEILING_MS["sphere_overview"]
     assert warm_p50 < _WARM_CEILING_MS["sphere_overview"]

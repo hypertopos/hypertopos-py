@@ -10,6 +10,7 @@ from pathlib import Path
 
 import lance
 import pytest
+from filelock import FileLock
 
 from hypertopos.engine.geometry import GDSEngine
 from hypertopos.navigation.navigator import GDSNavigator
@@ -22,23 +23,38 @@ SYNTHETIC_CHAIN_FIXTURES_PATH = (
 
 @pytest.fixture(scope="session", autouse=True)
 def ensure_fixtures() -> None:
-    """Generate test fixtures once per session if they don't exist."""
-    sphere_json = FIXTURES_PATH / "sphere.json"
-    if not sphere_json.exists():
-        fixture_script = Path(__file__).parent / "fixtures" / "generate_fixtures.py"
-        subprocess.run(
-            [sys.executable, str(fixture_script)],
-            check=True,
-        )
-    synthetic_sphere_json = SYNTHETIC_CHAIN_FIXTURES_PATH / "_gds_meta" / "sphere.json"
-    if not synthetic_sphere_json.exists():
-        synthetic_script = (
-            Path(__file__).parent / "fixtures" / "synthetic_chain_sphere.py"
-        )
-        subprocess.run(
-            [sys.executable, str(synthetic_script)],
-            check=True,
-        )
+    """Generate test fixtures once per session if they don't exist.
+
+    Under pytest-xdist every worker runs this fixture; the file lock makes the
+    first worker generate while the others wait, then re-check and skip.
+    """
+    lock_path = FIXTURES_PATH.parent / ".generate.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    # Fixtures written by one Lance version may not be readable by another, so the
+    # generated spheres are tagged with the Lance version that wrote them.
+    stamp_path = FIXTURES_PATH.parent / ".fixtures_lance_version"
+    lance_version = lance.__version__
+    with FileLock(str(lock_path)):
+        stale = not stamp_path.exists() or stamp_path.read_text().strip() != lance_version
+        if stale:
+            for path in (FIXTURES_PATH, SYNTHETIC_CHAIN_FIXTURES_PATH):
+                shutil.rmtree(path, ignore_errors=True)
+        sphere_json = FIXTURES_PATH / "_gds_meta" / "sphere.json"
+        if stale or not sphere_json.exists():
+            fixture_script = Path(__file__).parent / "fixtures" / "generate_fixtures.py"
+            subprocess.run(
+                [sys.executable, str(fixture_script)],
+                check=True,
+            )
+        synthetic_sphere_json = SYNTHETIC_CHAIN_FIXTURES_PATH / "_gds_meta" / "sphere.json"
+        if stale or not synthetic_sphere_json.exists():
+            synthetic_script = Path(__file__).parent / "fixtures" / "synthetic_chain_sphere.py"
+            subprocess.run(
+                [sys.executable, str(synthetic_script)],
+                check=True,
+            )
+        if stale:
+            stamp_path.write_text(lance_version)
 
 
 @pytest.fixture(autouse=True)

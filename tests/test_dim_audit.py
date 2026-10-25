@@ -3,10 +3,12 @@
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
 """Per-dimension label-aware signal audit — hand-verified math."""
+
 from __future__ import annotations
 
 import numpy as np
 import pytest
+
 from hypertopos.engine.dim_audit import (
     compute_per_dim_label_auroc,
     filter_delta_norm,
@@ -26,17 +28,20 @@ def test_per_dim_auroc_signal_carrier_identified():
     Dim 0: |delta| = [10, 10, 10, 1, 1, 1] → perfectly separable → AUROC = 1.0
     Dim 1: all zeros → AUROC = 0.5 (sigma_zero fallback)
     """
-    deltas = np.array([
-        [10.0, 0.0],
-        [10.0, 0.0],
-        [10.0, 0.0],
-        [-1.0, 0.0],
-        [-1.0, 0.0],
-        [-1.0, 0.0],
-    ])
+    deltas = np.array(
+        [
+            [10.0, 0.0],
+            [10.0, 0.0],
+            [10.0, 0.0],
+            [-1.0, 0.0],
+            [-1.0, 0.0],
+            [-1.0, 0.0],
+        ]
+    )
     labels = np.array([1, 1, 1, 0, 0, 0])
     result = compute_per_dim_label_auroc(
-        deltas=deltas, labels=labels,
+        deltas=deltas,
+        labels=labels,
         dim_labels=["strong", "dead"],
     )
     assert result["per_dim"][0]["label"] == "strong"
@@ -58,13 +63,21 @@ def test_per_dim_auroc_anti_signal_identified():
 
     Dim 0: AUROC(|delta|, labels) = 0.0 (perfect anti-correlation).
     """
-    deltas = np.array([
-        [1.0], [1.0], [1.0],
-        [10.0], [10.0], [10.0],
-    ])
+    deltas = np.array(
+        [
+            [1.0],
+            [1.0],
+            [1.0],
+            [10.0],
+            [10.0],
+            [10.0],
+        ]
+    )
     labels = np.array([1, 1, 1, 0, 0, 0])
     result = compute_per_dim_label_auroc(
-        deltas=deltas, labels=labels, dim_labels=["anti"],
+        deltas=deltas,
+        labels=labels,
+        dim_labels=["anti"],
     )
     assert result["per_dim"][0]["auroc"] == pytest.approx(0.0)
     assert result["per_dim"][0]["classification"] == "anti"
@@ -83,38 +96,66 @@ def test_per_dim_auroc_handles_ties_in_scores():
     deltas = np.array([[5.0], [5.0], [3.0], [7.0]])
     labels = np.array([1, 1, 0, 0])
     result = compute_per_dim_label_auroc(
-        deltas=deltas, labels=labels, dim_labels=["ties"],
+        deltas=deltas,
+        labels=labels,
+        dim_labels=["ties"],
     )
     assert result["per_dim"][0]["auroc"] == pytest.approx(0.5)
+
+
+def test_auroc_ignores_non_finite_scores():
+    # A missing (NaN / inf) score must not rank as the most anomalous one.
+    from hypertopos.engine.dim_audit import _auroc_unsafe
+
+    labels = np.array([0, 0, 1, 0, 0])
+    scores = np.array([np.nan, 0.1, 0.9, 0.2, np.inf])
+    assert _auroc_unsafe(scores, labels) == pytest.approx(1.0)
+    assert _auroc_unsafe(np.array([np.nan, np.nan]), np.array([0, 1])) == 0.5
 
 
 def test_per_dim_auroc_thresholds_configurable():
     """Caller can adjust signal / anti thresholds for noisy domains."""
     # Construct dim with AUROC ≈ 0.55 — borderline.
-    deltas = np.array([
-        [3.0], [3.0], [3.0], [3.0], [3.0],
-        [1.0], [1.0], [1.0], [1.0], [1.0],
-        [5.0],  # one negative with large |delta| — drops dim's AUROC
-    ])
+    deltas = np.array(
+        [
+            [3.0],
+            [3.0],
+            [3.0],
+            [3.0],
+            [3.0],
+            [1.0],
+            [1.0],
+            [1.0],
+            [1.0],
+            [1.0],
+            [5.0],  # one negative with large |delta| — drops dim's AUROC
+        ]
+    )
     labels = np.array([1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0])
     # With default 0.55 threshold this lands signal:
     r_default = compute_per_dim_label_auroc(
-        deltas=deltas, labels=labels, upper_threshold=0.55,
+        deltas=deltas,
+        labels=labels,
+        upper_threshold=0.55,
     )
     # Same dim with stricter 0.95 threshold lands neutral:
     r_strict = compute_per_dim_label_auroc(
-        deltas=deltas, labels=labels, upper_threshold=0.95,
+        deltas=deltas,
+        labels=labels,
+        upper_threshold=0.95,
     )
     assert r_strict["n_signal"] <= r_default["n_signal"]
 
 
 def test_filter_delta_norm_matches_unfiltered_when_keep_all():
     """filter_delta_norm with all idx == plain L2 norm."""
-    deltas = np.array([
-        [3.0, 4.0],   # norm = 5
-        [1.0, 0.0],   # norm = 1
-        [0.0, 0.0],   # norm = 0
-    ])
+    deltas = np.array(
+        [
+            [3.0, 4.0],  # norm = 5
+            [1.0, 0.0],  # norm = 1
+            [0.0, 0.0],  # norm = 0
+        ]
+    )
     full = np.linalg.norm(deltas, axis=1)
     filtered = filter_delta_norm(deltas=deltas, keep_idx=[0, 1])
     np.testing.assert_array_almost_equal(filtered, full)
@@ -177,24 +218,29 @@ def test_full_pipeline_reproduces_expected_lift_on_synthetic():
     """
     rng = np.random.RandomState(42)
     n = 50
-    pos_deltas = np.column_stack([
-        rng.normal(3.0, 0.5, n),   # signal
-        rng.normal(3.0, 0.5, n),   # signal
-        rng.normal(0.0, 1.0, n),   # neutral
-        rng.normal(0.0, 1.0, n),   # neutral
-        rng.normal(0.0, 0.5, n),   # anti (small for positives)
-    ])
-    neg_deltas = np.column_stack([
-        rng.normal(0.0, 0.5, n),
-        rng.normal(0.0, 0.5, n),
-        rng.normal(0.0, 1.0, n),
-        rng.normal(0.0, 1.0, n),
-        rng.normal(3.0, 0.5, n),   # anti (large for negatives)
-    ])
+    pos_deltas = np.column_stack(
+        [
+            rng.normal(3.0, 0.5, n),  # signal
+            rng.normal(3.0, 0.5, n),  # signal
+            rng.normal(0.0, 1.0, n),  # neutral
+            rng.normal(0.0, 1.0, n),  # neutral
+            rng.normal(0.0, 0.5, n),  # anti (small for positives)
+        ]
+    )
+    neg_deltas = np.column_stack(
+        [
+            rng.normal(0.0, 0.5, n),
+            rng.normal(0.0, 0.5, n),
+            rng.normal(0.0, 1.0, n),
+            rng.normal(0.0, 1.0, n),
+            rng.normal(3.0, 0.5, n),  # anti (large for negatives)
+        ]
+    )
     deltas = np.vstack([pos_deltas, neg_deltas])
     labels = np.array([1] * n + [0] * n)
     result = compute_per_dim_label_auroc(
-        deltas=deltas, labels=labels,
+        deltas=deltas,
+        labels=labels,
         dim_labels=["sig_a", "sig_b", "noise_a", "noise_b", "anti"],
     )
     sig_labels = [d["label"] for d in result["per_dim"] if d["classification"] == "signal"]
@@ -205,6 +251,7 @@ def test_full_pipeline_reproduces_expected_lift_on_synthetic():
     # Filtered L2 on signal dims only beats raw L2 (no skl required —
     # use the engine's own AUROC).
     from hypertopos.engine.dim_audit import _auroc_unsafe
+
     full_dn = np.linalg.norm(deltas, axis=1)
     sig_dn = filter_delta_norm(deltas=deltas, keep_idx=result["signal_idx"])
     full_a = _auroc_unsafe(full_dn, labels)
@@ -238,10 +285,12 @@ def test_lda_returns_unit_norm_direction():
     """Returned direction is L2-unit-normalised."""
     rng = np.random.RandomState(1)
     n = 30
-    deltas = np.vstack([
-        rng.normal(0.0, 1.0, (n, 4)),
-        rng.normal(2.0, 1.0, (n, 4)),
-    ])
+    deltas = np.vstack(
+        [
+            rng.normal(0.0, 1.0, (n, 4)),
+            rng.normal(2.0, 1.0, (n, 4)),
+        ]
+    )
     labels = np.array([0] * n + [1] * n)
     result = fit_lda_direction(deltas=deltas, labels=labels)
     assert np.linalg.norm(result["direction"]) == pytest.approx(1.0, abs=1e-6)
@@ -288,10 +337,12 @@ def test_lda_single_class_raises():
 def test_lda_too_few_per_class_raises():
     """A class with 1 sample → within-class scatter undefined."""
     rng = np.random.RandomState(5)
-    deltas = np.vstack([
-        rng.normal(0.0, 1.0, (10, 3)),   # 10 normals
-        rng.normal(3.0, 1.0, (1, 3)),    # 1 anomalous
-    ])
+    deltas = np.vstack(
+        [
+            rng.normal(0.0, 1.0, (10, 3)),  # 10 normals
+            rng.normal(3.0, 1.0, (1, 3)),  # 1 anomalous
+        ]
+    )
     labels = np.array([0] * 10 + [1] * 1)
     with pytest.raises(ValueError, match=">=2"):
         fit_lda_direction(deltas=deltas, labels=labels)
@@ -318,10 +369,12 @@ def test_lda_deterministic():
     """Same input twice → byte-identical output."""
     rng = np.random.RandomState(7)
     n = 40
-    deltas = np.vstack([
-        rng.normal(0.0, 1.0, (n, 5)),
-        rng.normal(1.5, 1.0, (n, 5)),
-    ])
+    deltas = np.vstack(
+        [
+            rng.normal(0.0, 1.0, (n, 5)),
+            rng.normal(1.5, 1.0, (n, 5)),
+        ]
+    )
     labels = np.array([0] * n + [1] * n)
     r1 = fit_lda_direction(deltas=deltas, labels=labels)
     r2 = fit_lda_direction(deltas=deltas, labels=labels)

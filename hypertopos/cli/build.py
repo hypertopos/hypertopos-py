@@ -8,13 +8,14 @@ Translates a parsed ``SphereConfig`` into the correct sequence of
 GDSBuilder calls: add_line, add_pattern, add_event_dimension,
 add_derived_dimension, add_composite_line, build, build_temporal.
 """
+
 from __future__ import annotations
 
 import json
 import shutil
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from hypertopos.cli.schema import (
     AliasConfig,
@@ -24,11 +25,14 @@ from hypertopos.cli.schema import (
     FeatureSpec,
     LineConfig,
     PatternConfig,
+    SourceConfig,
     SphereConfig,
-    TemporalConfig,
     parse_config,
 )
 from hypertopos.cli.sources import load_source
+
+if TYPE_CHECKING:
+    from hypertopos.builder.builder import GDSBuilder
 
 
 def run_build(
@@ -56,8 +60,17 @@ def run_build(
     if out_path.exists():
         if not force:
             print(
-                f"error: output directory '{out_path}' already exists. "
-                "Use --force to overwrite.",
+                f"error: output directory '{out_path}' already exists. Use --force to overwrite.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        from hypertopos.storage._lance_branches import branch_names
+
+        branches = branch_names(out_path)
+        if branches:
+            print(
+                f"error: output directory '{out_path}' has branches {branches}; "
+                "delete them first (--force does not delete branches).",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -65,14 +78,19 @@ def run_build(
 
     try:
         _do_build(
-            cfg, base_dir, str(out_path), verbose,
-            no_temporal=no_temporal, no_chains=no_chains,
+            cfg,
+            base_dir,
+            str(out_path),
+            verbose,
+            no_temporal=no_temporal,
+            no_chains=no_chains,
             no_edges=no_edges,
             label_aware_calibration=label_aware_calibration,
         )
         print(f"Built: {out_path}")
     except Exception as exc:
         import traceback
+
         traceback.print_exc(file=sys.stderr)
         print(f"error: build failed: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -103,9 +121,7 @@ def run_validate(config_path: str) -> None:
                 if not jp.is_absolute():
                     jp = base_dir / jp
                 if not jp.exists():
-                    errors.append(
-                        f"Source '{name}' join: file not found: {jp}"
-                    )
+                    errors.append(f"Source '{name}' join: file not found: {jp}")
         elif src.script:
             sp = Path(src.script)
             if not sp.is_absolute():
@@ -116,10 +132,7 @@ def run_validate(config_path: str) -> None:
     # Check cross-references
     for pid, pat in cfg.patterns.items():
         if pat.event_dimensions and pat.type != "event":
-            errors.append(
-                f"Pattern '{pid}': event_dimensions only valid "
-                "on type=event patterns"
-            )
+            errors.append(f"Pattern '{pid}': event_dimensions only valid on type=event patterns")
         if pat.derived_dimensions:
             for group in pat.derived_dimensions:
                 fp = group.from_pattern
@@ -132,14 +145,13 @@ def run_validate(config_path: str) -> None:
     for tc in cfg.temporal:
         if tc.event_line not in cfg.lines:
             errors.append(
-                f"Temporal config for '{tc.pattern}': "
-                f"event_line '{tc.event_line}' not in lines"
+                f"Temporal config for '{tc.pattern}': event_line '{tc.event_line}' not in lines"
             )
-        pat = cfg.patterns.get(tc.pattern)
-        if pat and pat.type != "anchor":
+        tc_pat = cfg.patterns.get(tc.pattern)
+        if tc_pat and tc_pat.type != "anchor":
             errors.append(
-                f"Temporal config for '{tc.pattern}': "
-                f"pattern must be anchor type, got '{pat.type}'"
+                f"Temporal config for '{tc.pattern}': pattern must be anchor type, "
+                f"got '{tc_pat.type}'"
             )
 
     # Check for duplicate dimension names within a pattern
@@ -161,9 +173,7 @@ def run_validate(config_path: str) -> None:
         seen: set[str] = set()
         for dn in dim_names:
             if dn in seen:
-                errors.append(
-                    f"Pattern '{pid}': duplicate dimension name '{dn}'"
-                )
+                errors.append(f"Pattern '{pid}': duplicate dimension name '{dn}'")
             seen.add(dn)
 
     # Check for cycles in from_pattern references
@@ -185,9 +195,7 @@ def run_validate(config_path: str) -> None:
 
     for pid in cfg.patterns:
         if _has_cycle(pid, set()):
-            errors.append(
-                f"Pattern '{pid}': cycle detected in from_pattern references"
-            )
+            errors.append(f"Pattern '{pid}': cycle detected in from_pattern references")
 
     if errors:
         print("Validation errors:", file=sys.stderr)
@@ -215,6 +223,7 @@ def build_from_config(
     no_temporal: bool = False,
     no_chains: bool = False,
     label_aware_calibration: bool = False,
+    no_edges: bool = False,
 ) -> None:
     """Build a sphere from a parsed SphereConfig.
 
@@ -223,8 +232,13 @@ def build_from_config(
     """
     base_dir = source_dir or Path.cwd()
     _do_build(
-        cfg, base_dir, str(output_path), verbose,
-        no_temporal=no_temporal, no_chains=no_chains,
+        cfg,
+        base_dir,
+        str(output_path),
+        verbose,
+        no_temporal=no_temporal,
+        no_chains=no_chains,
+        no_edges=no_edges,
         label_aware_calibration=label_aware_calibration,
     )
 
@@ -252,8 +266,10 @@ def _do_build(
 
     t_total = time.time()
     builder = GDSBuilder(
-        cfg.sphere_id, output_path,
-        name=cfg.name, description=cfg.description,
+        cfg.sphere_id,
+        output_path,
+        name=cfg.name,
+        description=cfg.description,
     )
 
     # 1. Load all sources (parallel when >1)
@@ -261,7 +277,8 @@ def _do_build(
     tables: dict[str, pa.Table] = {}
     source_items = list(cfg.sources.items())
     if len(source_items) > 1:
-        def _load_one(name_cfg: tuple[str, object]) -> tuple[str, pa.Table]:
+
+        def _load_one(name_cfg: tuple[str, SourceConfig]) -> tuple[str, pa.Table]:
             name, src_cfg = name_cfg
             return name, load_source(src_cfg, base_dir)
 
@@ -269,15 +286,13 @@ def _do_build(
             for name, table in pool.map(_load_one, source_items):
                 tables[name] = table
                 if verbose:
-                    print(f"  Source '{name}': {table.num_rows:,} rows, "
-                          f"{table.num_columns} cols")
+                    print(f"  Source '{name}': {table.num_rows:,} rows, {table.num_columns} cols")
     else:
         for name, src_cfg in source_items:
             tables[name] = load_source(src_cfg, base_dir)
             if verbose:
                 t = tables[name]
-                print(f"  Source '{name}': {t.num_rows:,} rows, "
-                      f"{t.num_columns} cols")
+                print(f"  Source '{name}': {t.num_rows:,} rows, {t.num_columns} cols")
     if verbose:
         print(f"  Sources total: {time.time() - t_phase:.1f}s")
 
@@ -288,15 +303,13 @@ def _do_build(
         src_cols = set(src_table.schema.names)
         if line_cfg.key not in src_cols:
             col_errors.append(
-                f"Line '{line_id}': key column '{line_cfg.key}' "
-                f"not in source '{line_cfg.source}'"
+                f"Line '{line_id}': key column '{line_cfg.key}' not in source '{line_cfg.source}'"
             )
         if line_cfg.columns:
             for src_col in line_cfg.columns.values():
                 if src_col not in src_cols:
                     col_errors.append(
-                        f"Line '{line_id}': column '{src_col}' "
-                        f"not in source '{line_cfg.source}'"
+                        f"Line '{line_id}': column '{src_col}' not in source '{line_cfg.source}'"
                     )
     for pid, pat_cfg in cfg.patterns.items():
         entity_src = cfg.lines.get(pat_cfg.entity_line)
@@ -342,9 +355,7 @@ def _do_build(
                                         f"event source '{evt_line_id}'"
                                     )
     if col_errors:
-        raise ValueError(
-            "Column validation failed:\n  " + "\n  ".join(col_errors)
-        )
+        raise ValueError("Column validation failed:\n  " + "\n  ".join(col_errors))
 
     # 2. Register lines
     for line_id, line_cfg in cfg.lines.items():
@@ -359,15 +370,13 @@ def _do_build(
     for cl_id, cl_cfg in cfg.composite_lines.items():
         _add_composite_line(builder, cl_id, cl_cfg, cfg)
 
-    # 4b. Chain lines (with pickle cache for expensive extraction)
+    # 4b. Chain lines
     if not no_chains:
-        chain_cache_dir = base_dir / ".cache"
-        for cl_id, cl_cfg in cfg.chain_lines.items():
+        for cl_id, chain_cfg in cfg.chain_lines.items():
             t_phase = time.time()
             if verbose:
                 print(f"  Extracting chains for '{cl_id}'...")
-            _add_chain_line(builder, cl_id, cl_cfg, tables, verbose,
-                            cache_dir=chain_cache_dir)
+            _add_chain_line(builder, cl_id, chain_cfg, cfg, tables, verbose)
             if verbose:
                 print(f"  Chains total: {time.time() - t_phase:.1f}s")
     elif verbose and cfg.chain_lines:
@@ -427,10 +436,12 @@ def _do_build(
             if tc.pattern in patterns:
                 patterns[tc.pattern]["timestamp_col"] = tc.timestamp_col
             # Also tag the event pattern that owns tc.event_line
-            for pid, pat in patterns.items():
+            for pat in patterns.values():
                 if pat.get("entity_line") == tc.event_line and pat.get("pattern_type") == "event":
                     pat["timestamp_col"] = tc.timestamp_col
-        sphere_path.write_text(json.dumps(sphere_data, indent=2))
+        from hypertopos.storage.writer import write_sphere_json
+
+        write_sphere_json(sphere_path.parent, sphere_data)
 
     # 7. Trajectory indices — now built inline during build_temporal (step 6).
     #    Standalone rebuild: GDSWriter.build_trajectory_index(pattern_id)
@@ -440,10 +451,10 @@ def _do_build(
 
 
 def _add_line(
-    builder: object,
+    builder: GDSBuilder,
     line_id: str,
     line_cfg: LineConfig,
-    tables: dict,
+    tables: dict[str, Any],
 ) -> None:
     """Add a line to the builder, handling column rename and fts."""
     import pyarrow as pa
@@ -473,7 +484,7 @@ def _add_line(
     elif isinstance(line_cfg.fts, list):
         fts_columns = line_cfg.fts
 
-    builder.add_line(  # type: ignore[union-attr]
+    builder.add_line(
         line_id,
         table,
         key_col=line_cfg.key,
@@ -486,7 +497,7 @@ def _add_line(
 
 
 def _add_aliases(
-    builder: object,
+    builder: GDSBuilder,
     aliases: dict[str, AliasConfig],
 ) -> None:
     """Bridge alias configs from YAML to GDSBuilder.add_alias()."""
@@ -502,11 +513,11 @@ def _add_aliases(
             kwargs["cutting_plane_threshold"] = acfg.cutting_plane_threshold
         if acfg.description:
             kwargs["description"] = acfg.description
-        builder.add_alias(alias_id, **kwargs)  # type: ignore[union-attr]
+        builder.add_alias(alias_id, **kwargs)
 
 
 def _add_pattern(
-    builder: object,
+    builder: GDSBuilder,
     pid: str,
     pat_cfg: PatternConfig,
     cfg: SphereConfig,
@@ -519,18 +530,21 @@ def _add_pattern(
     relations: list[RelationSpec] = []
     if isinstance(pat_cfg.relations, list):
         for rc in pat_cfg.relations:
-            relations.append(RelationSpec(
-                line_id=rc.line,
-                fk_col=rc.key_on_entity,
-                direction=rc.direction,
-                required=rc.required,
-                display_name=rc.display_name,
-                edge_max=rc.edge_max,
-            ))
+            relations.append(
+                RelationSpec(
+                    line_id=rc.line,
+                    fk_col=rc.key_on_entity,
+                    direction=rc.direction,
+                    required=rc.required,
+                    display_name=rc.display_name,
+                    edge_max=rc.edge_max,
+                )
+            )
     # "auto" or None -> empty relations (derived dims auto-generate)
 
     # Edge table config (YAML → builder)
     from hypertopos.builder.builder import EdgeTableConfig as _ETC
+
     _et_cfg = None
     if pat_cfg.edge_table:
         _et_cfg = _ETC(
@@ -544,15 +558,19 @@ def _add_pattern(
     _edge_dims_cfg = None
     if pat_cfg.edge_dimensions:
         from hypertopos.builder.mapping import parse_edge_dimensions
+
         _edge_dims_cfg = parse_edge_dimensions(
-            pat_cfg.edge_dimensions, pattern_type=pat_cfg.type,
+            pat_cfg.edge_dimensions,
+            pattern_type=pat_cfg.type,
         )
 
     _edge_dim_agg_cfg = None
     if pat_cfg.edge_dim_aggregations:
         from hypertopos.builder.mapping import parse_edge_dim_aggregations
+
         _edge_dim_agg_cfg = parse_edge_dim_aggregations(
-            pat_cfg.edge_dim_aggregations, pattern_type=pat_cfg.type,
+            pat_cfg.edge_dim_aggregations,
+            pattern_type=pat_cfg.type,
         )
 
     # Multi-resolution FDR hierarchies — YAML dicts → model dataclasses.
@@ -560,27 +578,27 @@ def _add_pattern(
     _fdr_hierarchy = None
     if pat_cfg.fdr_hierarchy:
         from hypertopos.model.sphere import FDRHierarchyLevel
-        _fdr_hierarchy = [
-            FDRHierarchyLevel.from_dict(d) for d in pat_cfg.fdr_hierarchy
-        ]
+
+        _fdr_hierarchy = [FDRHierarchyLevel.from_dict(d) for d in pat_cfg.fdr_hierarchy]
     _fdr_temporal_hierarchy = None
     if pat_cfg.fdr_temporal_hierarchy:
         from hypertopos.model.sphere import FDRTemporalLevel
+
         _fdr_temporal_hierarchy = [
-            FDRTemporalLevel.from_dict(d)
-            for d in pat_cfg.fdr_temporal_hierarchy
+            FDRTemporalLevel.from_dict(d) for d in pat_cfg.fdr_temporal_hierarchy
         ]
 
     # Declarative conformance rules (YAML list → ConformanceRule list).
     # ``available_columns`` lets the loader reject prop references that
     # are not actual columns on the entity points table — fails fast at
     # build start, not at evaluate time.
-    _conformance_rules: list = []
+    _conformance_rules: list[Any] = []
     if pat_cfg.conformance_rules:
         from hypertopos.builder.conformance_mapping import (
             parse_conformance_rules,
         )
-        line_reg = builder._lines.get(pat_cfg.entity_line)  # type: ignore[attr-defined]
+
+        line_reg = builder._lines.get(pat_cfg.entity_line)
         avail_cols: set[str] | None = (
             set(line_reg.table.column_names) if line_reg is not None else None
         )
@@ -590,7 +608,7 @@ def _add_pattern(
             available_columns=avail_cols,
         )
 
-    builder.add_pattern(  # type: ignore[union-attr]
+    builder.add_pattern(
         pid,
         pattern_type=pat_cfg.type,
         entity_line=pat_cfg.entity_line,
@@ -611,12 +629,13 @@ def _add_pattern(
         fdr_hierarchy=_fdr_hierarchy,
         fdr_temporal_hierarchy=_fdr_temporal_hierarchy,
         conformance_rules=_conformance_rules,
+        bootstrap_iterations=pat_cfg.bootstrap_iterations,
     )
 
     # Event dimensions
     if pat_cfg.event_dimensions:
         for ed in pat_cfg.event_dimensions:
-            builder.add_event_dimension(  # type: ignore[union-attr]
+            builder.add_event_dimension(
                 pid,
                 column=ed.column,
                 edge_max="auto",
@@ -626,7 +645,7 @@ def _add_pattern(
     # Precomputed dimensions
     if pat_cfg.precomputed_dimensions:
         for pc in pat_cfg.precomputed_dimensions:
-            builder.add_precomputed_dimension(  # type: ignore[union-attr]
+            builder.add_precomputed_dimension(
                 pat_cfg.entity_line,
                 dimension_name=pc.column,
                 edge_max=pc.edge_max,
@@ -637,7 +656,7 @@ def _add_pattern(
     # Graph features
     if pat_cfg.graph_features:
         gf = pat_cfg.graph_features
-        builder.add_graph_features(  # type: ignore[union-attr]
+        builder.add_graph_features(
             pat_cfg.entity_line,
             event_line=gf.event_line,
             from_col=gf.from_col,
@@ -678,7 +697,7 @@ def _resolve_anchor_fk(
 
 
 def _add_derived_group(
-    builder: object,
+    builder: GDSBuilder,
     pid: str,
     group: DerivedDimGroup,
     pat_cfg: PatternConfig,
@@ -709,21 +728,28 @@ def _add_derived_group(
                 continue
             _registered_dims.add(dim_key)
         _add_one_feature(
-            builder, pid, feat, pat_cfg, event_line, time_col,
-            from_pattern=group.from_pattern, cfg=cfg,
+            builder,
+            pid,
+            feat,
+            pat_cfg,
+            event_line,
+            time_col,
+            from_pattern=group.from_pattern,
+            cfg=cfg,
             explicit_anchor_fk=group.anchor_fk,
         )
 
 
 def _add_one_feature(
-    builder: object,
+    builder: GDSBuilder,
     pid: str,
     feat: FeatureSpec,
     pat_cfg: PatternConfig,
     event_line: str | None,
     time_col: str | None,
     from_pattern: str | None = None,
-    cfg: SphereConfig | None = None,
+    *,
+    cfg: SphereConfig,
     explicit_anchor_fk: str | None = None,
 ) -> None:
     """Add a single derived dimension feature to the builder."""
@@ -735,19 +761,20 @@ def _add_one_feature(
 
     # For temporal or IET features, use the time_col from temporal config
     is_iet = feat.metric.startswith("iet_")
-    feat_time_col = feat.time_col or (
-        time_col if (feat.time_window or is_iet) else None
-    )
+    feat_time_col = feat.time_col or (time_col if (feat.time_window or is_iet) else None)
 
     # Resolve anchor FK: use explicit override if provided, else auto-resolve
     if explicit_anchor_fk:
         anchor_fk = explicit_anchor_fk
     else:
         anchor_fk = _resolve_anchor_fk(
-            pat_cfg.entity_line, event_line, from_pattern, cfg,
+            pat_cfg.entity_line,
+            event_line,
+            from_pattern,
+            cfg,
         )
 
-    builder.add_derived_dimension(  # type: ignore[union-attr]
+    builder.add_derived_dimension(
         anchor_line=pat_cfg.entity_line,
         event_line=event_line,
         anchor_fk=anchor_fk,
@@ -762,246 +789,250 @@ def _add_one_feature(
     )
 
 
-def _chain_cache_key(cl_id: str, cl_cfg: ChainLineConfig, n_events: int) -> str:
-    """Deterministic cache key from chain extraction parameters."""
-    import hashlib
-    parts = [
-        cl_id, cl_cfg.from_col, cl_cfg.to_col,
-        str(cl_cfg.seed_percentile_fan_out),
-        str(cl_cfg.seed_percentile_cross_bank),
-        str(cl_cfg.seed_multi_currency),
-        str(cl_cfg.seed_pass_through),
-        str(cl_cfg.time_window_hours),
-        str(cl_cfg.max_hops), str(cl_cfg.min_hops),
-        str(cl_cfg.max_chains), str(cl_cfg.bidirectional),
-        str(n_events),
-    ]
-    h = hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
-    return f"chains_{cl_id}_{h}.pkl"
-
-
 def _add_chain_line(
-    builder: object,
+    builder: GDSBuilder,
     cl_id: str,
     cl_cfg: ChainLineConfig,
-    tables: dict,
+    cfg: SphereConfig,
+    tables: dict[str, Any],
     verbose: bool,
-    cache_dir: Path | None = None,
 ) -> None:
     """Extract chains and register as anchor line."""
     import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
 
     from hypertopos.engine.chains import extract_chains, parse_timestamps_to_epoch
 
-    # Find the event line source table
-    event_table = None
-    for _src_name, tbl in tables.items():
-        if cl_cfg.from_col in tbl.schema.names and cl_cfg.to_col in tbl.schema.names:
-            event_table = tbl
-            break
-    if event_table is None:
+    source_name = cfg.lines[cl_cfg.event_line].source
+    event_table = tables[source_name]
+    schema_names = set(event_table.schema.names)
+    missing = [c for c in (cl_cfg.from_col, cl_cfg.to_col) if c not in schema_names]
+    if missing:
         raise ValueError(
-            f"chain_lines.{cl_id}: cannot find source with columns "
-            f"'{cl_cfg.from_col}' and '{cl_cfg.to_col}'"
+            f"chain_lines.{cl_id}: source '{source_name}' of event_line "
+            f"'{cl_cfg.event_line}' has no column(s) {missing}"
         )
-
-    import pyarrow.compute as pc
+    # Events with a null endpoint cannot be a hop (same rule as the edge table).
+    if event_table[cl_cfg.from_col].null_count or event_table[cl_cfg.to_col].null_count:
+        event_table = event_table.filter(
+            pc.and_(
+                pc.is_valid(event_table[cl_cfg.from_col]),
+                pc.is_valid(event_table[cl_cfg.to_col]),
+            )
+        )
 
     n = event_table.num_rows
 
-    # Check cache
-    import pickle
-    chains = None
-    cache_file = None
-    if cache_dir is not None:
-        cache_dir.mkdir(exist_ok=True)
-        cache_file = cache_dir / _chain_cache_key(cl_id, cl_cfg, n)
-        if cache_file.exists():
-            if verbose:
-                print(f"    Loading cached chains from {cache_file.name}...")
-            chains = pickle.loads(cache_file.read_bytes())
-            if verbose:
-                print(f"    Chains loaded: {len(chains):,}")
+    # Bulk extract all needed columns in one pass
+    needed_cols = [cl_cfg.from_col, cl_cfg.to_col]
+    if "primary_key" in schema_names:
+        needed_cols.append("primary_key")
 
-    if chains is None:
-        # Bulk extract all needed columns in one pass
-        needed_cols = [cl_cfg.from_col, cl_cfg.to_col]
-        if "primary_key" in event_table.schema.names:
-            needed_cols.append("primary_key")
+    # Column precedence: chain_lines field (a source column), then the edge_table
+    # of the event pattern on this event_line (a line column, mapped back through
+    # the line's rename), then well-known column names.
+    edge_tbl = next(
+        (
+            p.edge_table
+            for p in cfg.patterns.values()
+            if p.entity_line == cl_cfg.event_line and p.edge_table is not None
+        ),
+        None,
+    )
+    renames = cfg.lines[cl_cfg.event_line].columns or {}
 
-        ts_col = None
-        for col_name in ("timestamp", "date", "orderdate"):
-            if col_name in event_table.schema.names:
-                ts_col = col_name
-                needed_cols.append(ts_col)
-                break
-        # Type-based fallback: first column with timestamp type
-        if ts_col is None:
-            import pyarrow as pa
-            for field in event_table.schema:
-                if pa.types.is_timestamp(field.type):
-                    ts_col = field.name
-                    needed_cols.append(ts_col)
-                    break
-
-        cat_col = None
-        for col in ("receiving_currency", "category", "k_symbol", "type"):
-            if col in event_table.schema.names:
-                cat_col = col
-                needed_cols.append(cat_col)
-                break
-
-        amt_col = None
-        for col in ("amount_received", "amount", "extendedprice", "fare_amount", "total_amount"):
-            if col in event_table.schema.names:
-                amt_col = col
-                needed_cols.append(amt_col)
-                break
-
-        # Bank columns for cross_bank_count chain feature. Optional —
-        # only populated when both from_bank and to_bank are present
-        # in the event table (typical for AML / financial spheres).
-        from_bank_col = None
-        to_bank_col = None
-        for fcol, tcol in (
-            ("from_bank", "to_bank"),
-            ("source_bank", "destination_bank"),
-        ):
-            if (fcol in event_table.schema.names
-                    and tcol in event_table.schema.names):
-                from_bank_col, to_bank_col = fcol, tcol
-                needed_cols.append(from_bank_col)
-                needed_cols.append(to_bank_col)
-                break
-
-        # Single to_pydict — one pass instead of 6 separate to_pylist calls
-        bulk = event_table.select(list(set(needed_cols))).to_pydict()
-        from_keys = bulk[cl_cfg.from_col]
-        to_keys = bulk[cl_cfg.to_col]
-
-        # Timestamps — Arrow vectorized path
-        timestamps = parse_timestamps_to_epoch(bulk[ts_col]) if ts_col else [0.0] * n
-
-        # PKs
-        if "primary_key" in bulk:
-            event_pks = bulk["primary_key"]
-        else:
-            event_pks = [f"EV-{i:08d}" for i in range(n)]
-
-        # Categories
-        categories = bulk.get(cat_col, [""] * n) if cat_col else [""] * n
-
-        # Amounts — vectorized null handling
-        if amt_col:
-            amt_arr = event_table[amt_col]
-            import pyarrow as pa
-            amt_filled = pc.fill_null(pc.cast(amt_arr, pa.float64()), 0.0)
-            amounts = amt_filled.to_pylist()
-        else:
-            amounts = [0.0] * n
-
-        # Bank pairs per event — pass through to extract_chains so the
-        # resulting chains carry per-hop bank pairs in Chain.banks,
-        # enabling cross_bank_count feature derivation.
-        event_banks: list[tuple[str, str]] | None = None
-        if from_bank_col and to_bank_col:
-            from_banks = bulk.get(from_bank_col, [""] * n)
-            to_banks = bulk.get(to_bank_col, [""] * n)
-            event_banks = list(zip(
-                from_banks, to_banks, strict=False,
-            ))
-
-        # Seed selection — Arrow groupby instead of Python loop
-        # Fan-out: count distinct targets per source
-        fan_table = event_table.select(
-            [cl_cfg.from_col, cl_cfg.to_col],
-        ).group_by(cl_cfg.from_col).aggregate(
-            [(cl_cfg.to_col, "count_distinct")]
-        )
-        fan_col = f"{cl_cfg.to_col}_count_distinct"
-        fan_keys = fan_table[cl_cfg.from_col].to_pylist()
-        fan_vals = fan_table[fan_col].to_pylist()
-        fan_map = dict(zip(fan_keys, fan_vals, strict=False))
-
-        t_fan = float(np.percentile(fan_vals or [0], cl_cfg.seed_percentile_fan_out))
-
-        # Currency diversity per source (if cat_col exists)
-        curr_map: dict[str, int] = {}
-        if cat_col:
-            curr_table = event_table.select(
-                [cl_cfg.from_col, cat_col],
-            ).group_by(cl_cfg.from_col).aggregate(
-                [(cat_col, "count_distinct")]
-            )
-            curr_keys = curr_table[cl_cfg.from_col].to_pylist()
-            curr_vals = curr_table[f"{cat_col}_count_distinct"].to_pylist()
-            curr_map = dict(zip(curr_keys, curr_vals, strict=False))
-
-        # In-sources count (distinct senders per receiver)
-        in_table = event_table.select(
-            [cl_cfg.to_col, cl_cfg.from_col],
-        ).group_by(cl_cfg.to_col).aggregate(
-            [(cl_cfg.from_col, "count_distinct")]
-        )
-        in_keys = in_table[cl_cfg.to_col].to_pylist()
-        in_vals = in_table[f"{cl_cfg.from_col}_count_distinct"].to_pylist()
-        in_map = dict(zip(in_keys, in_vals, strict=False))
-
-        # Out count (total events per source)
-        out_table = event_table.group_by(cl_cfg.from_col).aggregate(
-            [(cl_cfg.to_col, "count")]
-        )
-        out_keys = out_table[cl_cfg.from_col].to_pylist()
-        out_vals = out_table[f"{cl_cfg.to_col}_count"].to_pylist()
-        out_count_map = dict(zip(out_keys, out_vals, strict=False))
-
-        # Build seed set
-        all_accts = sorted(set(from_keys) | set(to_keys) - {None})
-        seed_set: set[str] = set()
-        for k in all_accts:
-            if (
-                fan_map.get(k, 0) >= t_fan
-                or curr_map.get(k, 0) >= cl_cfg.seed_multi_currency
-                or (
-                    cl_cfg.seed_pass_through
-                    and in_map.get(k, 0) >= 2
-                    and fan_map.get(k, 0) >= 2
-                    and out_count_map.get(k, 0) >= 5
+    def _pick(
+        field_name: str,
+        explicit: str | None,
+        edge_tbl_col: str | None,
+        fallbacks: tuple[str, ...],
+    ) -> str | None:
+        if explicit is not None:
+            if explicit not in schema_names:
+                raise ValueError(
+                    f"chain_lines.{cl_id}: {field_name} '{explicit}' is not a column "
+                    f"of source '{source_name}'"
                 )
-            ):
-                seed_set.add(k)
+            return explicit
+        if edge_tbl_col is not None and renames.get(edge_tbl_col, edge_tbl_col) in schema_names:
+            return renames.get(edge_tbl_col, edge_tbl_col)
+        return next((c for c in fallbacks if c in schema_names), None)
 
-        seed_keys = sorted(seed_set)
-        if verbose:
-            print(f"    Seeds: {len(seed_keys):,}")
+    ts_col = _pick(
+        "timestamp_col",
+        cl_cfg.timestamp_col,
+        edge_tbl.timestamp_col if edge_tbl else None,
+        ("timestamp", "date", "orderdate"),
+    )
+    # Type-based fallback: first column with timestamp type
+    if ts_col is None:
+        for field in event_table.schema:
+            if pa.types.is_timestamp(field.type):
+                ts_col = field.name
+                break
+    if ts_col is not None:
+        needed_cols.append(ts_col)
 
-        chains = extract_chains(
-            from_keys=from_keys,
-            to_keys=to_keys,
-            event_pks=event_pks,
-            timestamps=timestamps,
-            categories=categories,
-            amounts=amounts,
-            time_window_hours=cl_cfg.time_window_hours,
-            max_hops=cl_cfg.max_hops,
-            min_hops=cl_cfg.min_hops,
-            seed_nodes=seed_keys,
-            max_chains=cl_cfg.max_chains,
-            bidirectional=cl_cfg.bidirectional,
-            event_banks=event_banks,
+    cat_col = _pick(
+        "category_col",
+        cl_cfg.category_col,
+        None,
+        ("receiving_currency", "category", "k_symbol", "type"),
+    )
+    if cat_col is not None:
+        needed_cols.append(cat_col)
+
+    amt_col = _pick(
+        "amount_col",
+        cl_cfg.amount_col,
+        edge_tbl.amount_col if edge_tbl else None,
+        ("amount_received", "amount", "extendedprice", "fare_amount", "total_amount"),
+    )
+    if amt_col is not None:
+        needed_cols.append(amt_col)
+
+    # Bank columns for cross_bank_count chain feature. Optional —
+    # only populated when both from_bank and to_bank are present
+    # in the event table (typical for AML / financial spheres).
+    from_bank_col = None
+    to_bank_col = None
+    for fcol, tcol in (
+        ("from_bank", "to_bank"),
+        ("source_bank", "destination_bank"),
+    ):
+        if fcol in event_table.schema.names and tcol in event_table.schema.names:
+            from_bank_col, to_bank_col = fcol, tcol
+            needed_cols.append(from_bank_col)
+            needed_cols.append(to_bank_col)
+            break
+
+    # Single to_pydict — one pass instead of 6 separate to_pylist calls
+    bulk = event_table.select(list(set(needed_cols))).to_pydict()
+    from_keys = bulk[cl_cfg.from_col]
+    to_keys = bulk[cl_cfg.to_col]
+
+    # Timestamps — Arrow vectorized path
+    timestamps = parse_timestamps_to_epoch(bulk[ts_col]) if ts_col else [0.0] * n
+
+    # PKs
+    event_pks = bulk["primary_key"] if "primary_key" in bulk else [f"EV-{i:08d}" for i in range(n)]
+
+    # Categories
+    categories = bulk.get(cat_col, [""] * n) if cat_col else [""] * n
+
+    # Amounts — vectorized null handling
+    if amt_col:
+        amt_arr = event_table[amt_col]
+        amt_filled = pc.fill_null(pc.cast(amt_arr, pa.float64()), 0.0)
+        amounts = amt_filled.to_pylist()
+    else:
+        amounts = [0.0] * n
+
+    # Bank pairs per event — pass through to extract_chains so the
+    # resulting chains carry per-hop bank pairs in Chain.banks,
+    # enabling cross_bank_count feature derivation.
+    event_banks: list[tuple[str, str]] | None = None
+    if from_bank_col and to_bank_col:
+        from_banks = bulk.get(from_bank_col, [""] * n)
+        to_banks = bulk.get(to_bank_col, [""] * n)
+        event_banks = list(
+            zip(
+                from_banks,
+                to_banks,
+                strict=False,
+            )
         )
 
-        # Save to cache
-        if cache_file is not None:
-            cache_file.write_bytes(pickle.dumps(chains))
-            if verbose:
-                print(f"    Chains cached to {cache_file.name}")
+    # Seed selection — Arrow groupby instead of Python loop
+    # Fan-out: count distinct targets per source
+    fan_table = (
+        event_table.select(
+            [cl_cfg.from_col, cl_cfg.to_col],
+        )
+        .group_by(cl_cfg.from_col)
+        .aggregate([(cl_cfg.to_col, "count_distinct")])
+    )
+    fan_col = f"{cl_cfg.to_col}_count_distinct"
+    fan_keys = fan_table[cl_cfg.from_col].to_pylist()
+    fan_vals = fan_table[fan_col].to_pylist()
+    fan_map = dict(zip(fan_keys, fan_vals, strict=False))
+
+    t_fan = float(np.percentile(fan_vals or [0], cl_cfg.seed_percentile_fan_out))
+
+    # Currency diversity per source (if cat_col exists)
+    curr_map: dict[str, int] = {}
+    if cat_col:
+        curr_table = (
+            event_table.select(
+                [cl_cfg.from_col, cat_col],
+            )
+            .group_by(cl_cfg.from_col)
+            .aggregate([(cat_col, "count_distinct")])
+        )
+        curr_keys = curr_table[cl_cfg.from_col].to_pylist()
+        curr_vals = curr_table[f"{cat_col}_count_distinct"].to_pylist()
+        curr_map = dict(zip(curr_keys, curr_vals, strict=False))
+
+    # In-sources count (distinct senders per receiver)
+    in_table = (
+        event_table.select(
+            [cl_cfg.to_col, cl_cfg.from_col],
+        )
+        .group_by(cl_cfg.to_col)
+        .aggregate([(cl_cfg.from_col, "count_distinct")])
+    )
+    in_keys = in_table[cl_cfg.to_col].to_pylist()
+    in_vals = in_table[f"{cl_cfg.from_col}_count_distinct"].to_pylist()
+    in_map = dict(zip(in_keys, in_vals, strict=False))
+
+    # Out count (total events per source)
+    out_table = event_table.group_by(cl_cfg.from_col).aggregate([(cl_cfg.to_col, "count")])
+    out_keys = out_table[cl_cfg.from_col].to_pylist()
+    out_vals = out_table[f"{cl_cfg.to_col}_count"].to_pylist()
+    out_count_map = dict(zip(out_keys, out_vals, strict=False))
+
+    # Build seed set
+    all_accts = sorted(set(from_keys) | set(to_keys))
+    seed_set: set[str] = set()
+    for k in all_accts:
+        if (
+            fan_map.get(k, 0) >= t_fan
+            or curr_map.get(k, 0) >= cl_cfg.seed_multi_currency
+            or (
+                cl_cfg.seed_pass_through
+                and in_map.get(k, 0) >= 2
+                and fan_map.get(k, 0) >= 2
+                and out_count_map.get(k, 0) >= 5
+            )
+        ):
+            seed_set.add(k)
+
+    seed_keys = sorted(seed_set)
+    if verbose:
+        print(f"    Seeds: {len(seed_keys):,}")
+
+    chains = extract_chains(
+        from_keys=from_keys,
+        to_keys=to_keys,
+        event_pks=event_pks,
+        timestamps=timestamps,
+        categories=categories,
+        amounts=amounts,
+        time_window_hours=cl_cfg.time_window_hours,
+        max_hops=cl_cfg.max_hops,
+        min_hops=cl_cfg.min_hops,
+        seed_nodes=seed_keys,
+        max_chains=cl_cfg.max_chains,
+        bidirectional=cl_cfg.bidirectional,
+        event_banks=event_banks,
+    )
 
     if verbose:
         print(f"    Chains extracted: {len(chains):,}")
 
     chain_dicts = [c.to_dict() for c in chains]
-    builder.add_chain_line(  # type: ignore[union-attr]
+    builder.add_chain_line(
         cl_id,
         chains=chain_dicts,
         features=cl_cfg.features,
@@ -1011,11 +1042,13 @@ def _add_chain_line(
     eda_cfg = None
     if cl_cfg.edge_dim_aggregations is not None:
         from hypertopos.builder.mapping import parse_edge_dim_aggregations
+
         eda_cfg = parse_edge_dim_aggregations(
-            cl_cfg.edge_dim_aggregations, pattern_type="anchor",
+            cl_cfg.edge_dim_aggregations,
+            pattern_type="anchor",
         )
     # Auto-create pattern for chain line
-    builder.add_pattern(  # type: ignore[union-attr]
+    builder.add_pattern(
         f"{cl_id}_pattern",
         pattern_type="anchor",
         entity_line=cl_id,
@@ -1027,13 +1060,13 @@ def _add_chain_line(
 
 
 def _add_composite_line(
-    builder: object,
+    builder: GDSBuilder,
     cl_id: str,
     cl_cfg: CompositeLineConfig,
     cfg: SphereConfig,
 ) -> None:
     """Register a composite line and its derived dimensions + pattern."""
-    builder.add_composite_line(  # type: ignore[union-attr]
+    builder.add_composite_line(
         cl_id,
         event_line=cl_cfg.event_line,
         key_cols=cl_cfg.key_cols,
@@ -1043,7 +1076,7 @@ def _add_composite_line(
     # Auto-create an anchor pattern for the composite line
     composite_pid = f"{cl_id}_pattern"
 
-    builder.add_pattern(  # type: ignore[union-attr]
+    builder.add_pattern(
         composite_pid,
         pattern_type="anchor",
         entity_line=cl_id,
@@ -1058,7 +1091,7 @@ def _add_composite_line(
         for group in cl_cfg.derived_dimensions:
             event_line = cl_cfg.event_line
             for feat in group.features:
-                builder.add_derived_dimension(  # type: ignore[union-attr]
+                builder.add_derived_dimension(
                     anchor_line=cl_id,
                     event_line=event_line,
                     anchor_fk=cl_cfg.key_cols,
@@ -1068,35 +1101,3 @@ def _add_composite_line(
                     edge_max="auto",
                     percentile=99.0,
                 )
-
-
-def _build_temporal(builder: object, tc: TemporalConfig) -> None:
-    """Call build_temporal on the builder for one temporal config."""
-    builder.build_temporal(  # type: ignore[union-attr]
-        time_col=tc.timestamp_col,
-        time_window=tc.window,
-        event_line=tc.event_line,
-        anchor_pattern=tc.pattern,
-    )
-
-
-def _build_trajectory_indices(
-    cfg: SphereConfig,
-    output_path: str,
-    verbose: bool,
-) -> None:
-    """Build trajectory index for each anchor pattern with temporal config."""
-    if not cfg.temporal:
-        return
-
-    from hypertopos.storage.writer import GDSWriter
-
-    writer = GDSWriter(output_path)
-    temporal_patterns = {tc.pattern for tc in cfg.temporal}
-
-    for pid in temporal_patterns:
-        pat = cfg.patterns.get(pid)
-        if pat and pat.type == "anchor":
-            if verbose:
-                print(f"  Building trajectory index for '{pid}'...")
-            writer.build_trajectory_index(pid)

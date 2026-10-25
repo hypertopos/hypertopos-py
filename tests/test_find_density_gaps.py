@@ -1,106 +1,147 @@
 """Navigator-level integration for find_density_gaps.
 
-Uses the bundled Berka sphere because synthetic GDSBuilder spheres
-trigger Lance internal panics on small entity counts (the encoder
-divides by zero on undersized rowgroups).
+Runs on a small sphere built in the test (200 accounts, four derived
+dimensions from seeded transactions), so it needs no external data.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
+import pyarrow as pa
 import pytest
 
 from hypertopos import HyperSphere
+from hypertopos.builder.builder import GDSBuilder
+
+_N_ACCOUNTS = 200
+_PATTERN = "account_behavior_pattern"
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-BERKA_PATH = PROJECT_ROOT / "benchmark" / "berka" / "sphere" / "gds_berka_banking"
-
-
-def _has_berka_3_0() -> bool:
-    sphere_json = BERKA_PATH / "_gds_meta" / "sphere.json"
-    if not sphere_json.exists():
-        return False
-    import json
-    return json.loads(sphere_json.read_text()).get("format_version") == "3.0"
-
-
-pytestmark = pytest.mark.skipif(
-    not _has_berka_3_0(),
-    reason="Berka sphere not built at format 3.0 (run benchmark/berka/sphere/sphere.yaml first)",
-)
+def _build_sphere(path: Path) -> None:
+    rng = np.random.default_rng(7)
+    accounts = [f"A{i:03d}" for i in range(_N_ACCOUNTS)]
+    tx_per_account = rng.integers(1, 30, size=_N_ACCOUNTS)
+    senders: list[str] = []
+    amounts: list[float] = []
+    for acc, n_tx in zip(accounts, tx_per_account, strict=True):
+        scale = float(rng.lognormal(4.0, 1.0))
+        senders.extend([acc] * int(n_tx))
+        amounts.extend(rng.exponential(scale, size=int(n_tx)).round(2).tolist())
+    txns = pa.table(
+        {
+            "primary_key": [f"TX{i:05d}" for i in range(len(senders))],
+            "account_id": senders,
+            "amount": amounts,
+        }
+    )
+    builder = GDSBuilder("density_gaps_test", str(path))
+    builder.add_line("accounts", pa.table({"primary_key": accounts}), "primary_key", "t")
+    builder.add_line("transactions", txns, "primary_key", "t", role="event")
+    for metric, col, name in (
+        ("count", None, "tx_count"),
+        ("sum", "amount", "amount_sum"),
+        ("max", "amount", "amount_max"),
+        ("std", "amount", "amount_std"),
+    ):
+        builder.add_derived_dimension("accounts", "transactions", "account_id", metric, col, name)
+    builder.add_pattern(_PATTERN, "anchor", "accounts", relations=[])
+    builder.build()
 
 
 @pytest.fixture(scope="module")
-def berka_nav():
-    hs = HyperSphere.open(BERKA_PATH)
+def dg_nav(tmp_path_factory: pytest.TempPathFactory):
+    path = tmp_path_factory.mktemp("density_gaps") / "sphere"
+    _build_sphere(path)
+    hs = HyperSphere.open(str(path))
     return hs.session("dg-test").navigator()
 
 
-def test_find_density_gaps_returns_dict_with_gaps(berka_nav):
-    out = berka_nav.find_density_gaps(
-        "account_behavior_pattern", top_n=10,
+def test_find_density_gaps_returns_dict_with_gaps(dg_nav):
+    out = dg_nav.find_density_gaps(
+        _PATTERN,
+        top_n=10,
     )
     assert isinstance(out, dict)
     assert "gaps" in out
     assert "excluded_dims" in out
     assert "n_pairs_tested" in out
+    assert out["n_pairs_tested"] > 0
     assert out["n_entities"] >= 100
 
 
-def test_find_density_gaps_rejects_unknown_pattern(berka_nav):
+def test_find_density_gaps_rejects_unknown_pattern(dg_nav):
     with pytest.raises(Exception, match="pattern not found"):
-        berka_nav.find_density_gaps("nonexistent")
+        dg_nav.find_density_gaps("nonexistent")
 
 
-def test_find_density_gaps_rejects_invalid_alpha(berka_nav):
+def test_find_density_gaps_rejects_invalid_alpha(dg_nav):
     with pytest.raises(Exception, match="alpha"):
-        berka_nav.find_density_gaps(
-            "account_behavior_pattern", alpha=0.0,
+        dg_nav.find_density_gaps(
+            _PATTERN,
+            alpha=0.0,
         )
 
 
-def test_find_density_gaps_rejects_invalid_bins(berka_nav):
+def test_find_density_gaps_rejects_invalid_bins(dg_nav):
     with pytest.raises(Exception, match="bins"):
-        berka_nav.find_density_gaps(
-            "account_behavior_pattern", bins=2,
+        dg_nav.find_density_gaps(
+            _PATTERN,
+            bins=2,
         )
 
 
-def test_find_density_gaps_rejects_invalid_r_window(berka_nav):
+def test_find_density_gaps_rejects_invalid_r_window(dg_nav):
     with pytest.raises(Exception, match="r_min"):
-        berka_nav.find_density_gaps(
-            "account_behavior_pattern", r_min=0.5, r_max=0.4,
+        dg_nav.find_density_gaps(
+            _PATTERN,
+            r_min=0.5,
+            r_max=0.4,
         )
 
 
-def test_find_density_gaps_rejects_invalid_top_n(berka_nav):
+def test_find_density_gaps_rejects_invalid_top_n(dg_nav):
     with pytest.raises(Exception, match="top_n"):
-        berka_nav.find_density_gaps(
-            "account_behavior_pattern", top_n=0,
+        dg_nav.find_density_gaps(
+            _PATTERN,
+            top_n=0,
         )
 
 
-def test_find_density_gaps_returns_sorted_by_ratio(berka_nav):
-    out = berka_nav.find_density_gaps(
-        "account_behavior_pattern", top_n=20,
+# Coarse bins and the full correlation window give the 200-entity sphere
+# enough power to flag gaps (the defaults find none at this size).
+_GAP_KWARGS = {"bins": 4, "r_max": 1.0}
+
+
+def test_find_density_gaps_returns_sorted_by_ratio(dg_nav):
+    out = dg_nav.find_density_gaps(
+        _PATTERN,
+        top_n=20,
+        **_GAP_KWARGS,
     )
     ratios = [g["ratio"] for g in out["gaps"]]
+    assert len(ratios) > 1
     assert ratios == sorted(ratios, reverse=True)
+    # Empty cells keep a finite ratio (infinity serialises as null).
+    assert all(np.isfinite(r) for r in ratios)
 
 
-def test_find_density_gaps_unknown_dim_in_user_pairs(berka_nav):
+def test_find_density_gaps_unknown_dim_in_user_pairs(dg_nav):
     with pytest.raises(Exception, match="unknown dim names"):
-        berka_nav.find_density_gaps(
-            "account_behavior_pattern",
+        dg_nav.find_density_gaps(
+            _PATTERN,
             dim_pairs=[("nope_x", "nope_y")],
         )
 
 
-def test_find_density_gaps_includes_raw_ranges(berka_nav):
-    out = berka_nav.find_density_gaps(
-        "account_behavior_pattern", top_n=5,
+def test_find_density_gaps_includes_raw_ranges(dg_nav):
+    out = dg_nav.find_density_gaps(
+        _PATTERN,
+        top_n=5,
+        **_GAP_KWARGS,
     )
+    assert out["gaps"]
     for gap in out["gaps"]:
         assert "delta_range_i" in gap
         assert "delta_range_j" in gap

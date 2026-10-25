@@ -6,6 +6,7 @@ checks (sphere.json, dimension_kinds, geometry delta length) plus
 HyperSphere-driven behavior smoke (anomaly_summary, π5_attract_anomaly)
 exercising the chain regime added in 0.6.2.
 """
+
 from __future__ import annotations
 
 import json
@@ -20,7 +21,6 @@ from hypertopos.builder.mapping import (
     EdgeDimensionsConfig,
 )
 from hypertopos.storage.reader import GDSReader
-
 
 _CHAIN_FEATURES = ["hop_count", "is_cyclic"]
 
@@ -52,34 +52,32 @@ def _make_chain_sphere(
             {"acct_id": "D"},
             {"acct_id": "E"},
         ],
-        key_col="acct_id", source_id="t",
+        key_col="acct_id",
+        source_id="t",
     )
     b.add_line(
         "transactions",
         [
-            {"tx_id": "evt1", "from_acct": "A", "to_acct": "B",
-             "ts": 1000.0, "amount": 10000.0},
-            {"tx_id": "evt2", "from_acct": "B", "to_acct": "C",
-             "ts": 2000.0, "amount": 5000.0},
-            {"tx_id": "evt3", "from_acct": "C", "to_acct": "D",
-             "ts": 3000.0, "amount": 2500.0},
-            {"tx_id": "evt4", "from_acct": "A", "to_acct": "E",
-             "ts": 4000.0, "amount": 8000.0},
-            {"tx_id": "evt5", "from_acct": "D", "to_acct": "E",
-             "ts": 5000.0, "amount": 1200.0},
-            {"tx_id": "evt6", "from_acct": "E", "to_acct": "A",
-             "ts": 6000.0, "amount": 600.0},
+            {"tx_id": "evt1", "from_acct": "A", "to_acct": "B", "ts": 1000.0, "amount": 10000.0},
+            {"tx_id": "evt2", "from_acct": "B", "to_acct": "C", "ts": 2000.0, "amount": 5000.0},
+            {"tx_id": "evt3", "from_acct": "C", "to_acct": "D", "ts": 3000.0, "amount": 2500.0},
+            {"tx_id": "evt4", "from_acct": "A", "to_acct": "E", "ts": 4000.0, "amount": 8000.0},
+            {"tx_id": "evt5", "from_acct": "D", "to_acct": "E", "ts": 5000.0, "amount": 1200.0},
+            {"tx_id": "evt6", "from_acct": "E", "to_acct": "A", "ts": 6000.0, "amount": 600.0},
         ],
-        key_col="tx_id", source_id="t",
+        key_col="tx_id",
+        source_id="t",
     )
 
-    edge_dims = EdgeDimensionsConfig(dims={
-        "find_motif_structuring": {
-            "time_window_hours": 24.0,
-            "amt1_min": 5000.0,
-            "amt2_max": 7500.0,
-        },
-    })
+    edge_dims = EdgeDimensionsConfig(
+        dims={
+            "find_motif_structuring": {
+                "time_window_hours": 24.0,
+                "amt1_min": 5000.0,
+                "amt2_max": 7500.0,
+            },
+        }
+    )
 
     # Event pattern declared FIRST so its sidecar exists when chain anchor
     # tries to aggregate from it.
@@ -89,12 +87,17 @@ def _make_chain_sphere(
         entity_line="transactions",
         relations=[
             RelationSpec(
-                "accounts", fk_col="from_acct", direction="in", required=True,
+                "accounts",
+                fk_col="from_acct",
+                direction="in",
+                required=True,
             ),
         ],
         edge_table=EdgeTableConfig(
-            from_col="from_acct", to_col="to_acct",
-            timestamp_col="ts", amount_col="amount",
+            from_col="from_acct",
+            to_col="to_acct",
+            timestamp_col="ts",
+            amount_col="amount",
         ),
         edge_dimensions=edge_dims,
     )
@@ -104,31 +107,36 @@ def _make_chain_sphere(
             "chain_id": "ch_long",
             "keys": ["A", "B", "C", "D"],
             "event_keys": ["evt1", "evt2", "evt3"],
-            "hop_count": 3, "is_cyclic": 0.0,
+            "hop_count": 3,
+            "is_cyclic": 0.0,
         },
         {
             "chain_id": "ch_cycle",
             "keys": ["A", "E", "A"],
             "event_keys": ["evt4", "evt6"],
-            "hop_count": 2, "is_cyclic": 1.0,
+            "hop_count": 2,
+            "is_cyclic": 1.0,
         },
         {
             "chain_id": "ch_short",
             "keys": ["D", "E"],
             "event_keys": ["evt5"],
-            "hop_count": 1, "is_cyclic": 0.0,
+            "hop_count": 1,
+            "is_cyclic": 0.0,
         },
         {
             "chain_id": "ch_overlap",
             "keys": ["A", "B", "C"],
             "event_keys": ["evt1", "evt2"],
-            "hop_count": 2, "is_cyclic": 0.0,
+            "hop_count": 2,
+            "is_cyclic": 0.0,
         },
         {
             "chain_id": "ch_isolated",
             "keys": ["E", "A"],
             "event_keys": ["evt6"],
-            "hop_count": 1, "is_cyclic": 0.0,
+            "hop_count": 1,
+            "is_cyclic": 0.0,
         },
     ]
     b.add_chain_line("tx_chains", chains=chains, features=_CHAIN_FEATURES)
@@ -138,7 +146,8 @@ def _make_chain_sphere(
             from_event_pattern="tx_pattern",
             dims=("find_motif_structuring",),
         )
-        if with_chain_aggregations else None
+        if with_chain_aggregations
+        else None
     )
     b.add_pattern(
         "tx_chains_pattern",
@@ -215,9 +224,7 @@ def test_chain_pattern_dim_labels_include_aggregated_names(tmp_path: Path):
         f"dim_labels must include aggregated names; got {labels}"
     )
     for lbl in labels:
-        assert not lbl.startswith("dim_"), (
-            f"placeholder label leaked: {lbl!r}"
-        )
+        assert not lbl.startswith("dim_"), f"placeholder label leaked: {lbl!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +306,7 @@ def test_chain_long_multihop_aggregation(tmp_path: Path):
     # check the wrong slots if any of those grow later.
     labels = pat.dim_labels
     mean_idx = labels.index("find_motif_structuring_mean")
-    max_idx  = labels.index("find_motif_structuring_max")
+    max_idx = labels.index("find_motif_structuring_max")
     delta = geo["delta"][long_idx].as_py()
     assert any(abs(v) > 1e-6 for v in (delta[mean_idx], delta[max_idx])), (
         f"chain aggregates appear all-zero on ch_long — chain regime did "
@@ -339,32 +346,43 @@ def test_chain_with_zero_chains_extracted_raises(tmp_path: Path):
     b.add_line(
         "accounts",
         [{"acct_id": "A"}, {"acct_id": "B"}],
-        key_col="acct_id", source_id="t",
+        key_col="acct_id",
+        source_id="t",
     )
     b.add_line(
         "transactions",
         [
-            {"tx_id": "evt1", "from_acct": "A", "to_acct": "B",
-             "ts": 1000.0, "amount": 100.0},
+            {"tx_id": "evt1", "from_acct": "A", "to_acct": "B", "ts": 1000.0, "amount": 100.0},
         ],
-        key_col="tx_id", source_id="t",
+        key_col="tx_id",
+        source_id="t",
     )
-    edge_dims = EdgeDimensionsConfig(dims={
-        "find_motif_structuring": {
-            "time_window_hours": 24.0,
-            "amt1_min": 5000.0, "amt2_max": 7500.0,
-        },
-    })
+    edge_dims = EdgeDimensionsConfig(
+        dims={
+            "find_motif_structuring": {
+                "time_window_hours": 24.0,
+                "amt1_min": 5000.0,
+                "amt2_max": 7500.0,
+            },
+        }
+    )
     b.add_pattern(
-        "tx_pattern", pattern_type="event", entity_line="transactions",
+        "tx_pattern",
+        pattern_type="event",
+        entity_line="transactions",
         relations=[
             RelationSpec(
-                "accounts", fk_col="from_acct", direction="in", required=True,
+                "accounts",
+                fk_col="from_acct",
+                direction="in",
+                required=True,
             ),
         ],
         edge_table=EdgeTableConfig(
-            from_col="from_acct", to_col="to_acct",
-            timestamp_col="ts", amount_col="amount",
+            from_col="from_acct",
+            to_col="to_acct",
+            timestamp_col="ts",
+            amount_col="amount",
         ),
         edge_dimensions=edge_dims,
     )
@@ -372,7 +390,9 @@ def test_chain_with_zero_chains_extracted_raises(tmp_path: Path):
     # chain_events column emitted).
     b.add_chain_line("tx_chains", chains=[], features=["hop_count"])
     b.add_pattern(
-        "tx_chains_pattern", pattern_type="anchor", entity_line="tx_chains",
+        "tx_chains_pattern",
+        pattern_type="anchor",
+        entity_line="tx_chains",
         relations=[],
         edge_dim_aggregations=EdgeDimAggregationsConfig(
             from_event_pattern="tx_pattern",

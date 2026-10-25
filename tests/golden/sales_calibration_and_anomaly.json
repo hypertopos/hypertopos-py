@@ -1,0 +1,65 @@
+{
+  "anomaly": {
+    "clusters": null,
+    "meta": null,
+    "ranking": [
+      {
+        "anomaly_confidence": null,
+        "delta": [
+          10.0,
+          5.0
+        ],
+        "delta_norm": 11.18033981,
+        "delta_rank_pct": 100.0,
+        "is_anomaly": true,
+        "primary_key": "CUST-001"
+      }
+    ],
+    "total_found": 1
+  },
+  "calibration": {
+    "customer_pattern": {
+      "mu": [
+        0.7,
+        0.4
+      ],
+      "pattern_type": "anchor",
+      "population_size": 100,
+      "relations": [
+        {
+          "direction": "out",
+          "line_id": "products",
+          "required": true
+        },
+        {
+          "direction": "in",
+          "line_id": "stores",
+          "required": false
+        }
+      ],
+      "sigma_diag": [
+        0.2,
+        0.3
+      ],
+      "theta": [
+        7.5,
+        5.0
+      ]
+    }
+  },
+  "explain": {
+    "delta_norm": 2.0069,
+    "pattern_id": "customer_pattern",
+    "primary_key": "CUST-001",
+    "reliability_flags": {
+      "confidence": null,
+      "dominant_dim": "products",
+      "dominant_dim_share": 0.5586,
+      "flags": [],
+      "low_confidence_bucket": false,
+      "single_dim_driven": false
+    },
+    "severity": "normal",
+    "theta_norm": 9.0139
+  }
+}

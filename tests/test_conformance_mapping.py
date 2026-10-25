@@ -13,17 +13,20 @@ Covers:
     duplicate rule_id, non-list block, non-iterable ``in`` value, ...)
   * end-to-end YAML → builder → sidecar → runtime evaluator round-trip
 """
+
 from __future__ import annotations
 
 import json
 
 import pyarrow as pa
 import pytest
+
 from hypertopos.builder.builder import GDSBuilder, RelationSpec
 from hypertopos.builder.conformance import evaluate_conformance_rules
 from hypertopos.builder.conformance_mapping import parse_conformance_rules
 from hypertopos.engine.conformance import read_violations
 from hypertopos.model.sphere import Pattern
+from hypertopos.storage.reader import GDSReader
 
 # ---------------------------------------------------------------------------
 # Unit tests — predicate / rule parsing
@@ -178,7 +181,9 @@ def test_available_columns_accepts_known_prop():
         },
     ]
     parse_conformance_rules(
-        raw, pattern_id="p", available_columns={"country", "amount"},
+        raw,
+        pattern_id="p",
+        available_columns={"country", "amount"},
     )
 
 
@@ -193,7 +198,9 @@ def test_available_columns_rejects_unknown_prop():
     ]
     with pytest.raises(ValueError, match=r"ghost_col.*not a column"):
         parse_conformance_rules(
-            raw, pattern_id="p", available_columns={"a", "b"},
+            raw,
+            pattern_id="p",
+            available_columns={"a", "b"},
         )
 
 
@@ -370,7 +377,16 @@ def _ten_row_table() -> pa.Table:
             "primary_key": [f"E{i}" for i in range(10)],
             "amount": [200, 150, 110, 50, 40, 30, 20, 10, 5, 1],
             "region": [
-                "EU", "XX", "US", "EU", "US", "EU", "US", "EU", "US", "EU",
+                "EU",
+                "XX",
+                "US",
+                "EU",
+                "US",
+                "EU",
+                "US",
+                "EU",
+                "US",
+                "EU",
             ],
         },
     )
@@ -389,7 +405,9 @@ def test_parsed_rules_match_handcoded_runtime_violations():
             "rule_id": "rule_in",
             "severity": "low",
             "violates_when": {
-                "op": "in", "prop": "region", "value": ["XX", "APAC"],
+                "op": "in",
+                "prop": "region",
+                "value": ["XX", "APAC"],
             },
         },
     ]
@@ -497,7 +515,9 @@ def test_builder_end_to_end_writes_sidecar_with_yaml_rules(tmp_path):
             "rule_id": "sanctioned_region",
             "severity": "critical",
             "violates_when": {
-                "op": "in", "prop": "region", "value": ["XX", "ZZ"],
+                "op": "in",
+                "prop": "region",
+                "value": ["XX", "ZZ"],
             },
         },
     ]
@@ -534,6 +554,7 @@ def test_builder_end_to_end_writes_sidecar_with_yaml_rules(tmp_path):
 
     # Sidecar landed under _gds_meta/conformance/violations/account_pattern.
     violations, manifest = read_violations(
+        reader=GDSReader(str(out_path)),
         base_path=out_path,
         pattern_id="account_pattern",
         version=1,
@@ -594,7 +615,5 @@ def test_builder_no_rules_writes_no_sidecar(tmp_path):
     )
     builder.build()
 
-    sidecar_dir = (
-        out_path / "_gds_meta" / "conformance" / "violations" / "account_pattern"
-    )
+    sidecar_dir = out_path / "_gds_meta" / "conformance" / "violations" / "account_pattern"
     assert not sidecar_dir.exists()

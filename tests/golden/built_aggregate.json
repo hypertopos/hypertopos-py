@@ -1,0 +1,200 @@
+{
+  "count_by_account": {
+    "distinct": false,
+    "event_pattern_id": "tx_pattern",
+    "filters": null,
+    "geometry_filters": null,
+    "group_by_line": "accounts",
+    "group_by_property": null,
+    "metric": "count",
+    "offset": 0,
+    "results": [
+      {
+        "anomaly_rate": 0.0,
+        "count": 47,
+        "key": "A027",
+        "value": 47
+      },
+      {
+        "anomaly_rate": 0.0,
+        "count": 39,
+        "key": "A028",
+        "value": 39
+      },
+      {
+        "anomaly_rate": 0.0,
+        "count": 39,
+        "key": "A035",
+        "value": 39
+      },
+      {
+        "anomaly_rate": 0.0,
+        "count": 38,
+        "key": "A014",
+        "value": 38
+      },
+      {
+        "anomaly_rate": 0.0263,
+        "count": 38,
+        "key": "A030",
+        "value": 38
+      },
+      {
+        "anomaly_rate": 0.0,
+        "count": 37,
+        "key": "A039",
+        "value": 37
+      },
+      {
+        "anomaly_rate": 0.0,
+        "count": 36,
+        "key": "A002",
+        "value": 36
+      },
+      {
+        "anomaly_rate": 0.0,
+        "count": 36,
+        "key": "A004",
+        "value": 36
+      }
+    ],
+    "sampled": false,
+    "total_groups": 40
+  },
+  "sum_amount_by_region": {
+    "collapse_by_property": false,
+    "distinct": false,
+    "event_pattern_id": "tx_pattern",
+    "filters": null,
+    "geometry_filters": null,
+    "group_by_line": "accounts",
+    "group_by_property": "accounts:region",
+    "metric": "sum:amount",
+    "offset": 0,
+    "results": [
+      {
+        "count": 35,
+        "key": "A029",
+        "region": "south",
+        "value": 120587.33
+      },
+      {
+        "count": 30,
+        "key": "A003",
+        "region": "west",
+        "value": 109954.0
+      },
+      {
+        "count": 20,
+        "key": "A017",
+        "region": "south",
+        "value": 62701.0
+      },
+      {
+        "count": 47,
+        "key": "A027",
+        "region": "west",
+        "value": 9326.68
+      },
+      {
+        "count": 38,
+        "key": "A030",
+        "region": "east",
+        "value": 9265.0
+      },
+      {
+        "count": 31,
+        "key": "A031",
+        "region": "west",
+        "value": 8857.58
+      },
+      {
+        "count": 38,
+        "key": "A014",
+        "region": "east",
+        "value": 8852.38
+      },
+      {
+        "count": 33,
+        "key": "A008",
+        "region": "north",
+        "value": 8334.24
+      },
+      {
+        "count": 39,
+        "key": "A035",
+        "region": "west",
+        "value": 8307.12
+      },
+      {
+        "count": 39,
+        "key": "A028",
+        "region": "north",
+        "value": 8217.25
+      },
+      {
+        "count": 30,
+        "key": "A013",
+        "region": "south",
+        "value": 7352.89
+      },
+      {
+        "count": 27,
+        "key": "A034",
+        "region": "east",
+        "value": 7349.1
+      },
+      {
+        "count": 33,
+        "key": "A011",
+        "region": "west",
+        "value": 7198.69
+      },
+      {
+        "count": 32,
+        "key": "A036",
+        "region": "north",
+        "value": 7131.42
+      },
+      {
+        "count": 28,
+        "key": "A015",
+        "region": "west",
+        "value": 6899.21
+      },
+      {
+        "count": 36,
+        "key": "A004",
+        "region": "north",
+        "value": 6752.58
+      },
+      {
+        "count": 35,
+        "key": "A000",
+        "region": "north",
+        "value": 6736.11
+      },
+      {
+        "count": 26,
+        "key": "A010",
+        "region": "east",
+        "value": 6681.36
+      },
+      {
+        "count": 37,
+        "key": "A039",
+        "region": "west",
+        "value": 6659.84
+      },
+      {
+        "count": 33,
+        "key": "A006",
+        "region": "east",
+        "value": 6652.85
+      }
+    ],
+    "sampled": false,
+    "total_entities": 40,
+    "total_groups": 40
+  }
+}

@@ -1,4 +1,5 @@
 """Tests for hypertopos.engine.selection -- submodular facility location."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -79,7 +80,7 @@ class TestFacilityLocation:
         X = np.vstack(clusters)
         idx, rep = lazy_greedy_facility_location(X, 5)
         # Each selected should come from a different cluster
-        cluster_ids = set(int(i) // 20 for i in idx)
+        cluster_ids = {int(i) // 20 for i in idx}
         assert len(cluster_ids) == 5
 
     def test_representativeness_sums_to_N(self):

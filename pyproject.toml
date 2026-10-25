@@ -4,18 +4,30 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hypertopos"
-version = "0.8.1"
+version = "0.9.0"
 description = "Understand the structure of your data — without training machine learning models"
+readme = "README.md"
 requires-python = ">=3.12"
-license = {text = "BSL-1.1"}
+license = "BUSL-1.1"
+license-files = ["LICENSE.md"]
+keywords = ["anomaly-detection", "geometry", "ai-agents", "mcp", "lance", "arrow", "aml"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Typing :: Typed",
+]
 dependencies = [
     "pyarrow>=14.0",
     "numpy>=1.26",
     "scipy>=1.11",
     "pandas>=2.0",
-    "pylance>=7.0,<8.0",
+    "pylance>=13.0,<14.0",
     "pyyaml>=6.0",
-    "packaging>=23.0",
 ]
 
 [project.optional-dependencies]
@@ -31,12 +43,14 @@ dev = [
     "pytest",
     "pytest-cov",
     "pytest-asyncio",
-    "ruff",
-    "mypy",
+    "pytest-xdist",
+    "filelock",
+    "ruff==0.15.2",
+    "mypy==1.19.1",
     "igraph>=0.11",
 ]
 mcp = [
-    "mcp[cli]>=1.20",
+    "mcp[cli]>=2.3,<3",
     "tzdata>=2024.1",
 ]
 
@@ -58,3 +72,31 @@ packages = ["hypertopos"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v"
+markers = [
+    "slow: tests dominated by process start-up or large synthetic builds (deselect locally with -m 'not slow')",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+
+# Third-party libraries that ship without type stubs or a py.typed marker.
+[[tool.mypy.overrides]]
+module = [
+    "igraph.*",
+    "networkx.*",
+    "pandas.*",
+    "pyarrow.*",
+    "ripser.*",
+    "scipy.*",
+    "sklearn.*",
+    "yaml.*",
+]
+ignore_missing_imports = true

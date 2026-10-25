@@ -12,6 +12,7 @@ from datetime import UTC
 from pathlib import Path
 
 import pyarrow as pa
+
 from hypertopos.storage.reader import BATCH_SCAN_THRESHOLD, GDSReader  # noqa: E402
 
 # ---------------------------------------------------------------------------

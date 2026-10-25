@@ -4,12 +4,14 @@
 """Unit tests for builder's fdr_hierarchy.from_dimension column injection +
 the inject-before-validate ordering at the three _build_and_write call sites.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
 
 import pyarrow as pa
 import pytest
+
 from hypertopos.model.sphere import (
     FDRHierarchyLevel,
     FDRTemporalLevel,
@@ -57,21 +59,27 @@ class TestFDRHierarchyColumnInjection:
             ],
         )
         geometry = pa.table({"primary_key": ["A1", "A2", "A3"]})
-        anchor = pa.table({
-            "primary_key": ["A1", "A2", "A3", "A4"],
-            "bank_id": ["B01", "B02", "B01", "B99"],
-            "other_col": ["x", "y", "z", "w"],
-        })
+        anchor = pa.table(
+            {
+                "primary_key": ["A1", "A2", "A3", "A4"],
+                "bank_id": ["B01", "B02", "B01", "B99"],
+                "other_col": ["x", "y", "z", "w"],
+            }
+        )
         out = _inject_fdr_hierarchy_columns(
-            pat, geometry_table=geometry, anchor_table=anchor,
+            pat,
+            geometry_table=geometry,
+            anchor_table=anchor,
         )
         assert "bank_id" in out.column_names
         # Order-preserving join keyed on primary_key
-        rows = dict(zip(
-            out["primary_key"].to_pylist(),
-            out["bank_id"].to_pylist(),
-            strict=True,
-        ))
+        rows = dict(
+            zip(
+                out["primary_key"].to_pylist(),
+                out["bank_id"].to_pylist(),
+                strict=True,
+            )
+        )
         assert rows == {"A1": "B01", "A2": "B02", "A3": "B01"}
         # Only requested column was injected, not "other_col"
         assert "other_col" not in out.column_names
@@ -84,16 +92,22 @@ class TestFDRHierarchyColumnInjection:
                 FDRHierarchyLevel(level="bank", from_dimension="bank_id"),
             ],
         )
-        geometry = pa.table({
-            "primary_key": ["A1", "A2"],
-            "bank_id": ["preset_1", "preset_2"],
-        })
-        anchor = pa.table({
-            "primary_key": ["A1", "A2"],
-            "bank_id": ["DIFFERENT_1", "DIFFERENT_2"],
-        })
+        geometry = pa.table(
+            {
+                "primary_key": ["A1", "A2"],
+                "bank_id": ["preset_1", "preset_2"],
+            }
+        )
+        anchor = pa.table(
+            {
+                "primary_key": ["A1", "A2"],
+                "bank_id": ["DIFFERENT_1", "DIFFERENT_2"],
+            }
+        )
         out = _inject_fdr_hierarchy_columns(
-            pat, geometry_table=geometry, anchor_table=anchor,
+            pat,
+            geometry_table=geometry,
+            anchor_table=anchor,
         )
         # Helper is a no-op when column already on geometry — preset values win
         assert out["bank_id"].to_pylist() == ["preset_1", "preset_2"]
@@ -108,13 +122,17 @@ class TestFDRHierarchyColumnInjection:
             entity_line="accounts",
         )
         geometry = pa.table({"primary_key": ["A1"]})
-        anchor = pa.table({
-            "primary_key": ["A1"],
-            "country_code": ["PL"],
-        })
+        anchor = pa.table(
+            {
+                "primary_key": ["A1"],
+                "country_code": ["PL"],
+            }
+        )
         with pytest.raises(ValueError) as exc_info:
             _inject_fdr_hierarchy_columns(
-                pat, geometry_table=geometry, anchor_table=anchor,
+                pat,
+                geometry_table=geometry,
+                anchor_table=anchor,
             )
         msg = str(exc_info.value)
         assert "bank_id" in msg
@@ -127,7 +145,9 @@ class TestFDRHierarchyColumnInjection:
         geometry = pa.table({"primary_key": ["A1"]})
         anchor = pa.table({"primary_key": ["A1"], "bank_id": ["B01"]})
         out = _inject_fdr_hierarchy_columns(
-            pat, geometry_table=geometry, anchor_table=anchor,
+            pat,
+            geometry_table=geometry,
+            anchor_table=anchor,
         )
         assert out.column_names == ["primary_key"]
 
@@ -138,18 +158,23 @@ class TestFDRHierarchyColumnInjection:
             fdr_hierarchy=[
                 FDRHierarchyLevel(level="bank", from_dimension="bank_id"),
                 FDRHierarchyLevel(
-                    level="community", from_dimension="community_id",
+                    level="community",
+                    from_dimension="community_id",
                 ),
             ],
         )
         geometry = pa.table({"primary_key": ["A1", "A2"]})
-        anchor = pa.table({
-            "primary_key": ["A1", "A2"],
-            "bank_id": ["B01", "B02"],
-            "community_id": ["C7", "C8"],
-        })
+        anchor = pa.table(
+            {
+                "primary_key": ["A1", "A2"],
+                "bank_id": ["B01", "B02"],
+                "community_id": ["C7", "C8"],
+            }
+        )
         out = _inject_fdr_hierarchy_columns(
-            pat, geometry_table=geometry, anchor_table=anchor,
+            pat,
+            geometry_table=geometry,
+            anchor_table=anchor,
         )
         assert "bank_id" in out.column_names
         assert "community_id" in out.column_names
@@ -182,15 +207,9 @@ class TestInjectBeforeValidateOrder:
                 temp_line = None
                 val_line = None
                 for j in range(i + 1, min(i + 15, len(lines))):
-                    if (
-                        temp_line is None
-                        and "self._inject_fdr_temporal_buckets" in lines[j]
-                    ):
+                    if temp_line is None and "self._inject_fdr_temporal_buckets" in lines[j]:
                         temp_line = j + 1
-                    elif (
-                        val_line is None
-                        and "_validate_fdr_hierarchy_columns(" in lines[j]
-                    ):
+                    elif val_line is None and "_validate_fdr_hierarchy_columns(" in lines[j]:
                         val_line = j + 1
                         break
                 if temp_line is not None and val_line is not None:
@@ -203,10 +222,7 @@ class TestInjectBeforeValidateOrder:
     def test_three_call_sites_inject_hierarchy_before_temporal_before_validate(
         self,
     ):
-        builder_path = (
-            Path(__file__).parent.parent
-            / "hypertopos" / "builder" / "builder.py"
-        )
+        builder_path = Path(__file__).parent.parent / "hypertopos" / "builder" / "builder.py"
         src = builder_path.read_text(encoding="utf-8")
         sites = self._call_site_line_numbers(src)
         assert len(sites) == 3, (
@@ -237,17 +253,23 @@ class TestInjectThenValidateEndToEnd:
                 FDRHierarchyLevel(level="bank", from_dimension="bank_id"),
             ],
         )
-        geometry = pa.table({
-            "primary_key": ["A1", "A2"],
-            "delta_norm": [0.1, 0.2],
-        })
-        anchor = pa.table({
-            "primary_key": ["A1", "A2"],
-            "bank_id": ["B01", "B02"],
-        })
+        geometry = pa.table(
+            {
+                "primary_key": ["A1", "A2"],
+                "delta_norm": [0.1, 0.2],
+            }
+        )
+        anchor = pa.table(
+            {
+                "primary_key": ["A1", "A2"],
+                "bank_id": ["B01", "B02"],
+            }
+        )
         # 1. Inject hierarchy from anchor
         out = _inject_fdr_hierarchy_columns(
-            pat, geometry_table=geometry, anchor_table=anchor,
+            pat,
+            geometry_table=geometry,
+            anchor_table=anchor,
         )
         # 2. Validate against the post-inject column set
         _validate_fdr_hierarchy_columns(pat, list(out.column_names))

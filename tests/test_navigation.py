@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 import pytest
+
 from hypertopos.model.manifest import Contract, Manifest
 from hypertopos.model.objects import Edge, Point, Polygon, Solid, SolidSlice
 from hypertopos.navigation.navigator import (
@@ -60,9 +61,7 @@ class _MockEngine:
     def build_polygon(self, bk, pid, manifest):
         return _make_polygon_with_edge("PROD-001", "products")
 
-    def build_solid(
-        self, bk, pid, manifest, filters=None, timestamp=None, **kwargs
-    ):
+    def build_solid(self, bk, pid, manifest, filters=None, timestamp=None, **kwargs):
         from hypertopos.model.objects import Solid
 
         return Solid(
@@ -79,18 +78,24 @@ class _MockStorage:
         "products": ["PROD-001", "PROD-002"],
     }
 
-    def read_points(self, line_id, version, filters=None):
+    def read_points(self, line_id, version, filters=None, primary_key=None):
         import pyarrow as pa
 
         keys = self._POINTS.get(line_id, ["UNKNOWN-001"])
+        if primary_key is not None:
+            keys = [k for k in keys if k == primary_key]
         n = len(keys)
         return pa.table(
             {
-                "primary_key": keys,
+                "primary_key": pa.array(keys, type=pa.string()),
                 "version": [1] * n,
                 "status": ["active"] * n,
-                "created_at": [datetime(2024, 1, 1, tzinfo=UTC)] * n,
-                "changed_at": [datetime(2024, 1, 1, tzinfo=UTC)] * n,
+                "created_at": pa.array(
+                    [datetime(2024, 1, 1, tzinfo=UTC)] * n, type=pa.timestamp("us", tz="UTC")
+                ),
+                "changed_at": pa.array(
+                    [datetime(2024, 1, 1, tzinfo=UTC)] * n, type=pa.timestamp("us", tz="UTC")
+                ),
             }
         )
 
@@ -499,9 +504,7 @@ class _SlicedEngine:
     def build_polygon(self, bk, pid, manifest):
         return _make_polygon_with_edge("PROD-001", "products")
 
-    def build_solid(
-        self, bk, pid, manifest, filters=None, timestamp=None, **kwargs
-    ):
+    def build_solid(self, bk, pid, manifest, filters=None, timestamp=None, **kwargs):
         base = _make_polygon_with_edge("PROD-001", "products")
         all_slices = [
             SolidSlice(
@@ -1252,24 +1255,26 @@ class TestAnomalySummary:
         from hypertopos.model.sphere import Pattern, RelationDef
         from hypertopos.storage.cache import GDSCache
 
+        # One dim per entity, each entity elevated only on its own dim, so
+        # every anomaly carries a distinct cluster label.
         pattern = Pattern(
             pattern_id="p1",
             entity_type="items",
             pattern_type="anchor",
             relations=[
-                RelationDef(line_id="cats", direction="out", required=False),
-                RelationDef(line_id="shops", direction="out", required=False),
+                RelationDef(line_id=f"d{i}", direction="out", required=False)
+                for i in range(n_unique)
             ],
-            mu=np.zeros(2, dtype=np.float32),
-            sigma_diag=np.ones(2, dtype=np.float32),
-            theta=np.array([1.0, 1.0], dtype=np.float32),
+            mu=np.zeros(n_unique, dtype=np.float32),
+            sigma_diag=np.ones(n_unique, dtype=np.float32),
+            theta=np.ones(n_unique, dtype=np.float32) * 0.1,
             population_size=n_unique,
             computed_at=datetime(2024, 1, 1, tzinfo=UTC),
             version=1,
             status="production",
         )
         dt = datetime(2024, 1, 1, tzinfo=UTC)
-        deltas = [[float(i) * 0.5, 2.0] for i in range(n_unique)]
+        deltas = [[2.0 if j == i else 0.0 for j in range(n_unique)] for i in range(n_unique)]
         norms = [float(np.linalg.norm(d)) for d in deltas]
         geo = pa.table(
             {
@@ -1342,8 +1347,15 @@ def test_find_similar_entities():
             pass
 
         def find_nearest(
-            self, ref_delta, pattern_id, version, top_n=5, exclude_keys=None,
-            filter_expr=None, dim_mask_indices=None, metric="L2",
+            self,
+            ref_delta,
+            pattern_id,
+            version,
+            top_n=5,
+            exclude_keys=None,
+            filter_expr=None,
+            dim_mask_indices=None,
+            metric="L2",
         ):
             return [("CUST-002", 0.15), ("CUST-003", 0.42)]
 
@@ -1388,8 +1400,15 @@ def test_find_similar_entities_event_pattern():
             pass
 
         def find_nearest(
-            self, ref_delta, pattern_id, version, top_n=5, exclude_keys=None,
-            filter_expr=None, dim_mask_indices=None, metric="L2",
+            self,
+            ref_delta,
+            pattern_id,
+            version,
+            top_n=5,
+            exclude_keys=None,
+            filter_expr=None,
+            dim_mask_indices=None,
+            metric="L2",
         ):
             # Confirm event pattern_id is passed through unchanged
             assert pattern_id == "gl_pattern"
@@ -1433,8 +1452,15 @@ def test_find_similar_entities_with_neighbor_anomaly_populates_map():
             pass
 
         def find_nearest(
-            self, ref_delta, pattern_id, version, top_n=5, exclude_keys=None,
-            filter_expr=None, dim_mask_indices=None, metric="L2",
+            self,
+            ref_delta,
+            pattern_id,
+            version,
+            top_n=5,
+            exclude_keys=None,
+            filter_expr=None,
+            dim_mask_indices=None,
+            metric="L2",
         ):
             return [("CUST-002", 0.15), ("CUST-003", 0.42), ("CUST-004", 0.55)]
 
@@ -1442,23 +1468,39 @@ def test_find_similar_entities_with_neighbor_anomaly_populates_map():
         """Storage that returns a full (primary_key, is_anomaly) map for the cache load."""
 
         def read_geometry(
-            self, pattern_id, version, primary_key=None, filters=None,
-            point_keys=None, columns=None, filter=None,
+            self,
+            pattern_id,
+            version,
+            primary_key=None,
+            filters=None,
+            point_keys=None,
+            columns=None,
+            filter=None,
         ):
             import pyarrow as pa
 
             if (
-                point_keys is None and primary_key is None and filter is None
-                and columns and set(columns) == {"primary_key", "is_anomaly"}
+                point_keys is None
+                and primary_key is None
+                and filter is None
+                and columns
+                and set(columns) == {"primary_key", "is_anomaly"}
             ):
                 flags = {"CUST-002": True, "CUST-003": False, "CUST-004": True}
-                return pa.table({
-                    "primary_key": list(flags),
-                    "is_anomaly": list(flags.values()),
-                })
+                return pa.table(
+                    {
+                        "primary_key": list(flags),
+                        "is_anomaly": list(flags.values()),
+                    }
+                )
             return super().read_geometry(
-                pattern_id, version, primary_key=primary_key,
-                filters=filters, point_keys=point_keys, columns=columns, filter=filter,
+                pattern_id,
+                version,
+                primary_key=primary_key,
+                filters=filters,
+                point_keys=point_keys,
+                columns=columns,
+                filter=filter,
             )
 
     manifest = Manifest(
@@ -1478,7 +1520,10 @@ def test_find_similar_entities_with_neighbor_anomaly_populates_map():
     )
 
     results = nav.find_similar_entities(
-        "CUST-001", "customer_pattern", top_n=3, with_neighbor_anomaly=True,
+        "CUST-001",
+        "customer_pattern",
+        top_n=3,
+        with_neighbor_anomaly=True,
     )
 
     # Tuple iteration is unchanged — existing callers see 2-tuples.
@@ -1503,8 +1548,15 @@ def test_find_similar_entities_without_neighbor_anomaly_leaves_map_none():
             pass
 
         def find_nearest(
-            self, ref_delta, pattern_id, version, top_n=5, exclude_keys=None,
-            filter_expr=None, dim_mask_indices=None, metric="L2",
+            self,
+            ref_delta,
+            pattern_id,
+            version,
+            top_n=5,
+            exclude_keys=None,
+            filter_expr=None,
+            dim_mask_indices=None,
+            metric="L2",
         ):
             return [("CUST-002", 0.15)]
 
@@ -1545,8 +1597,15 @@ def test_find_similar_entities_passes_filter_expr():
             pass
 
         def find_nearest(
-            self, ref_delta, pattern_id, version, top_n=5, exclude_keys=None,
-            filter_expr=None, dim_mask_indices=None, metric="L2",
+            self,
+            ref_delta,
+            pattern_id,
+            version,
+            top_n=5,
+            exclude_keys=None,
+            filter_expr=None,
+            dim_mask_indices=None,
+            metric="L2",
         ):
             captured["filter_expr"] = filter_expr
             return [("CUST-002", 0.10)]
@@ -1591,9 +1650,15 @@ def test_find_similar_dim_mask():
             pass
 
         def find_nearest(
-            self, ref_delta, pattern_id, version, top_n=5,
-            exclude_keys=None, filter_expr=None,
-            dim_mask_indices=None, metric="L2",
+            self,
+            ref_delta,
+            pattern_id,
+            version,
+            top_n=5,
+            exclude_keys=None,
+            filter_expr=None,
+            dim_mask_indices=None,
+            metric="L2",
         ):
             captured["dim_mask_indices"] = dim_mask_indices
             captured["ref_delta"] = ref_delta.copy()
@@ -1613,6 +1678,7 @@ def test_find_similar_dim_mask():
     class _MaskStorage(_MockStorageWithDelta):
         def read_geometry(self, pattern_id, version, primary_key=None, columns=None, **kw):
             import pyarrow as pa
+
             if primary_key is None:
                 return pa.table({})
             return pa.table({"delta": [[1.0, 0.0, 3.0]]})
@@ -1621,18 +1687,25 @@ def test_find_similar_dim_mask():
             return _FakeSphere()
 
     manifest = Manifest(
-        manifest_id="test", agent_id="a",
-        snapshot_time=datetime(2024, 1, 1, tzinfo=UTC), status="active",
-        line_versions={"customers": 1}, pattern_versions={"customer_pattern": 1},
+        manifest_id="test",
+        agent_id="a",
+        snapshot_time=datetime(2024, 1, 1, tzinfo=UTC),
+        status="active",
+        line_versions={"customers": 1},
+        pattern_versions={"customer_pattern": 1},
     )
     contract = Contract("test", ["customer_pattern"])
     nav = GDSNavigator(
-        engine=_MaskEngine(), storage=_MaskStorage(),
-        manifest=manifest, contract=contract,
+        engine=_MaskEngine(),
+        storage=_MaskStorage(),
+        manifest=manifest,
+        contract=contract,
     )
 
     results = nav.find_similar_entities(
-        "CUST-001", "customer_pattern", top_n=1,
+        "CUST-001",
+        "customer_pattern",
+        top_n=1,
         dim_mask=["_d_amount", "_d_score"],
     )
 
@@ -1655,27 +1728,40 @@ def test_find_similar_cosine_metric():
             pass
 
         def find_nearest(
-            self, ref_delta, pattern_id, version, top_n=5,
-            exclude_keys=None, filter_expr=None,
-            dim_mask_indices=None, metric="L2",
+            self,
+            ref_delta,
+            pattern_id,
+            version,
+            top_n=5,
+            exclude_keys=None,
+            filter_expr=None,
+            dim_mask_indices=None,
+            metric="L2",
         ):
             captured["metric"] = metric
             return [("CUST-002", 0.1)]
 
     manifest = Manifest(
-        manifest_id="test", agent_id="a",
-        snapshot_time=datetime(2024, 1, 1, tzinfo=UTC), status="active",
+        manifest_id="test",
+        agent_id="a",
+        snapshot_time=datetime(2024, 1, 1, tzinfo=UTC),
+        status="active",
         line_versions={"customers": 1, "products": 1},
         pattern_versions={"customer_pattern": 1},
     )
     contract = Contract("test", ["customer_pattern"])
     nav = GDSNavigator(
-        engine=_CosEngine(), storage=_MockStorageWithDelta(),
-        manifest=manifest, contract=contract,
+        engine=_CosEngine(),
+        storage=_MockStorageWithDelta(),
+        manifest=manifest,
+        contract=contract,
     )
 
     results = nav.find_similar_entities(
-        "CUST-001", "customer_pattern", top_n=1, metric="cosine",
+        "CUST-001",
+        "customer_pattern",
+        top_n=1,
+        metric="cosine",
     )
 
     assert captured["metric"] == "cosine"
@@ -1692,17 +1778,24 @@ def test_find_nearest_cosine_distance():
 
         def read_geometry(self, pattern_id, version, columns=None, **kw):
             import pyarrow as pa
+
             # Entity A: [1, 0], Entity B: [0, 1], Entity C: [1, 1]
-            return pa.table({
-                "primary_key": ["A", "B", "C"],
-                "delta": [[1.0, 0.0], [0.0, 1.0], [0.707, 0.707]],
-            })
+            return pa.table(
+                {
+                    "primary_key": ["A", "B", "C"],
+                    "delta": [[1.0, 0.0], [0.0, 1.0], [0.707, 0.707]],
+                }
+            )
 
     engine = GDSEngine(storage=_FakeStorage(), cache=None)
     # Reference: [1, 0] — C should be closer by cosine than B
     ref = np.array([1.0, 0.0], dtype=np.float32)
     results = engine.find_nearest(
-        ref, "p", 1, top_n=3, metric="cosine",
+        ref,
+        "p",
+        1,
+        top_n=3,
+        metric="cosine",
     )
 
     keys = [r[0] for r in results]
@@ -1724,11 +1817,14 @@ def test_find_nearest_dim_mask():
 
         def read_geometry(self, pattern_id, version, columns=None, **kw):
             import pyarrow as pa
+
             # Dim 0 differs, dim 1 identical
-            return pa.table({
-                "primary_key": ["A", "B"],
-                "delta": [[5.0, 1.0], [0.0, 1.0]],
-            })
+            return pa.table(
+                {
+                    "primary_key": ["A", "B"],
+                    "delta": [[5.0, 1.0], [0.0, 1.0]],
+                }
+            )
 
     engine = GDSEngine(storage=_FakeStorage(), cache=None)
     ref = np.array([0.0, 1.0], dtype=np.float32)
@@ -1739,7 +1835,11 @@ def test_find_nearest_dim_mask():
 
     # With mask on dim 1 only: both A and B have dim 1 = 1.0, distance = 0
     results_masked = engine.find_nearest(
-        ref, "p", 1, top_n=2, dim_mask_indices=[1],
+        ref,
+        "p",
+        1,
+        top_n=2,
+        dim_mask_indices=[1],
     )
     assert results_masked[0][1] == pytest.approx(0.0, abs=1e-5)
     assert results_masked[1][1] == pytest.approx(0.0, abs=1e-5)
@@ -1928,8 +2028,7 @@ class TestPi6AttractBoundary:
         distances = [sd for _, sd in results]
         # With varied delta vectors (0.8 vs 0.2), distances must not all be 0.0
         assert not all(d == 0.0 for d in distances), (
-            f"All signed_distances are 0.0 — score_lookup key mismatch. "
-            f"Got: {distances}"
+            f"All signed_distances are 0.0 — score_lookup key mismatch. Got: {distances}"
         )
 
     def test_missing_alias_raises(self):
@@ -2188,7 +2287,7 @@ class TestPi6AttractBoundary:
         results = nav.π6_attract_boundary("seg", "p", direction="in", top_n=100)
         assert len(results) == 1
 
-    def test_signed_distances_not_flat(self):
+    def test_signed_distances_not_flat_keyword_args(self):
         """Returned entities must have varying signed_distance values (str conversion)."""
         nav = self._make_nav_with_geometry()
         results = nav.π6_attract_boundary(
@@ -2200,8 +2299,7 @@ class TestPi6AttractBoundary:
         distances = [sd for _, sd in results]
         # With varied delta vectors, distances must not all be 0.0
         assert not all(d == 0.0 for d in distances), (
-            f"All signed_distances are 0.0 — score_lookup key mismatch. "
-            f"Got: {distances}"
+            f"All signed_distances are 0.0 — score_lookup key mismatch. Got: {distances}"
         )
 
 
@@ -2256,6 +2354,79 @@ def _make_contrast_nav(anomaly_flags: list[bool], deltas: list[list[float]]):
     manifest.pattern_version.return_value = 1
     engine = GDSEngine(storage=None, cache=None)
     return GDSNavigator(engine=engine, storage=storage, manifest=manifest, contract=MagicMock())
+
+
+def _make_wide_label_nav():
+    """Pattern whose delta carries an edge dimension and a property column after
+    the relations: labels must follow pattern.dim_labels, not relations + props."""
+    from unittest.mock import MagicMock
+
+    from hypertopos.engine.geometry import GDSEngine
+    from hypertopos.model.sphere import Pattern, RelationDef
+
+    now_str = "2025-01-01T00:00:00"
+    deltas = [[0.1, 0.5, 0.0, 0.2]] * 3 + [[0.9, 0.5, 3.0, 0.2]] * 3
+    edges = [
+        [{"line_id": "products", "point_key": key, "status": "alive", "direction": "out"}]
+        for key in ["P1", "P1", "P1", "P2", "P2", "P2"]
+    ]
+    table = pa.table(
+        {
+            "primary_key": [f"E-{i:03d}" for i in range(6)],
+            "scale": [1] * 6,
+            "delta": deltas,
+            "delta_norm": [float(np.linalg.norm(d)) for d in deltas],
+            "is_anomaly": [False] * 3 + [True] * 3,
+            "edges": pa.array(edges, type=pa.list_(_EDGE_STRUCT)),
+            "last_refresh_at": [now_str] * 6,
+            "updated_at": [now_str] * 6,
+        }
+    )
+    pattern = Pattern(
+        pattern_id="p",
+        entity_type="e",
+        pattern_type="anchor",
+        relations=[
+            RelationDef(
+                line_id="products", direction="out", required=True, display_name="Products"
+            ),
+            RelationDef(line_id="stores", direction="in", required=False, display_name="Stores"),
+        ],
+        mu=np.zeros(4, dtype=np.float32),
+        sigma_diag=np.ones(4, dtype=np.float32),
+        theta=np.ones(4, dtype=np.float32),
+        population_size=6,
+        computed_at=datetime(2024, 1, 1, tzinfo=UTC),
+        version=1,
+        status="production",
+        edge_dim_names=["edge_amount_std"],
+        prop_columns=["tenure"],
+    )
+    assert pattern.dim_labels == ["Products", "Stores", "edge_amount_std", "tenure"]
+    sphere = MagicMock()
+    sphere.patterns = {"p": pattern}
+    sphere.entity_line.return_value = "entities"
+    storage = MagicMock()
+    storage.read_geometry.return_value = table
+    storage.read_sphere.return_value = sphere
+    manifest = MagicMock()
+    manifest.pattern_version.return_value = 1
+    engine = GDSEngine(storage=None, cache=None)
+    return GDSNavigator(engine=engine, storage=storage, manifest=manifest, contract=MagicMock())
+
+
+def test_contrast_populations_labels_every_dimension_from_pattern_dim_labels():
+    nav = _make_wide_label_nav()
+    result = nav.contrast_populations("p", {"anomaly": True}, {"anomaly": False})
+    labels = {r["dim_index"]: r["dim_label"] for r in result}
+    assert labels == {0: "Products", 1: "Stores", 2: "edge_amount_std", 3: "tenure"}
+
+
+def test_centroid_map_dimensions_follow_pattern_dim_labels():
+    nav = _make_wide_label_nav()
+    result = nav.centroid_map("p", group_by_line="products", include_drift=False)
+    assert result["dimensions"] == ["Products", "Stores", "edge_amount_std", "tenure"]
+    assert all(len(g["vector"]) == 4 for g in result["group_centroids"])
 
 
 class TestContrastPopulations:
@@ -2686,7 +2857,7 @@ class TestPi7AttractHub:
 
 
 class TestHubScoreStats:
-    """Tests for hub_score_stats population statistics."""
+    """Population statistics returned by π7_attract_hub_and_stats."""
 
     def _make_hub_nav(self, *, edge_max=None):
         """Reuse the same fixture as TestPi7AttractHub."""
@@ -2766,7 +2937,7 @@ class TestHubScoreStats:
         # Continuous path: mu=[0.5,0.5], edge_max=[5,5]
         # scores: K-001=5, K-002=2, K-003=5, K-004=0
         nav = self._make_hub_nav(edge_max=[5, 5])
-        stats = nav.hub_score_stats("p")
+        stats = nav.π7_attract_hub_and_stats("p")[1]
         assert stats["total_entities"] == 4
         assert stats["max"] == pytest.approx(5.0, abs=0.1)
         assert stats["mean"] == pytest.approx(3.0, abs=0.1)
@@ -2775,7 +2946,7 @@ class TestHubScoreStats:
     def test_stats_binary_mode(self):
         # Binary path: edges K-001=5, K-002=2, K-003=5, K-004=0
         nav = self._make_hub_nav(edge_max=None)
-        stats = nav.hub_score_stats("p")
+        stats = nav.π7_attract_hub_and_stats("p")[1]
         assert stats["total_entities"] == 4
         assert stats["max"] == pytest.approx(5.0, abs=0.1)
 
@@ -2824,7 +2995,7 @@ class TestHubScoreStats:
             manifest=manifest,
             contract=MagicMock(),
         )
-        stats = nav.hub_score_stats("p")
+        stats = nav.π7_attract_hub_and_stats("p")[1]
         assert stats["total_entities"] == 0
         assert stats["max"] == 0.0
         assert stats["mean"] == 0.0
@@ -2834,19 +3005,19 @@ class TestHubScoreStats:
         # scores: K-001=3.0, K-002=1.0, K-003=2.0, K-004=0.0
         # mean=1.5, max=3.0, total_entities=4
         nav = self._make_hub_nav(edge_max=[5, 5])
-        stats = nav.hub_score_stats("p", line_id_filter="customers")
+        stats = nav.π7_attract_hub_and_stats("p", line_id_filter="customers")[1]
         assert stats["total_entities"] == 4
         assert stats["max"] == pytest.approx(3.0, abs=0.1)
         assert stats["mean"] == pytest.approx(1.5, abs=0.1)
         # Must differ from global stats (max=5.0)
-        global_stats = nav.hub_score_stats("p")
+        global_stats = nav.π7_attract_hub_and_stats("p")[1]
         assert stats["max"] < global_stats["max"]
 
     def test_stats_with_line_id_filter_binary(self):
         # Binary mode, filtered by "customers"
         # K-001=3, K-002=1, K-003=2, K-004=0 → max=3, mean=1.5
         nav = self._make_hub_nav(edge_max=None)
-        stats = nav.hub_score_stats("p", line_id_filter="customers")
+        stats = nav.π7_attract_hub_and_stats("p", line_id_filter="customers")[1]
         assert stats["total_entities"] == 4
         assert stats["max"] == pytest.approx(3.0, abs=0.1)
         assert stats["mean"] == pytest.approx(1.5, abs=0.1)
@@ -3865,6 +4036,127 @@ class TestPi9AttractDrift:
         assert "profit_centers" in diffs
         assert abs(diffs["company_codes"] - 0.6) < 0.01
         assert abs(diffs["profit_centers"] - 0.2) < 0.01
+
+    def _two_dim_drift_nav(self, rows):
+        from hypertopos.model.sphere import Pattern, RelationDef
+
+        pattern = Pattern(
+            pattern_id="cust_pattern",
+            entity_type="customer",
+            pattern_type="anchor",
+            relations=[RelationDef("a", "in", True), RelationDef("b", "in", False)],
+            mu=np.array([0.8, 0.3], dtype=np.float32),
+            sigma_diag=np.array([0.1, 0.1], dtype=np.float32),
+            theta=np.array([0.3, 0.3], dtype=np.float32),
+            population_size=3,
+            computed_at=datetime(2024, 1, 1, tzinfo=UTC),
+            version=1,
+            status="production",
+        )
+        keys = sorted({r["pk"] for r in rows})
+        geometry = pa.table(
+            {
+                "primary_key": keys,
+                "scale": [1] * len(keys),
+                "delta": [[0.0, 0.0]] * len(keys),
+                "delta_norm": [0.0] * len(keys),
+                "is_anomaly": [False] * len(keys),
+                "edges": pa.array([[]] * len(keys), type=pa.list_(_EDGE_STRUCT)),
+                "last_refresh_at": [datetime(2024, 1, 1, tzinfo=UTC)] * len(keys),
+                "updated_at": [datetime(2024, 1, 1, tzinfo=UTC)] * len(keys),
+            }
+        )
+        temporal = _make_temporal_table(rows, mu=pattern.mu, sigma_diag=pattern.sigma_diag)
+        storage = _MockStorageWithPatterns({"cust_pattern": pattern}, geometry, temporal)
+        return GDSNavigator(_MockEngine(), storage, _make_manifest(), Contract("m-001", []))
+
+    def test_inactive_windows_excluded_from_trajectory(self):
+        # Shape 0 (no events) is delta -mu/sigma = [-8, -3]. X is busy once,
+        # then silent: no trajectory. Y changes modestly in every window.
+        t = [datetime(2024, m, 1, tzinfo=UTC) for m in (1, 2, 3)]
+        silent = [-8.0, -3.0]
+        rows = [
+            {"pk": "X", "idx": 0, "ts": t[0], "delta": [2.0, 7.0]},
+            {"pk": "X", "idx": 1, "ts": t[1], "delta": silent},
+            {"pk": "X", "idx": 2, "ts": t[2], "delta": silent},
+            {"pk": "Y", "idx": 0, "ts": t[0], "delta": [0.0, 0.0]},
+            {"pk": "Y", "idx": 1, "ts": t[1], "delta": [0.1, 0.1]},
+            {"pk": "Y", "idx": 2, "ts": t[2], "delta": [0.2, 0.2]},
+        ]
+        results = self._two_dim_drift_nav(rows).π9_attract_drift("cust_pattern", top_n=10)
+        assert [r["primary_key"] for r in results] == ["Y"]
+        assert results[0]["num_inactive_slices"] == 0
+
+    def test_intermediate_dormant_window_dropped(self):
+        t = [datetime(2024, m, 1, tzinfo=UTC) for m in (1, 2, 3)]
+        rows = [
+            {"pk": "Z", "idx": 0, "ts": t[0], "delta": [0.0, 0.0]},
+            {"pk": "Z", "idx": 1, "ts": t[1], "delta": [-8.0, -3.0]},
+            {"pk": "Z", "idx": 2, "ts": t[2], "delta": [0.3, 0.1]},
+        ]
+        [z] = self._two_dim_drift_nav(rows).π9_attract_drift("cust_pattern", top_n=10)
+        assert z["num_slices"] == 2
+        assert z["num_inactive_slices"] == 1
+        assert z["path_length"] == pytest.approx(z["displacement"])
+
+    def test_drift_uses_mahalanobis_metric(self):
+        """Slice deltas follow the pattern's Mahalanobis metric, like the solid."""
+        from hypertopos.model.sphere import Pattern, RelationDef
+
+        pattern = Pattern(
+            pattern_id="cust_pattern",
+            entity_type="customer",
+            pattern_type="anchor",
+            relations=[
+                RelationDef("company_codes", "in", True),
+                RelationDef("profit_centers", "in", False),
+            ],
+            mu=np.array([0.0, 0.0], dtype=np.float32),
+            sigma_diag=np.array([1.0, 1.0], dtype=np.float32),
+            theta=np.array([0.3, 0.3], dtype=np.float32),
+            population_size=2,
+            computed_at=datetime(2024, 1, 1, tzinfo=UTC),
+            version=1,
+            status="production",
+            cholesky_inv=np.array([[2.0, 0.0], [0.0, 3.0]], dtype=np.float32),
+        )
+        geometry = pa.table(
+            {
+                "primary_key": ["CUST-001"],
+                "scale": [1],
+                "delta": [[2.0, 3.0]],
+                "delta_norm": [3.606],
+                "is_anomaly": [False],
+                "edges": pa.array([[]], type=pa.list_(_EDGE_STRUCT)),
+                "last_refresh_at": [datetime(2024, 1, 1, tzinfo=UTC)],
+                "updated_at": [datetime(2024, 1, 1, tzinfo=UTC)],
+            }
+        )
+        temporal = _make_temporal_table(
+            [
+                {
+                    "pk": "CUST-001",
+                    "idx": 0,
+                    "ts": datetime(2024, 1, 1, tzinfo=UTC),
+                    # Both windows active (an all-zero shape is a window without events).
+                    "delta": [1.0, 1.0],
+                },
+                {
+                    "pk": "CUST-001",
+                    "idx": 1,
+                    "ts": datetime(2024, 6, 1, tzinfo=UTC),
+                    "delta": [2.0, 2.0],
+                },
+            ]
+        )
+        storage = _MockStorageWithPatterns({"cust_pattern": pattern}, geometry, temporal)
+        nav = GDSNavigator(_MockEngine(), storage, _make_manifest(), Contract("m-001", []))
+
+        results = nav.π9_attract_drift("cust_pattern", top_n=10)
+
+        assert abs(results[0]["displacement"] - float(np.hypot(2.0, 3.0))) < 1e-4
+        assert abs(results[0]["dimension_diffs"]["company_codes"] - 2.0) < 1e-4
+        assert abs(results[0]["dimension_diffs"]["profit_centers"] - 3.0) < 1e-4
 
     def test_includes_displacement_current(self):
         """displacement_current uses stored geometry delta, not slices[-1]."""
@@ -4909,9 +5201,7 @@ class _MockEngineKeyError:
     def build_polygon(self, bk, pid, manifest):
         raise KeyError(f"No geometry for {bk} in {pid} v1")
 
-    def build_solid(
-        self, bk, pid, manifest, filters=None, timestamp=None, **kwargs
-    ):
+    def build_solid(self, bk, pid, manifest, filters=None, timestamp=None, **kwargs):
         raise KeyError(f"No geometry for {bk} in {pid} v1")
 
 
@@ -5154,6 +5444,7 @@ def _make_π8_nav(n_entities: int = 12, n_relations: int = 2) -> GDSNavigator:
     from unittest.mock import MagicMock
 
     import pyarrow as pa
+
     from hypertopos.engine.geometry import GDSEngine
     from hypertopos.model.sphere import Pattern, RelationDef
     from hypertopos.storage.cache import GDSCache
@@ -5255,6 +5546,7 @@ class TestPi8AttractCluster:
         from unittest.mock import MagicMock
 
         import pyarrow as pa
+
         from hypertopos.engine.geometry import GDSEngine
         from hypertopos.navigation.navigator import GDSNavigator
         from hypertopos.storage.cache import GDSCache
@@ -5369,6 +5661,159 @@ def test_anomaly_summary_prop_fill_label():
     label = summary["clusters"][0]["label"]
     assert "prop:country" in label
     assert label != "excess edges"
+
+
+def _make_mixed_pattern():
+    """Pattern with 4 relations + 1 event dimension + 1 prop column, delta_dim=6."""
+    from hypertopos.model.sphere import EventDimDef, Pattern, RelationDef
+
+    return Pattern(
+        pattern_id="p",
+        entity_type="customer",
+        pattern_type="anchor",
+        relations=[
+            RelationDef(line_id=name, direction="out", required=True)
+            for name in ("a", "b", "c", "d")
+        ],
+        mu=np.zeros(6, dtype=np.float32),
+        sigma_diag=np.ones(6, dtype=np.float32),
+        theta=np.full(6, 1.0, dtype=np.float32),
+        population_size=10,
+        computed_at=datetime(2024, 1, 1, tzinfo=UTC),
+        version=1,
+        status="production",
+        event_dimensions=[EventDimDef(column="amount", edge_max=1.0)],
+        prop_columns=["country"],
+    )
+
+
+def test_anomaly_summary_label_names_top_dims_by_sign():
+    """anomaly_summary labels clusters like find_anomalies: top dims, elevated vs missing."""
+    from unittest.mock import MagicMock
+
+    from hypertopos.engine.geometry import GDSEngine
+    from hypertopos.storage.cache import GDSCache
+
+    pattern = _make_mixed_pattern()
+    anomalous = [5.0, -4.0, 3.0, 2.5, 2.0, 0.0]
+    table = pa.table(
+        {
+            "primary_key": ["CUST-001", "CUST-002"],
+            "delta": [anomalous, [0.1] * 6],
+            "delta_norm": [float(np.linalg.norm(anomalous)), float(np.linalg.norm([0.1] * 6))],
+            "is_anomaly": [True, False],
+        }
+    )
+    sphere = MagicMock()
+    sphere.patterns = {"p": pattern}
+    storage = MagicMock()
+    storage.read_geometry_stats.return_value = None
+    storage.read_geometry.return_value = table
+    storage.read_sphere.return_value = sphere
+    manifest = MagicMock()
+    manifest.pattern_version.return_value = 1
+    engine = GDSEngine(storage=None, cache=GDSCache())
+    nav = GDSNavigator(engine=engine, storage=storage, manifest=manifest, contract=MagicMock())
+
+    summary = nav.anomaly_summary("p")
+
+    assert summary["clusters"][0]["label"] == "elevated: a, c, d; missing: b"
+
+
+def test_anomaly_summary_groups_clusters_by_label():
+    """Two anomalies with different deltas but the same label are one cluster;
+    grouping by the rounded delta made nearly every entity its own cluster."""
+    from unittest.mock import MagicMock
+
+    from hypertopos.engine.geometry import GDSEngine
+    from hypertopos.storage.cache import GDSCache
+
+    pattern = _make_mixed_pattern()
+    first = [5.0, -4.0, 3.0, 2.5, 2.0, 0.0]
+    second = [6.0, -3.0, 2.0, 1.5, 1.0, 0.0]
+    table = pa.table(
+        {
+            "primary_key": ["CUST-001", "CUST-002"],
+            "delta": [first, second],
+            "delta_norm": [float(np.linalg.norm(first)), float(np.linalg.norm(second))],
+            "is_anomaly": [True, True],
+        }
+    )
+    sphere = MagicMock()
+    sphere.patterns = {"p": pattern}
+    storage = MagicMock()
+    storage.read_geometry_stats.return_value = None
+    storage.read_geometry.return_value = table
+    storage.read_sphere.return_value = sphere
+    manifest = MagicMock()
+    manifest.pattern_version.return_value = 1
+    engine = GDSEngine(storage=None, cache=GDSCache())
+    nav = GDSNavigator(engine=engine, storage=storage, manifest=manifest, contract=MagicMock())
+
+    summary = nav.anomaly_summary("p")
+
+    assert summary["total_clusters"] == 1
+    assert summary["clusters"][0]["count"] == 2
+    assert summary["clusters"][0]["label"] == "elevated: a, c, d; missing: b"
+
+
+def test_classify_anomalies_names_event_dims_and_props_by_layout():
+    """Cluster labels follow the storage layout: relations, event dims, then props."""
+    from hypertopos.engine.geometry import GDSEngine
+    from hypertopos.model.objects import Polygon
+
+    pattern = _make_mixed_pattern()
+    poly = Polygon(
+        primary_key="CUST-001",
+        pattern_id="p",
+        pattern_ver=1,
+        pattern_type="anchor",
+        scale=1,
+        delta=np.array([0.0, 0.0, 0.0, 0.0, 4.0, -3.0], dtype=np.float32),
+        delta_norm=5.0,
+        is_anomaly=True,
+        edges=[],
+        last_refresh_at=datetime(2024, 1, 1, tzinfo=UTC),
+        updated_at=datetime(2024, 1, 1, tzinfo=UTC),
+    )
+
+    [cluster] = GDSEngine(storage=None, cache=None).classify_anomalies([poly], pattern)
+
+    assert cluster["label"] == "elevated: amount; missing: prop:country"
+
+
+def test_classify_anomalies_groups_polygons_by_label():
+    """Polygons with different deltas but the same label form one cluster."""
+    from hypertopos.engine.geometry import GDSEngine
+    from hypertopos.model.objects import Polygon
+
+    pattern = _make_mixed_pattern()
+
+    def _poly(pk: str, amount: float, country: float) -> Polygon:
+        return Polygon(
+            primary_key=pk,
+            pattern_id="p",
+            pattern_ver=1,
+            pattern_type="anchor",
+            scale=1,
+            delta=np.array([0.0, 0.0, 0.0, 0.0, amount, country], dtype=np.float32),
+            delta_norm=5.0,
+            is_anomaly=True,
+            edges=[],
+            last_refresh_at=datetime(2024, 1, 1, tzinfo=UTC),
+            updated_at=datetime(2024, 1, 1, tzinfo=UTC),
+        )
+
+    clusters = GDSEngine(storage=None, cache=None).classify_anomalies(
+        [_poly("CUST-001", 4.0, -3.0), _poly("CUST-002", 6.0, -2.0)], pattern
+    )
+
+    assert len(clusters) == 1
+    [cluster] = clusters
+    assert cluster["label"] == "elevated: amount; missing: prop:country"
+    assert cluster["count"] == 2
+    assert cluster["examples"] == ["CUST-001", "CUST-002"]
+    assert cluster["delta"] == [0.0, 0.0, 0.0, 0.0, 5.0, -2.5]
 
 
 def test_anomaly_summary_cache_miss_boundary_included():
@@ -5694,9 +6139,7 @@ class TestTemporalQualitySummary:
         rows = []
         for pk in ["E-001", "E-002"]:
             for i in range(6):
-                delta = (
-                    [5.0, 5.0] if i % 2 == 0 else [0.1, 0.1]
-                )  # anomalous vs normal
+                delta = [5.0, 5.0] if i % 2 == 0 else [0.1, 0.1]  # anomalous vs normal
                 rows.append(
                     {
                         "pk": pk,
@@ -5714,6 +6157,86 @@ class TestTemporalQualitySummary:
         assert result["persistence_rate"] < 0.3
         assert result["signal_quality"] == "volatile"
         assert result["n_entities_sampled"] == 2
+
+    def _always_one_rows(self) -> list[dict]:
+        return [
+            {"pk": pk, "idx": i, "ts": datetime(2024, 1, 1 + i, tzinfo=UTC), "delta": [1.0, 1.0]}
+            for pk in ("E-001", "E-002")
+            for i in range(4)
+        ]
+
+    def test_uses_mahalanobis_metric(self):
+        """Slices at [1, 1] sit inside theta under the diagonal metric (norm ≈ 1.41
+        < 2.83) but far outside it under the pattern's Mahalanobis metric
+        (L⁻¹ = 10·I → norm ≈ 14.1); the summary must use the stored metric."""
+        pattern = self._make_pattern(theta=np.array([2.0, 2.0], dtype=np.float32))
+        pattern.cholesky_inv = np.diag([10.0, 10.0]).astype(np.float32)
+        nav = self._make_nav(pattern, _make_temporal_table(self._always_one_rows()))
+
+        result = nav.temporal_quality_summary("test_pattern")
+
+        assert result is not None
+        assert result["signal_quality"] == "persistent"
+        assert result["n_anomaly_transitions"] > 0
+
+    def test_theta_clamped_to_snapshot_width(self):
+        """Snapshots carry 2 of 3 pattern dims; θ must be clamped to the same 2."""
+        pattern = self._make_pattern(
+            mu=np.zeros(3, dtype=np.float32),
+            sigma=np.ones(3, dtype=np.float32),
+            theta=np.array([2.0, 2.0, 10.0], dtype=np.float32),  # full ≈ 10.4, first 2 ≈ 2.83
+        )
+        rows = [
+            {"pk": pk, "idx": i, "ts": datetime(2024, 1, 1 + i, tzinfo=UTC), "delta": [3.0, 3.0]}
+            for pk in ("E-001", "E-002")
+            for i in range(4)
+        ]
+        nav = self._make_nav(pattern, _make_temporal_table(rows))
+
+        result = nav.temporal_quality_summary("test_pattern")
+
+        assert result is not None
+        assert result["signal_quality"] == "persistent"
+
+    def test_uses_dimension_weights(self):
+        pattern = self._make_pattern(theta=np.array([2.0, 2.0], dtype=np.float32))
+        pattern.dimension_weights = np.array([10.0, 10.0], dtype=np.float32)
+        nav = self._make_nav(pattern, _make_temporal_table(self._always_one_rows()))
+
+        result = nav.temporal_quality_summary("test_pattern")
+
+        assert result is not None
+        assert result["signal_quality"] == "persistent"
+
+    def test_no_anomaly_transitions_is_insufficient_data(self):
+        """No anomalous slice is followed by another slice → no persistence
+        evidence either way, so the signal must not be labelled 'volatile'."""
+        pattern = self._make_pattern(
+            mu=np.array([0.0, 0.0], dtype=np.float32),
+            sigma=np.array([1.0, 1.0], dtype=np.float32),
+            theta=np.array([2.0, 2.0], dtype=np.float32),  # theta_norm ≈ 2.828
+        )
+        # E-001 is never anomalous; E-002 is anomalous only in its last slice.
+        rows = []
+        for pk, last_delta in [("E-001", [0.1, 0.1]), ("E-002", [5.0, 5.0])]:
+            for i in range(4):
+                rows.append(
+                    {
+                        "pk": pk,
+                        "idx": i,
+                        "ts": datetime(2024, 1, 1 + i, tzinfo=UTC),
+                        "delta": last_delta if i == 3 else [0.1, 0.1],
+                    }
+                )
+        temporal = _make_temporal_table(rows)
+        nav = self._make_nav(pattern, temporal)
+
+        result = nav.temporal_quality_summary("test_pattern")
+
+        assert result is not None
+        assert result["n_anomaly_transitions"] == 0
+        assert result["transition_rate"] == 0.0
+        assert result["signal_quality"] == "insufficient_data"
 
     def test_event_pattern_returns_none(self):
         """Event patterns should return None."""
@@ -5869,13 +6392,17 @@ class TestFindAnomaliesLanceSql:
 
     def test_total_found_and_page0(self, tmp_path):
         import lance as _lance
+
         from hypertopos.engine.lance_sql_agg import find_anomalies
+
         p = str(tmp_path / "g.lance")
         _lance.write_dataset(
-            pa.table({
-                "primary_key": ["A", "B", "C", "D"],
-                "delta_norm": [5.0, 4.0, 3.0, 1.0],
-            }),
+            pa.table(
+                {
+                    "primary_key": ["A", "B", "C", "D"],
+                    "delta_norm": [5.0, 4.0, 3.0, 1.0],
+                }
+            ),
             p,
             data_storage_version="2.2",
         )
@@ -5886,13 +6413,17 @@ class TestFindAnomaliesLanceSql:
 
     def test_offset_skips_rows(self, tmp_path):
         import lance as _lance
+
         from hypertopos.engine.lance_sql_agg import find_anomalies
+
         p = str(tmp_path / "g.lance")
         _lance.write_dataset(
-            pa.table({
-                "primary_key": ["A", "B", "C", "D"],
-                "delta_norm": [5.0, 4.0, 3.0, 1.0],
-            }),
+            pa.table(
+                {
+                    "primary_key": ["A", "B", "C", "D"],
+                    "delta_norm": [5.0, 4.0, 3.0, 1.0],
+                }
+            ),
             p,
             data_storage_version="2.2",
         )
@@ -5903,13 +6434,17 @@ class TestFindAnomaliesLanceSql:
 
     def test_offset_beyond_total_returns_empty(self, tmp_path):
         import lance as _lance
+
         from hypertopos.engine.lance_sql_agg import find_anomalies
+
         p = str(tmp_path / "g.lance")
         _lance.write_dataset(
-            pa.table({
-                "primary_key": ["A", "B"],
-                "delta_norm": [5.0, 4.0],
-            }),
+            pa.table(
+                {
+                    "primary_key": ["A", "B"],
+                    "delta_norm": [5.0, 4.0],
+                }
+            ),
             p,
             data_storage_version="2.2",
         )
@@ -6025,7 +6560,9 @@ class TestPi5DimensionWeights:
         """products=0.0 → CUST-001 effective delta=[0, 5.0], norm=5 < 9.01 → no anomaly."""
         nav = self._navigator(sphere_path)
         polygons, total_found, _, _ = nav.π5_attract_anomaly(
-            "customer_pattern", radius=None, top_n=10,
+            "customer_pattern",
+            radius=None,
+            top_n=10,
             dimension_weights={"products": 0.0},
         )
         assert total_found == 0
@@ -6035,7 +6572,9 @@ class TestPi5DimensionWeights:
         """stores=0.0 → CUST-001 effective delta=[10, 0], norm=10 > 9.01 → still anomaly."""
         nav = self._navigator(sphere_path)
         polygons, total_found, _, _ = nav.π5_attract_anomaly(
-            "customer_pattern", radius=None, top_n=10,
+            "customer_pattern",
+            radius=None,
+            top_n=10,
             dimension_weights={"stores": 0.0},
         )
         assert total_found == 1
@@ -6047,7 +6586,9 @@ class TestPi5DimensionWeights:
         """products=0.5 → CUST-001 effective delta=[5, 5], norm=sqrt(50)≈7.07 < 9.01."""
         nav = self._navigator(sphere_path)
         polygons, total_found, _, _ = nav.π5_attract_anomaly(
-            "customer_pattern", radius=None, top_n=10,
+            "customer_pattern",
+            radius=None,
+            top_n=10,
             dimension_weights={"products": 0.5},
         )
         assert total_found == 0
@@ -6058,7 +6599,9 @@ class TestPi5DimensionWeights:
         nav = self._navigator(sphere_path)
         # Only "products" specified at 1.0 → exactly equivalent to no weights at all.
         polygons, total_found, _, _ = nav.π5_attract_anomaly(
-            "customer_pattern", radius=None, top_n=10,
+            "customer_pattern",
+            radius=None,
+            top_n=10,
             dimension_weights={"products": 1.0},
         )
         assert total_found == 1
@@ -6069,7 +6612,9 @@ class TestPi5DimensionWeights:
         """dimension_weights={} is equivalent to None — no weighting, no path forced."""
         nav = self._navigator(sphere_path)
         polygons, total_found, _, _ = nav.π5_attract_anomaly(
-            "customer_pattern", radius=None, top_n=10,
+            "customer_pattern",
+            radius=None,
+            top_n=10,
             dimension_weights={},
         )
         # Identical to default-no-weights call.
@@ -6081,7 +6626,9 @@ class TestPi5DimensionWeights:
         nav = self._navigator(sphere_path)
         with pytest.raises(ValueError, match="unknown dimension 'nonexistent'"):
             nav.π5_attract_anomaly(
-                "customer_pattern", radius=None, top_n=10,
+                "customer_pattern",
+                radius=None,
+                top_n=10,
                 dimension_weights={"nonexistent": 1.0},
             )
 
@@ -6089,7 +6636,9 @@ class TestPi5DimensionWeights:
         nav = self._navigator(sphere_path)
         with pytest.raises(ValueError, match="non-negative finite number"):
             nav.π5_attract_anomaly(
-                "customer_pattern", radius=None, top_n=10,
+                "customer_pattern",
+                radius=None,
+                top_n=10,
                 dimension_weights={"products": -0.5},
             )
 
@@ -6097,7 +6646,9 @@ class TestPi5DimensionWeights:
         nav = self._navigator(sphere_path)
         with pytest.raises(ValueError, match="non-negative finite number"):
             nav.π5_attract_anomaly(
-                "customer_pattern", radius=None, top_n=10,
+                "customer_pattern",
+                radius=None,
+                top_n=10,
                 dimension_weights={"products": float("inf")},
             )
 
@@ -6105,7 +6656,9 @@ class TestPi5DimensionWeights:
         nav = self._navigator(sphere_path)
         with pytest.raises(ValueError, match="non-negative finite number"):
             nav.π5_attract_anomaly(
-                "customer_pattern", radius=None, top_n=10,
+                "customer_pattern",
+                radius=None,
+                top_n=10,
                 dimension_weights={"products": float("nan")},
             )
 
@@ -6113,7 +6666,9 @@ class TestPi5DimensionWeights:
         nav = self._navigator(sphere_path)
         with pytest.raises(ValueError, match="must be a number"):
             nav.π5_attract_anomaly(
-                "customer_pattern", radius=None, top_n=10,
+                "customer_pattern",
+                radius=None,
+                top_n=10,
                 dimension_weights={"products": "heavy"},
             )
 
@@ -6121,7 +6676,9 @@ class TestPi5DimensionWeights:
         nav = self._navigator(sphere_path)
         with pytest.raises(ValueError, match="must be a dict"):
             nav.π5_attract_anomaly(
-                "customer_pattern", radius=None, top_n=10,
+                "customer_pattern",
+                radius=None,
+                top_n=10,
                 dimension_weights=[1.0, 0.5],  # type: ignore[arg-type]
             )
 
@@ -6142,7 +6699,10 @@ class TestPi5DimensionWeights:
         nav = self._navigator(sphere_path)
         # Default Linf for CUST-001: max(|10|, |5|) = 10 > 9.01 → anomaly.
         polygons, total_found, _, _ = nav.π5_attract_anomaly(
-            "customer_pattern", radius=None, top_n=10, metric="Linf",
+            "customer_pattern",
+            radius=None,
+            top_n=10,
+            metric="Linf",
             dimension_weights={"products": 0.5},
         )
         # Weighted Linf: max(|5|, |5|) = 5 < 9.01 → no anomaly.
@@ -6159,8 +6719,9 @@ class TestPi5DimensionWeights:
             entity_type="test",
             pattern_type="anchor",
             relations=[
-                RelationDef(line_id="products", direction="out",
-                            required=True, display_name="goods"),
+                RelationDef(
+                    line_id="products", direction="out", required=True, display_name="goods"
+                ),
                 RelationDef(line_id="stores", direction="in", required=False),
             ],
             mu=np.zeros(2, dtype=np.float32),
@@ -6217,9 +6778,9 @@ class TestPi5DimensionWeights:
         vec = GDSNavigator._build_dimension_weight_vector(
             pat, {"amount_mean": 0.0, "amount_p95": 0.5}, metric="L2"
         )
-        assert vec[0] == 1.0       # "tx" (untouched)
-        assert vec[1] == 0.0       # "amount_mean"
-        assert vec[4] == 0.5       # "amount_p95"
+        assert vec[0] == 1.0  # "tx" (untouched)
+        assert vec[1] == 0.0  # "amount_mean"
+        assert vec[4] == 0.5  # "amount_p95"
 
 
 # ---------- dead_dim_indices ----------
@@ -6420,8 +6981,12 @@ def test_anomaly_summary_count_matches_find_anomalies():
         "total_anomalies": 0,  # wrong on purpose
         "theta_norm": theta_norm,
         "percentiles": {
-            "p50": 1.0, "p75": 1.5, "p90": 2.0,
-            "p95": 2.5, "p99": 3.0, "max": 4.0,
+            "p50": 1.0,
+            "p75": 1.5,
+            "p90": 2.0,
+            "p95": 2.5,
+            "p99": 3.0,
+            "max": 4.0,
         },
     }
     sphere = MagicMock()
@@ -6435,7 +7000,10 @@ def test_anomaly_summary_count_matches_find_anomalies():
     manifest.pattern_version.return_value = 1
     engine = GDSEngine(storage=None, cache=GDSCache())
     nav = GDSNavigator(
-        engine=engine, storage=storage, manifest=manifest, contract=MagicMock(),
+        engine=engine,
+        storage=storage,
+        manifest=manifest,
+        contract=MagicMock(),
     )
 
     summary = nav.anomaly_summary("p")
@@ -6567,10 +7135,16 @@ def test_sphere_overview_anomaly_rate_source():
     assert result[0]["anomaly_rate_source"] == "delta_norm_scan"
 
 
-def test_check_alerts_high_anomaly_rate(fixture_sphere_path):
+def test_check_alerts_high_anomaly_rate(fixture_sphere_path, tmp_path):
     """check_alerts fires high_anomaly_rate when >20% anomalies."""
     import json
     import uuid
+
+    from tests.conftest import clone_sphere
+
+    # Work on a private copy: this test overwrites geometry_stats, and the shared
+    # fixture is read concurrently by other tests (pytest-xdist workers).
+    fixture_sphere_path = clone_sphere(fixture_sphere_path, tmp_path / "sphere")
 
     sphere_json_path = fixture_sphere_path / "_gds_meta" / "sphere.json"
     sphere_data = json.loads(sphere_json_path.read_text())
@@ -6620,9 +7194,7 @@ def test_check_alerts_high_anomaly_rate(fixture_sphere_path):
         agent_id="test",
         snapshot_time=datetime(2024, 1, 1, tzinfo=UTC),
         status="active",
-        line_versions={
-            lid: line.current_version() for lid, line in sphere.lines.items()
-        },
+        line_versions={lid: line.current_version() for lid, line in sphere.lines.items()},
         pattern_versions={p: pat.version for p, pat in sphere.patterns.items()},
     )
     nav = GDSNavigator(
@@ -7227,207 +7799,6 @@ def test_compare_entities_interpretation():
 
 
 # ---------------------------------------------------------------------------
-# find_neighborhood — BFS through jumpable polygon edges
-# ---------------------------------------------------------------------------
-
-
-class _NeighborhoodMockStorage(_MockStorage):
-    """Mock storage returning edges and anomaly info per entity for BFS tests."""
-
-    def __init__(
-        self,
-        graph: dict[str, list[dict]],
-        anomaly_map: dict[str, bool] | None = None,
-        rank_map: dict[str, float] | None = None,
-    ):
-        super().__init__()
-        self._graph = graph  # key -> list of edge dicts
-        self._anomaly_map = anomaly_map or {}
-        self._rank_map = rank_map or {}
-
-    def read_sphere(self):
-        from hypertopos.model.sphere import Pattern, RelationDef, Sphere
-
-        pat = Pattern(
-            pattern_id="test_pattern",
-            entity_type="test",
-            pattern_type="anchor",
-            relations=[
-                RelationDef(line_id="line1", direction="in", required=True),
-            ],
-            mu=np.zeros(1, dtype=np.float32),
-            sigma_diag=np.ones(1, dtype=np.float32),
-            theta=np.array([3.0], dtype=np.float32),
-            population_size=10,
-            computed_at=datetime(2024, 1, 1, tzinfo=UTC),
-            version=1,
-            status="production",
-        )
-        return Sphere("s", "s", ".", patterns={"test_pattern": pat})
-
-    def read_geometry(
-        self,
-        pattern_id,
-        version,
-        primary_key=None,
-        filters=None,
-        point_keys=None,
-        columns=None,
-        filter=None,
-    ):
-        if primary_key is None or primary_key not in self._graph:
-            return pa.table({"primary_key": pa.array([], type=pa.string())})
-        edges_py = self._graph[primary_key]
-        edge_arr = pa.array([edges_py], type=pa.list_(_EDGE_STRUCT))
-        is_anom = self._anomaly_map.get(primary_key, False)
-        rank = self._rank_map.get(primary_key)
-        return pa.table(
-            {
-                "primary_key": [primary_key],
-                "edges": edge_arr,
-                "is_anomaly": [is_anom],
-                "delta_rank_pct": pa.array(
-                    [rank],
-                    type=pa.float64(),
-                ),
-            }
-        )
-
-
-class _NeighborhoodMockManifest:
-    def pattern_version(self, pid):
-        return 1
-
-    def line_version(self, lid):
-        return 1
-
-
-def _make_edge(line_id: str, point_key: str, status: str = "alive", direction: str = "in") -> dict:
-    return {
-        "line_id": line_id,
-        "point_key": point_key,
-        "status": status,
-        "direction": direction,
-    }
-
-
-def test_find_neighborhood_happy_path():
-    """BFS finds entities at hop 1 and hop 2."""
-    graph = {
-        "A": [_make_edge("line1", "B"), _make_edge("line1", "C")],
-        "B": [_make_edge("line1", "A"), _make_edge("line1", "D")],
-        "C": [_make_edge("line1", "A")],
-        "D": [_make_edge("line1", "B")],
-    }
-    storage = _NeighborhoodMockStorage(
-        graph,
-        anomaly_map={"B": True, "D": True},
-        rank_map={"B": 97.2, "C": 23.1, "D": 88.5},
-    )
-    nav = GDSNavigator(
-        engine=_MockEngine(),
-        storage=storage,
-        manifest=_NeighborhoodMockManifest(),
-        contract=Contract("m-001", []),
-    )
-    result = nav.find_neighborhood("A", "test_pattern", max_hops=2)
-
-    assert result["center"] == "A"
-    assert result["pattern_id"] == "test_pattern"
-    assert result["max_hops"] == 2
-    keys = {e["key"] for e in result["entities"]}
-    assert "B" in keys
-    assert "C" in keys
-    assert "D" in keys
-    assert "A" not in keys  # center excluded
-
-    # Check hop distances
-    by_key = {e["key"]: e for e in result["entities"]}
-    assert by_key["B"]["hop"] == 1
-    assert by_key["C"]["hop"] == 1
-    assert by_key["D"]["hop"] == 2
-
-    # Anomaly info
-    assert by_key["B"]["is_anomaly"] is True
-    assert by_key["B"]["delta_rank_pct"] == 97.2
-    assert by_key["C"]["is_anomaly"] is False
-
-    # Summary
-    s = result["summary"]
-    assert s["total"] == 3
-    assert s["anomalous"] == 2  # B and D
-    assert s["max_hop_reached"] == 2
-    assert s["capped"] is False
-
-
-def test_find_neighborhood_empty_geometry():
-    """Entity not found in geometry returns empty result."""
-    storage = _NeighborhoodMockStorage(graph={})
-    nav = GDSNavigator(
-        engine=_MockEngine(),
-        storage=storage,
-        manifest=_NeighborhoodMockManifest(),
-        contract=Contract("m-001", []),
-    )
-    result = nav.find_neighborhood("MISSING", "test_pattern")
-
-    assert result["center"] == "MISSING"
-    assert result["entities"] == []
-    assert result["summary"]["total"] == 0
-    assert result["summary"]["anomalous"] == 0
-    assert result["summary"]["max_hop_reached"] == 0
-    assert result["summary"]["capped"] is False
-
-
-def test_find_neighborhood_cap_reached():
-    """max_entities cap triggers capped=True."""
-    # A connects to B, C, D — but cap is 2
-    graph = {
-        "A": [
-            _make_edge("line1", "B"),
-            _make_edge("line1", "C"),
-            _make_edge("line1", "D"),
-        ],
-        "B": [],
-        "C": [],
-        "D": [],
-    }
-    storage = _NeighborhoodMockStorage(graph)
-    nav = GDSNavigator(
-        engine=_MockEngine(),
-        storage=storage,
-        manifest=_NeighborhoodMockManifest(),
-        contract=Contract("m-001", []),
-    )
-    result = nav.find_neighborhood("A", "test_pattern", max_entities=2)
-
-    assert result["summary"]["capped"] is True
-    assert result["summary"]["total"] == 2
-
-
-def test_find_neighborhood_no_jumpable_edges():
-    """Edges with empty point_key are not jumpable — nothing traversed."""
-    graph = {
-        "A": [
-            _make_edge("line1", ""),  # continuous mode — not jumpable
-            _make_edge("line1", ""),
-        ],
-    }
-    storage = _NeighborhoodMockStorage(graph)
-    nav = GDSNavigator(
-        engine=_MockEngine(),
-        storage=storage,
-        manifest=_NeighborhoodMockManifest(),
-        contract=Contract("m-001", []),
-    )
-    result = nav.find_neighborhood("A", "test_pattern")
-
-    assert result["entities"] == []
-    assert result["summary"]["total"] == 0
-    assert result["summary"]["capped"] is False
-
-
-# ---------------------------------------------------------------------------
 # find_chains_for_entity tests
 # ---------------------------------------------------------------------------
 
@@ -7917,7 +8288,9 @@ class _MockStorageSibling(_MockStorage):
         )
 
         return Sphere(
-            "s", "s", ".",
+            "s",
+            "s",
+            ".",
             lines={"line_a": line_a, "line_b": line_b, "txns": line_txns},
             patterns={"pat_a": pat_a, "pat_b": pat_b},
         )
@@ -7928,19 +8301,27 @@ class _MockStorageSibling(_MockStorage):
             keys = [k for k in keys if k == primary_key]
         n = len(keys)
         dt = datetime(2024, 1, 1, tzinfo=UTC)
-        return pa.table({
-            "primary_key": keys,
-            "version": [1] * n,
-            "status": ["active"] * n,
-            "created_at": [dt] * n,
-            "changed_at": [dt] * n,
-        })
+        return pa.table(
+            {
+                "primary_key": keys,
+                "version": [1] * n,
+                "status": ["active"] * n,
+                "created_at": [dt] * n,
+                "changed_at": [dt] * n,
+            }
+        )
 
     def read_geometry(
-        self, pattern_id, version, primary_key=None, filters=None,
-        point_keys=None, columns=None, filter=None, sample_size=None,
+        self,
+        pattern_id,
+        version,
+        primary_key=None,
+        filters=None,
+        point_keys=None,
+        columns=None,
+        filter=None,
+        sample_size=None,
     ):
-        dt = datetime(2024, 1, 1, tzinfo=UTC)
         all_data = {
             "primary_key": ["ACC-001", "ACC-002"],
             "delta_norm": [4.5, 1.0],
@@ -7952,11 +8333,17 @@ class _MockStorageSibling(_MockStorage):
             idx = [i for i, k in enumerate(all_data["primary_key"]) if k == primary_key]
             if not idx:
                 cols_out = columns or list(all_data.keys())
-                return pa.table({c: pa.array([], type=pa.float64() if c != "primary_key" else pa.string())
-                                 for c in cols_out if c in all_data})
+                return pa.table(
+                    {
+                        c: pa.array([], type=pa.float64() if c != "primary_key" else pa.string())
+                        for c in cols_out
+                        if c in all_data
+                    }
+                )
             i = idx[0]
-            all_data = {k: [v[i]] if isinstance(v, list) else v.take([i])
-                        for k, v in all_data.items()}
+            all_data = {
+                k: [v[i]] if isinstance(v, list) else v.take([i]) for k, v in all_data.items()
+            }
         tbl = pa.table(all_data)
         if columns is not None:
             available = set(tbl.schema.names)
@@ -8146,14 +8533,23 @@ class _MockStorageMultiDetector(_MockStorage):
             versions=[1],
         )
         return Sphere(
-            "s", "s", ".",
+            "s",
+            "s",
+            ".",
             lines={"accounts": line_acc, "txns": line_txn},
             patterns={"acc_pat": pat},
         )
 
     def read_geometry(
-        self, pattern_id, version, primary_key=None, filters=None,
-        point_keys=None, columns=None, filter=None, sample_size=None,
+        self,
+        pattern_id,
+        version,
+        primary_key=None,
+        filters=None,
+        point_keys=None,
+        columns=None,
+        filter=None,
+        sample_size=None,
     ):
         # 5 entities with varying anomaly_confidence
         all_data = {
@@ -8163,17 +8559,15 @@ class _MockStorageMultiDetector(_MockStorage):
             "delta_rank_pct": pa.array([10.0, 30.0, 60.0, 80.0, 99.0], type=pa.float64()),
             "conformal_p": pa.array([0.9, 0.7, 0.4, 0.2, 0.05], type=pa.float64()),
             "anomaly_confidence": pa.array(
-                [0.1, 0.3, 0.6, 0.8, 0.95], type=pa.float32(),
+                [0.1, 0.3, 0.6, 0.8, 0.95],
+                type=pa.float32(),
             ),
         }
         if point_keys is not None:
             keep = set(point_keys)
             keep_idx = [i for i, k in enumerate(all_data["primary_key"]) if k in keep]
             all_data = {
-                k: (
-                    [v[i] for i in keep_idx] if isinstance(v, list)
-                    else v.take(keep_idx)
-                )
+                k: ([v[i] for i in keep_idx] if isinstance(v, list) else v.take(keep_idx))
                 for k, v in all_data.items()
             }
         tbl = pa.table(all_data)
@@ -8255,7 +8649,9 @@ class TestCombineAnomalyPvalues:
             contract=Contract("m-multi", []),
         )
         result = nav.combine_anomaly_pvalues(
-            "acc_pat", detectors=("delta_norm",), top_n=5,
+            "acc_pat",
+            detectors=("delta_norm",),
+            top_n=5,
         )
         for entry in result:
             assert set(entry["p_per_detector"].keys()) == {"delta_norm"}
@@ -8277,7 +8673,8 @@ class TestCombineAnomalyPvalues:
         # Same detector + uniform single → HMP equals delta_norm p
         for entry in result:
             assert entry["hmp"] == pytest.approx(
-                entry["p_per_detector"]["delta_norm"], rel=1e-9,
+                entry["p_per_detector"]["delta_norm"],
+                rel=1e-9,
             )
 
     def test_empty_pattern_returns_empty(self):
@@ -8307,6 +8704,7 @@ class TestCombineAnomalyPvalues:
         )
         result = nav.combine_anomaly_pvalues("acc_pat", top_n=5)
         import math
+
         for entry in result:
             assert math.isfinite(entry["hmp"])
             for p in entry["p_per_detector"].values():
@@ -8324,7 +8722,9 @@ class TestCombineAnomalyPvalues:
 # multi-detector firing.
 _AML_PATH = (
     Path(__file__).resolve().parents[3]
-    / "benchmark" / "ibm-aml" / "hi_small_sphere"
+    / "benchmark"
+    / "ibm-aml"
+    / "hi_small_sphere"
     / "gds_aml_hi_small"
 )
 
@@ -8334,12 +8734,13 @@ def _aml_sphere_unavailable() -> bool:
     if not sphere_json.exists():
         return True
     import json
-    return json.loads(sphere_json.read_text()).get("format_version") != "3.0"
+
+    return json.loads(sphere_json.read_text()).get("format_version", "").split(".")[0] != "3"
 
 
 @pytest.mark.skipif(
     _aml_sphere_unavailable(),
-    reason="AML HI-small sphere not built at format 3.0",
+    reason="AML HI-small sphere not built (format 3.x)",
 )
 def test_combine_anomaly_pvalues_on_aml_hi_small_multi_detector():
     """Regression: combine_anomaly_pvalues on AML HI-small account_pattern
@@ -8357,16 +8758,13 @@ def test_combine_anomaly_pvalues_on_aml_hi_small_multi_detector():
     assert len(result) == 50, f"expected 50 entries, got {len(result)}"
 
     multi = sum(1 for e in result if len(e["p_per_detector"]) >= 2)
-    assert multi >= 15, (
-        f"expected ≥15/50 multi-detector entries (≥30%), got {multi}"
-    )
+    assert multi >= 15, f"expected ≥15/50 multi-detector entries (≥30%), got {multi}"
 
     detectors_seen: set[str] = set()
     for e in result:
         detectors_seen.update(e["p_per_detector"].keys())
     assert len(detectors_seen) >= 3, (
-        f"expected ≥3 distinct detectors firing across top-50, "
-        f"got {sorted(detectors_seen)}"
+        f"expected ≥3 distinct detectors firing across top-50, got {sorted(detectors_seen)}"
     )
 
     # HMP and per-detector p-values must be finite and within [0, 1] —
@@ -8450,7 +8848,9 @@ def test_aggregate_anomalies_basic(tmp_path):
         pattern_versions={"cp": 1},
     )
     nav = GDSNavigator(
-        engine=engine, storage=reader, manifest=manifest,
+        engine=engine,
+        storage=reader,
+        manifest=manifest,
         contract=Contract("m-1", ["cp"]),
     )
     result = nav.aggregate_anomalies("cp", group_by="region")
@@ -8509,7 +8909,9 @@ def test_aggregate_anomalies_property_filters(tmp_path):
         pattern_versions={"cp": 1},
     )
     nav = GDSNavigator(
-        engine=engine, storage=reader, manifest=manifest,
+        engine=engine,
+        storage=reader,
+        manifest=manifest,
         contract=Contract("m-1", ["cp"]),
     )
     # Without filter
@@ -8518,7 +8920,8 @@ def test_aggregate_anomalies_property_filters(tmp_path):
 
     # With filter — only APAC
     result_filtered = nav.aggregate_anomalies(
-        "cp", group_by="region",
+        "cp",
+        group_by="region",
         property_filters={"region": "APAC"},
     )
     assert result_filtered["total_anomalies"] <= total_all
@@ -8538,11 +8941,14 @@ def test_aggregate_anomalies_invalid_column(tmp_path):
     b.add_line(
         "customers",
         [{"cid": "C-1", "seg_id": "SEG-A"}],
-        key_col="cid", source_id="test",
+        key_col="cid",
+        source_id="test",
     )
     b.add_line("segments", [{"sid": "SEG-A"}], key_col="sid", source_id="test")
     b.add_pattern(
-        "cp", pattern_type="anchor", entity_line="customers",
+        "cp",
+        pattern_type="anchor",
+        entity_line="customers",
         relations=[RelationSpec("segments", fk_col="seg_id", direction="in", required=True)],
     )
     out = b.build()
@@ -8551,14 +8957,17 @@ def test_aggregate_anomalies_invalid_column(tmp_path):
     cache = GDSCache()
     engine = GDSEngine(storage=reader, cache=cache)
     manifest = Manifest(
-        manifest_id="m-1", agent_id="a-1",
+        manifest_id="m-1",
+        agent_id="a-1",
         snapshot_time=datetime(2024, 1, 1, tzinfo=UTC),
         status="active",
         line_versions={"customers": 1, "segments": 1, "categories": 1},
         pattern_versions={"cp": 1},
     )
     nav = GDSNavigator(
-        engine=engine, storage=reader, manifest=manifest,
+        engine=engine,
+        storage=reader,
+        manifest=manifest,
         contract=Contract("m-1", ["cp"]),
     )
     with pytest.raises(ValueError, match="not found"):
@@ -8607,7 +9016,9 @@ def test_aggregate_anomalies_ungrouped_field(tmp_path):
         pattern_versions={"cp": 1},
     )
     nav = GDSNavigator(
-        engine=engine, storage=reader, manifest=manifest,
+        engine=engine,
+        storage=reader,
+        manifest=manifest,
         contract=Contract("m-1", ["cp"]),
     )
     result = nav.aggregate_anomalies("cp", group_by="region")
@@ -8649,8 +9060,7 @@ def test_find_anomalies_dedup_duplicate_primary_keys(sphere_path):
     results, total, _, _ = nav.π5_attract_anomaly("customer_pattern", top_n=20)
     pks = [p.primary_key for p in results]
     assert len(pks) == len(set(pks)), (
-        f"Duplicate primary_keys in find_anomalies results: "
-        f"{[k for k in pks if pks.count(k) > 1]}"
+        f"Duplicate primary_keys in find_anomalies results: {[k for k in pks if pks.count(k) > 1]}"
     )
 
 
@@ -8681,9 +9091,11 @@ class TestClassifyDetectorConsensus:
                 "insufficient_data",
             }
             # anomalous + normal + borderline partition matches n_detectors_fired
-            assert (len(entry["anomalous_detectors"]) +
-                    len(entry["normal_detectors"]) +
-                    len(entry["borderline_detectors"])) == entry["n_detectors_fired"]
+            assert (
+                len(entry["anomalous_detectors"])
+                + len(entry["normal_detectors"])
+                + len(entry["borderline_detectors"])
+            ) == entry["n_detectors_fired"]
             # Detectors are sorted alphabetically (deterministic listing)
             assert entry["anomalous_detectors"] == sorted(entry["anomalous_detectors"])
             assert entry["normal_detectors"] == sorted(entry["normal_detectors"])
@@ -8699,7 +9111,10 @@ class TestClassifyDetectorConsensus:
             contract=Contract("m-multi", []),
         )
         result = nav.classify_detector_consensus(
-            "acc_pat", top_n=50, anomaly_threshold=0.5, normal_threshold=0.51,
+            "acc_pat",
+            top_n=50,
+            anomaly_threshold=0.5,
+            normal_threshold=0.51,
         )
         priority = {
             "mixed_signal": 0,
@@ -8735,7 +9150,10 @@ class TestClassifyDetectorConsensus:
             contract=Contract("m-multi", []),
         )
         result = nav.classify_detector_consensus(
-            "acc_pat", top_n=20, anomaly_threshold=0.01, normal_threshold=0.5,
+            "acc_pat",
+            top_n=20,
+            anomaly_threshold=0.01,
+            normal_threshold=0.5,
         )
         for entry in result:
             for det in entry["anomalous_detectors"]:
@@ -8748,9 +9166,7 @@ class TestClassifyDetectorConsensus:
                 )
             for det in entry["borderline_detectors"]:
                 p = entry["p_per_detector"][det]
-                assert 0.01 <= p <= 0.5, (
-                    f"Detector {det} marked borderline but p={p} outside band"
-                )
+                assert 0.01 <= p <= 0.5, f"Detector {det} marked borderline but p={p} outside band"
 
     def test_classification_excludes_borderline_threshold_squeak(self):
         """Discriminator test (added per advisor 2026-05-10):
@@ -8794,7 +9210,9 @@ class TestClassifyDetectorConsensus:
         )
         with pytest.raises(ValueError, match="normal_threshold"):
             nav.classify_detector_consensus(
-                "acc_pat", anomaly_threshold=0.5, normal_threshold=0.5,
+                "acc_pat",
+                anomaly_threshold=0.5,
+                normal_threshold=0.5,
             )
 
     def test_top_n_caps_returned_list(self):
@@ -8821,8 +9239,10 @@ class TestClassifyDetectorConsensus:
         )
         # Wide band: most detectors borderline -> insufficient_data or single_detector
         result_wide = nav.classify_detector_consensus(
-            "acc_pat", top_n=20,
-            anomaly_threshold=0.0001, normal_threshold=0.9999,
+            "acc_pat",
+            top_n=20,
+            anomaly_threshold=0.0001,
+            normal_threshold=0.9999,
         )
         for entry in result_wide:
             # Detectors with p in [0.0001, 0.9999] are borderline
@@ -8832,8 +9252,10 @@ class TestClassifyDetectorConsensus:
             )
         # Narrow band: detectors with p in (0.5, 0.51) are borderline; others vote
         result_narrow = nav.classify_detector_consensus(
-            "acc_pat", top_n=20,
-            anomaly_threshold=0.5, normal_threshold=0.51,
+            "acc_pat",
+            top_n=20,
+            anomaly_threshold=0.5,
+            normal_threshold=0.51,
         )
         for entry in result_narrow:
             for det in entry["anomalous_detectors"]:

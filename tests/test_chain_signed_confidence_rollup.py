@@ -13,6 +13,7 @@ against engineered polygons — geometry reads and signed-confidence
 attachment are monkeypatched so the verdict logic is tested
 independently of the storage / engine layers.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -20,6 +21,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
+
 from hypertopos import HyperSphere
 from hypertopos.model.objects import Polygon
 
@@ -130,32 +132,38 @@ def _patch_label_aware_pipeline(
             "fake_label": MagicMock(direction=1.0),
         }
         return sphere
+
     monkeypatch.setattr(nav._storage, "read_sphere", fake_read_sphere)
 
     # Stub read_geometry — payload contents are ignored downstream
     # (we replace geometry_to_polygons immediately after).
     monkeypatch.setattr(
-        nav._storage, "read_geometry",
+        nav._storage,
+        "read_geometry",
         lambda *a, **k: MagicMock(),
     )
     monkeypatch.setattr(
-        nav._engine, "geometry_to_polygons",
+        nav._engine,
+        "geometry_to_polygons",
         lambda *a, **k: list(polygons),
     )
     # No-op the attachers — polygons already carry the fields they
     # would set.
     monkeypatch.setattr(
-        nav, "_attach_reliability_flags",
+        nav,
+        "_attach_reliability_flags",
         lambda polys, *, pattern: None,
     )
     monkeypatch.setattr(
-        nav, "_attach_signed_confidence_fields",
+        nav,
+        "_attach_signed_confidence_fields",
         lambda polys, *, pattern: None,
     )
 
 
 def test_low_verdict_when_half_or_more_members_are_low_confidence(
-    synthetic_nav, monkeypatch,
+    synthetic_nav,
+    monkeypatch,
 ):
     """4 members, 3 with reliability_penalty >= 0.5 → verdict 'low'."""
     polygons = [
@@ -183,7 +191,8 @@ def test_low_verdict_when_half_or_more_members_are_low_confidence(
 
 
 def test_medium_verdict_when_mean_below_one_but_not_low(
-    synthetic_nav, monkeypatch,
+    synthetic_nav,
+    monkeypatch,
 ):
     """4 members, only 1 low-confidence, mean < 1.0 → 'medium'."""
     polygons = [
@@ -210,7 +219,8 @@ def test_medium_verdict_when_mean_below_one_but_not_low(
 
 
 def test_high_verdict_when_mean_at_or_above_one_and_clean(
-    synthetic_nav, monkeypatch,
+    synthetic_nav,
+    monkeypatch,
 ):
     """4 clean members, mean >= 1.0 → 'high'."""
     polygons = [
@@ -254,7 +264,8 @@ def test_label_aware_unavailable_yields_null_fields(synthetic_nav):
 
 
 def test_low_verdict_takes_precedence_over_high_mean(
-    synthetic_nav, monkeypatch,
+    synthetic_nav,
+    monkeypatch,
 ):
     """Verdict precedence test — even if mean is high, when >= half of
     members are low-confidence, verdict must collapse to 'low'.

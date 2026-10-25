@@ -1,4 +1,5 @@
 """YAML parsing + validation for edge_dimensions block."""
+
 from __future__ import annotations
 
 import pytest
@@ -38,7 +39,8 @@ def test_parse_mixed_bare_and_overrides():
 
 def test_parse_defaults_filled_in():
     cfg = parse_edge_dimensions(
-        ["pair_amount_zscore"], pattern_type="event",
+        ["pair_amount_zscore"],
+        pattern_type="event",
     )
     assert cfg.dims["pair_amount_zscore"]["cv_threshold"] == 0.05
     assert cfg.dims["pair_amount_zscore"]["min_count"] == 3
@@ -105,10 +107,15 @@ def test_reject_min_count_below_2():
 def test_reject_amt1_min_negative():
     with pytest.raises(ValueError, match="amt1_min"):
         parse_edge_dimensions(
-            [{"find_motif_structuring": {
-                "time_window_hours": 1.0,
-                "amt1_min": -100.0, "amt2_max": 10000.0,
-            }}],
+            [
+                {
+                    "find_motif_structuring": {
+                        "time_window_hours": 1.0,
+                        "amt1_min": -100.0,
+                        "amt2_max": 10000.0,
+                    }
+                }
+            ],
             pattern_type="event",
         )
 
@@ -116,10 +123,15 @@ def test_reject_amt1_min_negative():
 def test_reject_amt2_max_zero():
     with pytest.raises(ValueError, match="amt2_max"):
         parse_edge_dimensions(
-            [{"find_motif_structuring": {
-                "time_window_hours": 1.0,
-                "amt1_min": 10000.0, "amt2_max": 0.0,
-            }}],
+            [
+                {
+                    "find_motif_structuring": {
+                        "time_window_hours": 1.0,
+                        "amt1_min": 10000.0,
+                        "amt2_max": 0.0,
+                    }
+                }
+            ],
             pattern_type="event",
         )
 
@@ -127,10 +139,15 @@ def test_reject_amt2_max_zero():
 def test_reject_time_window_hours_zero():
     with pytest.raises(ValueError, match="time_window_hours"):
         parse_edge_dimensions(
-            [{"find_motif_structuring": {
-                "time_window_hours": 0.0,
-                "amt1_min": 10000.0, "amt2_max": 10000.0,
-            }}],
+            [
+                {
+                    "find_motif_structuring": {
+                        "time_window_hours": 0.0,
+                        "amt1_min": 10000.0,
+                        "amt2_max": 10000.0,
+                    }
+                }
+            ],
             pattern_type="event",
         )
 
@@ -138,9 +155,14 @@ def test_reject_time_window_hours_zero():
 def test_reject_burst_seconds_negative():
     with pytest.raises(ValueError, match="burst_seconds"):
         parse_edge_dimensions(
-            [{"time_since_pair_last_edge": {
-                "burst_seconds": -1.0, "dormant_seconds": 999.0,
-            }}],
+            [
+                {
+                    "time_since_pair_last_edge": {
+                        "burst_seconds": -1.0,
+                        "dormant_seconds": 999.0,
+                    }
+                }
+            ],
             pattern_type="event",
         )
 
@@ -153,7 +175,7 @@ def test_reject_non_list_input():
 def test_reject_malformed_entry():
     with pytest.raises(ValueError, match="must be a string or single-key dict"):
         parse_edge_dimensions(
-            [{"a": {}, "b": {}}],   # dict with two keys is malformed
+            [{"a": {}, "b": {}}],  # dict with two keys is malformed
             pattern_type="event",
         )
 

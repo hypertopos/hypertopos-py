@@ -1,11 +1,11 @@
 """Engine + navigator tests for find_lead_lag (cross-pattern lead-lag)."""
+
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pytest
-
 
 # ── engine: _compute_centroid_drift_series ────────────────────────────────────
 
@@ -25,7 +25,9 @@ def test_centroid_drift_series_simple():
     mu = np.zeros(2, dtype=np.float32)
     sigma = np.ones(2, dtype=np.float32)
     centroid_series, volatility_series, mu_pop = _compute_centroid_drift_series(
-        shapes, mu, sigma,
+        shapes,
+        mu,
+        sigma,
     )
     assert centroid_series.shape == (2,)
     assert centroid_series[0] == pytest.approx(1.0, abs=1e-3)
@@ -44,7 +46,9 @@ def test_centroid_drift_uses_sigma_floor():
     mu = np.zeros(2, dtype=np.float32)
     sigma = np.array([0.0, 1.0], dtype=np.float32)  # σ=0 → flooring kicks in
     centroid_series, volatility_series, mu_pop = _compute_centroid_drift_series(
-        shapes, mu, sigma,
+        shapes,
+        mu,
+        sigma,
     )
     assert np.isfinite(centroid_series).all()
     assert np.isfinite(volatility_series).all()
@@ -126,7 +130,8 @@ def test_per_dim_matrix_engineered_leading_pair():
     mu_pop_b[2:, 0] = base[:-2]
     mu_pop_b[:2, 0] = rng.normal(size=2)
     pairs, _, _ = _compute_per_dim_lead_lag(
-        mu_pop_a, mu_pop_b,
+        mu_pop_a,
+        mu_pop_b,
         max_lag=5,
         fdr_alpha=0.05,
         fdr_method="bh",
@@ -154,8 +159,11 @@ def test_per_dim_matrix_dim_labels_passthrough():
     mu_pop_a = rng.normal(size=(n_epochs, D_a))
     mu_pop_b = rng.normal(size=(n_epochs, D_b))
     pairs, _, _ = _compute_per_dim_lead_lag(
-        mu_pop_a, mu_pop_b,
-        max_lag=4, fdr_alpha=0.05, fdr_method="bh",
+        mu_pop_a,
+        mu_pop_b,
+        max_lag=4,
+        fdr_alpha=0.05,
+        fdr_method="bh",
         dim_labels_a=["alpha", "beta"],
         dim_labels_b=["one", "two", "three"],
     )
@@ -174,9 +182,13 @@ def test_per_dim_matrix_dim_labels_none_safe():
     mu_pop_a = rng.normal(size=(n_epochs, 2))
     mu_pop_b = rng.normal(size=(n_epochs, 2))
     pairs, _, _ = _compute_per_dim_lead_lag(
-        mu_pop_a, mu_pop_b,
-        max_lag=3, fdr_alpha=0.05, fdr_method="bh",
-        dim_labels_a=None, dim_labels_b=None,
+        mu_pop_a,
+        mu_pop_b,
+        max_lag=3,
+        fdr_alpha=0.05,
+        fdr_method="bh",
+        dim_labels_a=None,
+        dim_labels_b=None,
     )
     assert all(p.dim_label_a is None and p.dim_label_b is None for p in pairs)
 
@@ -199,11 +211,15 @@ def test_compute_lead_lag_report_synthetic_a_leads_b():
     for e in range(n_entities):
         shapes_a[:, e, 0] = base_traj_a + rng.normal(scale=0.05, size=n_epochs)
         shapes_b[:, e, 0] = base_traj_b + rng.normal(scale=0.05, size=n_epochs)
-    shapes_a[:, :, 1:] = rng.normal(scale=0.1, size=(n_epochs, n_entities, D - 1)).astype(np.float32)
-    shapes_b[:, :, 1:] = rng.normal(scale=0.1, size=(n_epochs, n_entities, D - 1)).astype(np.float32)
+    shapes_a[:, :, 1:] = rng.normal(scale=0.1, size=(n_epochs, n_entities, D - 1)).astype(
+        np.float32
+    )
+    shapes_b[:, :, 1:] = rng.normal(scale=0.1, size=(n_epochs, n_entities, D - 1)).astype(
+        np.float32
+    )
     mu = np.zeros(D, dtype=np.float32)
     sigma = np.ones(D, dtype=np.float32)
-    epoch0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    epoch0 = datetime(2024, 1, 1, tzinfo=UTC)
     timestamps = [epoch0 + timedelta(days=2 * i) for i in range(n_epochs)]
     report = _compute_lead_lag_report(
         pattern_a="P_A",
@@ -211,14 +227,19 @@ def test_compute_lead_lag_report_synthetic_a_leads_b():
         entity_key=None,
         shapes_a=shapes_a,
         shapes_b=shapes_b,
-        mu_a=mu, sigma_a=sigma,
-        mu_b=mu, sigma_b=sigma,
+        mu_a=mu,
+        sigma_a=sigma,
+        mu_b=mu,
+        sigma_b=sigma,
         dim_labels_a=["a0", "a1", "a2"],
         dim_labels_b=["b0", "b1", "b2"],
         timestamps=timestamps,
-        n_dropped_a=0, n_dropped_b=0,
-        cohort_size=n_entities, cohort_dropped=0,
-        schema_hash_a="aaa", schema_hash_b="bbb",
+        n_dropped_a=0,
+        n_dropped_b=0,
+        cohort_size=n_entities,
+        cohort_dropped=0,
+        schema_hash_a="aaa",
+        schema_hash_b="bbb",
         max_lag=5,
         fdr_alpha=0.05,
         fdr_method="bh",
@@ -248,20 +269,29 @@ def test_compute_lead_lag_report_verbose_includes_full_matrix():
     shapes_b = rng.normal(size=(n_epochs, n_entities, D)).astype(np.float32)
     mu = np.zeros(D, dtype=np.float32)
     sigma = np.ones(D, dtype=np.float32)
-    timestamps = [
-        datetime(2024, 1, 1, tzinfo=timezone.utc) + timedelta(days=i)
-        for i in range(n_epochs)
-    ]
+    timestamps = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(n_epochs)]
     report = _compute_lead_lag_report(
-        pattern_a="P_A", pattern_b="P_B", entity_key=None,
-        shapes_a=shapes_a, shapes_b=shapes_b,
-        mu_a=mu, sigma_a=sigma, mu_b=mu, sigma_b=sigma,
-        dim_labels_a=None, dim_labels_b=None,
+        pattern_a="P_A",
+        pattern_b="P_B",
+        entity_key=None,
+        shapes_a=shapes_a,
+        shapes_b=shapes_b,
+        mu_a=mu,
+        sigma_a=sigma,
+        mu_b=mu,
+        sigma_b=sigma,
+        dim_labels_a=None,
+        dim_labels_b=None,
         timestamps=timestamps,
-        n_dropped_a=0, n_dropped_b=0,
-        cohort_size=n_entities, cohort_dropped=0,
-        schema_hash_a="x", schema_hash_b="x",
-        max_lag=3, fdr_alpha=0.05, fdr_method="bh",
+        n_dropped_a=0,
+        n_dropped_b=0,
+        cohort_size=n_entities,
+        cohort_dropped=0,
+        schema_hash_a="x",
+        schema_hash_b="x",
+        max_lag=3,
+        fdr_alpha=0.05,
+        fdr_method="bh",
         verbose=True,
     )
     assert report.per_dim_pairs is not None
@@ -296,20 +326,29 @@ def test_compute_lead_lag_report_degenerate_signal_flag():
     shapes_b = np.ones((n_epochs, n_entities, D), dtype=np.float32) * 2.0
     mu = np.zeros(D, dtype=np.float32)
     sigma = np.ones(D, dtype=np.float32)
-    timestamps = [
-        datetime(2024, 1, 1, tzinfo=timezone.utc) + timedelta(days=i)
-        for i in range(n_epochs)
-    ]
+    timestamps = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(n_epochs)]
     report = _compute_lead_lag_report(
-        pattern_a="P_A", pattern_b="P_B", entity_key=None,
-        shapes_a=shapes_a, shapes_b=shapes_b,
-        mu_a=mu, sigma_a=sigma, mu_b=mu, sigma_b=sigma,
-        dim_labels_a=None, dim_labels_b=None,
+        pattern_a="P_A",
+        pattern_b="P_B",
+        entity_key=None,
+        shapes_a=shapes_a,
+        shapes_b=shapes_b,
+        mu_a=mu,
+        sigma_a=sigma,
+        mu_b=mu,
+        sigma_b=sigma,
+        dim_labels_a=None,
+        dim_labels_b=None,
         timestamps=timestamps,
-        n_dropped_a=0, n_dropped_b=0,
-        cohort_size=n_entities, cohort_dropped=0,
-        schema_hash_a="x", schema_hash_b="x",
-        max_lag=3, fdr_alpha=0.05, fdr_method="bh",
+        n_dropped_a=0,
+        n_dropped_b=0,
+        cohort_size=n_entities,
+        cohort_dropped=0,
+        schema_hash_a="x",
+        schema_hash_b="x",
+        max_lag=3,
+        fdr_alpha=0.05,
+        fdr_method="bh",
         verbose=False,
     )
     assert report.degenerate_signal is True
@@ -329,20 +368,29 @@ def test_compute_lead_lag_report_coverage_warning_small_cohort():
     shapes_b = rng.normal(size=(n_epochs, n_entities, D)).astype(np.float32)
     mu = np.zeros(D, dtype=np.float32)
     sigma = np.ones(D, dtype=np.float32)
-    timestamps = [
-        datetime(2024, 1, 1, tzinfo=timezone.utc) + timedelta(days=i)
-        for i in range(n_epochs)
-    ]
+    timestamps = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(n_epochs)]
     report = _compute_lead_lag_report(
-        pattern_a="P_A", pattern_b="P_B", entity_key=None,
-        shapes_a=shapes_a, shapes_b=shapes_b,
-        mu_a=mu, sigma_a=sigma, mu_b=mu, sigma_b=sigma,
-        dim_labels_a=None, dim_labels_b=None,
+        pattern_a="P_A",
+        pattern_b="P_B",
+        entity_key=None,
+        shapes_a=shapes_a,
+        shapes_b=shapes_b,
+        mu_a=mu,
+        sigma_a=sigma,
+        mu_b=mu,
+        sigma_b=sigma,
+        dim_labels_a=None,
+        dim_labels_b=None,
         timestamps=timestamps,
-        n_dropped_a=0, n_dropped_b=0,
-        cohort_size=n_entities, cohort_dropped=0,
-        schema_hash_a="x", schema_hash_b="x",
-        max_lag=3, fdr_alpha=0.05, fdr_method="bh",
+        n_dropped_a=0,
+        n_dropped_b=0,
+        cohort_size=n_entities,
+        cohort_dropped=0,
+        schema_hash_a="x",
+        schema_hash_b="x",
+        max_lag=3,
+        fdr_alpha=0.05,
+        fdr_method="bh",
         verbose=False,
     )
     assert report.coverage_warning is True
@@ -364,21 +412,29 @@ def test_compute_lead_lag_report_entity_key_mode():
     shapes_b[:2, 0, 0] = rng.normal(size=2).astype(np.float32)
     mu = np.zeros(D, dtype=np.float32)
     sigma = np.ones(D, dtype=np.float32)
-    timestamps = [
-        datetime(2024, 1, 1, tzinfo=timezone.utc) + timedelta(days=i)
-        for i in range(n_epochs)
-    ]
+    timestamps = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(n_epochs)]
     report = _compute_lead_lag_report(
-        pattern_a="P_A", pattern_b="P_B",
+        pattern_a="P_A",
+        pattern_b="P_B",
         entity_key="entity_42",
-        shapes_a=shapes_a, shapes_b=shapes_b,
-        mu_a=mu, sigma_a=sigma, mu_b=mu, sigma_b=sigma,
-        dim_labels_a=None, dim_labels_b=None,
+        shapes_a=shapes_a,
+        shapes_b=shapes_b,
+        mu_a=mu,
+        sigma_a=sigma,
+        mu_b=mu,
+        sigma_b=sigma,
+        dim_labels_a=None,
+        dim_labels_b=None,
         timestamps=timestamps,
-        n_dropped_a=0, n_dropped_b=0,
-        cohort_size=1, cohort_dropped=None,
-        schema_hash_a="x", schema_hash_b="x",
-        max_lag=5, fdr_alpha=0.05, fdr_method="bh",
+        n_dropped_a=0,
+        n_dropped_b=0,
+        cohort_size=1,
+        cohort_dropped=None,
+        schema_hash_a="x",
+        schema_hash_b="x",
+        max_lag=5,
+        fdr_alpha=0.05,
+        fdr_method="bh",
         verbose=False,
     )
     assert report.entity_key == "entity_42"
@@ -406,21 +462,29 @@ def test_compute_lead_lag_report_schema_hash_mismatch_passes():
     shapes_b = rng.normal(size=(n_epochs, n_entities, D)).astype(np.float32)
     mu = np.zeros(D, dtype=np.float32)
     sigma = np.ones(D, dtype=np.float32)
-    timestamps = [
-        datetime(2024, 1, 1, tzinfo=timezone.utc) + timedelta(days=i)
-        for i in range(n_epochs)
-    ]
+    timestamps = [datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i) for i in range(n_epochs)]
     report = _compute_lead_lag_report(
-        pattern_a="P_A", pattern_b="P_B", entity_key=None,
-        shapes_a=shapes_a, shapes_b=shapes_b,
-        mu_a=mu, sigma_a=sigma, mu_b=mu, sigma_b=sigma,
-        dim_labels_a=None, dim_labels_b=None,
+        pattern_a="P_A",
+        pattern_b="P_B",
+        entity_key=None,
+        shapes_a=shapes_a,
+        shapes_b=shapes_b,
+        mu_a=mu,
+        sigma_a=sigma,
+        mu_b=mu,
+        sigma_b=sigma,
+        dim_labels_a=None,
+        dim_labels_b=None,
         timestamps=timestamps,
-        n_dropped_a=0, n_dropped_b=0,
-        cohort_size=n_entities, cohort_dropped=0,
+        n_dropped_a=0,
+        n_dropped_b=0,
+        cohort_size=n_entities,
+        cohort_dropped=0,
         schema_hash_a="hash_aaa_1234567890ab",
         schema_hash_b="hash_bbb_0987654321cd",
-        max_lag=3, fdr_alpha=0.05, fdr_method="bh",
+        max_lag=3,
+        fdr_alpha=0.05,
+        fdr_method="bh",
         verbose=False,
     )
     assert report.schema_hash_a == "hash_aaa_1234567890ab"
@@ -446,9 +510,13 @@ def test_per_dim_discriminator_distinct_lags():
     mu_pop_b[:, 0] = base_b0_lag2
     mu_pop_b[:, 1] = base_b1_concurrent
     pairs, _, _ = _compute_per_dim_lead_lag(
-        mu_pop_a, mu_pop_b,
-        max_lag=5, fdr_alpha=0.05, fdr_method="bh",
-        dim_labels_a=None, dim_labels_b=None,
+        mu_pop_a,
+        mu_pop_b,
+        max_lag=5,
+        fdr_alpha=0.05,
+        fdr_method="bh",
+        dim_labels_a=None,
+        dim_labels_b=None,
     )
     pair_00 = next(p for p in pairs if p.dim_index_a == 0 and p.dim_index_b == 0)
     pair_01 = next(p for p in pairs if p.dim_index_a == 0 and p.dim_index_b == 1)

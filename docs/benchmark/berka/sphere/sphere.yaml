@@ -213,10 +213,8 @@ temporal:
   - pattern: account_stress_pattern
     event_line: transactions
     timestamp_col: date
-    anchor_fk: account_id
     window: 90d
   - pattern: loan_stress_pattern
     event_line: transactions
     timestamp_col: date
-    anchor_fk: account_id
     window: 90d

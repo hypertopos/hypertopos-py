@@ -26,7 +26,7 @@ That makes GDS useful when the interesting part of the problem is not a single r
 
 ## Mathematical Foundation
 
-GDS operates in a **delta space** (ℝ^D, d₂) — a complete metric space where each entity is embedded via its relationship structure.
+GDS operates in a **delta space** (ℝ^D, d₂) — a complete metric space where each entity's position is derived from its relationship structure.
 
 **Shape vector.** For entity *e* with *D* typed relation dimensions:
 
@@ -34,13 +34,13 @@ GDS operates in a **delta space** (ℝ^D, d₂) — a complete metric space wher
 s(e) ∈ [0,1]^D     (normalized edge counts per relation type)
 ```
 
-**Delta vector.** Population-relative z-score embedding:
+**Delta vector.** Population-relative z-score position:
 
 ```
 δ(e) = (s(e) − μ) ⊘ σ
 ```
 
-where μ = E[s] is the population mean, σ = max(std(s), ε) the clamped standard deviation. The delta vector is the core coordinate — it tells you where an entity sits relative to its population in every dimension simultaneously.
+where μ = E[s] is the population mean, σ = max(std(s), ε) the clamped standard deviation. The delta vector is the core coordinate — it tells you where an entity sits relative to its population norm, dimension by dimension. Its length, `delta_norm` = ‖δ‖₂, is the entity's distance from the population centre. μ, σ and the threshold θ together are the pattern's **calibration** (see [Calibration epochs](#calibration-epochs)).
 
 **What the delta space enables:**
 
@@ -50,42 +50,40 @@ where μ = E[s] is the population mean, σ = max(std(s), ε) the clamped standar
 - **Hub analysis** — structural centrality scores from normalized connectivity in the shape vector
 - **Segment partitioning** — cutting planes (w·δ ≥ b) partition the population into named segments with derived statistics
 - **Anomaly detection** — entities with ‖δ‖₂ > θ (empirical quantile threshold) are flagged — no training, no labels
-- **Dimension ranking** — contribution magnitude per dimension identifies which relations drive an entity's position (witness sets)
+- **Dimension ranking** — each dimension's share of `delta_norm²` identifies which relations drive an entity's position (witness sets)
 - **Drift tracking** — temporal sequences τ(e) = (δ₁, ..., δₜ) measure how an entity's geometric position evolves
 - **Trajectory forecasting** — extrapolation of temporal coordinate sequences predicts future position, anomaly status, and segment crossings
 - **Population-level temporal analysis** — centroid displacement across time windows detects structural regime shifts
 - **Stateful navigation** — typed position state (Point → Polygon → Solid) with AI agent tool-callable primitives
-- **Cross-sphere comparison** *(planned)* — dimensionless scalar metrics from independently calibrated coordinate spaces enable comparison across separate data systems
-- **What-if analysis** *(planned)* — hypothetical edge changes produce a modified coordinate vector showing the geometric effect
+- **Cross-sphere comparison** — `delta_norm` is dimensionless, so scalar metrics from independently calibrated coordinate spaces compare across separate data systems
+- **What-if analysis** — hypothetical edge or dimension changes (`simulate_edge_removal`, `simulate_dimension_change`) recompute an entity's position against the fixed calibration; a recalibration or ingest tried on a [sphere branch](#sessions-snapshots-and-branches) shows its effect on the whole population before it touches main
 
 ## Statistical Guarantees
 
-Two opt-in post-processing stages can be applied to any attract primitive that scans a population (pi5, pi6, pi7, pi9). Both are off by default — omitting them preserves the legacy behavior exactly.
+Two opt-in post-processing stages are available. Diverse selection applies to every attract primitive that scans a population (pi5, pi6, pi7, pi9); FDR control applies only where a model p-value exists (pi5, pi6). Both are off by default.
 
-**FDR control.** When `fdr_alpha` is set, the result set passes through a Benjamini-Hochberg (BH) procedure. Each entity's empirical-null p-value is derived from its population rank percentile: `p = 1 - rank_pct / 100`, where `rank_pct` is the entity's position in the full population sorted by the primitive's ranking metric (delta norm for pi5/pi6, hub score for pi7, displacement for pi9). The BH procedure guarantees `E[FDR] <= alpha` under independence or positive regression dependency (PRDS). Every retained entity carries a q-value — the minimum alpha at which it would still be retained. Entities with `q_value > alpha` are removed before the top-N / selection step.
+**FDR control.** When `fdr_alpha` is set on pi5 / pi6, the result set passes through a Benjamini-Hochberg (BH) procedure on χ² model p-values: the upper-tail χ²(df) survival on `‖δ‖²` with `df` = pattern dimensionality — the null under `δ_i ~ N(0, 1)`. The BH procedure guarantees `E[FDR] <= alpha` under independence or positive regression dependency (PRDS). The family is the whole tested population, not the returned page: q-values use the pattern's population size and each entity's rank among all tested entities (exact for an unfiltered top-n page, conservative under filters or sampling), and Storey's π̂₀ is estimated from the stored `delta_norm` column of the whole population. Every returned entity carries a q-value — the minimum alpha at which it would still be retained — and entities with `q_value > alpha` are dropped from the page. The guarantee is only as good as the χ² null: check the calibration regime (`median(‖δ‖)` vs `√df`) before reading q-values as error rates. Rank-only scores — hub score (pi7) and drift displacement (pi9) — have no model p-value: a p-value derived from population rank is uniform by construction and only encodes the entity's position in the result set, so BH on it would select a fixed fraction of whatever was requested. Those primitives therefore offer no FDR parameters.
 
-**Storey adaptive correction.** `fdr_method="storey"` scales BH q-values by the Storey LSL estimator of the null-hypothesis proportion π₀ — when the population contains a genuine null mass alongside the anomalous tail, Storey shrinks q-values by that factor and recovers additional discoveries at the same α. This only works if p-values can separate null from alternative in the first place, so `fdr_method="storey"` should be paired with `p_value_method="chi2"`. Chi-squared p-values come from the upper-tail χ²(df) survival on `‖δ‖²` — the mathematically correct null under `δ_i ~ N(0, 1)`. Rank-based p-values are uniform(0, 1) by construction and carry no null-vs-alternative signal, so Storey collapses to BH on them regardless of the underlying population structure.
+**Storey adaptive correction.** `fdr_method="storey"` scales BH q-values by the Storey LSL estimator of the null-hypothesis proportion π₀ — when the population contains a genuine null mass alongside the anomalous tail, Storey shrinks q-values by that factor and recovers additional discoveries at the same α. This works because χ² p-values can separate null from alternative.
 
-Power recovery is **regime-dependent**. The Storey + chi2 combination delivers 10–15% additional discoveries at α=0.05 on spheres whose ranking metric has a moderate super-anomaly distribution with a real null tail — e.g. NYC Taxi trip_pattern where `median(‖δ‖) ≈ 1.8 × √df`. On spheres whose `δ` is over-compressed relative to the N(0,1) null (AML HI-Small account_pattern, `median ≈ 0.85 × √df`) Storey sees the whole population as null and falls back to BH. On patterns whose `δ` is extreme super-anomaly (Berka account_stress, `median ≈ 3 × √df`) BH already rejects every entity, so there is nothing left for Storey to recover. The `benchmark/storey_vs_bh/` harness makes this regime sensitivity reproducible.
+Power recovery is **regime-dependent**, and the regime is read from `median(‖δ‖)` relative to `√df`. When the ranking metric has a moderate super-anomaly distribution with a real null tail (median somewhat above `√df`), Storey recovers additional discoveries at the same α. When `δ` is over-compressed relative to the N(0,1) null (median below `√df`), Storey sees the whole population as null and falls back to BH. When `δ` is extreme super-anomaly (median several times `√df`), BH already rejects every entity, so there is nothing left for Storey to recover.
 
 **Diverse selection.** When `select="diverse"`, the top-N step is replaced by a lazy-greedy facility location algorithm that maximizes a monotone submodular objective over pairwise cosine similarity of delta vectors. The greedy selection achieves a `(1 - 1/e)` approximation to the optimal K-subset. Each selected entity reports a representativeness count — how many population members are closest to it among the selected set. The result is K entities that cover the geometric space of the result set rather than clustering around a single extreme region.
 
-Both stages compose: `fdr_alpha=0.05, select="diverse"` first filters to FDR-controlled discoveries, then picks the K most geometrically diverse among them.
+Both stages compose on pi5 / pi6: `fdr_alpha=0.05, select="diverse"` first filters to FDR-controlled discoveries, then picks the K most geometrically diverse among them.
 
 ## Bregman Divergence
 
-Standard anomaly scoring in GDS uses `‖δ‖₂` — a single Euclidean distance that treats every dimension identically. This is fast and works well when dimensions are roughly Gaussian.
+Anomaly scoring in GDS uses `delta_norm` = `‖δ‖₂` — a single Euclidean distance that treats every dimension identically. It is the metric behind `is_anomaly`, the threshold θ and anomaly ranking, and it works well when dimensions are roughly Gaussian.
 
-**Bregman divergence** generalises the scoring: each dimension contributes an anomaly score computed from the generator function matched to its distribution family (`kind`). For a dimension with kind `gaussian`, the generator is squared loss (identical to L2). For `poisson`, it is the Kullback-Leibler divergence for counts. For `bernoulli`, it is binary cross-entropy.
+**Bregman divergence** is a distribution-aware companion score: each dimension contributes a term computed from the generator function matched to its distribution family (`kind`). For a dimension with kind `gaussian`, the generator is squared loss (identical to L2). For `poisson`, it is the Kullback-Leibler divergence for counts. For `bernoulli`, it is binary cross-entropy.
 
-The per-dimension Bregman scores are summed to produce `bregman_divergence` — a single float stored alongside `delta_norm` in the geometry file. Dimensions with a poor match between their assumed family and actual data shape produce disproportionately large Bregman terms, making them visible in `explain_anomaly` output.
+The per-dimension terms are summed into `bregman_divergence` — one float per polygon, precomputed at build time and stored alongside `delta_norm` in the geometry dataset (`Polygon.bregman_divergence`). It is read as stored and cannot be reweighted at query time.
 
 **What this enables:**
-- Binary FK dimensions (bernoulli) no longer inflate the total score when an entity is merely "active" in that relation — the scoring accounts for the 0/1 nature of the edge
+- A binary FK dimension (bernoulli) is scored for the 0/1 nature of the edge, so an entity that is merely "active" in that relation does not get a large term
 - Count-based derived features (poisson) are scored against their expected arrival rate rather than a z-score
-- `explain_anomaly` returns per-dimension Bregman contributions with `kind` and `pct_of_total`, identifying which distribution mismatch is the primary driver
-
-`bregman_divergence` is stored in sphere format ≥ 2.3. Pre-2.3 spheres return `None` for this field.
+- `explain_anomaly` tags each entry of `top_dimensions` (`{dim, kind, delta, pct_of_total}`) with its `kind`; the ranking itself (`pct_of_total`) is the dimension's share of `delta_norm²`, the metric behind `is_anomaly`, so the explanation always names the dimensions that pushed the entity past theta and the shares sum to 100%
 
 ### Dimension Kinds
 
@@ -169,6 +167,8 @@ The important nuance is:
 - the polygon is the linked structure of points inside that population
 - the edges connect those points to other lines
 
+A `Solid`'s slices store raw shape snapshots. Every temporal analysis — the solid itself, drift, population comparison, regime change, trajectory classification and vectors, temporal centroids and temporal signal quality — turns a snapshot into a delta with the same metric as the stored polygon delta: Mahalanobis when the pattern has a covariance factor, otherwise per-dimension σ, then the pattern's dimension weights. Snapshots carry the time-varying dimensions only (build-time aggregates such as edge-dimension aggregations have no history), so a slice's delta norm is comparable with the entity's current delta and with θ restricted to those same dimensions. The same metric governs every write and the inverse direction: a full build, an incremental update and a recalibration all store deltas in the pattern's saved metric, and anything that recovers an entity's shape from its stored delta (hub scoring, what-if and edge-removal simulations, calibration-influence diagnostics, per-dimension attribution) inverts that metric — un-weighting, then undoing the whitening or the per-dimension σ.
+
 ### Anchor and event lines
 
 Every line has a `line_role` — either **anchor** or **event**. The distinction reflects the nature of the entities it holds.
@@ -193,7 +193,7 @@ The same distinction carries into patterns: `pattern_type` is `"anchor"` or `"ev
 - **relations** — edges pointing back to anchor lines (e.g. transaction → account, transaction → operation)
 - **event dimensions** — continuous numeric columns on the event itself (e.g. amount, balance)
 
-In a typical sphere, event lines feed into anchor patterns via `derived_dimensions` — the builder aggregates event-level data per anchor entity to produce behavioral features. This is how "1M transactions" becomes "4,500 account behavioral profiles."
+In a typical sphere, event lines feed into anchor patterns via `derived_dimensions` — the builder aggregates event-level data per anchor entity to produce behavioral features. This is how millions of transactions become one behavioral profile per account.
 
 ## Edge Table
 
@@ -203,7 +203,7 @@ An edge table is a flat Lance dataset that links anchor entities through an even
 
 **What it enables:**
 - **Runtime graph traversal** -- `find_geometric_path` uses bidirectional BFS over the edge table, scoring discovered paths by geometric coherence of intermediate entities
-- **Lazy chain discovery** -- `discover_chains` performs temporal BFS on edges without requiring build-time chain extraction
+- **Seeded chain extraction** -- `extract_chains(pattern, seed_nodes=[key])` starts from specific entities and uses every event for exact chains, with no pre-built chain lines required
 - **Edge statistics** -- row counts, unique entity counts, timestamp and amount ranges
 - **Witness cohort discovery** -- `find_witness_cohort` ranks entities that share the target's witness signature by combining delta similarity, witness overlap, trajectory alignment, and a graded anomaly bonus, while excluding entities already connected via the edge table. **Investigative peer ranking, not edge forecasting** — surfaces existing peers rather than predicting future edges. Uniquely possible because population-relative geometry, witness sets, temporal solids, and the edge table all live in one storage layer
 
@@ -222,8 +222,11 @@ a uniform `[0, 1]` marginal via its empirical CDF (probability integral
 transform), so the test is dim-kind agnostic — Gaussian, Poisson,
 heavy-tail and non-parametric dims all reduce to the same uniform
 representation. Pairs with Pearson `|r|` in `[r_min, r_max]` (default
-`[0.1, 0.7]`) are tested against the uniform-independence expectation
-on a `bins × bins` joint histogram via per-cell chi² residual; only
+`[0.1, 0.7]`) are tested against the independence expectation (product
+of the observed marginals) on a `bins × bins` joint histogram via per-cell
+chi² residual. A dim with ties (e.g. a zero-inflated count) maps to a
+point mass, so some quantile bins stay empty by construction; those cells
+have expected count 0 and are not tested, so ties never read as gaps. Only
 under-populated cells are kept and Benjamini-Hochberg correction is
 applied across the test set to control FDR. Each flagged cell maps
 back to a named delta-space range (z-score units — geometry deltas, not
@@ -252,7 +255,7 @@ These dims are computed at edge-table emission time, written to the `_gds_meta/e
 
 ## Chain Interpretation
 
-Chains (both build-time `chain_lines` and runtime `discover_chains`) are sequences of entities linked by temporally ordered edges. They represent **structural paths** — the existence of a route through the graph within a time window — not causally linked flows.
+Chains (both build-time `chain_lines` and runtime `extract_chains`) are sequences of entities linked by temporally ordered edges. They represent **structural paths** — the existence of a route through the graph within a time window — not causally linked flows.
 
 **What `total_amount` means:** the sum of per-hop `amount` values along the path. Each hop independently selects the best temporally-ordered edge between two entities. The amounts at different hops may originate from unrelated events. A chain `A→B (500) → C (10000)` means A connected to B with amount 500, and B connected to C with amount 10000 — not that 500 propagated from A to C.
 
@@ -261,7 +264,7 @@ Chains (both build-time `chain_lines` and runtime `discover_chains`) are sequenc
 - **Amount decay** (`last_hop / first_hop`) is more informative than total — a decreasing pattern along the path suggests value dispersion
 - **Exact value tracking** (matching amounts across consecutive hops within a tolerance) is a separate analytical step not built into chain extraction
 - **Cyclic chains** (`is_cyclic=true`) indicate structural loops, not that the same value returned to the origin
-- These properties apply equally to pre-computed `chain_lines` and runtime `discover_chains`
+- These properties apply equally to pre-computed `chain_lines` and runtime `extract_chains`
 
 **External chains.** Chains discovered outside hypertopos — SAR typology engines, ERP supply-chain workflows, EHR clinical pathways, customer-journey platforms — can be ingested as anchor lines and navigated with the same primitives. See [External Chains as Anchor Lines](external-chains-as-anchor-line.md) for the schema convention (chain anchor table = `(chain_id, member_keys, ...features)`, with optional `chain_keys` column to unlock the chain-coherent investigative loop).
 
@@ -365,19 +368,34 @@ A typical GDS exploration might look like this:
 
 That pattern is the core of the system: broad structure first, focused investigation second.
 
-## Calibration epoch vs schema version vs schema hash
+## Calibration epochs
 
-Three orthogonal axes describe a pattern's state:
+A pattern's **calibration** is the population statistics (μ, σ, θ) its coordinates are measured against. A **calibration epoch** is one recorded fit. Two operations record one:
 
-| Axis | Field | Increments on |
+- a full build, which fits the population from source data;
+- `HyperSession.recalibrate(pattern_id)`, which refits μ, σ and θ on the stored shapes and rewrites the calibration-dependent geometry. `exclude_keys` fits without those entities — suspected influencers, known bad records — while every entity is still scored against the new fit.
+
+Because both record an epoch, `compare_calibrations`, the theta-sensitivity diagnostics and the drift tools compare the fit before and after a recalibration exactly as they do across rebuilds.
+
+Three orthogonal axes describe a pattern's state (fields of the pattern entry in `sphere.json`):
+
+| Axis | Field | Changes on |
 |---|---|---|
-| Schema (coarse) | `pattern.version` | Intended: schema change. Currently dormant — builder always writes `1`. |
-| Schema (fine) | `pattern.schema_hash` | Schema change (relations / event_dimensions / prop_columns / dimension_kinds / dim order). |
-| Calibration epoch | `pattern.calibration_epoch` | Re-fit on the same schema — every full builder run. |
+| Schema (coarse) | `version` | Reserved for schema changes; the builder writes `1`. |
+| Schema (fine) | `schema_hash` | Schema change (relations / event_dimensions / prop_columns / dimension_kinds / dim order). |
+| Calibration epoch | `calibration_epoch` | Re-fit on the same schema — every full build and every `recalibrate`. |
 
 A `CalibrationFit` (one historical epoch) is identified by `(pattern_id, calibration_epoch)`
 and is self-described by `schema_hash`. Schema drift wipes prior epochs because mu/sigma
 vectors from a different schema have different dimensionality.
+
+## Sessions, snapshots and branches
+
+Everything above is read through a **session**. A session reads one consistent snapshot of the sphere — the state current when it opened. An ingest or a recalibration by another process does not change what the session sees, so two reads of the same question inside one investigation agree. `is_stale()` reports whether a newer state exists; `refresh()` moves the session to it. Nothing refreshes a session automatically; the only change it sees without a refresh is its own `recalibrate` of the ref it reads (a recalibration it sends to a branch leaves it unchanged).
+
+A **sphere branch** is a copy-free what-if workspace. A session can read main (the default ref) or a named branch. Writes on a branch — a recalibration with `exclude_keys`, a trial ingest — never touch main, so the question "what would change if…" is answered on the whole population without risking the coordinates other sessions read. `compare_branches` then reports, entity by entity, who became anomalous on the branch (`flipped_in`), who stopped being anomalous (`flipped_out`), how much the two anomaly sets overlap (`jaccard`) and how far the threshold moved. A branch ends in one of two ways: it is promoted — its recipes are replayed on main and the branch is deleted — or it is deleted.
+
+For how snapshots and branches are stored, see [architecture.md](architecture.md#mvcc-model).
 
 ## Coordinate system influence
 
@@ -418,10 +436,10 @@ When the same entity participates in multiple anchor patterns over the same
 entity line, each pattern produces a parallel temporal trajectory in an
 independently-calibrated population-relative coordinate space. Comparing the
 centroid drift of one pattern's population to another's at varying lag reveals
-the temporal ordering of population-level shifts: when the
-`account_behavior_pattern` centroid begins to move before the
-`account_stress_pattern` centroid, behavior is the leading indicator and
-stress is the lagging consequence.
+the temporal ordering of population-level shifts: when the centroid of a
+behaviour pattern begins to move before the centroid of a stress pattern
+over the same accounts, behaviour is the leading indicator and stress is
+the lagging consequence.
 
 The signal is computed as the magnitude of the population centroid step
 between consecutive epochs — a scalar per pattern per epoch. Pearson
@@ -456,19 +474,6 @@ This is not a full API reference or storage specification. For those, see:
 
 - [quickstart.md](quickstart.md) -- getting started with hypertopos
 - [api-reference.md](api-reference.md) -- full Python API and primitive signatures
-- [data-format.md](data-format.md) -- Arrow IPC format, directory structure, and schemas
+- [architecture.md](architecture.md) -- package layers, snapshot sessions, sphere branches and the MCP layer
+- [data-format.md](data-format.md) -- Lance storage format, directory structure, and schemas
 - [configuration.md](configuration.md) -- YAML builder syntax and field tables
-
-## Patent Pending
-
-This work explores a different way of thinking about data.
-
-Instead of querying entities or training models, it constructs a shared geometric space where every entity occupies a position defined relative to the population it belongs to. Entities are mapped to coordinates derived from their relational structure, enabling direct geometric interpretation of similarity, deviation, and change over time.
-
-From this perspective, anomaly is distance. Similarity is proximity. Change is trajectory.
-
-The system derives these positions directly from observable relational patterns and maintains them as a persistent, population-calibrated coordinate system — enabling analysis, comparison, and navigation without retraining or opaque embeddings.
-
-This approach opens the door to treating complex data systems as navigable spaces rather than queryable records.
-
-Based on a U.S. provisional patent application (2026, USPTO). The scope of protection will be defined by the claims of the subsequent non-provisional application.

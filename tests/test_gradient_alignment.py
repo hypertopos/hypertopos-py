@@ -3,6 +3,7 @@
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
 """Unit tests for the gradient_alignment / drift_direction enrichment on pi9_attract_drift."""
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock

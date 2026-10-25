@@ -10,6 +10,7 @@ import json
 
 import numpy as np
 import pytest
+
 from hypertopos.builder._stats import (
     compute_conformal_p,
     compute_stats_grouped,
@@ -355,16 +356,12 @@ class TestDimensionWeights:
         import lance
 
         norms1 = (
-            lance.dataset(
-                str(tmp_path / "a" / "gds" / "geometry" / "acct_pattern" / "data.lance")
-            )
+            lance.dataset(str(tmp_path / "a" / "gds" / "geometry" / "acct_pattern" / "data.lance"))
             .to_table(columns=["delta_norm"])["delta_norm"]
             .to_numpy()
         )
         norms2 = (
-            lance.dataset(
-                str(tmp_path / "b" / "gds" / "geometry" / "acct_pattern" / "data.lance")
-            )
+            lance.dataset(str(tmp_path / "b" / "gds" / "geometry" / "acct_pattern" / "data.lance"))
             .to_table(columns=["delta_norm"])["delta_norm"]
             .to_numpy()
         )
@@ -398,16 +395,12 @@ class TestDimensionWeights:
         import lance
 
         norms1 = (
-            lance.dataset(
-                str(tmp_path / "a" / "gds" / "geometry" / "acct_pattern" / "data.lance")
-            )
+            lance.dataset(str(tmp_path / "a" / "gds" / "geometry" / "acct_pattern" / "data.lance"))
             .to_table(columns=["delta_norm"])["delta_norm"]
             .to_numpy()
         )
         norms2 = (
-            lance.dataset(
-                str(tmp_path / "b" / "gds" / "geometry" / "acct_pattern" / "data.lance")
-            )
+            lance.dataset(str(tmp_path / "b" / "gds" / "geometry" / "acct_pattern" / "data.lance"))
             .to_table(columns=["delta_norm"])["delta_norm"]
             .to_numpy()
         )
@@ -544,16 +537,12 @@ class TestGMM:
         import lance
 
         norms1 = (
-            lance.dataset(
-                str(tmp_path / "a" / "gds" / "geometry" / "acct_pattern" / "data.lance")
-            )
+            lance.dataset(str(tmp_path / "a" / "gds" / "geometry" / "acct_pattern" / "data.lance"))
             .to_table(columns=["delta_norm"])["delta_norm"]
             .to_numpy()
         )
         norms2 = (
-            lance.dataset(
-                str(tmp_path / "b" / "gds" / "geometry" / "acct_pattern" / "data.lance")
-            )
+            lance.dataset(str(tmp_path / "b" / "gds" / "geometry" / "acct_pattern" / "data.lance"))
             .to_table(columns=["delta_norm"])["delta_norm"]
             .to_numpy()
         )
@@ -607,9 +596,9 @@ class TestIET:
 
         import lance
 
-        geo = lance.dataset(
-            str(tmp_path / "gds" / "geometry" / "p" / "data.lance")
-        ).to_table(columns=["primary_key", "delta_norm"])
+        geo = lance.dataset(str(tmp_path / "gds" / "geometry" / "p" / "data.lance")).to_table(
+            columns=["primary_key", "delta_norm"]
+        )
         assert geo.num_rows == 2
 
     def test_iet_requires_time_col(self):
@@ -660,9 +649,7 @@ class TestMahalanobis:
         import lance
 
         norms = (
-            lance.dataset(
-                str(tmp_path / "gds" / "geometry" / "acct_pattern" / "data.lance")
-            )
+            lance.dataset(str(tmp_path / "gds" / "geometry" / "acct_pattern" / "data.lance"))
             .to_table(columns=["delta_norm"])["delta_norm"]
             .to_numpy()
         )

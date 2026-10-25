@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the cluster d2 cycle — auto-discovery branch on
 find_calibration_influencers + per-influencer temporal impact cache."""
+
 from __future__ import annotations
 
 import json
@@ -11,10 +12,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Synthetic 3-cluster anchor sphere
 # ---------------------------------------------------------------------------
+
 
 def _build_three_cluster_sphere(
     sphere_path: Path,
@@ -36,22 +37,26 @@ def _build_three_cluster_sphere(
         if target.exists():
             shutil.rmtree(target)
 
-    cluster_centers = np.array([
-        [0.0, 0.0],
-        [20.0, 0.0],
-        [0.0, 20.0],
-    ])
+    cluster_centers = np.array(
+        [
+            [0.0, 0.0],
+            [20.0, 0.0],
+            [0.0, 20.0],
+        ]
+    )
 
     entities: list[dict] = []
     for c_idx, center in enumerate(cluster_centers):
         for i in range(n_per_cluster):
             jitter = rng.normal(0.0, 0.5, size=2)
             x, y = center + jitter
-            entities.append({
-                "entity_id": f"C{c_idx}_E{i:03d}",
-                "x_axis": float(x),
-                "y_axis": float(y),
-            })
+            entities.append(
+                {
+                    "entity_id": f"C{c_idx}_E{i:03d}",
+                    "x_axis": float(x),
+                    "y_axis": float(y),
+                }
+            )
 
     b = GDSBuilder("d2_three_cluster", str(sphere_path))
     b.add_line(
@@ -88,7 +93,8 @@ def three_cluster_sphere(tmp_path):
 
 class TestAutoDiscoveryBranch:
     def test_auto_discover_three_cluster_returns_one_per_cluster(
-        self, three_cluster_sphere,
+        self,
+        three_cluster_sphere,
     ):
         """auto_discover=True with auto_k=3 on a 300-entity, 3-cluster
         anchor sphere returns three influencer candidates with distinct
@@ -123,14 +129,14 @@ class TestAutoDiscoveryBranch:
             # 3 clusters should each carry ~100 members.
             sizes = sorted(e.cluster_size for e in report.entries)
             assert sum(sizes) >= 270, (
-                f"Expected ~300 entities partitioned across reps, got "
-                f"{sum(sizes)}"
+                f"Expected ~300 entities partitioned across reps, got {sum(sizes)}"
             )
         finally:
             session.close()
 
     def test_auto_discover_auto_k_two_returns_at_most_two(
-        self, three_cluster_sphere,
+        self,
+        three_cluster_sphere,
     ):
         """auto_k=2 returns at most 2 representatives."""
         from hypertopos.sphere import HyperSphere
@@ -321,16 +327,16 @@ class TestInfluencerHistoryCache:
             / pid
             / f"influencer_{quote(pk, safe='')}.json"
         )
-        assert cache_path.exists(), (
-            f"Expected influencer cache at {cache_path}; got nothing"
-        )
+        assert cache_path.exists(), f"Expected influencer cache at {cache_path}; got nothing"
         blob = json.loads(cache_path.read_text(encoding="utf-8"))
         assert blob["primary_key"] == pk
         assert blob["pattern_id"] == pid
         assert isinstance(blob["entries"], list)
         assert len(blob["entries"]) >= 1
         for record in blob["entries"]:
-            assert {"epoch", "calibrated_at", "mu_impact", "delta_norm_impact"} <= set(record.keys())
+            assert {"epoch", "calibrated_at", "mu_impact", "delta_norm_impact"} <= set(
+                record.keys()
+            )
 
 
 # ---------------------------------------------------------------------------

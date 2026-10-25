@@ -3,6 +3,7 @@
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
 """Tests for per-detector p-value calibration adapters."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -21,11 +22,13 @@ from hypertopos.engine.p_value_calibration import (
 class TestDeltaNormAdapter:
     def test_uses_anomaly_confidence_when_present(self):
         # primary path: p = 1 - anomaly_confidence
-        tbl = pa.table({
-            "primary_key": ["A", "B", "C"],
-            "delta_norm": [1.0, 2.0, 3.0],
-            "anomaly_confidence": [0.1, 0.5, 0.99],
-        })
+        tbl = pa.table(
+            {
+                "primary_key": ["A", "B", "C"],
+                "delta_norm": [1.0, 2.0, 3.0],
+                "anomaly_confidence": [0.1, 0.5, 0.99],
+            }
+        )
         result = detector_p_value_delta_norm(tbl, ["A", "B", "C"])
         assert set(result.keys()) == {"A", "B", "C"}
         assert abs(result["A"] - 0.9) < 1e-6
@@ -37,10 +40,12 @@ class TestDeltaNormAdapter:
 
     def test_falls_back_to_chi2_when_no_anomaly_confidence(self):
         # fallback: 1 - chi2.cdf(delta_norm**2, df=D)
-        tbl = pa.table({
-            "primary_key": ["A", "B"],
-            "delta_norm": [0.5, 5.0],
-        })
+        tbl = pa.table(
+            {
+                "primary_key": ["A", "B"],
+                "delta_norm": [0.5, 5.0],
+            }
+        )
         result = detector_p_value_delta_norm(tbl, ["A", "B"], df=4)
         assert "A" in result and "B" in result
         # high delta_norm => low p-value
@@ -50,11 +55,13 @@ class TestDeltaNormAdapter:
             assert 0.0 < p <= 1.0
 
     def test_handles_null_anomaly_confidence_with_chi2_fallback(self):
-        tbl = pa.table({
-            "primary_key": ["A", "B"],
-            "delta_norm": pa.array([1.0, 4.0], type=pa.float64()),
-            "anomaly_confidence": pa.array([None, 0.99], type=pa.float32()),
-        })
+        tbl = pa.table(
+            {
+                "primary_key": ["A", "B"],
+                "delta_norm": pa.array([1.0, 4.0], type=pa.float64()),
+                "anomaly_confidence": pa.array([None, 0.99], type=pa.float32()),
+            }
+        )
         result = detector_p_value_delta_norm(tbl, ["A", "B"], df=3)
         # B uses 1 - 0.99 = 0.01
         assert abs(result["B"] - 0.01) < 1e-3
@@ -62,41 +69,52 @@ class TestDeltaNormAdapter:
         assert 0.0 < result["A"] <= 1.0
 
     def test_disable_anomaly_confidence_path(self):
-        tbl = pa.table({
-            "primary_key": ["A"],
-            "delta_norm": [2.0],
-            "anomaly_confidence": [0.99],
-        })
+        tbl = pa.table(
+            {
+                "primary_key": ["A"],
+                "delta_norm": [2.0],
+                "anomaly_confidence": [0.99],
+            }
+        )
         result = detector_p_value_delta_norm(
-            tbl, ["A"], use_anomaly_confidence=False, df=2,
+            tbl,
+            ["A"],
+            use_anomaly_confidence=False,
+            df=2,
         )
         # Should not be 0.01; should follow chi2 path with df=2
         assert result["A"] != pytest.approx(0.01)
         assert 0.0 < result["A"] <= 1.0
 
     def test_empty_input(self):
-        tbl = pa.table({
-            "primary_key": pa.array([], type=pa.string()),
-            "delta_norm": pa.array([], type=pa.float64()),
-        })
+        tbl = pa.table(
+            {
+                "primary_key": pa.array([], type=pa.string()),
+                "delta_norm": pa.array([], type=pa.float64()),
+            }
+        )
         result = detector_p_value_delta_norm(tbl, [])
         assert result == {}
 
     def test_filters_to_primary_keys(self):
-        tbl = pa.table({
-            "primary_key": ["A", "B", "C"],
-            "delta_norm": [1.0, 2.0, 3.0],
-            "anomaly_confidence": [0.5, 0.5, 0.5],
-        })
+        tbl = pa.table(
+            {
+                "primary_key": ["A", "B", "C"],
+                "delta_norm": [1.0, 2.0, 3.0],
+                "anomaly_confidence": [0.5, 0.5, 0.5],
+            }
+        )
         result = detector_p_value_delta_norm(tbl, ["A", "C"])
         assert set(result.keys()) == {"A", "C"}
 
     def test_no_nan_or_inf(self):
-        tbl = pa.table({
-            "primary_key": ["A", "B"],
-            "delta_norm": [0.0, 100.0],
-            "anomaly_confidence": [0.0, 1.0],
-        })
+        tbl = pa.table(
+            {
+                "primary_key": ["A", "B"],
+                "delta_norm": [0.0, 100.0],
+                "anomaly_confidence": [0.0, 1.0],
+            }
+        )
         result = detector_p_value_delta_norm(tbl, ["A", "B"])
         for p in result.values():
             assert np.isfinite(p)
@@ -109,7 +127,10 @@ class TestNeighborContaminationAdapter:
         # baseline rate 10%, observed 80% — strong signal => low p
         observations = {"E1": (10, 8)}
         result = detector_p_value_neighbor_contamination(
-            observations, total_population=1000, total_anomalies=100, k=10,
+            observations,
+            total_population=1000,
+            total_anomalies=100,
+            k=10,
         )
         assert "E1" in result
         assert 0.0 < result["E1"] <= 1.0
@@ -119,7 +140,10 @@ class TestNeighborContaminationAdapter:
         # baseline rate 10%, observed 1/10 = 10% — no signal
         observations = {"E1": (10, 1)}
         result = detector_p_value_neighbor_contamination(
-            observations, total_population=1000, total_anomalies=100, k=10,
+            observations,
+            total_population=1000,
+            total_anomalies=100,
+            k=10,
         )
         assert result["E1"] > 0.3
 
@@ -127,7 +151,10 @@ class TestNeighborContaminationAdapter:
         # When observed equals expected, p should be near 0.5
         observations = {f"E{i}": (10, 1) for i in range(20)}
         result = detector_p_value_neighbor_contamination(
-            observations, total_population=1000, total_anomalies=100, k=10,
+            observations,
+            total_population=1000,
+            total_anomalies=100,
+            k=10,
         )
         assert all(0.0 < p <= 1.0 for p in result.values())
         # All identical observations → all identical p
@@ -137,21 +164,30 @@ class TestNeighborContaminationAdapter:
     def test_zero_observed_returns_p_one(self):
         observations = {"E1": (10, 0)}
         result = detector_p_value_neighbor_contamination(
-            observations, total_population=1000, total_anomalies=100, k=10,
+            observations,
+            total_population=1000,
+            total_anomalies=100,
+            k=10,
         )
         # P(X >= 0) = 1
         assert result["E1"] == pytest.approx(1.0)
 
     def test_empty_input(self):
         result = detector_p_value_neighbor_contamination(
-            {}, total_population=1000, total_anomalies=100, k=10,
+            {},
+            total_population=1000,
+            total_anomalies=100,
+            k=10,
         )
         assert result == {}
 
     def test_no_nan_or_inf(self):
         observations = {f"E{i}": (5, i % 6) for i in range(6)}
         result = detector_p_value_neighbor_contamination(
-            observations, total_population=500, total_anomalies=50, k=5,
+            observations,
+            total_population=500,
+            total_anomalies=50,
+            k=5,
         )
         for p in result.values():
             assert np.isfinite(p)
@@ -162,8 +198,12 @@ class TestSegmentShiftAdapter:
     def test_concentrated_segment_anomalies_low_p(self):
         # Segment X has 90/100 anomalies; segment Y has 10/100 — strong concentration
         observations = {
-            "S_X": {"in_segment_anomalous": 90, "in_segment_total": 100,
-                    "out_segment_anomalous": 10, "out_segment_total": 100},
+            "S_X": {
+                "in_segment_anomalous": 90,
+                "in_segment_total": 100,
+                "out_segment_anomalous": 10,
+                "out_segment_total": 100,
+            },
         }
         result = detector_p_value_segment_shift(observations)
         assert "S_X" in result
@@ -173,11 +213,36 @@ class TestSegmentShiftAdapter:
     def test_uniform_segment_high_p(self):
         # Same anomaly rate in both segments
         observations = {
-            "S_X": {"in_segment_anomalous": 10, "in_segment_total": 100,
-                    "out_segment_anomalous": 10, "out_segment_total": 100},
+            "S_X": {
+                "in_segment_anomalous": 10,
+                "in_segment_total": 100,
+                "out_segment_anomalous": 10,
+                "out_segment_total": 100,
+            },
         }
         result = detector_p_value_segment_shift(observations)
         assert result["S_X"] > 0.5
+
+    def test_depleted_segment_is_not_evidence_of_anomaly(self):
+        # Segment has a far LOWER anomaly rate than the rest: its members are
+        # less likely to be anomalous, so the detector must not give them a tiny p.
+        observations = {
+            "S_low": {
+                "in_segment_anomalous": 5,
+                "in_segment_total": 10_000,
+                "out_segment_anomalous": 5_000,
+                "out_segment_total": 100_000,
+            },
+            "S_high": {
+                "in_segment_anomalous": 500,
+                "in_segment_total": 1_000,
+                "out_segment_anomalous": 5_000,
+                "out_segment_total": 100_000,
+            },
+        }
+        result = detector_p_value_segment_shift(observations)
+        assert result["S_low"] > 0.5
+        assert result["S_high"] < 1e-10
 
     def test_empty_input(self):
         assert detector_p_value_segment_shift({}) == {}
@@ -185,16 +250,24 @@ class TestSegmentShiftAdapter:
     def test_zero_marginal_returns_p_one(self):
         # No anomalies at all → p = 1
         observations = {
-            "S_X": {"in_segment_anomalous": 0, "in_segment_total": 50,
-                    "out_segment_anomalous": 0, "out_segment_total": 50},
+            "S_X": {
+                "in_segment_anomalous": 0,
+                "in_segment_total": 50,
+                "out_segment_anomalous": 0,
+                "out_segment_total": 50,
+            },
         }
         result = detector_p_value_segment_shift(observations)
         assert result["S_X"] == pytest.approx(1.0)
 
     def test_no_nan_or_inf(self):
         observations = {
-            f"S{i}": {"in_segment_anomalous": i, "in_segment_total": 50,
-                      "out_segment_anomalous": 1, "out_segment_total": 50}
+            f"S{i}": {
+                "in_segment_anomalous": i,
+                "in_segment_total": 50,
+                "out_segment_anomalous": 1,
+                "out_segment_total": 50,
+            }
             for i in range(0, 10)
         }
         result = detector_p_value_segment_shift(observations)
@@ -250,6 +323,9 @@ class TestTrajectoryContinuousAdapter:
         assert set(result.keys()) == set(scores.keys())
         # Highest score → smallest p; rank-based
         assert result["E"] < result["A"]
+        # p = (n - rank + 1) / (n + 1): extremes are 1/(n+1) and n/(n+1)
+        assert result["E"] == pytest.approx(1 / 6)
+        assert result["A"] == pytest.approx(5 / 6)
         for p in result.values():
             assert 0.0 < p <= 1.0
 

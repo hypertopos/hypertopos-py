@@ -14,6 +14,8 @@ or genuinely novel behavior.
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 
 
@@ -51,7 +53,8 @@ def compute_expected_delta(
             dtype=np.float32,
         )
 
-    return np.mean(neighbor_deltas, axis=0).astype(np.float32)
+    mean_delta: np.ndarray = np.mean(neighbor_deltas, axis=0).astype(np.float32)
+    return mean_delta
 
 
 def compute_novelty_score(
@@ -79,7 +82,7 @@ def compute_novelty_decomposition(
     actual_delta: np.ndarray,
     expected_delta: np.ndarray,
     dimension_names: list[str],
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Per-dimension decomposition sorted by |deviation| descending.
 
     Parameters
@@ -97,13 +100,15 @@ def compute_novelty_decomposition(
         Each entry: ``{dimension, expected, actual, deviation}``.
     """
     deviations = actual_delta - expected_delta
-    result = []
+    result: list[dict[str, Any]] = []
     for i, name in enumerate(dimension_names):
-        result.append({
-            "dimension": name,
-            "expected": round(float(expected_delta[i]), 6),
-            "actual": round(float(actual_delta[i]), 6),
-            "deviation": round(float(deviations[i]), 6),
-        })
+        result.append(
+            {
+                "dimension": name,
+                "expected": round(float(expected_delta[i]), 6),
+                "actual": round(float(actual_delta[i]), 6),
+                "deviation": round(float(deviations[i]), 6),
+            }
+        )
     result.sort(key=lambda r: abs(r["deviation"]), reverse=True)
     return result

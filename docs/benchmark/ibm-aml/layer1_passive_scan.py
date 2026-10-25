@@ -15,6 +15,7 @@ Usage:
     .venv/Scripts/python benchmark/ibm-aml/layer1_passive_scan_v2.py \
         --sphere benchmark/ibm-aml/li_small_sphere/gds_aml_li_small --dataset LI-Small
 """
+
 import argparse
 import sys
 import time
@@ -29,9 +30,7 @@ from hypertopos import HyperSphere
 from hypertopos.navigation.scanner import PassiveScanner
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "ibm-aml"
-DEFAULT_SPHERE = str(
-    Path(__file__).resolve().parent / "hi_small_sphere" / "gds_aml_hi_small"
-)
+DEFAULT_SPHERE = str(Path(__file__).resolve().parent / "hi_small_sphere" / "gds_aml_hi_small")
 
 
 def load_ground_truth(dataset: str):
@@ -72,7 +71,7 @@ def _print_step(label, src, cum_set, gt, prev_tp_count):
     print(
         f"  {label:<32} {len(src):>8,} suspects  "
         f"+{new:<4} TP  cum={tp:<5}  "
-        f"recall={tp/len(gt)*100:.1f}%  FP/TP={fp_per_tp:.1f}"
+        f"recall={tp / len(gt) * 100:.1f}%  FP/TP={fp_per_tp:.1f}"
     )
     return tp
 
@@ -81,9 +80,13 @@ def run_scan(sphere_path: str, dataset: str = "HI-Small"):
     t0 = time.time()
     gt_patterns, gt_full, patterns_by_type = load_ground_truth(dataset)
     name_map = {
-        "Out": "FAN-OUT", "In": "FAN-IN", "CYCLE": "CYCLE",
-        "GATHER": "GATHER", "BIPARTITE": "BIPARTITE",
-        "STACK": "STACK", "RANDOM": "RANDOM",
+        "Out": "FAN-OUT",
+        "In": "FAN-IN",
+        "CYCLE": "CYCLE",
+        "GATHER": "GATHER",
+        "BIPARTITE": "BIPARTITE",
+        "STACK": "STACK",
+        "RANDOM": "RANDOM",
     }
 
     print(f"Dataset: {dataset}")
@@ -104,10 +107,14 @@ def run_scan(sphere_path: str, dataset: str = "HI-Small"):
         # Sources 1-3: geometry (same as v1)
         scanner.add_source("account_pattern", "account_pattern", key_type="direct")
         scanner.add_source(
-            "account_pairs_pattern", "account_pairs_pattern", key_type="composite",
+            "account_pairs_pattern",
+            "account_pairs_pattern",
+            key_type="composite",
         )
         scanner.add_source(
-            "tx_chains_pattern", "tx_chains_pattern", key_type="chain",
+            "tx_chains_pattern",
+            "tx_chains_pattern",
+            key_type="chain",
         )
 
         # Source 4: multi-cur cross-border (points rules — no geometry needed)
@@ -134,12 +141,15 @@ def run_scan(sphere_path: str, dataset: str = "HI-Small"):
 
         # Source 5: borderline
         scanner.add_borderline_source(
-            "borderline", "account_pattern", rank_threshold=80,
+            "borderline",
+            "account_pattern",
+            rank_threshold=80,
         )
 
         # Source 7: structuring — must match v1: total_tx >= 5 AND pct > 0.5
         scanner.add_points_source(
-            "structuring", "accounts",
+            "structuring",
+            "accounts",
             rules={
                 "structuring_pct": (">", 0.5),
                 "tx_out_count": (">=", 5),
@@ -160,12 +170,11 @@ def run_scan(sphere_path: str, dataset: str = "HI-Small"):
         # Stream D: structuring_pct >= 0.5 AND amount_uniformity >= 0.5
         #           AND tx_out_count >= p50 (compute p50 dynamically)
         import pyarrow.compute as pc
+
         pts_table = reader.read_points("accounts", sphere.lines["accounts"].current_version())
         if "tx_out_count" in pts_table.schema.names:
             tx_out_arr = pc.fill_null(pts_table["tx_out_count"], 0)
-            tx_out_p50 = float(
-                pc.quantile(tx_out_arr, q=[0.5])[0].as_py()
-            )
+            tx_out_p50 = float(pc.quantile(tx_out_arr, q=[0.5])[0].as_py())
         else:
             tx_out_p50 = 5.0  # fallback
 
@@ -189,8 +198,7 @@ def run_scan(sphere_path: str, dataset: str = "HI-Small"):
         source_sets: dict[str, set] = {}
         for src_name in scan_result.sources_summary:
             source_sets[src_name] = {
-                h.primary_key for h in scan_result.hits
-                if src_name in h.sources
+                h.primary_key for h in scan_result.hits if src_name in h.sources
             }
 
         # Step-by-step reporting (all 9 sources)
@@ -219,7 +227,9 @@ def run_scan(sphere_path: str, dataset: str = "HI-Small"):
         temporal_dir = Path(sphere_path) / "temporal" / "account_pattern" / "data.lance"
         if temporal_dir.exists():
             import lance
+
             from hypertopos.engine.geometry import GDSEngine
+
             pattern = sphere.patterns["account_pattern"]
             theta_norm = float(np.linalg.norm(pattern.theta))
             _sigma = np.maximum(pattern.sigma_diag, 1e-2)
@@ -230,6 +240,7 @@ def run_scan(sphere_path: str, dataset: str = "HI-Small"):
             for pk, shape in zip(
                 t_table["primary_key"].to_pylist(),
                 t_table["shape_snapshot"].to_pylist(),
+                strict=True,
             ):
                 if pk is None or shape is None:
                     continue
@@ -257,7 +268,7 @@ def run_scan(sphere_path: str, dataset: str = "HI-Small"):
             found = gs & cum
             print(
                 f"{name_map[pt]:<15} {len(gs):>5} {len(found):>6} "
-                f"{len(found)/len(gs)*100:>7.1f}%"
+                f"{len(found) / len(gs) * 100:>7.1f}%"
             )
         print("-" * 38)
 
@@ -271,13 +282,10 @@ def run_scan(sphere_path: str, dataset: str = "HI-Small"):
             fp = cum - gt_set
             fpt = len(fp) / len(tp) if tp else 0
             print(f"\nGT: {gt_name} ({len(gt_set):,} accounts)")
+            print(f"  TP: {len(tp):,}  FP: {len(fp):,}  Suspects: {len(cum):,}")
             print(
-                f"  TP: {len(tp):,}  FP: {len(fp):,}  "
-                f"Suspects: {len(cum):,}"
-            )
-            print(
-                f"  Recall: {len(tp)/len(gt_set)*100:.1f}%  "
-                f"Precision: {len(tp)/len(cum)*100:.2f}%  "
+                f"  Recall: {len(tp) / len(gt_set) * 100:.1f}%  "
+                f"Precision: {len(tp) / len(cum) * 100:.2f}%  "
                 f"FP/TP: {fpt:.1f}"
             )
 
@@ -285,7 +293,8 @@ def run_scan(sphere_path: str, dataset: str = "HI-Small"):
         tx_density: dict[str, float] = {}
         if "tx_pattern" in sphere.patterns:
             tx_geo_anom = reader.read_geometry(
-                "tx_pattern", 1,
+                "tx_pattern",
+                1,
                 columns=["entity_keys", "delta_norm"],
                 filter="is_anomaly = true",
             )
@@ -293,26 +302,25 @@ def run_scan(sphere_path: str, dataset: str = "HI-Small"):
             for ek, dn in zip(
                 tx_geo_anom["entity_keys"].to_pylist(),
                 tx_geo_anom["delta_norm"].to_pylist(),
+                strict=True,
             ):
                 if not ek or dn is None:
                     continue
                 for acct_key in ek:
                     if acct_key:
-                        tx_anom_count[acct_key] = (
-                            tx_anom_count.get(acct_key, 0) + 1
-                        )
+                        tx_anom_count[acct_key] = tx_anom_count.get(acct_key, 0) + 1
 
             tx_geo_all = reader.read_geometry(
-                "tx_pattern", 1, columns=["entity_keys"],
+                "tx_pattern",
+                1,
+                columns=["entity_keys"],
             )
             tx_total_count: dict[str, int] = {}
             for ek in tx_geo_all["entity_keys"].to_pylist():
                 if ek:
                     for acct_key in ek:
                         if acct_key:
-                            tx_total_count[acct_key] = (
-                                tx_total_count.get(acct_key, 0) + 1
-                            )
+                            tx_total_count[acct_key] = tx_total_count.get(acct_key, 0) + 1
 
             for acct, anom in tx_anom_count.items():
                 total = tx_total_count.get(acct, 1)
@@ -325,9 +333,7 @@ def run_scan(sphere_path: str, dataset: str = "HI-Small"):
         all_accounts = set()
         for src in core_sets:
             all_accounts |= src
-        acct_scores = {
-            a: sum(1 for src in core_sets if a in src) for a in all_accounts
-        }
+        acct_scores = {a: sum(1 for src in core_sets if a in src) for a in all_accounts}
         # Stage 1 includes C/D streams too
         all_sources_incl_streams = core_sets + [
             source_sets.get(n, set()) for n, _ in stream_sources
@@ -341,7 +347,8 @@ def run_scan(sphere_path: str, dataset: str = "HI-Small"):
 
         def _stage_report(label, suspects):
             for gt_name, gt_set in [
-                ("Patterns", gt_patterns), ("Full", gt_full),
+                ("Patterns", gt_patterns),
+                ("Full", gt_full),
             ]:
                 if gt_set is None:
                     continue
@@ -350,7 +357,7 @@ def run_scan(sphere_path: str, dataset: str = "HI-Small"):
                 fpt = len(fp) / len(tp) if tp else 0
                 print(
                     f"  {label:<30} {len(suspects):>7,} suspects  "
-                    f"TP={len(tp):>5,}  recall={len(tp)/len(gt_set)*100:.1f}%  "
+                    f"TP={len(tp):>5,}  recall={len(tp) / len(gt_set) * 100:.1f}%  "
                     f"FP/TP={fpt:.1f}  ({gt_name})"
                 )
 
@@ -373,10 +380,7 @@ def run_scan(sphere_path: str, dataset: str = "HI-Small"):
         _stage_report("Stage 3: Investigation", stage3)
 
         # Stage 4: Critical — score >= 3 + density filter >= 0.05
-        stage4 = {
-            a for a, sc in acct_scores.items()
-            if sc >= 3 and tx_density.get(a, 0) >= 0.05
-        }
+        stage4 = {a for a, sc in acct_scores.items() if sc >= 3 and tx_density.get(a, 0) >= 0.05}
         _stage_report("Stage 4: Critical", stage4)
 
         # Score distribution
@@ -391,7 +395,7 @@ def run_scan(sphere_path: str, dataset: str = "HI-Small"):
                 fpt = len(fp) / len(tp) if tp else 0
                 print(
                     f"  score>={min_score}: {len(scored):>7,} suspects  "
-                    f"TP={len(tp):>5,}  recall={len(tp)/len(gt_set)*100:.1f}%  "
+                    f"TP={len(tp):>5,}  recall={len(tp) / len(gt_set) * 100:.1f}%  "
                     f"FP/TP={fpt:.1f}  ({gt_name})"
                 )
 

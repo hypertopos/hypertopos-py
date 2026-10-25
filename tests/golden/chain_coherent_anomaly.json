@@ -1,0 +1,127 @@
+{
+  "anchor_pattern_id": "account_pattern",
+  "chains": [
+    {
+      "chain_id": "CH-001",
+      "max_delta_norm": 55.0454,
+      "run_keys": [
+        "A1",
+        "A2",
+        "A3",
+        "A4"
+      ],
+      "run_length": 4,
+      "run_start_idx": 0,
+      "top_dim": "dim_0"
+    },
+    {
+      "chain_id": "CH-011",
+      "max_delta_norm": 55.0454,
+      "run_keys": [
+        "A1",
+        "A2",
+        "A3",
+        "A4"
+      ],
+      "run_length": 4,
+      "run_start_idx": 0,
+      "top_dim": "dim_0"
+    },
+    {
+      "chain_id": "CH-012",
+      "max_delta_norm": 55.0454,
+      "run_keys": [
+        "A1",
+        "A2",
+        "A3"
+      ],
+      "run_length": 3,
+      "run_start_idx": 1,
+      "top_dim": "dim_0"
+    },
+    {
+      "chain_id": "CH-006",
+      "max_delta_norm": 50.0999,
+      "run_keys": [
+        "A3",
+        "A4",
+        "A1"
+      ],
+      "run_length": 3,
+      "run_start_idx": 0,
+      "top_dim": "dim_0"
+    },
+    {
+      "chain_id": "CH-002",
+      "max_delta_norm": 55.0454,
+      "run_keys": [
+        "A1",
+        "A2"
+      ],
+      "run_length": 2,
+      "run_start_idx": 0,
+      "top_dim": "dim_0"
+    },
+    {
+      "chain_id": "CH-005",
+      "max_delta_norm": 55.0454,
+      "run_keys": [
+        "A1",
+        "A2"
+      ],
+      "run_length": 2,
+      "run_start_idx": 0,
+      "top_dim": "dim_0"
+    },
+    {
+      "chain_id": "CH-009",
+      "max_delta_norm": 55.0454,
+      "run_keys": [
+        "A1",
+        "A2"
+      ],
+      "run_length": 2,
+      "run_start_idx": 0,
+      "top_dim": "dim_0"
+    },
+    {
+      "chain_id": "CH-008",
+      "max_delta_norm": 45.0444,
+      "run_keys": [
+        "A1",
+        "A1"
+      ],
+      "run_length": 2,
+      "run_start_idx": 0,
+      "top_dim": "dim_0"
+    }
+  ],
+  "diagnostics": {
+    "all_coherent_chain_ids": [
+      "CH-001",
+      "CH-002",
+      "CH-005",
+      "CH-006",
+      "CH-008",
+      "CH-009",
+      "CH-011",
+      "CH-012"
+    ],
+    "n_anomaly_entities": 4,
+    "n_chains_total": 12,
+    "n_runs_total_pre_truncation": 8,
+    "run_length_distribution_full": {
+      "max": 4,
+      "mean": 2.75,
+      "min": 2,
+      "p50": 2,
+      "p75": 3,
+      "p90": 4
+    },
+    "top_dim_counts_full": {
+      "dim_0": 8
+    }
+  },
+  "n_results": 8,
+  "pattern_id": "chain_pattern"
+}

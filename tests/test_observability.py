@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pyarrow as pa
 import pytest
+
 from hypertopos.model.manifest import Manifest
 from hypertopos.navigation.navigator import GDSNavigator
 
@@ -1225,9 +1226,7 @@ def _make_event_divergence_sphere(anchor_theta: float = 3.77):
         "anchor_pattern": anchor_pat,
         "event_pattern": event_pat,
     }
-    sphere.entity_line.side_effect = lambda pid: (
-        "customers" if pid == "anchor_pattern" else None
-    )
+    sphere.entity_line.side_effect = lambda pid: "customers" if pid == "anchor_pattern" else None
     return sphere
 
 
@@ -1237,21 +1236,29 @@ def _make_divergence_nav(sphere=None):
     return nav
 
 
-def _make_event_geo(entity_keys_per_row: list[list[str]], is_anomaly_per_row: list[bool]) -> pa.Table:
+def _make_event_geo(
+    entity_keys_per_row: list[list[str]], is_anomaly_per_row: list[bool]
+) -> pa.Table:
     """Build mock event geometry table with entity_keys + is_anomaly columns."""
-    return pa.table({
-        "entity_keys": pa.array(entity_keys_per_row, type=pa.list_(pa.string())),
-        "is_anomaly": pa.array(is_anomaly_per_row, type=pa.bool_()),
-    })
+    return pa.table(
+        {
+            "entity_keys": pa.array(entity_keys_per_row, type=pa.list_(pa.string())),
+            "is_anomaly": pa.array(is_anomaly_per_row, type=pa.bool_()),
+        }
+    )
 
 
-def _make_anchor_geo(keys: list[str], delta_norms: list[float], is_anomalies: list[bool]) -> pa.Table:
+def _make_anchor_geo(
+    keys: list[str], delta_norms: list[float], is_anomalies: list[bool]
+) -> pa.Table:
     """Build mock anchor geometry table."""
-    return pa.table({
-        "primary_key": pa.array(keys, type=pa.string()),
-        "delta_norm": pa.array(delta_norms, type=pa.float32()),
-        "is_anomaly": pa.array(is_anomalies, type=pa.bool_()),
-    })
+    return pa.table(
+        {
+            "primary_key": pa.array(keys, type=pa.string()),
+            "delta_norm": pa.array(delta_norms, type=pa.float32()),
+            "is_anomaly": pa.array(is_anomalies, type=pa.bool_()),
+        }
+    )
 
 
 class TestComputeEventRateDivergence:
@@ -1263,10 +1270,16 @@ class TestComputeEventRateDivergence:
 
     def _setup_geo(self, nav, event_rows, anchor_keys, anchor_norms, anchor_anomalies):
         """Configure read_geometry mock: event geo first call, anchor geo second call."""
-        event_table = _make_event_geo(*zip(*event_rows)) if event_rows else pa.table({
-            "entity_keys": pa.array([], type=pa.list_(pa.string())),
-            "is_anomaly": pa.array([], type=pa.bool_()),
-        })
+        event_table = (
+            _make_event_geo(*zip(*event_rows, strict=True))
+            if event_rows
+            else pa.table(
+                {
+                    "entity_keys": pa.array([], type=pa.list_(pa.string())),
+                    "is_anomaly": pa.array([], type=pa.bool_()),
+                }
+            )
+        )
         anchor_table = _make_anchor_geo(anchor_keys, anchor_norms, anchor_anomalies)
 
         # First call = event geometry (sample_size present), second = anchor geometry (filter)
@@ -1278,14 +1291,26 @@ class TestComputeEventRateDivergence:
         # CUST-001: 3/10 anomalous = 30% rate
         # CUST-002: 1/10 anomalous = 10% rate (below threshold)
         event_rows = [
-            (["CUST-001"], True), (["CUST-001"], True), (["CUST-001"], True),
-            (["CUST-001"], False), (["CUST-001"], False), (["CUST-001"], False),
-            (["CUST-001"], False), (["CUST-001"], False), (["CUST-001"], False),
+            (["CUST-001"], True),
+            (["CUST-001"], True),
+            (["CUST-001"], True),
+            (["CUST-001"], False),
+            (["CUST-001"], False),
+            (["CUST-001"], False),
+            (["CUST-001"], False),
+            (["CUST-001"], False),
+            (["CUST-001"], False),
             (["CUST-001"], False),
             (["CUST-002"], True),
-            (["CUST-002"], False), (["CUST-002"], False), (["CUST-002"], False),
-            (["CUST-002"], False), (["CUST-002"], False), (["CUST-002"], False),
-            (["CUST-002"], False), (["CUST-002"], False), (["CUST-002"], False),
+            (["CUST-002"], False),
+            (["CUST-002"], False),
+            (["CUST-002"], False),
+            (["CUST-002"], False),
+            (["CUST-002"], False),
+            (["CUST-002"], False),
+            (["CUST-002"], False),
+            (["CUST-002"], False),
+            (["CUST-002"], False),
         ]
         self._setup_geo(nav, event_rows, ["CUST-001"], [1.5], [False])
 
@@ -1321,10 +1346,12 @@ class TestComputeEventRateDivergence:
     def test_no_alerts_when_event_geo_empty(self):
         """No alerts when event geometry is empty."""
         nav = _make_divergence_nav()
-        nav._storage.read_geometry.return_value = pa.table({
-            "entity_keys": pa.array([], type=pa.list_(pa.string())),
-            "is_anomaly": pa.array([], type=pa.bool_()),
-        })
+        nav._storage.read_geometry.return_value = pa.table(
+            {
+                "entity_keys": pa.array([], type=pa.list_(pa.string())),
+                "is_anomaly": pa.array([], type=pa.bool_()),
+            }
+        )
 
         assert nav._compute_event_rate_divergence() == []
 
@@ -1333,8 +1360,10 @@ class TestComputeEventRateDivergence:
         nav = _make_divergence_nav()
         # CUST-A: 2/10 = 20%, CUST-B: 5/10 = 50%
         event_rows = (
-            [(["CUST-A"], True)] * 2 + [(["CUST-A"], False)] * 8 +
-            [(["CUST-B"], True)] * 5 + [(["CUST-B"], False)] * 5
+            [(["CUST-A"], True)] * 2
+            + [(["CUST-A"], False)] * 8
+            + [(["CUST-B"], True)] * 5
+            + [(["CUST-B"], False)] * 5
         )
         self._setup_geo(nav, event_rows, ["CUST-A", "CUST-B"], [1.0, 1.0], [False, False])
 

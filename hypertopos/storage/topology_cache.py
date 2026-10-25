@@ -12,31 +12,41 @@ side by side; on a pattern re-calibration the new version writes a fresh
 Two schemas live here: ``ANOMALIES_SCHEMA`` for ``find_topological_anomalies``
 output and ``TRAJECTORY_SCHEMA`` for ``find_topological_trajectory_anomalies``.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
-import lance
 import pyarrow as pa
 
-ANOMALIES_SCHEMA = pa.schema([
-    ("primary_key", pa.string()),
-    ("topo_score", pa.float64()),
-    ("h1_max_persistence", pa.float64()),
-    ("h0_mean_death", pa.float64()),
-    ("n_h1_features", pa.int32()),
-    ("computed_at", pa.timestamp("us", tz="UTC")),
-])
+from hypertopos.storage.writer import _write_lance
 
-TRAJECTORY_SCHEMA = pa.schema([
-    ("primary_key", pa.string()),
-    ("trajectory_topo_score", pa.float64()),
-    ("n_timesteps", pa.int32()),
-    ("h1_total_persistence", pa.float64()),
-    ("dominant_feature_birth", pa.float64()),
-    ("dominant_feature_death", pa.float64()),
-    ("computed_at", pa.timestamp("us", tz="UTC")),
-])
+if TYPE_CHECKING:
+    from hypertopos.storage.reader import GDSReader
+
+ANOMALIES_SCHEMA = pa.schema(
+    [
+        ("primary_key", pa.string()),
+        ("topo_score", pa.float64()),
+        ("h1_max_persistence", pa.float64()),
+        ("h0_mean_death", pa.float64()),
+        ("n_h1_features", pa.int32()),
+        ("computed_at", pa.timestamp("us", tz="UTC")),
+    ]
+)
+
+TRAJECTORY_SCHEMA = pa.schema(
+    [
+        ("primary_key", pa.string()),
+        ("trajectory_topo_score", pa.float64()),
+        ("n_timesteps", pa.int32()),
+        ("h1_total_persistence", pa.float64()),
+        ("dominant_feature_birth", pa.float64()),
+        ("dominant_feature_death", pa.float64()),
+        ("computed_at", pa.timestamp("us", tz="UTC")),
+    ]
+)
 
 
 def cache_path(
@@ -56,7 +66,11 @@ def cache_path(
     (back-compatible ``v={version}.lance``).
     """
     return (
-        sphere_root / "_gds_meta" / "topology_cache" / kind / pattern_id
+        sphere_root
+        / "_gds_meta"
+        / "topology_cache"
+        / kind
+        / pattern_id
         / f"v={version}{params_key}.lance"
     )
 
@@ -75,18 +89,24 @@ def anomalies_params_key(
     return f"_k{k_neighbors}_pca{pca_dim}_s{sample_size}_h{homology_dim}"
 
 
-def read_cache(path: Path) -> pa.Table | None:
-    """Return the cached table, or ``None`` when the file is absent / unreadable."""
+def read_cache(path: Path, reader: GDSReader) -> pa.Table | None:
+    """Return the cached table, or ``None`` when the file is absent / unreadable.
+
+    Deliberately not pinned to the session snapshot: the path already names
+    the session's pattern version and scoring parameters, sessions write the
+    cache themselves, and the content is deterministic for that key — a pin
+    taken at open time would hide the session's own fresh write.
+    """
     if not path.exists():
         return None
     try:
-        return lance.dataset(str(path)).to_table()
+        return reader.dataset(path).to_table()
     except (OSError, ValueError, RuntimeError):
         return None
 
 
-def write_cache(path: Path, rows: list[dict], schema: pa.Schema) -> None:
+def write_cache(path: Path, rows: list[dict[str, Any]], schema: pa.Schema) -> None:
     """Overwrite the cache at ``path`` with ``rows`` (schema-validated)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tbl = pa.Table.from_pylist(rows, schema=schema)
-    lance.write_dataset(tbl, str(path), mode="overwrite")
+    _write_lance(tbl, str(path), mode="overwrite")

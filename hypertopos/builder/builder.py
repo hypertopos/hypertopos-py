@@ -6,10 +6,11 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
 import pyarrow as pa
@@ -22,6 +23,12 @@ from hypertopos.storage._schemas import (  # noqa: F401,E501
 )
 from hypertopos.storage.calibration_history import compute_pattern_schema_hash
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from hypertopos.builder.derived import DerivedDimSpec
+    from hypertopos.cli.schema import LabelAuditConfig
+
 logger = logging.getLogger(__name__)
 
 MIN_FILL_RATE: float = 0.05  # props with lower fill rate excluded from delta
@@ -33,7 +40,7 @@ _INTERNAL_COLUMNS = {"version", "status", "created_at", "changed_at"}
 
 
 def _compute_schema_hash_for_pattern_def(
-    pattern_def,
+    pattern_def: Any,
     *,
     prop_columns: list[str] | None = None,
     dimension_kinds: list[str] | None = None,
@@ -62,9 +69,7 @@ def _compute_schema_hash_for_pattern_def(
     # the resulting payload matches the list-of-strings shape stored in
     # sphere.json that _compute_schema_hash_from_pattern_node sees on read.
     event_dims_raw = getattr(pattern_def, "event_dimensions", None) or []
-    event_dimensions = [
-        getattr(ed, "column", ed) for ed in event_dims_raw
-    ]
+    event_dimensions = [getattr(ed, "column", ed) for ed in event_dims_raw]
     # prop_columns / dimension_kinds: prefer caller-supplied (post-refit)
     # values when given; otherwise fall back to whatever the pattern_def
     # carries (test doubles set these directly). Falling back to an empty
@@ -76,9 +81,7 @@ def _compute_schema_hash_for_pattern_def(
     else:
         prop_columns_final = list(prop_columns)
     if dimension_kinds is None:
-        dimension_kinds_raw = (
-            getattr(pattern_def, "dimension_kinds", None) or []
-        )
+        dimension_kinds_raw = getattr(pattern_def, "dimension_kinds", None) or []
         dimension_kinds_final = list(dimension_kinds_raw)
     else:
         dimension_kinds_final = list(dimension_kinds)
@@ -95,7 +98,7 @@ def _is_textual_or_binary_col(field: pa.Field) -> bool:
     arrow_type = field.type
     if pa.types.is_dictionary(arrow_type):
         arrow_type = arrow_type.value_type
-    return (
+    return bool(
         pa.types.is_string(arrow_type)
         or pa.types.is_large_string(arrow_type)
         or pa.types.is_binary(arrow_type)
@@ -106,10 +109,14 @@ def _is_textual_or_binary_col(field: pa.Field) -> bool:
 
 def _arrow_type_to_str(arrow_type: pa.DataType) -> str:
     _mapping = {
-        pa.string(): "string", pa.large_string(): "string",
-        pa.int32(): "int32", pa.int64(): "int64",
-        pa.float32(): "float32", pa.float64(): "float64",
-        pa.bool_(): "bool", pa.date32(): "date32",
+        pa.string(): "string",
+        pa.large_string(): "string",
+        pa.int32(): "int32",
+        pa.int64(): "int64",
+        pa.float32(): "float32",
+        pa.float64(): "float64",
+        pa.bool_(): "bool",
+        pa.date32(): "date32",
     }
     if arrow_type in _mapping:
         return _mapping[arrow_type]
@@ -186,9 +193,7 @@ def _inject_fdr_hierarchy_columns(
         anchor_vals = anchor_table[col].to_pylist()
         index = {pk: i for i, pk in enumerate(anchor_pk)}
         geom_pk = out["primary_key"].to_pylist()
-        aligned = [
-            anchor_vals[index[pk]] if pk in index else None for pk in geom_pk
-        ]
+        aligned = [anchor_vals[index[pk]] if pk in index else None for pk in geom_pk]
         out = out.append_column(
             col,
             pa.array(aligned, type=anchor_table.schema.field(col).type),
@@ -319,9 +324,7 @@ def _maybe_materialise_temporal_buckets(
         bucket_vals = bucket_table[col_name].to_pylist()
         index = {pk: i for i, pk in enumerate(bucket_pk)}
         geom_pk = out["primary_key"].to_pylist()
-        aligned = [
-            bucket_vals[index[pk]] if pk in index else None for pk in geom_pk
-        ]
+        aligned = [bucket_vals[index[pk]] if pk in index else None for pk in geom_pk]
         out = out.append_column(
             col_name,
             pa.array(aligned, type=bucket_table.schema.field(col_name).type),
@@ -334,18 +337,20 @@ def compute_entity_geometry(
     entity_table: pa.Table,
     mu: np.ndarray,
     sigma: np.ndarray,
-    relations_meta: list[dict],
-    event_dimensions_meta: list[dict] | None = None,
+    relations_meta: list[dict[str, Any]],
+    event_dimensions_meta: list[dict[str, Any]] | None = None,
     dimension_weights: np.ndarray | None = None,
     prop_columns: list[str] | None = None,
     edge_dim_agg_labels: list[str] | None = None,
+    cholesky_inv: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute deltas, norms, and shape vectors for entities using existing pattern stats.
 
     Builds shape vectors from entity_table columns based on relations, event
     dimensions, edge_dim_aggregation, and prop_columns metadata (from
-    sphere.json), then z-scores against the provided mu/sigma to produce delta
-    vectors.
+    sphere.json), then calibrates them in the pattern's saved metric
+    (``cholesky_inv`` when set, else ``sigma`` floored at ``SIGMA_EPSILON``,
+    then ``dimension_weights``) to produce delta vectors.
 
     Block layout matches the full-build concatenation order: relations →
     event_dimensions → edge_dim_aggregations → prop_columns. The aggregated
@@ -376,14 +381,10 @@ def compute_entity_geometry(
     schema_names = set(entity_table.schema.names)
     missing_value_cols: list[str] = []
     if edge_dim_agg_labels:
-        missing_value_cols += [
-            label for label in edge_dim_agg_labels if label not in schema_names
-        ]
+        missing_value_cols += [label for label in edge_dim_agg_labels if label not in schema_names]
     if event_dimensions_meta:
         missing_value_cols += [
-            edim["column"]
-            for edim in event_dimensions_meta
-            if edim["column"] not in schema_names
+            edim["column"] for edim in event_dimensions_meta if edim["column"] not in schema_names
         ]
     if missing_value_cols:
         raise ValueError(
@@ -398,7 +399,8 @@ def compute_entity_geometry(
         )
 
     shape_vectors = np.zeros(
-        (n, D_rel + D_event + D_agg + D_prop), dtype=np.float32,
+        (n, D_rel + D_event + D_agg + D_prop),
+        dtype=np.float32,
     )
 
     for j, rel in enumerate(relations_meta):
@@ -412,9 +414,13 @@ def compute_entity_geometry(
             fk_col_name = rel.get("fk_col")
             if fk_col_name and fk_col_name in entity_table.schema.names:
                 col = entity_table[fk_col_name]
-                count_arr = pc.fill_null(col, 0).to_numpy(
-                    zero_copy_only=False,
-                ).astype(np.float32)
+                count_arr = (
+                    pc.fill_null(col, 0)
+                    .to_numpy(
+                        zero_copy_only=False,
+                    )
+                    .astype(np.float32)
+                )
                 shape_vectors[:, j] = np.clip(count_arr, 0, edge_max) / edge_max
             # If fk_col not found, shape stays 0.0 (dead edge)
         else:
@@ -440,9 +446,13 @@ def compute_entity_geometry(
             em = edim["edge_max"]
             if col_name in entity_table.schema.names:
                 col = entity_table[col_name]
-                raw_arr = pc.fill_null(col, 0).to_numpy(
-                    zero_copy_only=False,
-                ).astype(np.float32)
+                raw_arr = (
+                    pc.fill_null(col, 0)
+                    .to_numpy(
+                        zero_copy_only=False,
+                    )
+                    .astype(np.float32)
+                )
                 if isinstance(em, (int, float)) and em > 0:
                     shape_vectors[:, D_rel + k] = np.clip(raw_arr / em, 0.0, 3.0)
 
@@ -456,9 +466,13 @@ def compute_entity_geometry(
         for k, label in enumerate(edge_dim_agg_labels):
             if label in entity_table.schema.names:
                 col = entity_table[label]
-                shape_vectors[:, D_base + k] = pc.fill_null(col, 0).to_numpy(
-                    zero_copy_only=False,
-                ).astype(np.float32)
+                shape_vectors[:, D_base + k] = (
+                    pc.fill_null(col, 0)
+                    .to_numpy(
+                        zero_copy_only=False,
+                    )
+                    .astype(np.float32)
+                )
             # Missing column → stays 0.0 (no contribution, consistent with
             # absent FK relations above).
 
@@ -468,21 +482,25 @@ def compute_entity_geometry(
         for k, prop in enumerate(prop_columns):
             if prop in entity_table.schema.names:
                 col = entity_table[prop]
-                fill_vec = pc.is_valid(col).to_numpy(
-                    zero_copy_only=False,
-                ).astype(np.float32)
+                fill_vec = (
+                    pc.is_valid(col)
+                    .to_numpy(
+                        zero_copy_only=False,
+                    )
+                    .astype(np.float32)
+                )
                 shape_vectors[:, D_base + k] = fill_vec
 
-    # Z-score against existing mu/sigma
-    sigma_safe = np.maximum(sigma, 1e-9)
-    d = shape_vectors.shape[1]
-    deltas = (
-        (shape_vectors - mu[:d]) / sigma_safe[:d]
-    ).astype(np.float32)
+    # Calibrate against the pattern's saved metric (same maths as the build).
+    from hypertopos.engine.geometry import calibrated_deltas
 
-    # Apply dimension weights if present
-    if dimension_weights is not None:
-        deltas = (deltas * dimension_weights[: deltas.shape[1]]).astype(np.float32)
+    deltas = calibrated_deltas(
+        shape_vectors,
+        mu=np.asarray(mu, dtype=np.float32),
+        sigma_diag=np.asarray(sigma, dtype=np.float32),
+        cholesky_inv=cholesky_inv,
+        dimension_weights=dimension_weights,
+    ).astype(np.float32)
 
     delta_norms = np.sqrt(
         np.einsum("ij,ij->i", deltas, deltas),
@@ -491,7 +509,7 @@ def compute_entity_geometry(
     return deltas, delta_norms, shape_vectors
 
 
-def _edge_dim_aggregation_labels(eda_meta: dict | None) -> list[str]:
+def _edge_dim_aggregation_labels(eda_meta: dict[str, Any] | None) -> list[str]:
     """Reconstruct ``{source_dim}_{aggregate}`` labels in build order from the
     serialized ``edge_dim_aggregations`` sphere.json node.
 
@@ -505,6 +523,7 @@ def _edge_dim_aggregation_labels(eda_meta: dict | None) -> list[str]:
     per_dim = eda_meta.get("aggregates_per_dim")
     if per_dim is None:
         from hypertopos.engine.edge_features import AGGREGATE_NAMES
+
         per_dim = {d: list(AGGREGATE_NAMES) for d in dims}
     labels: list[str] = []
     for d in dims:
@@ -514,16 +533,17 @@ def _edge_dim_aggregation_labels(eda_meta: dict | None) -> list[str]:
 
 
 def _classify_changed_keys(
-    lance_path: str,
+    geometry: Any,
     primary_keys: list[str],
 ) -> tuple[list[str], list[str]]:
     """Classify keys as new (not in geometry) or modified (already exists).
 
-    Returns (new_keys, modified_keys).
+    ``geometry`` is the geometry dataset (or its path). Returns
+    (new_keys, modified_keys).
     """
     import lance
 
-    ds = lance.dataset(lance_path)
+    ds = lance.dataset(geometry) if isinstance(geometry, str) else geometry
     escaped = [k.replace("'", "''") for k in primary_keys]
     in_clause = ", ".join(f"'{k}'" for k in escaped)
     existing_table = ds.to_table(
@@ -551,10 +571,11 @@ class RelationSpec:
 @dataclass
 class EventDimSpec:
     """Continuous dimension for event patterns: reads a value column from entity data."""
-    column: str                      # column name in entity table
-    edge_max: float | str = "auto"   # float = fixed, "auto" = p99
+
+    column: str  # column name in entity table
+    edge_max: float | str = "auto"  # float = fixed, "auto" = p99
     display_name: str | None = None  # label in dim_labels (defaults to column)
-    percentile: float = 99.0         # percentile for auto edge_max
+    percentile: float = 99.0  # percentile for auto edge_max
 
 
 @dataclass
@@ -598,7 +619,7 @@ class _PatternReg:
     # Generalized dimension blocks (g/t/s)
     geo_properties: list[str] | None = None
     metric_properties: list[str] | None = None
-    semantic_dim: dict | None = None  # {"columns": [...], "n_components": int}
+    semantic_dim: dict[str, Any] | None = None  # {"columns": [...], "n_components": int}
     # Per-edge derived dim catalog (event patterns only).
     # ``EdgeDimensionsConfig.dims`` keyed by dim_name → params dict.
     edge_dimensions: Any = None  # EdgeDimensionsConfig | None
@@ -606,13 +627,13 @@ class _PatternReg:
     # Multi-resolution FDR hierarchies (lists of FDRHierarchyLevel /
     # FDRTemporalLevel from hypertopos.model.sphere). Empty defaults mean
     # no behaviour change for patterns that do not opt in.
-    fdr_hierarchy: list = field(default_factory=list)
-    fdr_temporal_hierarchy: list = field(default_factory=list)
+    fdr_hierarchy: list[Any] = field(default_factory=list)
+    fdr_temporal_hierarchy: list[Any] = field(default_factory=list)
     # Declarative conformance rules (M1.7) — list of ConformanceRule from
     # hypertopos.model.sphere. Empty default is the cost-neutral fast path;
     # when populated, the builder evaluates them after points materialization
     # and writes a sidecar Lance dataset of violations.
-    conformance_rules: list = field(default_factory=list)
+    conformance_rules: list[Any] = field(default_factory=list)
 
 
 @dataclass
@@ -637,15 +658,13 @@ class PopulationStats:
     delta_norms: np.ndarray
     delta_rank_pcts: np.ndarray
     conformal_p: np.ndarray
-    fk_arrays: list  # list[pa.ChunkedArray | np.ndarray | None]
+    fk_arrays: list[pa.ChunkedArray | np.ndarray | None]
     prop_columns: list[str]
     excluded_properties: list[str]
-    group_stats_dict: (
-        dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, int]] | None
-    )
+    group_stats_dict: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, int]] | None
     is_anomaly_arr: np.ndarray | None
     dim_weights: np.ndarray | None
-    gmm_components: list | None
+    gmm_components: list[Any] | None
     cholesky_inv: np.ndarray | None
     n_anom_dims: np.ndarray
     bregman_norms: np.ndarray | None = None
@@ -672,6 +691,8 @@ class PopulationStats:
     # concatenation between event_dim_matrix and prop_fill_matrix; empty
     # for patterns without edge_dimensions.
     edge_dim_names: list[str] = field(default_factory=list)
+    # Per-dim |delta| thresholds behind n_anom_dims (P99 of the population).
+    n_anom_dims_thresholds: np.ndarray | None = None
 
 
 @dataclass
@@ -684,11 +705,9 @@ class PatternBuildResult:
     population_size: int
     prop_columns: list[str]
     excluded_properties: list[str]
-    group_stats: (
-        dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, int]] | None
-    )
+    group_stats: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, int]] | None
     dimension_weights: np.ndarray | None
-    gmm_components: list | None
+    gmm_components: list[Any] | None
     cholesky_inv: np.ndarray | None
     dim_percentiles: dict[str, dict[str, float]] | None = None
     dimension_kinds: list[str] | None = None
@@ -701,6 +720,9 @@ class PatternBuildResult:
     # Edge-derived per-event dim names — populated on event patterns with
     # ``edge_dimensions:`` declared, empty otherwise.
     edge_dim_names: list[str] = field(default_factory=list)
+    # Per-dim |delta| thresholds that define n_anomalous_dims; persisted so
+    # incremental updates count anomalous dims against the same thresholds.
+    n_anomalous_dims_thresholds: np.ndarray | None = None
     # Label-aware per-dim calibration (Fisher LDA per-dim moments + global
     # direction). Populated by ``_run_label_aware_calibration`` when the
     # pattern is listed under ``label_audit.patterns`` in sphere.yaml AND
@@ -736,6 +758,21 @@ class IncrementalUpdateResult:
 # ── Temporal helpers (extracted from build_temporal closure) ──────────
 
 
+def _bucket_timestamps_us(min_ts: float, win_secs: float, buckets: np.ndarray) -> np.ndarray:
+    """Bucket start times as int64 UTC microseconds.
+
+    Rounds exactly like ``datetime.fromtimestamp`` (half-even on the
+    fractional second), so both temporal write paths agree to the microsecond.
+    """
+    frac, whole = np.modf(min_ts + buckets.astype(np.int64) * win_secs)
+    micros = np.round(frac * 1e6)
+    carry = micros >= 1e6
+    micros[carry] -= 1e6
+    whole[carry] += 1
+    out: np.ndarray = whole.astype(np.int64) * 1_000_000 + micros.astype(np.int64)
+    return out
+
+
 def _temporal_tensor_to_lance(
     shape_tensor: np.ndarray,
     keys_list: list[str],
@@ -755,71 +792,96 @@ def _temporal_tensor_to_lance(
     flat = shape_tensor[:, non_empty, :].reshape(total, D)
     pk_idx = np.repeat(np.arange(n_ent), n_w)
     bkt_idx = np.tile(non_empty, n_ent)
-    bkt_ts = [
-        datetime.fromtimestamp(min_ts + int(b) * win_secs, tz=UTC)
-        for b in non_empty
-    ]
+    bkt_us = _bucket_timestamps_us(min_ts, win_secs, non_empty)
     pk_c = pa.array([keys_list[i] for i in pk_idx], type=pa.string())
-    ts_c = pa.array(
-        [bkt_ts[i % n_w] for i in range(total)],
-        type=pa.timestamp("us", tz="UTC"),
-    )
+    ts_c = pa.array(np.tile(bkt_us, n_ent), type=pa.timestamp("us", tz="UTC"))
     sc = (
         pa.FixedSizeListArray.from_arrays(
-            pa.array(flat.ravel(), type=pa.float32()), list_size=D,
+            pa.array(flat.ravel(), type=pa.float32()),
+            list_size=D,
         ).cast(pa.list_(pa.float32()))
         if D > 0
         else pa.array([[] for _ in range(total)], type=pa.list_(pa.float32()))
     )
-    tbl = pa.table({
-        "primary_key": pk_c,
-        "slice_index": pa.array(bkt_idx.astype(np.int32), type=pa.int32()),
-        "timestamp": ts_c,
-        "deformation_type": pa.array(["window_snapshot"] * total),
-        "shape_snapshot": sc,
-        "pattern_ver": pa.array(np.full(total, 1, dtype=np.int32)),
-        "changed_property": pa.nulls(total, type=pa.string()),
-        "changed_line_id": pa.nulls(total, type=pa.string()),
-    }, schema=_TEMPORAL_SCHEMA)
+    tbl = pa.table(
+        {
+            "primary_key": pk_c,
+            "slice_index": pa.array(bkt_idx.astype(np.int32), type=pa.int32()),
+            "timestamp": ts_c,
+            "deformation_type": pa.array(["window_snapshot"] * total),
+            "shape_snapshot": sc,
+            "pattern_ver": pa.array(np.full(total, 1, dtype=np.int32)),
+            "changed_property": pa.nulls(total, type=pa.string()),
+            "changed_line_id": pa.nulls(total, type=pa.string()),
+        },
+        schema=_TEMPORAL_SCHEMA,
+    )
     mode = "append" if lance_p.exists() else "create"
     _write_lance(tbl, str(lance_p), mode=mode)
 
 
 def _build_traj_chunk(
-    traj_tables: list,
+    traj_tables: list[Any],
     tensor: np.ndarray,
     pks: list[str],
-    bkt_ts: list,
+    bkt_ts: list[Any],
     mu_a: np.ndarray | None,
     sig_a: np.ndarray | None,
+    chol_a: np.ndarray | None,
+    weights_a: np.ndarray | None,
 ) -> None:
+    from hypertopos.engine.geometry import active_window_trajectories, calibrated_deltas
+
     nt, nb, dt = tensor.shape
     if nt == 0 or nb < 2:
         return
     d2 = dt * 2
-    _s = np.maximum(sig_a, 1e-2) if sig_a is not None else None
-    d = (tensor - mu_a) / _s if mu_a is not None and _s is not None else tensor
-    tv = np.concatenate([d.mean(axis=1), d.std(axis=1)], axis=1).astype(np.float32)
-    disp = np.linalg.norm(d[:, -1, :] - d[:, 0, :], axis=1).astype(np.float32)
-    ts = pa.schema([
-        pa.field("primary_key", pa.string()),
-        pa.field("trajectory_vector", pa.list_(pa.float32(), d2)),
-        pa.field("displacement", pa.float32()),
-        pa.field("num_slices", pa.int32()),
-        pa.field("first_timestamp", pa.timestamp("us", tz="UTC")),
-        pa.field("last_timestamp", pa.timestamp("us", tz="UTC")),
-    ])
+    d = (
+        calibrated_deltas(
+            tensor,
+            mu=mu_a,
+            sigma_diag=sig_a,
+            cholesky_inv=chol_a,
+            dimension_weights=weights_a,
+        )
+        if mu_a is not None and sig_a is not None
+        else tensor
+    )
+    # Only active windows count (the rule drift uses).
+    kept, tv, disp, num_slices, first_w, last_w = active_window_trajectories(tensor, d)
+    if len(kept) == 0:
+        return
+    ts = pa.schema(
+        [
+            pa.field("primary_key", pa.string()),
+            pa.field("trajectory_vector", pa.list_(pa.float32(), d2)),
+            pa.field("displacement", pa.float32()),
+            pa.field("num_slices", pa.int32()),
+            pa.field("first_timestamp", pa.timestamp("us", tz="UTC")),
+            pa.field("last_timestamp", pa.timestamp("us", tz="UTC")),
+        ]
+    )
     tvc = pa.FixedSizeListArray.from_arrays(
-        pa.array(tv.ravel(), type=pa.float32()), list_size=d2,
+        pa.array(tv.ravel(), type=pa.float32()),
+        list_size=d2,
     ).cast(pa.list_(pa.float32(), d2))
-    traj_tables.append(pa.table({
-        "primary_key": pa.array(pks, type=pa.string()),
-        "trajectory_vector": tvc,
-        "displacement": pa.array(disp, type=pa.float32()),
-        "num_slices": pa.array(np.full(nt, nb, dtype=np.int32)),
-        "first_timestamp": pa.array([bkt_ts[0]] * nt, type=pa.timestamp("us", tz="UTC")),
-        "last_timestamp": pa.array([bkt_ts[-1]] * nt, type=pa.timestamp("us", tz="UTC")),
-    }, schema=ts))
+    traj_tables.append(
+        pa.table(
+            {
+                "primary_key": pa.array([pks[i] for i in kept], type=pa.string()),
+                "trajectory_vector": tvc,
+                "displacement": pa.array(disp, type=pa.float32()),
+                "num_slices": pa.array(num_slices.astype(np.int32)),
+                "first_timestamp": pa.array(
+                    [bkt_ts[i] for i in first_w], type=pa.timestamp("us", tz="UTC")
+                ),
+                "last_timestamp": pa.array(
+                    [bkt_ts[i] for i in last_w], type=pa.timestamp("us", tz="UTC")
+                ),
+            },
+            schema=ts,
+        )
+    )
 
 
 class GDSBuilder:
@@ -838,12 +900,12 @@ class GDSBuilder:
         self._description = description
         self._lines: dict[str, _LineReg] = {}
         self._patterns: dict[str, _PatternReg] = {}
-        self._derived_dims: list = []  # DerivedDimSpec list
-        self._composite_lines: list = []  # CompositeLineSpec list
-        self._graph_features: list = []  # GraphFeaturesSpec list
-        self._chain_dims: list = []  # (line_id, feature_name, edge_max) tuples
+        self._derived_dims: list[Any] = []  # DerivedDimSpec list
+        self._composite_lines: list[Any] = []  # CompositeLineSpec list
+        self._graph_features: list[Any] = []  # GraphFeaturesSpec list
+        self._chain_dims: list[tuple[str, str, int]] = []  # (line_id, feature_name, edge_max)
         self._chain_lines: set[str] = set()  # line_ids registered via add_chain_line
-        self._precomputed_dims: list = []  # PrecomputedDimSpec list
+        self._precomputed_dims: list[Any] = []  # PrecomputedDimSpec list
         self._aliases: dict[str, _AliasReg] = {}
         self._no_edges: bool = False  # set by CLI --no-edges
         # Opt-in label-aware calibration plumbing. The CLI sets
@@ -852,7 +914,7 @@ class GDSBuilder:
         # column resolution. Until both are set, the build path
         # short-circuits — no behavior change for unlabeled spheres.
         self._label_aware_calibration: bool = False
-        self._label_audit_block: object | None = None
+        self._label_audit_block: LabelAuditConfig | None = None
         # In-build registry of per-pattern label-aware Fisher LDA direction
         # vectors. Populated by the label-aware calibration hook (driven by
         # ``_label_aware_calibration`` + ``_label_audit_block``) before the
@@ -864,7 +926,7 @@ class GDSBuilder:
         # Per-pattern calibration epoch state populated during build by
         # _write_calibration_epoch_for_pattern. Each thread writes a distinct
         # pattern_id key, so plain assignment is safe under ThreadPoolExecutor.
-        self._calibration_state: dict[str, dict] = {}
+        self._calibration_state: dict[str, dict[str, Any]] = {}
         # Per-pattern edge_dim_aggregations thresholds populated during the
         # population-stats dispatch when the anchor pattern declares
         # `edge_dim_aggregations:`. Keyed by anchor pattern_id, value is the
@@ -898,9 +960,18 @@ class GDSBuilder:
         ``_PatternReg`` + ``PopulationStats`` because at calibration time
         the runtime ``Pattern`` dataclass has not been constructed yet.
         """
-        labels: list[str] = []
-        for r in pat.relations:
-            labels.append(r.display_name if r.display_name else r.line_id)
+        from types import SimpleNamespace
+
+        from hypertopos.model.sphere import relation_dim_labels
+
+        # A relation's sphere.yaml display_name is its role once the sphere is
+        # read back, so label it the same way the runtime pattern will.
+        labels: list[str] = relation_dim_labels(
+            [
+                SimpleNamespace(line_id=r.line_id, display_name=None, role=r.display_name)
+                for r in pat.relations
+            ]
+        )
         for ed in pat.event_dimensions:
             labels.append(ed.display_name or ed.column)
         labels.extend(ps.edge_dim_names)
@@ -953,7 +1024,9 @@ class GDSBuilder:
             logger.warning(
                 "label-aware calibration skipped for pattern %r — "
                 "label_column %r not present on entity line %r",
-                pat.pattern_id, block.label_column, pat.entity_line,
+                pat.pattern_id,
+                block.label_column,
+                pat.entity_line,
             )
             return None
         label_col = entity_table[block.label_column]
@@ -973,7 +1046,10 @@ class GDSBuilder:
                 "label-aware calibration skipped for pattern %r — "
                 "could not compare label_column %r against positive "
                 "value %r: %s",
-                pat.pattern_id, block.label_column, pos_value, exc,
+                pat.pattern_id,
+                block.label_column,
+                pos_value,
+                exc,
             )
             return None
         labels = np.where(mask, 1, 0).astype(np.int32)
@@ -981,14 +1057,17 @@ class GDSBuilder:
             logger.warning(
                 "label-aware calibration skipped for pattern %r — "
                 "label vector length %d != delta row count %d",
-                pat.pattern_id, labels.shape[0], deltas.shape[0],
+                pat.pattern_id,
+                labels.shape[0],
+                deltas.shape[0],
             )
             return None
         if labels.sum() == 0 or labels.sum() == labels.shape[0]:
             logger.warning(
                 "label-aware calibration skipped for pattern %r — "
                 "only one class present in label_column %r",
-                pat.pattern_id, block.label_column,
+                pat.pattern_id,
+                block.label_column,
             )
             return None
 
@@ -997,7 +1076,9 @@ class GDSBuilder:
             logger.warning(
                 "label-aware calibration skipped for pattern %r — "
                 "dim_label count %d != delta column count %d",
-                pat.pattern_id, len(dim_labels), deltas.shape[1],
+                pat.pattern_id,
+                len(dim_labels),
+                deltas.shape[1],
             )
             return None
 
@@ -1014,12 +1095,14 @@ class GDSBuilder:
         except (ValueError, np.linalg.LinAlgError) as exc:
             logger.warning(
                 "label-aware calibration failed for pattern %r — %s",
-                pat.pattern_id, exc,
+                pat.pattern_id,
+                exc,
             )
             return None
 
         direction_vec = np.asarray(
-            result.signed_direction_vector, dtype=np.float32,
+            result.signed_direction_vector,
+            dtype=np.float32,
         )
         self._label_aware_directions[pat.pattern_id] = direction_vec
         return {
@@ -1062,9 +1145,7 @@ class GDSBuilder:
         now = datetime.now(UTC)
         ts_type = pa.timestamp("us", tz="UTC")
         if n > 0:
-            now_arr = pa.array([now], type=ts_type).take(
-                pa.array(np.zeros(n, dtype=np.int32))
-            )
+            now_arr = pa.array([now], type=ts_type).take(pa.array(np.zeros(n, dtype=np.int32)))
         else:
             now_arr = pa.array([], type=ts_type)
         if "version" not in table.schema.names:
@@ -1104,13 +1185,13 @@ class GDSBuilder:
         edge_table: EdgeTableConfig | None = None,
         geo_properties: list[str] | None = None,
         metric_properties: list[str] | None = None,
-        semantic_dim: dict | None = None,
+        semantic_dim: dict[str, Any] | None = None,
         bootstrap_iterations: int = 200,
         edge_dimensions: Any = None,
         edge_dim_aggregations: Any = None,
-        fdr_hierarchy: list | None = None,
-        fdr_temporal_hierarchy: list | None = None,
-        conformance_rules: list | None = None,
+        fdr_hierarchy: list[Any] | None = None,
+        fdr_temporal_hierarchy: list[Any] | None = None,
+        conformance_rules: list[Any] | None = None,
     ) -> GDSBuilder:
         _VALID_DW = ("auto", "kurtosis", "uniform")
         if isinstance(dimension_weights, str) and dimension_weights not in _VALID_DW:
@@ -1118,6 +1199,10 @@ class GDSBuilder:
                 f"Pattern '{pattern_id}': dimension_weights='{dimension_weights}' "
                 f"is not valid. Expected one of {_VALID_DW}, an explicit list, or None."
             )
+        if use_mahalanobis and isinstance(dimension_weights, list):
+            from hypertopos.builder._stats import validate_mahalanobis_weights
+
+            validate_mahalanobis_weights(pattern_id, dimension_weights)
         self._patterns[pattern_id] = _PatternReg(
             pattern_id=pattern_id,
             pattern_type=pattern_type,
@@ -1158,21 +1243,21 @@ class GDSBuilder:
         amounts, quantities, etc.
         """
         if pattern_id not in self._patterns:
-            raise ValueError(
-                f"Pattern '{pattern_id}' not registered — call add_pattern() first"
-            )
+            raise ValueError(f"Pattern '{pattern_id}' not registered — call add_pattern() first")
         pat = self._patterns[pattern_id]
         if pat.pattern_type != "event":
             raise ValueError(
                 f"add_event_dimension only applies to event patterns, "
                 f"'{pattern_id}' is '{pat.pattern_type}'"
             )
-        pat.event_dimensions.append(EventDimSpec(
-            column=column,
-            edge_max=edge_max,
-            display_name=display_name,
-            percentile=percentile,
-        ))
+        pat.event_dimensions.append(
+            EventDimSpec(
+                column=column,
+                edge_max=edge_max,
+                display_name=display_name,
+                percentile=percentile,
+            )
+        )
         return self
 
     def add_derived_dimension(
@@ -1214,25 +1299,25 @@ class GDSBuilder:
                 f"(only 'count' and 'iet_*' allow metric_col=None)"
             )
         if isinstance(edge_max, str) and edge_max != "auto":
-            raise ValueError(
-                f"edge_max must be int or 'auto', got '{edge_max}'"
-            )
+            raise ValueError(f"edge_max must be int or 'auto', got '{edge_max}'")
 
         from hypertopos.builder.derived import DerivedDimSpec
 
-        self._derived_dims.append(DerivedDimSpec(
-            anchor_line=anchor_line,
-            event_line=event_line,
-            anchor_fk=anchor_fk,
-            metric=metric,
-            metric_col=metric_col,
-            dimension_name=dimension_name,
-            edge_max=edge_max,
-            percentile=percentile,
-            time_col=time_col,
-            time_window=time_window,
-            window_aggregation=window_aggregation,
-        ))
+        self._derived_dims.append(
+            DerivedDimSpec(
+                anchor_line=anchor_line,
+                event_line=event_line,
+                anchor_fk=anchor_fk,
+                metric=metric,  # type: ignore[arg-type]  # free-form str, rejected downstream if unknown
+                metric_col=metric_col,
+                dimension_name=dimension_name,
+                edge_max=edge_max,
+                percentile=percentile,
+                time_col=time_col,
+                time_window=time_window,
+                window_aggregation=window_aggregation,
+            )
+        )
         return self
 
     def add_composite_line(
@@ -1255,12 +1340,14 @@ class GDSBuilder:
         """
         from hypertopos.builder.derived import CompositeLineSpec
 
-        self._composite_lines.append(CompositeLineSpec(
-            line_id=line_id,
-            event_line=event_line,
-            key_cols=key_cols,
-            separator=separator,
-        ))
+        self._composite_lines.append(
+            CompositeLineSpec(
+                line_id=line_id,
+                event_line=event_line,
+                key_cols=key_cols,
+                separator=separator,
+            )
+        )
         return self
 
     def add_precomputed_dimension(
@@ -1286,17 +1373,20 @@ class GDSBuilder:
             dimension_name: Column name on the entity table.
             edge_max: int = fixed cap, "auto" = p{percentile} of column values.
             percentile: Percentile for auto edge_max (default 99.0).
-            display_name: Label in dim_labels (defaults to dimension_name).
+            display_name: Relation name (role); labels the dim only when the
+                pattern relates to the same line more than once.
         """
         from hypertopos.builder.derived import PrecomputedDimSpec
 
-        self._precomputed_dims.append(PrecomputedDimSpec(
-            anchor_line=anchor_line,
-            dimension_name=dimension_name,
-            edge_max=edge_max,
-            percentile=percentile,
-            display_name=display_name,
-        ))
+        self._precomputed_dims.append(
+            PrecomputedDimSpec(
+                anchor_line=anchor_line,
+                dimension_name=dimension_name,
+                edge_max=edge_max,
+                percentile=percentile,
+                display_name=display_name,
+            )
+        )
         return self
 
     def add_graph_features(
@@ -1321,19 +1411,22 @@ class GDSBuilder:
         """
         from hypertopos.builder.derived import GraphFeaturesSpec
 
-        self._graph_features.append(GraphFeaturesSpec(
-            anchor_line=anchor_line,
-            event_line=event_line,
-            from_col=from_col,
-            to_col=to_col,
-            features=features or ["in_degree", "out_degree", "reciprocity", "counterpart_overlap"],
-        ))
+        self._graph_features.append(
+            GraphFeaturesSpec(
+                anchor_line=anchor_line,
+                event_line=event_line,
+                from_col=from_col,
+                to_col=to_col,
+                features=features
+                or ["in_degree", "out_degree", "reciprocity", "counterpart_overlap"],
+            )
+        )
         return self
 
     def add_chain_line(
         self,
         line_id: str,
-        chains: list[dict],
+        chains: list[dict[str, Any]],
         features: list[str] | None = None,
     ) -> GDSBuilder:
         """Create an anchor line from extracted chains.
@@ -1354,17 +1447,22 @@ class GDSBuilder:
         """
         if features is None:
             features = [
-                "hop_count", "is_cyclic", "n_distinct_categories",
-                "amount_decay", "cross_bank_count",
+                "hop_count",
+                "is_cyclic",
+                "n_distinct_categories",
+                "amount_decay",
+                "cross_bank_count",
                 "amount_monotone_decreasing",
             ]
 
         if not chains:
             # Empty chains → empty line
-            cols: dict[str, list] = {"primary_key": []}
+            cols: dict[str, list[Any]] = {"primary_key": []}
             for f in features:
                 cols[f] = []
-            self.add_line(line_id, pa.table(cols), key_col="primary_key", source_id=line_id, role="anchor")
+            self.add_line(
+                line_id, pa.table(cols), key_col="primary_key", source_id=line_id, role="anchor"
+            )
             self._chain_lines.add(line_id)
             return self
 
@@ -1381,7 +1479,7 @@ class GDSBuilder:
             )
 
         # Build table columns AND collect arrays for edge_max in one pass
-        cols: dict[str, list] = {"primary_key": [c["chain_id"] for c in chains]}
+        cols = {"primary_key": [c["chain_id"] for c in chains]}
         feature_arrays: dict[str, np.ndarray] = {}
 
         for f in features:
@@ -1406,14 +1504,19 @@ class GDSBuilder:
 
         # Auto-create derived dims using pre-computed arrays (no second loop over chains)
         for f in features:
-            vals = feature_arrays[f]
-            nonzero = vals[vals > 0]
+            feat_vals = feature_arrays[f]
+            nonzero = feat_vals[feat_vals > 0]
             em = max(1, int(np.percentile(nonzero, 99))) if len(nonzero) > 0 else 1
 
             dim_line_id = f"_d_chain_{f}"
             if dim_line_id not in self._lines:
-                self.add_line(dim_line_id, pa.table({"primary_key": ["_dummy"]}),
-                              key_col="primary_key", source_id=dim_line_id, role="anchor")
+                self.add_line(
+                    dim_line_id,
+                    pa.table({"primary_key": ["_dummy"]}),
+                    key_col="primary_key",
+                    source_id=dim_line_id,
+                    role="anchor",
+                )
 
             # Store in _chain_dims for pattern resolution
             self._chain_dims.append((line_id, f, em))
@@ -1453,20 +1556,18 @@ class GDSBuilder:
             alias_id=alias_id,
             base_pattern_id=base_pattern_id,
             cutting_plane_normal=cutting_plane_normal,
-            cutting_plane_bias=(
-                cutting_plane_bias if cutting_plane_bias is not None else 0.0
-            ),
+            cutting_plane_bias=(cutting_plane_bias if cutting_plane_bias is not None else 0.0),
             cutting_plane_dimension=cutting_plane_dimension,
             cutting_plane_threshold=(
-                cutting_plane_threshold
-                if cutting_plane_threshold is not None else 0.0
+                cutting_plane_threshold if cutting_plane_threshold is not None else 0.0
             ),
             description=description,
         )
         return self
 
     def _compute_population_stats(
-        self, pat: _PatternReg,
+        self,
+        pat: _PatternReg,
     ) -> PopulationStats:
         """Compute shape vectors and population statistics for a pattern."""
         # Dimension-order guard. The geometry concat below places edge_dimensions
@@ -1482,8 +1583,7 @@ class GDSBuilder:
         # the geometry. Unifying the order behind one source of truth is a 0.9.0
         # task.
         if pat.tracked_properties and (
-            pat.edge_dimensions is not None
-            or pat.edge_dim_aggregations is not None
+            pat.edge_dimensions is not None or pat.edge_dim_aggregations is not None
         ):
             raise ValueError(
                 f"pattern {pat.pattern_id!r} declares tracked_properties together "
@@ -1493,7 +1593,11 @@ class GDSBuilder:
                 f"combination is not yet supported — declare one block type per "
                 f"pattern, or split into separate patterns."
             )
-        from hypertopos.builder._stats import compute_conformal_p, compute_stats
+        from hypertopos.builder._stats import (
+            compute_conformal_p,
+            compute_stats,
+            population_left_ranks,
+        )
 
         entity_line = self._lines[pat.entity_line]
         entity_table = entity_line.table
@@ -1510,9 +1614,7 @@ class GDSBuilder:
                 fk_arrays.append(None)
             elif rel.edge_max is not None:
                 col = entity_table[rel.fk_col]
-                count_arr = pc.fill_null(col, 0).to_numpy(
-                    zero_copy_only=False
-                ).astype(np.float32)
+                count_arr = pc.fill_null(col, 0).to_numpy(zero_copy_only=False).astype(np.float32)
                 shape_vectors[:, j] = np.clip(count_arr, 0, rel.edge_max) / rel.edge_max
                 fk_arrays.append(count_arr)
             else:
@@ -1525,9 +1627,7 @@ class GDSBuilder:
                     ),
                     False,
                 )
-                shape_vectors[:, j] = valid_mask.to_numpy(
-                    zero_copy_only=False
-                ).astype(np.float32)
+                shape_vectors[:, j] = valid_mask.to_numpy(zero_copy_only=False).astype(np.float32)
 
         # 1a. Build edge-derived dimension values (event patterns only).
         # Computed at edge-table emission time, baked into shape vector AND
@@ -1556,11 +1656,7 @@ class GDSBuilder:
             # Resolve dormant_seconds: "auto" → sphere temporal span.
             dims_cfg = dict(pat.edge_dimensions.dims)
             tsl = dims_cfg.get("time_since_pair_last_edge")
-            if (
-                tsl is not None
-                and isinstance(tsl, dict)
-                and tsl.get("dormant_seconds") == "auto"
-            ):
+            if tsl is not None and isinstance(tsl, dict) and tsl.get("dormant_seconds") == "auto":
                 if edges_tbl.num_rows > 0:
                     ts = edges_tbl["timestamp"].to_numpy()
                     span = float(ts.max() - ts.min())
@@ -1568,62 +1664,54 @@ class GDSBuilder:
                 else:
                     span = 1.0
                 dims_cfg["time_since_pair_last_edge"] = {
-                    **tsl, "dormant_seconds": span,
+                    **tsl,
+                    "dormant_seconds": span,
                 }
 
             features = compute_all_edge_dims(edges_tbl, dims_cfg)
-            edge_dim_names = [
-                c for c in features.column_names if c != "event_key"
-            ]
+            edge_dim_names = [c for c in features.column_names if c != "event_key"]
             if edge_dim_names and edges_tbl.num_rows > 0:
                 # Map per-event values to per-entity rows. For event patterns
                 # entity.primary_key == edge.event_key 1:1.
-                pk_to_idx = {
-                    pk: i
-                    for i, pk in enumerate(
-                        entity_table["primary_key"].to_pylist(),
-                    )
-                }
+                from hypertopos.builder._scatter import scatter_columns
+
                 edge_dim_matrix = np.zeros(
-                    (n, len(edge_dim_names)), dtype=np.float32,
+                    (n, len(edge_dim_names)),
+                    dtype=np.float32,
                 )
-                event_keys = features["event_key"].to_pylist()
-                for col_idx, name in enumerate(edge_dim_names):
-                    vals = features[name].to_numpy()
-                    for row_idx, ek in enumerate(event_keys):
-                        ent_idx = pk_to_idx.get(ek)
-                        if ent_idx is not None:
-                            edge_dim_matrix[ent_idx, col_idx] = vals[row_idx]
+                scatter_columns(
+                    edge_dim_matrix,
+                    entity_table["primary_key"].combine_chunks(),
+                    features["event_key"],
+                    [features[name] for name in edge_dim_names],
+                )
             elif edge_dim_names:
                 edge_dim_matrix = np.zeros(
-                    (n, len(edge_dim_names)), dtype=np.float32,
+                    (n, len(edge_dim_names)),
+                    dtype=np.float32,
                 )
 
             # Persist sidecar Lance — forward-compat for the planned
             # HopPredicate.edge_dim_predicates query API.
             if edge_dim_names:
-                try:
-                    import lance
+                from hypertopos.storage.writer import _write_lance
 
-                    sidecar_dir = (
-                        self.output_path
-                        / "_gds_meta" / "edge_features" / pat.pattern_id
-                    )
+                # Anchor patterns' edge_dim_aggregations read this sidecar later in
+                # the build: a failed write must stop the build here, at its cause.
+                sidecar_dir = self.output_path / "_gds_meta" / "edge_features" / pat.pattern_id
+                try:
                     sidecar_dir.mkdir(parents=True, exist_ok=True)
-                    lance.write_dataset(
-                        features,
-                        str(sidecar_dir / "data.lance"),
-                        mode="overwrite",
-                    )
+                    _write_lance(features, str(sidecar_dir / "data.lance"), mode="overwrite")
                 except Exception as exc:
-                    logger.warning(
-                        "edge_features sidecar write failed for %s: %s",
-                        pat.pattern_id, exc,
-                    )
+                    raise RuntimeError(
+                        f"edge_features sidecar write failed for {pat.pattern_id!r} "
+                        f"at {sidecar_dir}: {exc}"
+                    ) from exc
 
         # Stash kinds for downstream concatenation step (3.2).
         if edge_dim_names:
             from hypertopos.engine.edge_features import EDGE_DIM_KINDS
+
             edge_dim_kinds = [EDGE_DIM_KINDS[name] for name in edge_dim_names]
         else:
             edge_dim_kinds = []
@@ -1632,12 +1720,8 @@ class GDSBuilder:
         edge_dim_agg_matrix = np.empty((n, 0), dtype=np.float32)
         edge_dim_agg_kinds: list[str] = []
         edge_dim_agg_labels: list[str] = []
-        if (
-            pat.edge_dim_aggregations is not None
-            and pat.pattern_type == "anchor"
-        ):
+        if pat.edge_dim_aggregations is not None and pat.pattern_type == "anchor":
             from hypertopos.engine.edge_features import (
-                AGGREGATE_NAMES,
                 EDGE_DIM_KINDS,
                 aggregate_edge_dims_for_anchor,
                 aggregate_kind,
@@ -1658,8 +1742,11 @@ class GDSBuilder:
                     f"declare edge_table on that event pattern",
                 )
             sidecar_path = (
-                self.output_path / "_gds_meta" / "edge_features"
-                / cfg.from_event_pattern / "data.lance"
+                self.output_path
+                / "_gds_meta"
+                / "edge_features"
+                / cfg.from_event_pattern
+                / "data.lance"
             )
             if not sidecar_path.exists():
                 raise ValueError(
@@ -1669,6 +1756,7 @@ class GDSBuilder:
                     f"anchor pattern in YAML so it is built first",
                 )
             import lance
+
             sidecar_tbl = lance.dataset(str(sidecar_path)).to_table()
             avail = [c for c in sidecar_tbl.column_names if c != "event_key"]
             agg_dims = list(cfg.dims) if cfg.dims is not None else avail
@@ -1676,8 +1764,7 @@ class GDSBuilder:
 
             src_lines = {r.line_id for r in src_pat.relations}
             composite_match = next(
-                (cs for cs in self._composite_lines
-                 if cs.line_id == pat.entity_line),
+                (cs for cs in self._composite_lines if cs.line_id == pat.entity_line),
                 None,
             )
             chain_events_col: list[str] | None = None
@@ -1738,10 +1825,10 @@ class GDSBuilder:
                 )
 
             primary_keys = entity_table["primary_key"].to_pylist()
-            edge_dim_thresholds_resolved = (
-                self._resolve_and_persist_edge_dim_thresholds(
-                    pat.pattern_id, sidecar_tbl, agg_dims,
-                )
+            edge_dim_thresholds_resolved = self._resolve_and_persist_edge_dim_thresholds(
+                pat.pattern_id,
+                sidecar_tbl,
+                agg_dims,
             )
             aggregates_per_dim = cfg.aggregates_per_dim
             extra = aggregate_edge_dims_for_anchor(
@@ -1763,9 +1850,7 @@ class GDSBuilder:
             for d in agg_dims:
                 src_kind = EDGE_DIM_KINDS[d]
                 for agg in aggregates_per_dim[d]:
-                    edge_dim_agg_matrix[:, col_idx] = (
-                        extra[f"{d}_{agg}"].to_numpy()
-                    )
+                    edge_dim_agg_matrix[:, col_idx] = extra[f"{d}_{agg}"].to_numpy()
                     edge_dim_agg_kinds.append(aggregate_kind(src_kind, agg))
                     edge_dim_agg_labels.append(f"{d}_{agg}")
                     col_idx += 1
@@ -1773,26 +1858,21 @@ class GDSBuilder:
         # 1b. Build event dimension values
         event_dim_matrix = np.empty((n, 0), dtype=np.float32)
         if pat.event_dimensions:
-            event_dim_matrix = np.zeros(
-                (n, len(pat.event_dimensions)), dtype=np.float32
-            )
+            event_dim_matrix = np.zeros((n, len(pat.event_dimensions)), dtype=np.float32)
             for k, edim in enumerate(pat.event_dimensions):
                 col = entity_table[edim.column]
-                raw_arr = pc.fill_null(col, 0).to_numpy(
-                    zero_copy_only=False
-                ).astype(np.float32)
-                em = edim.edge_max
+                raw_arr = pc.fill_null(col, 0).to_numpy(zero_copy_only=False).astype(np.float32)
+                em: int | float | str | None = edim.edge_max
                 if em is None or em == "auto":
                     positive = raw_arr[raw_arr > 0]
                     computed = (
                         float(np.percentile(positive, edim.percentile))
-                        if len(positive) > 0 else 1.0
+                        if len(positive) > 0
+                        else 1.0
                     )
                     em = max(computed, 1e-9)
                     edim.edge_max = em  # store computed value for sphere.json
-                event_dim_matrix[:, k] = np.clip(
-                    raw_arr / em, 0.0, 3.0
-                )
+                event_dim_matrix[:, k] = np.clip(raw_arr / em, 0.0, 3.0)
 
         # 2. Property fill calibration (skip for event patterns)
         prop_columns: list[str] = []
@@ -1809,9 +1889,7 @@ class GDSBuilder:
                     fill_rates.append(0.0)
                     continue
                 col = entity_table[prop]
-                fill_vec = pc.is_valid(col).to_numpy(
-                    zero_copy_only=False
-                ).astype(np.float32)
+                fill_vec = pc.is_valid(col).to_numpy(zero_copy_only=False).astype(np.float32)
                 candidate_fill[:, j] = fill_vec
                 fill_rates.append(float(fill_vec.mean()))
 
@@ -1820,7 +1898,8 @@ class GDSBuilder:
                     excluded_properties.append(prop)
                     logger.info(
                         "Excluding '%s': fill_rate=%.3f < MIN_FILL_RATE",
-                        prop, fill_rates[j],
+                        prop,
+                        fill_rates[j],
                     )
                 elif fill_rates[j] >= MAX_FILL_RATE and not _is_textual_or_binary_col(
                     entity_table.schema.field(prop)
@@ -1828,15 +1907,14 @@ class GDSBuilder:
                     excluded_properties.append(prop)
                     logger.info(
                         "Excluding '%s': fill_rate=%.3f >= MAX_FILL_RATE (zero-variance)",
-                        prop, fill_rates[j],
+                        prop,
+                        fill_rates[j],
                     )
                 else:
                     prop_columns.append(prop)
 
             if prop_columns:
-                included_indices = [
-                    j for j, prop in enumerate(tracked) if prop in prop_columns
-                ]
+                included_indices = [j for j, prop in enumerate(tracked) if prop in prop_columns]
                 prop_fill_matrix = candidate_fill[:, included_indices]
 
         # 2c. Build generalized dimension blocks (g/t/s)
@@ -1863,9 +1941,11 @@ class GDSBuilder:
                     )
                 col = entity_table[col_name]
                 geo_cols.append(
-                    pc.fill_null(col, 0).to_numpy(
+                    pc.fill_null(col, 0)
+                    .to_numpy(
                         zero_copy_only=False,
-                    ).astype(np.float32)
+                    )
+                    .astype(np.float32)
                 )
             geo_raw = np.column_stack(geo_cols)
             geo_norm, geo_mu, geo_sigma = normalize_geo_block(geo_raw)
@@ -1889,9 +1969,11 @@ class GDSBuilder:
                     )
                 col = entity_table[col_name]
                 metric_cols.append(
-                    pc.fill_null(col, 0).to_numpy(
+                    pc.fill_null(col, 0)
+                    .to_numpy(
                         zero_copy_only=False,
-                    ).astype(np.float32)
+                    )
+                    .astype(np.float32)
                 )
             metric_raw = np.column_stack(metric_cols)
             metric_norm, metric_mu, metric_sigma = normalize_metric_block(
@@ -1919,13 +2001,16 @@ class GDSBuilder:
                     )
                 col = entity_table[col_name]
                 sem_raw_cols.append(
-                    pc.fill_null(col, 0).to_numpy(
+                    pc.fill_null(col, 0)
+                    .to_numpy(
                         zero_copy_only=False,
-                    ).astype(np.float32)
+                    )
+                    .astype(np.float32)
                 )
             sem_raw = np.column_stack(sem_raw_cols)
             sem_norm, sem_mu, sem_sigma, sem_pca = normalize_semantic_block(
-                sem_raw, n_components=sem_n_comp,
+                sem_raw,
+                n_components=sem_n_comp,
             )
             dim_block_matrices.append(sem_norm)
             actual_n_comp = sem_norm.shape[1]
@@ -1950,21 +2035,14 @@ class GDSBuilder:
             parts.append(prop_fill_matrix)
         for blk in dim_block_matrices:
             parts.append(blk)
-        full_shape_vectors = (
-            np.concatenate(parts, axis=1) if len(parts) > 1
-            else shape_vectors
-        )
+        full_shape_vectors = np.concatenate(parts, axis=1) if len(parts) > 1 else shape_vectors
 
         # 3.2 Auto-detect Bregman dimension kinds
-        from hypertopos.builder._bregman import (
-            detect_kinds_for_pattern,
-            format_kinds_summary,
-        )
-
         # Gather dimension kinds — one per dimension in delta vector order:
         # [relations (incl. _d_* derived/precomputed)] → [event_dims] → [prop_fill] → [dim_blocks]
         from hypertopos.builder._bregman import (
             detect_kind_for_column,
+            format_kinds_summary,
         )
 
         # Build lookup: dimension_name → metric for derived dims
@@ -2000,7 +2078,7 @@ class GDSBuilder:
                 em = rel.edge_max
                 if isinstance(em, (int, float)) and int(em) == 1:
                     dimension_kinds.append("bernoulli")
-                elif em is not None and em != "auto":
+                elif em is not None:
                     dimension_kinds.append("poisson")
                 else:
                     dimension_kinds.append("bernoulli")
@@ -2034,13 +2112,17 @@ class GDSBuilder:
             logger.warning(
                 "Bregman kind count (%d) != shape dim count (%d) for %s — "
                 "falling back to uniform gaussian kinds",
-                len(dimension_kinds), D_full, pat.pattern_id,
+                len(dimension_kinds),
+                D_full,
+                pat.pattern_id,
             )
             dimension_kinds = ["gaussian"] * D_full
 
         logger.info(
             "Bregman kinds for %s: %s (D=%d)",
-            pat.pattern_id, format_kinds_summary(dimension_kinds), D_full,
+            pat.pattern_id,
+            format_kinds_summary(dimension_kinds),
+            D_full,
         )
 
         # 3.5 Resolve dimension weights
@@ -2051,7 +2133,8 @@ class GDSBuilder:
             dim_weights = compute_dimension_weights(full_shape_vectors, method="kurtosis")
             logger.info(
                 "Auto-computed dimension weights for %s: %s",
-                pat.pattern_id, dim_weights.tolist(),
+                pat.pattern_id,
+                dim_weights.tolist(),
             )
         elif isinstance(pat.dimension_weights, list):
             dim_weights = np.array(pat.dimension_weights, dtype=np.float32)
@@ -2086,7 +2169,8 @@ class GDSBuilder:
 
             # Global stats (for backward compat + fallback)
             mu, sigma, theta, global_deltas, global_norms, _ = compute_stats(
-                full_shape_vectors, pat.anomaly_percentile,
+                full_shape_vectors,
+                pat.anomaly_percentile,
             )
 
             # Per-group stats — prop_dim_start applies SIGMA_EPS_PROP inside
@@ -2095,27 +2179,27 @@ class GDSBuilder:
             n_event = len(pat.event_dimensions) if pat.event_dimensions else 0
             _prop_start = (n_rel + n_event) if prop_columns else None
             group_stats_dict, deltas, delta_norms = compute_stats_grouped(
-                full_shape_vectors, group_ids, pat.anomaly_percentile,
+                full_shape_vectors,
+                group_ids,
+                pat.anomaly_percentile,
                 prop_dim_start=_prop_start,
             )
 
             # Pre-compute boolean masks once — reused in all three group loops
             unique_groups = list(group_stats_dict.keys())
-            group_mask_map: dict[str, np.ndarray] = {
-                gid: group_ids == gid for gid in unique_groups
-            }
+            group_mask_map: dict[str, np.ndarray] = {gid: group_ids == gid for gid in unique_groups}
 
             # Prop_columns sigma override for global stats
             if prop_columns:
                 from hypertopos.builder._stats import SIGMA_EPS_PROP
 
                 prop_start = n_rel + n_event
-                sigma[prop_start:prop_start + len(prop_columns)] = np.maximum(
-                    sigma[prop_start:prop_start + len(prop_columns)], SIGMA_EPS_PROP
+                sigma[prop_start : prop_start + len(prop_columns)] = np.maximum(
+                    sigma[prop_start : prop_start + len(prop_columns)], SIGMA_EPS_PROP
                 )
                 global_deltas = ((full_shape_vectors - mu) / sigma).astype(np.float32)
                 global_norms = np.sqrt(
-                    np.einsum('ij,ij->i', global_deltas, global_deltas),
+                    np.einsum("ij,ij->i", global_deltas, global_deltas),
                 ).astype(np.float32)
                 theta_scalar = float(np.percentile(global_norms, pat.anomaly_percentile))
                 D_full = full_shape_vectors.shape[1]
@@ -2134,30 +2218,33 @@ class GDSBuilder:
 
             heteroscedasticity_diagnostic = {
                 pat.group_by_property: levene_test_per_group(
-                    global_norms, group_ids,
+                    global_norms,
+                    group_ids,
                 ),
             }
         else:
             mu, sigma, theta, deltas, delta_norms, mah_cov_inv = compute_stats(
-                full_shape_vectors, pat.anomaly_percentile,
+                full_shape_vectors,
+                pat.anomaly_percentile,
                 use_mahalanobis=bool(pat.use_mahalanobis),
             )
 
-            # Prop_columns are binary (0/1) — use higher sigma floor
+            # Prop_columns are binary (0/1) — use higher sigma floor. Under
+            # Mahalanobis the stored deltas are whitened by the saved
+            # cholesky_inv and do not use sigma, so they stay as computed.
             n_rel = len(pat.relations)
             n_event = len(pat.event_dimensions) if pat.event_dimensions else 0
             if prop_columns:
                 from hypertopos.builder._stats import SIGMA_EPS_PROP
 
                 prop_start = n_rel + n_event
-                sigma[prop_start:prop_start + len(prop_columns)] = np.maximum(
-                    sigma[prop_start:prop_start + len(prop_columns)], SIGMA_EPS_PROP
+                sigma[prop_start : prop_start + len(prop_columns)] = np.maximum(
+                    sigma[prop_start : prop_start + len(prop_columns)], SIGMA_EPS_PROP
                 )
+            if prop_columns and mah_cov_inv is None:
                 deltas = ((full_shape_vectors - mu) / sigma).astype(np.float32)
-                delta_norms = np.sqrt(np.einsum('ij,ij->i', deltas, deltas)).astype(np.float32)
-                theta_scalar = float(
-                    np.percentile(delta_norms, pat.anomaly_percentile)
-                )
+                delta_norms = np.sqrt(np.einsum("ij,ij->i", deltas, deltas)).astype(np.float32)
+                theta_scalar = float(np.percentile(delta_norms, pat.anomaly_percentile))
                 D_full = full_shape_vectors.shape[1]
                 component = theta_scalar / np.sqrt(D_full) if D_full > 0 else 0.0
                 theta = np.full(D_full, component, dtype=np.float32)
@@ -2165,7 +2252,7 @@ class GDSBuilder:
         # 4.5 Apply dimension weights to deltas (after z-scoring, before norms)
         if dim_weights is not None:
             deltas = (deltas * dim_weights).astype(np.float32)
-            delta_norms = np.sqrt(np.einsum('ij,ij->i', deltas, deltas)).astype(np.float32)
+            delta_norms = np.sqrt(np.einsum("ij,ij->i", deltas, deltas)).astype(np.float32)
             # Recompute theta in weighted space
             theta_scalar = float(np.percentile(delta_norms, pat.anomaly_percentile))
             D_full = full_shape_vectors.shape[1]
@@ -2179,7 +2266,8 @@ class GDSBuilder:
                     g_norms = delta_norms[mask]
                     g_theta_scalar = (
                         float(np.percentile(g_norms, pat.anomaly_percentile))
-                        if len(g_norms) > 1 else 0.0
+                        if len(g_norms) > 1
+                        else 0.0
                     )
                     g_comp = g_theta_scalar / np.sqrt(D_full) if D_full > 0 else 0.0
                     g_theta = np.full(D_full, g_comp, dtype=np.float32)
@@ -2192,6 +2280,8 @@ class GDSBuilder:
         if dimension_kinds is not None:
             from hypertopos.builder._bregman import (
                 bregman_norms as _bregman_norms_fn,
+            )
+            from hypertopos.builder._bregman import (
                 per_dim_theta as _per_dim_theta_fn,
             )
 
@@ -2199,11 +2289,17 @@ class GDSBuilder:
             # Per-group calibration is already captured in is_anomaly (L2).
             # Bregman as supplementary metric uses global for consistent ranking.
             bregman_norms_arr = _bregman_norms_fn(
-                full_shape_vectors, mu, sigma, dimension_kinds,
+                full_shape_vectors,
+                mu,
+                sigma,
+                dimension_kinds,
                 weights=dim_weights,
             ).astype(np.float32)
             theta_per_dim_arr = _per_dim_theta_fn(
-                full_shape_vectors, mu, sigma, dimension_kinds,
+                full_shape_vectors,
+                mu,
+                sigma,
+                dimension_kinds,
                 anomaly_percentile=pat.anomaly_percentile,
             )
 
@@ -2214,7 +2310,8 @@ class GDSBuilder:
 
             k = pat.gmm_n_components
             gmm_components_result, gmm_assignments = fit_kmeans_components(
-                full_shape_vectors, n_components=k,
+                full_shape_vectors,
+                n_components=k,
                 anomaly_percentile=pat.anomaly_percentile,
             )
 
@@ -2229,15 +2326,15 @@ class GDSBuilder:
                 # Apply SIGMA_EPS_PROP floor to prop dims in cluster sigma
                 if prop_columns:
                     sigma_c = sigma_c.copy()
-                    sigma_c[prop_start_gmm:prop_start_gmm + len(prop_columns)] = np.maximum(
-                        sigma_c[prop_start_gmm:prop_start_gmm + len(prop_columns)], SIGMA_EPS_PROP
+                    sigma_c[prop_start_gmm : prop_start_gmm + len(prop_columns)] = np.maximum(
+                        sigma_c[prop_start_gmm : prop_start_gmm + len(prop_columns)], SIGMA_EPS_PROP
                     )
                     gmm_components_result[c_idx] = (mu_c, sigma_c, theta_c, pop_c)
                 c_shapes = full_shape_vectors[mask]
                 c_deltas = ((c_shapes - mu_c) / sigma_c).astype(np.float32)
                 if dim_weights is not None:
                     c_deltas = (c_deltas * dim_weights).astype(np.float32)
-                c_norms = np.sqrt(np.einsum('ij,ij->i', c_deltas, c_deltas)).astype(np.float32)
+                c_norms = np.sqrt(np.einsum("ij,ij->i", c_deltas, c_deltas)).astype(np.float32)
                 deltas[mask] = c_deltas
                 delta_norms[mask] = c_norms
                 # Recompute theta in (possibly weighted) space
@@ -2256,7 +2353,8 @@ class GDSBuilder:
 
             logger.info(
                 "GMM k=%d for %s — cluster sizes: %s",
-                k, pat.pattern_id,
+                k,
+                pat.pattern_id,
                 [c[3] for c in gmm_components_result],
             )
 
@@ -2266,28 +2364,33 @@ class GDSBuilder:
                 from hypertopos.builder._bregman import (
                     bregman_norms as _bregman_norms_fn,
                 )
+
                 bregman_norms_arr = np.zeros(n, dtype=np.float32)
                 for c_idx, (c_mu, c_sigma, _c_theta, _c_pop) in enumerate(gmm_components_result):
                     mask = gmm_assignments == c_idx
                     if mask.any():
                         bregman_norms_arr[mask] = _bregman_norms_fn(
-                            full_shape_vectors[mask], c_mu, c_sigma,
-                            dimension_kinds, weights=dim_weights,
+                            full_shape_vectors[mask],
+                            c_mu,
+                            c_sigma,
+                            dimension_kinds,
+                            weights=dim_weights,
                         ).astype(np.float32)
 
         # 5. Compute delta_rank_pct (population-level percentile rank)
         sorted_norms = np.sort(delta_norms)
-        ranks = np.searchsorted(sorted_norms, delta_norms, side="left")
+        ranks = population_left_ranks(delta_norms)
         delta_rank_pcts = (ranks / n * 100).astype(np.float32)
 
-        # 6. Compute conformal p-values (reuse sorted_norms from step 5)
-        conformal_p = compute_conformal_p(delta_norms, sorted_norms=sorted_norms)
+        # 6. Compute conformal p-values (reuse the ranks from step 5)
+        conformal_p = compute_conformal_p(delta_norms, left_ranks=ranks)
 
         # 6b. Theta sensitivity surface — calibration-quality diagnostic.
         # Glues onto the same sorted_norms (no new sort, O(P) per pattern).
         from hypertopos.builder._theta_sensitivity import (
             compute_theta_sensitivity_from_sorted,
         )
+
         theta_sensitivity = compute_theta_sensitivity_from_sorted(sorted_norms)
 
         # 7. Compute is_anomaly (per-cluster if GMM, per-group if grouped, else global)
@@ -2316,14 +2419,23 @@ class GDSBuilder:
         cov_inv = mah_cov_inv if not pat.group_by_property else None
 
         # 8. Per-dimension anomaly count
-        from hypertopos.builder._stats import compute_per_dim_anomaly_count
-        n_anom_dims = compute_per_dim_anomaly_count(deltas, percentile=99.0)
+        from hypertopos.builder._stats import (
+            compute_per_dim_anomaly_count,
+            per_dim_anomaly_thresholds,
+        )
+
+        n_anom_dims_thresholds = per_dim_anomaly_thresholds(deltas, percentile=99.0)
+        n_anom_dims = compute_per_dim_anomaly_count(deltas, thresholds=n_anom_dims_thresholds)
 
         return PopulationStats(
-            mu=mu, sigma=sigma, theta=theta,
-            deltas=deltas, delta_norms=delta_norms,
+            mu=mu,
+            sigma=sigma,
+            theta=theta,
+            deltas=deltas,
+            delta_norms=delta_norms,
             delta_rank_pcts=delta_rank_pcts,
-            conformal_p=conformal_p, fk_arrays=fk_arrays,
+            conformal_p=conformal_p,
+            fk_arrays=fk_arrays,
             prop_columns=prop_columns,
             excluded_properties=excluded_properties,
             group_stats_dict=group_stats_dict,
@@ -2338,13 +2450,11 @@ class GDSBuilder:
             dim_block_names=dim_block_names,
             dim_block_stats=dim_block_stats if dim_block_stats else None,
             theta_sensitivity=theta_sensitivity,
-            edge_dim_agg_matrix=(
-                edge_dim_agg_matrix
-                if edge_dim_agg_matrix.shape[1] > 0 else None
-            ),
+            edge_dim_agg_matrix=(edge_dim_agg_matrix if edge_dim_agg_matrix.shape[1] > 0 else None),
             edge_dim_agg_labels=edge_dim_agg_labels,
             heteroscedasticity_diagnostic=heteroscedasticity_diagnostic,
             edge_dim_names=edge_dim_names,
+            n_anom_dims_thresholds=n_anom_dims_thresholds,
         )
 
     def _build_geometry_slice(
@@ -2407,7 +2517,8 @@ class GDSBuilder:
                 rel_directions.append(_const_str("self"))
                 alive_masks.append(np.ones(cn, dtype=bool))
             elif rel.edge_max is not None:
-                count_arr = fk_arrays[j][start:end]
+                # fk_arrays[j] is an ndarray of counts whenever rel.edge_max is set
+                count_arr = cast(np.ndarray, fk_arrays[j])[start:end]
                 alive_np = count_arr > 0
                 alive_mask_pa = pa.array(alive_np)
                 status_arr = pc.if_else(alive_mask_pa, "alive", "dead")
@@ -2417,11 +2528,9 @@ class GDSBuilder:
                 rel_directions.append(_const_str(rel.direction))
                 alive_masks.append(alive_np)
             else:
-                fk_col = fk_arrays[j].slice(start, cn)
+                fk_col = cast(pa.ChunkedArray, fk_arrays[j]).slice(start, cn)  # plain FK column
                 alive_mask = pc.fill_null(
-                    pc.and_(
-                        pc.is_valid(fk_col), pc.not_equal(fk_col, "")
-                    ),
+                    pc.and_(pc.is_valid(fk_col), pc.not_equal(fk_col, "")),
                     False,
                 )
                 alive_np = alive_mask.to_numpy(zero_copy_only=False)
@@ -2435,9 +2544,7 @@ class GDSBuilder:
                 alive_masks.append(alive_np)
 
         if D == 0:
-            empty_offsets = pa.array(
-                np.zeros(cn + 1, dtype=np.int32), type=pa.int32()
-            )
+            empty_offsets = pa.array(np.zeros(cn + 1, dtype=np.int32), type=pa.int32())
             empty_structs = pa.StructArray.from_arrays(
                 [
                     pa.array([], type=pa.string()),
@@ -2453,13 +2560,9 @@ class GDSBuilder:
                 ],
             )
             edges_col = pa.ListArray.from_arrays(empty_offsets, empty_structs)
-            entity_keys_col = pa.array(
-                [[] for _ in range(cn)], type=pa.list_(pa.string())
-            )
+            entity_keys_col = pa.array([[] for _ in range(cn)], type=pa.list_(pa.string()))
         else:
-            interleave_idx = pa.array(
-                np.arange(cn * D, dtype=np.int32).reshape(D, cn).T.ravel()
-            )
+            interleave_idx = pa.array(np.arange(cn * D, dtype=np.int32).reshape(D, cn).T.ravel())
 
             def _interleave_arrays(arrays: list[pa.Array]) -> pa.Array:
                 return pa.concat_arrays(arrays).take(interleave_idx)
@@ -2470,8 +2573,7 @@ class GDSBuilder:
             flat_directions = _interleave_arrays(rel_directions)
 
             flat_structs = pa.StructArray.from_arrays(
-                [flat_line_ids, flat_point_keys,
-                 flat_statuses, flat_directions],
+                [flat_line_ids, flat_point_keys, flat_statuses, flat_directions],
                 fields=[
                     pa.field("line_id", pa.string()),
                     pa.field("point_key", pa.string()),
@@ -2510,9 +2612,7 @@ class GDSBuilder:
             )
             delta_col = delta_col.cast(pa.list_(pa.float32()))
         else:
-            delta_col = pa.array(
-                [[] for _ in range(cn)], type=pa.list_(pa.float32())
-            )
+            delta_col = pa.array([[] for _ in range(cn)], type=pa.list_(pa.float32()))
 
         _zeros_i32 = pa.array(np.zeros(cn, dtype=np.int32))
 
@@ -2539,13 +2639,13 @@ class GDSBuilder:
             chunk_signed_arr = pa.array([None] * cn, type=pa.float32())
 
         common_cols = {
-            "primary_key":     pk_str,
-            "scale":           _const_i32(1),
-            "delta":           delta_col,
-            "delta_norm":      pa.array(chunk_norms, type=pa.float32()),
-            "delta_rank_pct":  pa.array(chunk_ranks, type=pa.float32()),
-            "is_anomaly":      pa.array(is_anomaly_arr, type=pa.bool_()),
-            "conformal_p":     chunk_conformal,
+            "primary_key": pk_str,
+            "scale": _const_i32(1),
+            "delta": delta_col,
+            "delta_norm": pa.array(chunk_norms, type=pa.float32()),
+            "delta_rank_pct": pa.array(chunk_ranks, type=pa.float32()),
+            "is_anomaly": pa.array(is_anomaly_arr, type=pa.bool_()),
+            "conformal_p": chunk_conformal,
             "bregman_divergence": (
                 pa.array(bregman_norms_arr[start:end], type=pa.float32())
                 if bregman_norms_arr is not None
@@ -2566,24 +2666,31 @@ class GDSBuilder:
 
         if pat.pattern_type == "event":
             # Event patterns: skip edges — reconstruct from entity_keys + relations at read time
-            return pa.table({
-                **common_cols,
-                "entity_keys":     entity_keys_col,
-                "last_refresh_at": now_arr,
-                "updated_at":      now_arr,
-            }, schema=GEOMETRY_EVENT_SCHEMA)
+            return pa.table(
+                {
+                    **common_cols,
+                    "entity_keys": entity_keys_col,
+                    "last_refresh_at": now_arr,
+                    "updated_at": now_arr,
+                },
+                schema=GEOMETRY_EVENT_SCHEMA,
+            )
         else:
             # Anchor patterns: keep edges (small population, needed for display)
-            return pa.table({
-                **common_cols,
-                "edges":           edges_col,
-                "entity_keys":     entity_keys_col,
-                "last_refresh_at": now_arr,
-                "updated_at":      now_arr,
-            }, schema=GEOMETRY_SCHEMA)
+            return pa.table(
+                {
+                    **common_cols,
+                    "edges": edges_col,
+                    "entity_keys": entity_keys_col,
+                    "last_refresh_at": now_arr,
+                    "updated_at": now_arr,
+                },
+                schema=GEOMETRY_SCHEMA,
+            )
 
     def _build_geometry_table(
-        self, pat: _PatternReg,
+        self,
+        pat: _PatternReg,
     ) -> tuple[pa.Table, PopulationStats, dict[str, Any] | None]:
         """Build geometry Arrow table for a pattern (single-pass, in-memory).
 
@@ -2633,14 +2740,24 @@ class GDSBuilder:
         elif n > _BOOTSTRAP_MAX_N and pat.bootstrap_iterations > 0:
             logger.info(
                 "Bootstrap skipped for '%s' (n=%d > %d) — use conformal_p",
-                pat.pattern_id, n, _BOOTSTRAP_MAX_N,
+                pat.pattern_id,
+                n,
+                _BOOTSTRAP_MAX_N,
             )
 
         theta_norm = float(np.linalg.norm(ps.theta))
         table = self._build_geometry_slice(
-            pat, 0, n, ps.deltas, ps.delta_norms,
-            ps.delta_rank_pcts, theta_norm, ps.fk_arrays,
-            ps.conformal_p, ps.is_anomaly_arr, ps.n_anom_dims,
+            pat,
+            0,
+            n,
+            ps.deltas,
+            ps.delta_norms,
+            ps.delta_rank_pcts,
+            theta_norm,
+            ps.fk_arrays,
+            ps.conformal_p,
+            ps.is_anomaly_arr,
+            ps.n_anom_dims,
             bregman_norms_arr=ps.bregman_norms,
             anomaly_confidence_arr=confidence_arr,
         )
@@ -2649,7 +2766,8 @@ class GDSBuilder:
     # ── Edge table helpers ─────────────────────────────────────
 
     def _resolve_edge_table_config(
-        self, pat: _PatternReg,
+        self,
+        pat: _PatternReg,
     ) -> EdgeTableConfig | None:
         """Determine edge table config for a pattern.
 
@@ -2679,21 +2797,18 @@ class GDSBuilder:
                 )
 
         # Infer from relations: 2+ FK relations to the same anchor line
-        fk_rels = [
-            r for r in pat.relations
-            if r.fk_col and r.direction != "self"
-        ]
+        fk_rels = [r for r in pat.relations if r.fk_col and r.direction != "self"]
         by_line: dict[str, list[RelationSpec]] = {}
         for r in fk_rels:
             by_line.setdefault(r.line_id, []).append(r)
-        for line_id, rels in by_line.items():
+        for rels in by_line.values():
             if len(rels) >= 2:
                 ts_col, amt_col = self._infer_edge_temporal_amount(
                     pat.entity_line,
                 )
                 return EdgeTableConfig(
-                    from_col=rels[0].fk_col,
-                    to_col=rels[1].fk_col,
+                    from_col=cast(str, rels[0].fk_col),  # fk_rels keeps only truthy fk_col
+                    to_col=cast(str, rels[1].fk_col),
                     timestamp_col=ts_col,
                     amount_col=amt_col,
                 )
@@ -2701,7 +2816,8 @@ class GDSBuilder:
         return None
 
     def _infer_edge_temporal_amount(
-        self, entity_line_id: str,
+        self,
+        entity_line_id: str,
     ) -> tuple[str | None, str | None]:
         """Heuristic: pick a timestamp + amount column from event line schema.
 
@@ -2714,26 +2830,39 @@ class GDSBuilder:
         schema_names = set(line_reg.table.schema.names)
 
         ts_candidates = (
-            "timestamp", "ts", "event_time", "tx_date", "date",
+            "timestamp",
+            "ts",
+            "event_time",
+            "tx_date",
+            "date",
         )
         amt_candidates = (
-            "amount_received", "amount", "amount_paid", "value",
-            "total", "amt", "fare_amount", "total_amount",
+            "amount_received",
+            "amount",
+            "amount_paid",
+            "value",
+            "total",
+            "amt",
+            "fare_amount",
+            "total_amount",
         )
 
         ts_col = next(
-            (c for c in ts_candidates if c in schema_names), None,
+            (c for c in ts_candidates if c in schema_names),
+            None,
         )
         # Type-based fallback: first non-metadata column with timestamp type
         _META_COLS = {"created_at", "changed_at", "version"}
         if ts_col is None:
             import pyarrow as pa
+
             for field in line_reg.table.schema:
                 if pa.types.is_timestamp(field.type) and field.name not in _META_COLS:
                     ts_col = field.name
                     break
         amt_col = next(
-            (c for c in amt_candidates if c in schema_names), None,
+            (c for c in amt_candidates if c in schema_names),
+            None,
         )
         return ts_col, amt_col
 
@@ -2780,7 +2909,8 @@ class GDSBuilder:
                         break
                 if not ts_resolved:
                     ts_arr = pa.array(
-                        [0.0] * len(event_table), type=pa.float64(),
+                        [0.0] * len(event_table),
+                        type=pa.float64(),
                     )
 
         # Amount — resolve from config, then name heuristic
@@ -2788,21 +2918,30 @@ class GDSBuilder:
         amt_col = cfg.amount_col
         if amt_col and amt_col in schema_names:
             amt_arr = pc.cast(
-                pc.fill_null(event_table[amt_col], 0.0), pa.float64(),
+                pc.fill_null(event_table[amt_col], 0.0),
+                pa.float64(),
             )
         else:
             for name in (
-                "amount", "value", "total", "amt",
-                "fare_amount", "total_amount", "amount_received", "amount_paid",
+                "amount",
+                "value",
+                "total",
+                "amt",
+                "fare_amount",
+                "total_amount",
+                "amount_received",
+                "amount_paid",
             ):
                 if name in schema_names:
                     amt_arr = pc.cast(
-                        pc.fill_null(event_table[name], 0.0), pa.float64(),
+                        pc.fill_null(event_table[name], 0.0),
+                        pa.float64(),
                     )
                     break
             else:
                 amt_arr = pa.array(
-                    [0.0] * len(event_table), type=pa.float64(),
+                    [0.0] * len(event_table),
+                    type=pa.float64(),
                 )
 
         # Filter out rows with null from/to keys
@@ -2862,14 +3001,15 @@ class GDSBuilder:
         registry. No-op for patterns without ``fdr_temporal_hierarchy``.
 
         Called by all three geometry-write paths so the materialised buckets
-        land before write_geometry / write_chunk_fn.
+        land before write_geometry / write_chunks_fn.
         """
         if not pat.fdr_temporal_hierarchy:
             return geometry_table
         if pat.pattern_type != "anchor":
             return geometry_table
         event_pat = _auto_discover_event_pattern_for_anchor(
-            pat, self._patterns,
+            pat,
+            self._patterns,
         )
         event_reg = self._lines.get(event_pat.entity_line)
         if event_reg is None:
@@ -2918,11 +3058,9 @@ class GDSBuilder:
             try:
                 pc.strptime(sample, fmt, "us")
                 # Format matched on sample — parse full column
+                # Naive parse = UTC epoch; no timezone pass (it would not change the
+                # integers and is very slow on Windows).
                 parsed = pc.strptime(col, fmt, "us")
-                try:
-                    parsed = pc.assume_timezone(parsed, timezone="UTC")
-                except Exception:
-                    pass  # tz database missing (Windows) — treat as UTC
                 return pc.divide(pc.cast(pc.cast(parsed, pa.int64()), pa.float64()), 1e6)
             except Exception:
                 continue
@@ -2952,7 +3090,7 @@ class GDSBuilder:
             # Resolve cutting plane
             if areg.cutting_plane_normal is not None:
                 normal = list(areg.cutting_plane_normal)
-                bias = areg.cutting_plane_bias
+                bias = cast(float, areg.cutting_plane_bias)  # add_alias defaults to 0.0
             else:
                 dim_idx = areg.cutting_plane_dimension
                 if isinstance(dim_idx, str):
@@ -2966,8 +3104,9 @@ class GDSBuilder:
                         )
                     dim_idx = names.index(dim_idx)
                 normal = [0.0] * D
-                normal[dim_idx] = 1.0
-                bias = areg.cutting_plane_threshold
+                # add_alias requires a dimension whenever no normal is given
+                normal[cast(int, dim_idx)] = 1.0
+                bias = cast(float, areg.cutting_plane_threshold)  # add_alias defaults to 0.0
 
             cp = CuttingPlane(normal=normal, bias=bias)
 
@@ -2975,22 +3114,19 @@ class GDSBuilder:
             import lance
 
             if areg.base_pattern_id not in _delta_cache:
-                geo_path = (
-                    self.output_path / "geometry" / areg.base_pattern_id
-                    / "data.lance"
-                )
+                geo_path = self.output_path / "geometry" / areg.base_pattern_id / "data.lance"
                 ds = lance.dataset(str(geo_path))
                 delta_col = ds.to_table(columns=["delta"])["delta"]
                 if hasattr(delta_col, "combine_chunks"):
                     delta_col = delta_col.combine_chunks()
-                list_size = (
-                    delta_col.type.list_size
-                    if hasattr(delta_col.type, "list_size")
-                    else D
+                list_size = delta_col.type.list_size if hasattr(delta_col.type, "list_size") else D
+                _delta_cache[areg.base_pattern_id] = (
+                    delta_col.values.to_numpy(
+                        zero_copy_only=False,
+                    )
+                    .reshape(-1, list_size)
+                    .astype(np.float32)
                 )
-                _delta_cache[areg.base_pattern_id] = delta_col.values.to_numpy(
-                    zero_copy_only=False,
-                ).reshape(-1, list_size).astype(np.float32)
             deltas = _delta_cache[areg.base_pattern_id]
 
             # Filter by cutting plane: signed_distance >= 0 means inside
@@ -2999,9 +3135,7 @@ class GDSBuilder:
             sub_n = int(inside_mask.sum())
 
             if sub_n == 0:
-                raise ValueError(
-                    f"Alias '{alias_id}': cutting plane selects 0 entities"
-                )
+                raise ValueError(f"Alias '{alias_id}': cutting plane selects 0 entities")
 
             # Compute sub-population statistics
             sub_mu = sub_deltas.mean(axis=0)
@@ -3074,9 +3208,7 @@ class GDSBuilder:
                 "intrinsic_displacement_mean": None,
                 "extrinsic_displacement_mean": None,
             }
-        signed_p, intr_mean, extr_mean = (
-            GDSBuilder._compute_signed_artefacts(deltas, direction)
-        )
+        signed_p, intr_mean, extr_mean = GDSBuilder._compute_signed_artefacts(deltas, direction)
         return {
             "label_aware_calibration": lac_bundle.get("per_dim"),
             "label_aware_n_pos": lac_bundle.get("n_pos"),
@@ -3294,10 +3426,7 @@ class GDSBuilder:
                 "pattern_id": entity_lines.get(line_id, ""),
                 "partitioning": {
                     "mode": "static",
-                    "columns": (
-                        [line_reg.partition_col]
-                        if line_reg.partition_col else []
-                    ),
+                    "columns": ([line_reg.partition_col] if line_reg.partition_col else []),
                 },
                 "versions": [1],
             }
@@ -3307,10 +3436,12 @@ class GDSBuilder:
             columns = []
             for f in line_reg.table.schema:
                 if f.name not in _INTERNAL_COLUMNS:
-                    columns.append({
-                        "name": f.name,
-                        "type": _arrow_type_to_str(f.type),
-                    })
+                    columns.append(
+                        {
+                            "name": f.name,
+                            "type": _arrow_type_to_str(f.type),
+                        }
+                    )
             lines_dict[line_id]["columns"] = columns
             # Store resolved fts_columns: None → auto-resolved value
             fts = line_reg.fts_columns
@@ -3324,9 +3455,7 @@ class GDSBuilder:
             pbr = pattern_stats[pat_id]
             pat_dict: dict[str, Any] = {
                 "pattern_id": pat_id,
-                "entity_type": (
-                    self._lines[pat.entity_line].entity_type
-                ),
+                "entity_type": (self._lines[pat.entity_line].entity_type),
                 "pattern_type": pat.pattern_type,
                 "entity_line": pat.entity_line,
                 "version": 1,
@@ -3336,14 +3465,8 @@ class GDSBuilder:
                         "line_id": rel.line_id,
                         "direction": rel.direction,
                         "required": rel.required,
-                        **(
-                            {"edge_max": rel.edge_max}
-                            if rel.edge_max is not None else {}
-                        ),
-                        **(
-                            {"display_name": rel.display_name}
-                            if rel.display_name else {}
-                        ),
+                        **({"edge_max": rel.edge_max} if rel.edge_max is not None else {}),
+                        **({"display_name": rel.display_name} if rel.display_name else {}),
                     }
                     for rel in pat.relations
                 ],
@@ -3354,41 +3477,36 @@ class GDSBuilder:
                         **({"display_name": edim.display_name} if edim.display_name else {}),
                     }
                     for edim in pat.event_dimensions
-                ] if pat.event_dimensions else [],
+                ]
+                if pat.event_dimensions
+                else [],
                 "mu": pbr.mu.tolist(),
                 "sigma_diag": pbr.sigma.tolist(),
                 "theta": pbr.theta.tolist(),
                 "edge_max": (
                     [
-                        1 if r.direction == "self"
-                        else r.edge_max if r.edge_max is not None
-                        else 1
+                        1 if r.direction == "self" else r.edge_max if r.edge_max is not None else 1
                         for r in pat.relations
                     ]
                     + [edim.edge_max for edim in pat.event_dimensions]
                     + [0] * len(pbr.prop_columns)
-                ) if (
-                    any(r.edge_max is not None for r in pat.relations)
-                    or pat.event_dimensions
-                ) else None,
+                )
+                if (any(r.edge_max is not None for r in pat.relations) or pat.event_dimensions)
+                else None,
                 "population_size": pbr.population_size,
+                "anomaly_percentile": float(pat.anomaly_percentile),
                 "computed_at": now_str,
                 "last_calibrated_at": now_str,
                 "prop_columns": pbr.prop_columns,
                 "excluded_properties": pbr.excluded_properties,
-                **(
-                    {"edge_dim_names": list(pbr.edge_dim_names)}
-                    if pbr.edge_dim_names else {}
-                ),
+                **({"edge_dim_names": list(pbr.edge_dim_names)} if pbr.edge_dim_names else {}),
             }
             if pbr.dim_block_names:
                 pat_dict["dim_block_names"] = pbr.dim_block_names
             if pbr.dim_block_stats:
                 pat_dict["dim_block_stats"] = pbr.dim_block_stats
             if pbr.group_stats:
-                pat_dict["group_by_property"] = (
-                    pat.group_by_property
-                )
+                pat_dict["group_by_property"] = pat.group_by_property
                 pat_dict["group_stats"] = {
                     gid: {
                         "mu": g_mu.tolist(),
@@ -3396,13 +3514,10 @@ class GDSBuilder:
                         "theta": g_theta.tolist(),
                         "population_size": g_pop,
                     }
-                    for gid, (g_mu, g_sigma, g_theta, g_pop)
-                    in pbr.group_stats.items()
+                    for gid, (g_mu, g_sigma, g_theta, g_pop) in pbr.group_stats.items()
                 }
             if pbr.dimension_weights is not None:
-                pat_dict["dimension_weights"] = (
-                    pbr.dimension_weights.tolist()
-                )
+                pat_dict["dimension_weights"] = pbr.dimension_weights.tolist()
             if pbr.gmm_components is not None:
                 pat_dict["gmm_components"] = [
                     {
@@ -3411,21 +3526,18 @@ class GDSBuilder:
                         "theta": c_th.tolist(),
                         "population_size": c_pop,
                     }
-                    for c_mu, c_sig, c_th, c_pop
-                    in pbr.gmm_components
+                    for c_mu, c_sig, c_th, c_pop in pbr.gmm_components
                 ]
             if pbr.cholesky_inv is not None:
-                pat_dict["cholesky_inv"] = (
-                    pbr.cholesky_inv.tolist()
-                )
+                pat_dict["cholesky_inv"] = pbr.cholesky_inv.tolist()
             if pbr.dimension_kinds is not None:
                 pat_dict["dimension_kinds"] = pbr.dimension_kinds
             if pbr.dim_percentiles:
                 pat_dict["dim_percentiles"] = pbr.dim_percentiles
+            if pbr.n_anomalous_dims_thresholds is not None:
+                pat_dict["n_anomalous_dims_thresholds"] = pbr.n_anomalous_dims_thresholds.tolist()
             if pbr.heteroscedasticity_diagnostic:
-                pat_dict["heteroscedasticity_diagnostic"] = (
-                    pbr.heteroscedasticity_diagnostic
-                )
+                pat_dict["heteroscedasticity_diagnostic"] = pbr.heteroscedasticity_diagnostic
             if pbr.dim_normality_pvalues:
                 pat_dict["dim_normality_pvalues"] = pbr.dim_normality_pvalues
             if pbr.label_aware_calibration:
@@ -3476,9 +3588,8 @@ class GDSBuilder:
                 ]
             if pat.conformance_rules:
                 from hypertopos.model.sphere import _rule_to_dict
-                pat_dict["conformance_rules"] = [
-                    _rule_to_dict(r) for r in pat.conformance_rules
-                ]
+
+                pat_dict["conformance_rules"] = [_rule_to_dict(r) for r in pat.conformance_rules]
             # Edge table metadata
             edge_cfg = self._resolve_edge_table_config(pat)
             if edge_cfg is not None:
@@ -3499,12 +3610,9 @@ class GDSBuilder:
                 eda = pat.edge_dim_aggregations
                 pat_dict["edge_dim_aggregations"] = {
                     "from": eda.from_event_pattern,
-                    "dims": (
-                        list(eda.dims) if eda.dims is not None else None
-                    ),
+                    "dims": (list(eda.dims) if eda.dims is not None else None),
                     "aggregates_per_dim": {
-                        d: list(aggs)
-                        for d, aggs in eda.aggregates_per_dim.items()
+                        d: list(aggs) for d, aggs in eda.aggregates_per_dim.items()
                     },
                 }
             # Calibration epoch metadata (populated by _build_and_write)
@@ -3566,11 +3674,16 @@ class GDSBuilder:
                 )
             event_table = self._lines[spec.event_line].table
             composite_table = build_composite_table(
-                event_table, spec.key_cols, spec.separator,
+                event_table,
+                spec.key_cols,
+                spec.separator,
             )
             self.add_line(
-                spec.line_id, composite_table,
-                key_col="primary_key", source_id=spec.line_id, role="anchor",
+                spec.line_id,
+                composite_table,
+                key_col="primary_key",
+                source_id=spec.line_id,
+                role="anchor",
             )
 
         # 2. Resolve derived dimensions — aggregate and add columns + RelationSpecs
@@ -3589,10 +3702,10 @@ class GDSBuilder:
 
         # Group batchable specs by (anchor_line, event_line, anchor_fk)
         # so one group_by call handles multiple metrics on the same FK.
-        batch_groups: dict[
-            tuple[str, str, str], list
-        ] = defaultdict(list)
-        single_specs: list = []
+        batch_groups: dict[tuple[str, str, str | tuple[str, ...]], list[DerivedDimSpec]] = (
+            defaultdict(list)
+        )
+        single_specs: list[DerivedDimSpec] = []
 
         for spec in self._derived_dims:
             if _is_batchable(spec):
@@ -3619,7 +3732,10 @@ class GDSBuilder:
                         break
 
             batch_results = compute_derived_batch(
-                event_table, anchor_keys, actual_fk, specs,
+                event_table,
+                anchor_keys,
+                actual_fk,
+                specs,
                 separator=separator,
             )
 
@@ -3628,38 +3744,63 @@ class GDSBuilder:
             for spec in specs:
                 dim_name = spec.dimension_name
                 values, em = batch_results[dim_name]
-                new_columns.append((
-                    dim_name,
-                    pa.array(values, type=pa.float64()),
-                ))
+                new_columns.append(
+                    (
+                        dim_name,
+                        pa.array(values, type=pa.float64()),
+                    )
+                )
                 # Auto-create dummy dim line + RelationSpec
                 dim_line_id = f"_d_{dim_name}"
                 if dim_line_id not in self._lines:
                     self.add_line(
                         dim_line_id,
                         pa.table({"primary_key": ["_dummy"]}),
-                        key_col="primary_key", source_id=dim_line_id, role="anchor",
+                        key_col="primary_key",
+                        source_id=dim_line_id,
+                        role="anchor",
                     )
                 for pat in self._patterns.values():
                     if pat.entity_line == anchor_line:
-                        pat.relations.append(RelationSpec(
-                            line_id=dim_line_id,
-                            fk_col=dim_name,
-                            direction="out",
-                            required=False,
-                            display_name=dim_name,
-                            edge_max=em,
-                        ))
+                        pat.relations.append(
+                            RelationSpec(
+                                line_id=dim_line_id,
+                                fk_col=dim_name,
+                                direction="out",
+                                required=False,
+                                display_name=dim_name,
+                                edge_max=em,
+                            )
+                        )
 
             for col_name, col_arr in new_columns:
                 anchor_reg.table = anchor_reg.table.append_column(
-                    col_name, col_arr,
+                    col_name,
+                    col_arr,
                 )
 
-        # 2b. Single path — specs that need special handling
+        # 2b. Single path — specs that need special handling.
+        # Time-based specs read their time column only as epoch seconds, so
+        # each (event line, time column) is converted once and shared:
+        # parsing a string timestamp column is the costly part of these specs.
+        from hypertopos.utils import time as _time_utils
+
+        epoch_tables: dict[tuple[str, str], pa.Table] = {}
+
+        def _event_table_for(spec: DerivedDimSpec) -> pa.Table:
+            table = self._lines[spec.event_line].table
+            col = spec.time_col
+            if not col or col not in table.column_names:
+                return table
+            key = (spec.event_line, col)
+            if key not in epoch_tables:
+                epoch = _time_utils.to_epoch_seconds(table[col])
+                epoch_tables[key] = table.set_column(table.schema.get_field_index(col), col, epoch)
+            return epoch_tables[key]
+
         for spec in single_specs:
             anchor_reg = self._lines[spec.anchor_line]
-            event_table = self._lines[spec.event_line].table
+            event_table = _event_table_for(spec)
             anchor_keys = anchor_reg.table["primary_key"]
 
             # For composite anchors, find matching CompositeLineSpec separator
@@ -3671,9 +3812,13 @@ class GDSBuilder:
                         break
 
             values, em = compute_derived_dimension(
-                event_table, anchor_keys, spec.anchor_fk,
-                spec.metric, spec.metric_col,
-                spec.edge_max, spec.percentile,
+                event_table,
+                anchor_keys,
+                spec.anchor_fk,
+                spec.metric,
+                spec.metric_col,
+                spec.edge_max,
+                spec.percentile,
                 time_col=spec.time_col,
                 time_window=spec.time_window,
                 window_aggregation=spec.window_aggregation,
@@ -3692,18 +3837,22 @@ class GDSBuilder:
                 self.add_line(
                     dim_line_id,
                     pa.table({"primary_key": ["_dummy"]}),
-                    key_col="primary_key", source_id=dim_line_id, role="anchor",
+                    key_col="primary_key",
+                    source_id=dim_line_id,
+                    role="anchor",
                 )
             for pat in self._patterns.values():
                 if pat.entity_line == spec.anchor_line:
-                    pat.relations.append(RelationSpec(
-                        line_id=dim_line_id,
-                        fk_col=spec.dimension_name,
-                        direction="out",
-                        required=False,
-                        display_name=spec.dimension_name,
-                        edge_max=em,
-                    ))
+                    pat.relations.append(
+                        RelationSpec(
+                            line_id=dim_line_id,
+                            fk_col=spec.dimension_name,
+                            direction="out",
+                            required=False,
+                            display_name=spec.dimension_name,
+                            edge_max=em,
+                        )
+                    )
 
         # 2b. Resolve precomputed dimensions — column already on entity table
         for spec in self._precomputed_dims:
@@ -3722,15 +3871,16 @@ class GDSBuilder:
 
             # Compute edge_max from existing column values
             col = anchor_reg.table[spec.dimension_name]
-            vals = pc.fill_null(col, 0).to_numpy(
-                zero_copy_only=False,
-            ).astype(np.float32)
+            vals = (
+                pc.fill_null(col, 0)
+                .to_numpy(
+                    zero_copy_only=False,
+                )
+                .astype(np.float32)
+            )
             if spec.edge_max == "auto":
                 nonzero = vals[vals > 0]
-                em = (
-                    max(1, int(np.percentile(nonzero, spec.percentile)))
-                    if len(nonzero) > 0 else 1
-                )
+                em = max(1, int(np.percentile(nonzero, spec.percentile))) if len(nonzero) > 0 else 1
             else:
                 em = int(spec.edge_max)
 
@@ -3740,36 +3890,39 @@ class GDSBuilder:
                 self.add_line(
                     dim_line_id,
                     pa.table({"primary_key": ["_dummy"]}),
-                    key_col="primary_key", source_id=dim_line_id, role="anchor",
+                    key_col="primary_key",
+                    source_id=dim_line_id,
+                    role="anchor",
                 )
             for pat in self._patterns.values():
                 if pat.entity_line == spec.anchor_line:
-                    pat.relations.append(RelationSpec(
-                        line_id=dim_line_id,
-                        fk_col=spec.dimension_name,
-                        direction="out",
-                        required=False,
-                        display_name=spec.display_name or spec.dimension_name,
-                        edge_max=em,
-                    ))
+                    pat.relations.append(
+                        RelationSpec(
+                            line_id=dim_line_id,
+                            fk_col=spec.dimension_name,
+                            direction="out",
+                            required=False,
+                            display_name=spec.display_name or spec.dimension_name,
+                            edge_max=em,
+                        )
+                    )
 
         # 3. Resolve graph features — compute and add as derived dims
         for spec in self._graph_features:
             if spec.anchor_line not in self._lines:
-                raise ValueError(
-                    f"Graph features: anchor_line '{spec.anchor_line}' not registered"
-                )
+                raise ValueError(f"Graph features: anchor_line '{spec.anchor_line}' not registered")
             if spec.event_line not in self._lines:
-                raise ValueError(
-                    f"Graph features: event_line '{spec.event_line}' not registered"
-                )
+                raise ValueError(f"Graph features: event_line '{spec.event_line}' not registered")
             anchor_reg = self._lines[spec.anchor_line]
             event_table = self._lines[spec.event_line].table
             anchor_keys = anchor_reg.table["primary_key"]
 
             feature_results = compute_graph_features(
-                event_table, anchor_keys,
-                spec.from_col, spec.to_col, spec.features,
+                event_table,
+                anchor_keys,
+                spec.from_col,
+                spec.to_col,
+                spec.features,
             )
 
             for feat_name, (values, em) in feature_results.items():
@@ -3782,18 +3935,22 @@ class GDSBuilder:
                     self.add_line(
                         dim_line_id,
                         pa.table({"primary_key": ["_dummy"]}),
-                        key_col="primary_key", source_id=dim_line_id, role="anchor",
+                        key_col="primary_key",
+                        source_id=dim_line_id,
+                        role="anchor",
                     )
                 for pat in self._patterns.values():
                     if pat.entity_line == spec.anchor_line:
-                        pat.relations.append(RelationSpec(
-                            line_id=dim_line_id,
-                            fk_col=feat_name,
-                            direction="out",
-                            required=False,
-                            display_name=feat_name,
-                            edge_max=em,
-                        ))
+                        pat.relations.append(
+                            RelationSpec(
+                                line_id=dim_line_id,
+                                fk_col=feat_name,
+                                direction="out",
+                                required=False,
+                                display_name=feat_name,
+                                edge_max=em,
+                            )
+                        )
 
     def _resolve_chain_dims(self) -> None:
         """Resolve chain dimensions — auto-create RelationSpecs on chain patterns."""
@@ -3801,14 +3958,16 @@ class GDSBuilder:
             dim_line_id = f"_d_chain_{feat_name}"
             for pat in self._patterns.values():
                 if pat.entity_line == line_id:
-                    pat.relations.append(RelationSpec(
-                        line_id=dim_line_id,
-                        fk_col=feat_name,
-                        direction="out",
-                        required=False,
-                        display_name=feat_name,
-                        edge_max=em,
-                    ))
+                    pat.relations.append(
+                        RelationSpec(
+                            line_id=dim_line_id,
+                            fk_col=feat_name,
+                            direction="out",
+                            required=False,
+                            display_name=feat_name,
+                            edge_max=em,
+                        )
+                    )
 
     def _evaluate_conformance_rules(self) -> None:
         """Build conformance sidecars for every pattern that declares rules.
@@ -3865,17 +4024,33 @@ class GDSBuilder:
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
+        from hypertopos.storage._lance_branches import branch_names
+        from hypertopos.storage.exceptions import GDSError
+
+        branches = branch_names(self.output_path)
+        if branches:
+            # Branches pin the current points, temporal and sidecar versions;
+            # a full build is the only writer that would rewrite them.
+            raise GDSError(
+                f"cannot build into {self.output_path}: it has branches {branches}; "
+                "delete them first"
+            )
         self._resolve_derived()
         self._resolve_chain_dims()
         self._validate()
 
         pattern_stats: dict[str, PatternBuildResult] = {}
 
-        # 1. Write all points files (skip internal dummy lines)
+        # 1. Conformance rules — validate against in-memory tables BEFORE any
+        # point dataset is written to disk.  The evaluator reads from
+        # ``line_reg.table`` (Arrow, in-memory) so no Lance I/O is needed.
+        # Running here ensures a failed check leaves no partial state on disk.
+        self._evaluate_conformance_rules()
+
+        # 1.5 Write all points files (skip internal dummy lines)
         from hypertopos.builder._writer import (
-            finalize_geometry_chunks,
             write_geometry,
-            write_geometry_chunk,
+            write_geometry_chunks,
             write_points,
         )
         from hypertopos.storage.writer import GDSWriter
@@ -3895,47 +4070,39 @@ class GDSBuilder:
                 fts_columns=fts,
             )
 
-        real_lines = [
-            (lid, lr) for lid, lr in self._lines.items()
-            if not lid.startswith("_d_")
-        ]
+        real_lines = [(lid, lr) for lid, lr in self._lines.items() if not lid.startswith("_d_")]
         if len(real_lines) > 1:
             with ThreadPoolExecutor(max_workers=min(4, len(real_lines))) as pool:
-                futures = [
-                    pool.submit(_write_line_points, lid, lr)
-                    for lid, lr in real_lines
-                ]
+                futures = [pool.submit(_write_line_points, lid, lr) for lid, lr in real_lines]
                 for fut in futures:
                     fut.result()
         else:
             for lid, lr in real_lines:
                 _write_line_points(lid, lr)
 
-        # 1.5 Conformance rules — evaluate after points are materialized
-        # and BEFORE geometry build. Cost-neutral fast path when no
-        # pattern declares any rules: short-circuit on the first check.
-        self._evaluate_conformance_rules()
-
         # 2. Build geometry (and optionally temporal) per pattern
         _stats_writer = GDSWriter(str(self.output_path))
 
         def _build_and_write(
-            pat_id: str, pat: _PatternReg,
+            pat_id: str,
+            pat: _PatternReg,
         ) -> tuple[str, PatternBuildResult]:
             n = len(self._lines[pat.entity_line].table)
 
             if n > GEOMETRY_CHUNK_SIZE:
-                if (pat.group_by_property
-                        or pat.gmm_n_components
-                        or pat.use_mahalanobis):
+                if pat.group_by_property or pat.gmm_n_components or pat.use_mahalanobis:
                     pat_id_out, pbr = self._build_and_write_chunked(
-                        pat_id, pat, _stats_writer,
-                        write_geometry_chunk, finalize_geometry_chunks,
+                        pat_id,
+                        pat,
+                        _stats_writer,
+                        write_geometry_chunks,
                     )
                 else:
                     pat_id_out, pbr = self._build_and_write_streaming(
-                        pat_id, pat, _stats_writer,
-                        write_geometry_chunk, finalize_geometry_chunks,
+                        pat_id,
+                        pat,
+                        _stats_writer,
+                        write_geometry_chunks,
                     )
                 self._write_calibration_epoch_for_pattern(pat, pbr)
                 return pat_id_out, pbr
@@ -3944,10 +4111,14 @@ class GDSBuilder:
             geom_table = self._inject_fdr_hierarchy_carriers(pat, geom_table)
             geom_table = self._inject_fdr_temporal_buckets(pat, geom_table)
             _validate_fdr_hierarchy_columns(
-                pat, list(geom_table.column_names),
+                pat,
+                list(geom_table.column_names),
             )
             write_geometry(
-                self.output_path, pat_id, geom_table, version=1,
+                self.output_path,
+                pat_id,
+                geom_table,
+                version=1,
             )
 
             delta_norms = geom_table["delta_norm"].to_numpy(
@@ -3958,8 +4129,10 @@ class GDSBuilder:
             )
             theta_norm = float(np.linalg.norm(ps.theta))
             _stats_writer.write_geometry_stats(
-                pat_id, version=1,
-                delta_norms=delta_norms, theta_norm=theta_norm,
+                pat_id,
+                version=1,
+                delta_norms=delta_norms,
+                theta_norm=theta_norm,
                 is_anomaly_arr=is_anomaly_arr,
             )
 
@@ -3969,18 +4142,24 @@ class GDSBuilder:
                 if edge_table.num_rows > 0:
                     _stats_writer.write_edges(pat_id, edge_table)
                     import pyarrow.compute as _pc
-                    _stats_writer.write_edge_stats(pat_id, {
-                        "row_count": edge_table.num_rows,
-                        "unique_from": _pc.count_distinct(edge_table["from_key"]).as_py(),
-                        "unique_to": _pc.count_distinct(edge_table["to_key"]).as_py(),
-                        "timestamp_min": float(_pc.min(edge_table["timestamp"]).as_py()),
-                        "timestamp_max": float(_pc.max(edge_table["timestamp"]).as_py()),
-                        "amount_min": float(_pc.min(edge_table["amount"]).as_py()),
-                        "amount_max": float(_pc.max(edge_table["amount"]).as_py()),
-                    })
+
+                    _stats_writer.write_edge_stats(
+                        pat_id,
+                        {
+                            "row_count": edge_table.num_rows,
+                            "unique_from": _pc.count_distinct(edge_table["from_key"]).as_py(),
+                            "unique_to": _pc.count_distinct(edge_table["to_key"]).as_py(),
+                            "timestamp_min": float(_pc.min(edge_table["timestamp"]).as_py()),
+                            "timestamp_max": float(_pc.max(edge_table["timestamp"]).as_py()),
+                            "amount_min": float(_pc.min(edge_table["amount"]).as_py()),
+                            "amount_max": float(_pc.max(edge_table["amount"]).as_py()),
+                        },
+                    )
 
             pbr = PatternBuildResult(
-                mu=ps.mu, sigma=ps.sigma, theta=ps.theta,
+                mu=ps.mu,
+                sigma=ps.sigma,
+                theta=ps.theta,
                 population_size=n,
                 prop_columns=ps.prop_columns,
                 excluded_properties=ps.excluded_properties,
@@ -4004,6 +4183,7 @@ class GDSBuilder:
                     edge_dim_agg_labels=ps.edge_dim_agg_labels,
                 ),
                 edge_dim_names=ps.edge_dim_names,
+                n_anomalous_dims_thresholds=ps.n_anom_dims_thresholds,
                 **self._unpack_lac_bundle(lac, ps.deltas),
             )
             self._write_calibration_epoch_for_pattern(pat, pbr)
@@ -4020,20 +4200,23 @@ class GDSBuilder:
                 if ctx is not None and p.pattern_type == "anchor":
                     pat_meta = self._build_pat_meta_for_temporal(p, stats)
                     self._build_temporal_one(
-                        pat_id, p, pat_meta, ctx["event_table"],
-                        ctx["bucket_np"], ctx["n_buckets"],
-                        ctx["min_ts"], ctx["window_secs"],
+                        pat_id,
+                        p,
+                        pat_meta,
+                        ctx["event_table"],
+                        ctx["bucket_np"],
+                        ctx["n_buckets"],
+                        ctx["min_ts"],
+                        ctx["window_secs"],
                         temporal_writer,
                     )
                 return pat_id, stats
 
             event_items_p = [
-                (pid, p) for pid, p in self._patterns.items()
-                if p.pattern_type == "event"
+                (pid, p) for pid, p in self._patterns.items() if p.pattern_type == "event"
             ]
             anchor_items_p = [
-                (pid, p) for pid, p in self._patterns.items()
-                if p.pattern_type == "anchor"
+                (pid, p) for pid, p in self._patterns.items() if p.pattern_type == "anchor"
             ]
 
             def _run_phase_pipeline(
@@ -4045,10 +4228,7 @@ class GDSBuilder:
                     with ThreadPoolExecutor(
                         max_workers=min(4, len(items)),
                     ) as pool:
-                        futs = {
-                            pool.submit(_pipeline, pid, p): pid
-                            for pid, p in items
-                        }
+                        futs = {pool.submit(_pipeline, pid, p): pid for pid, p in items}
                         for fut in as_completed(futs):
                             pat_id, stats = fut.result()
                             pattern_stats[pat_id] = stats
@@ -4065,12 +4245,10 @@ class GDSBuilder:
             # event pattern's edge_features sidecar — built in two phases
             # so the dependency holds without a topo sort.
             event_items = [
-                (pid, p) for pid, p in self._patterns.items()
-                if p.pattern_type == "event"
+                (pid, p) for pid, p in self._patterns.items() if p.pattern_type == "event"
             ]
             anchor_items = [
-                (pid, p) for pid, p in self._patterns.items()
-                if p.pattern_type == "anchor"
+                (pid, p) for pid, p in self._patterns.items() if p.pattern_type == "anchor"
             ]
 
             def _run_phase(items: list[tuple[str, _PatternReg]]) -> None:
@@ -4080,10 +4258,7 @@ class GDSBuilder:
                     with ThreadPoolExecutor(
                         max_workers=min(4, len(items)),
                     ) as pool:
-                        futures = [
-                            pool.submit(_build_and_write, pid, p)
-                            for pid, p in items
-                        ]
+                        futures = [pool.submit(_build_and_write, pid, p) for pid, p in items]
                         for fut in futures:
                             pat_id, stats = fut.result()
                             pattern_stats[pat_id] = stats
@@ -4102,14 +4277,19 @@ class GDSBuilder:
         sphere_data = self._build_sphere_json(pattern_stats)
         meta_dir = self.output_path / "_gds_meta"
         meta_dir.mkdir(parents=True, exist_ok=True)
-        (meta_dir / "sphere.json").write_text(json.dumps(sphere_data, indent=2))
+        from hypertopos.storage.writer import write_sphere_json
+
+        write_sphere_json(meta_dir, sphere_data)
 
         # 4. Initialize calibration tracker for each pattern
         from hypertopos.engine.calibration import CalibrationTracker
 
         for pid, pbr in pattern_stats.items():
             tracker = CalibrationTracker.from_stats(
-                pbr.mu, pbr.sigma, pbr.theta, n=pbr.population_size,
+                pbr.mu,
+                pbr.sigma,
+                pbr.theta,
+                n=pbr.population_size,
             )
             _stats_writer.write_calibration_tracker(pid, tracker)
 
@@ -4133,7 +4313,7 @@ class GDSBuilder:
         The prior sphere.json is only read here (not written) — the new
         sphere.json is written sequentially after the pool joins.
         """
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         from hypertopos.model.sphere import CalibrationFit
         from hypertopos.storage.calibration_history import (
@@ -4151,7 +4331,7 @@ class GDSBuilder:
         )
 
         prev_sphere_path = self.output_path / "_gds_meta" / "sphere.json"
-        prev_meta: dict = {}
+        prev_meta: dict[str, Any] = {}
         prev_schema_hash: str | None = None
         prev_calibration_epoch: int = 0
         if prev_sphere_path.exists():
@@ -4163,13 +4343,15 @@ class GDSBuilder:
             )
             if prev_pattern_node is not None:
                 prev_schema_hash = prev_pattern_node.get("schema_hash")
-                prev_calibration_epoch = prev_pattern_node.get(
-                    "calibration_epoch", 0,
-                ) or 0
+                prev_calibration_epoch = (
+                    prev_pattern_node.get(
+                        "calibration_epoch",
+                        0,
+                    )
+                    or 0
+                )
 
-        last_k = (
-            prev_meta.get("calibration_history_policy") or {}
-        ).get("last_k", 5)
+        last_k = (prev_meta.get("calibration_history_policy") or {}).get("last_k", 5)
         if last_k < 1:
             raise ValueError(
                 f"calibration_history_policy.last_k must be >= 1, got {last_k} "
@@ -4177,13 +4359,12 @@ class GDSBuilder:
             )
 
         history_present = history_dir(
-            self.output_path, pat.pattern_id,
+            self.output_path,
+            pat.pattern_id,
         ).exists()
 
         reset = (
-            prev_schema_hash is None
-            or prev_schema_hash != new_schema_hash
-            or not history_present
+            prev_schema_hash is None or prev_schema_hash != new_schema_hash or not history_present
         )
         if reset:
             reset_calibration_history(self.output_path, pat.pattern_id)
@@ -4196,21 +4377,20 @@ class GDSBuilder:
         # CalibrationFit serializer round-trips these via json.dumps, so
         # numpy arrays must be tolist()'d here.
         if pbr.group_stats:
-            group_stats_json: dict | None = {
+            group_stats_json: dict[str, dict[str, Any]] | None = {
                 gid: {
                     "mu": g_mu.tolist(),
                     "sigma_diag": g_sigma.tolist(),
                     "theta": g_theta.tolist(),
                     "population_size": int(g_pop),
                 }
-                for gid, (g_mu, g_sigma, g_theta, g_pop)
-                in pbr.group_stats.items()
+                for gid, (g_mu, g_sigma, g_theta, g_pop) in pbr.group_stats.items()
             }
         else:
             group_stats_json = None
 
         if pbr.gmm_components is not None:
-            gmm_components_json: list | None = [
+            gmm_components_json: list[dict[str, Any]] | None = [
                 {
                     "mu": c_mu.tolist(),
                     "sigma_diag": c_sig.tolist(),
@@ -4225,27 +4405,23 @@ class GDSBuilder:
         # Reconstruct edge_max vector matching sphere.json composition: one
         # entry per relation, then per event_dim, then zero per prop_column.
         # Mirrors the shape used at sphere.json build time.
-        if (
-            any(r.edge_max is not None for r in pat.relations)
-            or pat.event_dimensions
-        ):
+        if any(r.edge_max is not None for r in pat.relations) or pat.event_dimensions:
             edge_max_list = (
                 [
-                    1 if r.direction == "self"
-                    else r.edge_max if r.edge_max is not None
-                    else 1
+                    1 if r.direction == "self" else r.edge_max if r.edge_max is not None else 1
                     for r in pat.relations
                 ]
                 + [edim.edge_max for edim in pat.event_dimensions]
                 + [0] * len(pbr.prop_columns)
             )
             edge_max_arr: np.ndarray | None = np.asarray(
-                edge_max_list, dtype=np.float32,
+                edge_max_list,
+                dtype=np.float32,
             )
         else:
             edge_max_arr = None
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         fit = CalibrationFit(
             pattern_id=pat.pattern_id,
             calibration_epoch=new_epoch,
@@ -4257,11 +4433,11 @@ class GDSBuilder:
             population_size=int(pbr.population_size),
             dimension_weights=(
                 np.asarray(pbr.dimension_weights, dtype=np.float32)
-                if pbr.dimension_weights is not None else None
+                if pbr.dimension_weights is not None
+                else None
             ),
             dimension_kinds=(
-                list(pbr.dimension_kinds)
-                if pbr.dimension_kinds is not None else None
+                list(pbr.dimension_kinds) if pbr.dimension_kinds is not None else None
             ),
             dim_percentiles=pbr.dim_percentiles,
             group_stats=group_stats_json,
@@ -4274,7 +4450,9 @@ class GDSBuilder:
             dim_normality_pvalues=pbr.dim_normality_pvalues,
         )
         write_calibration_history_epoch(
-            self.output_path, fit, last_k=last_k,
+            self.output_path,
+            fit,
+            last_k=last_k,
         )
 
         self._calibration_state[pat.pattern_id] = {
@@ -4300,22 +4478,17 @@ class GDSBuilder:
             anchor_pattern = tc.get("anchor_pattern")
 
             if event_line_id is None:
-                event_lines = [
-                    lid for lid, lr in self._lines.items()
-                    if lr.role == "event"
-                ]
+                event_lines = [lid for lid, lr in self._lines.items() if lr.role == "event"]
                 if len(event_lines) == 0:
                     raise ValueError("No event lines registered")
                 if len(event_lines) > 1:
                     raise ValueError(
-                        f"Multiple event lines found: {event_lines}. "
-                        "Specify event_line explicitly."
+                        f"Multiple event lines found: {event_lines}. Specify event_line explicitly."
                     )
                 event_line_id = event_lines[0]
 
-            event_table = self._lines[event_line_id].table
-            bucket_np, n_buckets, min_ts, window_secs = (
-                self._parse_event_buckets(event_table, time_col, time_window)
+            event_table, bucket_np, n_buckets, min_ts, window_secs = self._parse_event_buckets(
+                self._lines[event_line_id].table, time_col, time_window
             )
             if n_buckets == 0:
                 continue
@@ -4339,7 +4512,9 @@ class GDSBuilder:
         return result
 
     def _resolve_anchor_pattern_for_edge_table(
-        self, pat_id: str, pat: _PatternReg,
+        self,
+        pat_id: str,
+        pat: _PatternReg,
     ) -> str | None:
         """Find which anchor pattern's geometry holds the is_anomaly bitmap
         for entities appearing in *pat*'s edge table.
@@ -4367,21 +4542,23 @@ class GDSBuilder:
         geom_table: pa.Table,
     ) -> pa.Table:
         """Arrow-native contagion stats — no Python loops over rows."""
-        import math
 
-        _empty = pa.table({
-            "primary_key": pa.array([], type=pa.string()),
-            "neighbor_count": pa.array([], type=pa.int32()),
-            "anomalous_neighbor_count": pa.array([], type=pa.int32()),
-            "contagion_ratio": pa.array([], type=pa.float32()),
-        })
+        _empty = pa.table(
+            {
+                "primary_key": pa.array([], type=pa.string()),
+                "neighbor_count": pa.array([], type=pa.int32()),
+                "anomalous_neighbor_count": pa.array([], type=pa.int32()),
+                "contagion_ratio": pa.array([], type=pa.float32()),
+            }
+        )
 
         if edges_table.num_rows == 0:
             return _empty
 
         # Filter self-loops
         not_self = pc.not_equal(
-            edges_table["from_key"], edges_table["to_key"],
+            edges_table["from_key"],
+            edges_table["to_key"],
         )
         edges_table = edges_table.filter(not_self)
         if edges_table.num_rows == 0:
@@ -4411,14 +4588,18 @@ class GDSBuilder:
                 [("to_key", "count_distinct")],
             )
         else:
-            anom_counts = pa.table({
-                "from_key": pa.array([], type=pa.string()),
-                "to_key_count_distinct": pa.array([], type=pa.int64()),
-            })
+            anom_counts = pa.table(
+                {
+                    "from_key": pa.array([], type=pa.string()),
+                    "to_key_count_distinct": pa.array([], type=pa.int64()),
+                }
+            )
 
         # Join
         joined = neighbor_counts.join(
-            anom_counts, keys="from_key", join_type="left outer",
+            anom_counts,
+            keys="from_key",
+            join_type="left outer",
             right_suffix="_anom",
         )
 
@@ -4441,23 +4622,28 @@ class GDSBuilder:
             )
         else:
             ac = pa.array(
-                np.zeros(joined.num_rows, dtype=np.int64), type=pa.int64(),
+                np.zeros(joined.num_rows, dtype=np.int64),
+                type=pa.int64(),
             )
 
         nc_np = nc.to_numpy(zero_copy_only=False).astype(np.float32)
         ac_np = ac.to_numpy(zero_copy_only=False).astype(np.float32)
         ratio = np.where(nc_np > 0, ac_np / nc_np, float("nan"))
 
-        return pa.table({
-            "primary_key": pk,
-            "neighbor_count": pa.array(
-                nc.to_numpy(zero_copy_only=False), type=pa.int32(),
-            ),
-            "anomalous_neighbor_count": pa.array(
-                ac.to_numpy(zero_copy_only=False), type=pa.int32(),
-            ),
-            "contagion_ratio": pa.array(ratio, type=pa.float32()),
-        })
+        return pa.table(
+            {
+                "primary_key": pk,
+                "neighbor_count": pa.array(
+                    nc.to_numpy(zero_copy_only=False),
+                    type=pa.int32(),
+                ),
+                "anomalous_neighbor_count": pa.array(
+                    ac.to_numpy(zero_copy_only=False),
+                    type=pa.int32(),
+                ),
+                "contagion_ratio": pa.array(ratio, type=pa.float32()),
+            }
+        )
 
     def _build_contagion_stats(self, stats_writer: Any) -> None:
         """Precompute per-entity contagion statistics for every pattern that
@@ -4479,14 +4665,16 @@ class GDSBuilder:
                 columns=["from_key", "to_key"],
             ).to_table()
 
-            geom_path = (
-                self.output_path / "geometry" / anchor_pat_id / "data.lance"
-            )
+            geom_path = self.output_path / "geometry" / anchor_pat_id / "data.lance"
             if not geom_path.exists():
                 continue
-            geom_table = _lance.dataset(str(geom_path)).scanner(
-                columns=["primary_key", "is_anomaly"],
-            ).to_table()
+            geom_table = (
+                _lance.dataset(str(geom_path))
+                .scanner(
+                    columns=["primary_key", "is_anomaly"],
+                )
+                .to_table()
+            )
 
             contagion_table = self._compute_contagion_arrow(edges_table, geom_table)
             stats_writer.write_contagion_stats(pat_id, contagion_table)
@@ -4499,6 +4687,7 @@ class GDSBuilder:
         recalibrate: str = "auto",
         reindex: bool = False,
         recompute_ranks: bool = True,
+        branch: str | None = None,
     ) -> IncrementalUpdateResult:
         """Update geometry incrementally for changed/deleted entities.
 
@@ -4517,13 +4706,14 @@ class GDSBuilder:
                 index so the appended rows are immediately visible to
                 ANN-dependent navigation (e.g. π10_attract_trajectory).
                 When False (default) the index is rebuilt only once the
-                unindexed fraction crosses the standard 10% threshold — except
-                that a ``recompute_ranks=True`` call drops the index as a side
-                effect (its merge_insert invalidates it), so the default path
-                then rebuilds on every call. In the ``recompute_ranks=False``
-                deferred path the index is preserved and the 10% threshold
-                genuinely gates rebuilds; call ``finalize_incremental`` to force
-                a final rebuild at session end.
+                unindexed fraction crosses the standard 10% threshold, on both
+                the ``recompute_ranks=True`` and the deferred
+                ``recompute_ranks=False`` path (the rank recompute leaves the
+                vector index intact). Rows not yet in the index are still
+                found by ANN queries, through a brute-force pass over the
+                unindexed rows, so they are slower to search, not missing.
+                Call ``finalize_incremental`` to force a final rebuild at
+                session end.
             recompute_ranks: When True (default), recompute the global
                 delta_rank_pct percentile for the whole population on every
                 call, so each call is standalone-correct. When False, defer the
@@ -4532,15 +4722,26 @@ class GDSBuilder:
                 new rows carry a batch-local rank. Use False for batched
                 ingestion of many small appends, then call
                 ``finalize_incremental`` once at the end of the session.
+            branch: Apply the update to this sphere branch only; main is not
+                touched. The update is appended to the branch's recipe log
+                (with a copy of ``changed_entities``); an automatic
+                recalibration is recorded as its own recipe.
         """
-        import lance as _lance
-
         from hypertopos.builder._writer import _prepare_geometry_for_lance
+        from hypertopos.storage import _lance_branches
         from hypertopos.storage.reader import GDSReader
         from hypertopos.storage.writer import GDSWriter, _write_lance
 
+        if branch:
+            _lance_branches.verify_branch(self.output_path, branch)
+        meta_root = (
+            _lance_branches.overlay_dir(Path(self.output_path).resolve(), branch)
+            if branch
+            else Path(self.output_path)
+        )
+
         # 1. Read sphere.json for pattern metadata
-        sphere_path = self.output_path / "_gds_meta" / "sphere.json"
+        sphere_path = meta_root / "_gds_meta" / "sphere.json"
         sphere_data = json.loads(sphere_path.read_text())
         pat_meta = sphere_data["patterns"][pattern_id]
 
@@ -4552,19 +4753,16 @@ class GDSBuilder:
         relations_meta = pat_meta.get("relations", [])
         event_dims_meta = pat_meta.get("event_dimensions") or None
         dim_weights_raw = pat_meta.get("dimension_weights")
-        dim_weights = (
-            np.array(dim_weights_raw, dtype=np.float32)
-            if dim_weights_raw else None
-        )
+        dim_weights = np.array(dim_weights_raw, dtype=np.float32) if dim_weights_raw else None
+        chol_raw = pat_meta.get("cholesky_inv")
+        cholesky_inv = np.array(chol_raw, dtype=np.float32) if chol_raw else None
 
         # 2. Read calibration tracker
-        reader = GDSReader(str(self.output_path))
+        reader = GDSReader(str(self.output_path), branch=branch)
         tracker = reader.read_calibration_tracker(pattern_id)
 
         # 3. Resolve geometry Lance path (native MVCC — flat directory).
-        lance_path = str(
-            self.output_path / "geometry" / pattern_id / "data.lance"
-        )
+        lance_path = str(self.output_path / "geometry" / pattern_id / "data.lance")
 
         # 4. Classify changed entity keys
         added_count = 0
@@ -4574,7 +4772,9 @@ class GDSBuilder:
 
         if changed_entities is not None and len(changed_entities) > 0:
             changed_pks = changed_entities["primary_key"].to_pylist()
-            new_keys, mod_keys = _classify_changed_keys(lance_path, changed_pks)
+            new_keys, mod_keys = _classify_changed_keys(
+                _lance_branches.open_ref(lance_path, branch), changed_pks
+            )
             added_count = len(new_keys)
             modified_count = len(mod_keys)
             # Modified keys need old rows deleted before re-insert
@@ -4582,7 +4782,7 @@ class GDSBuilder:
 
         # 5. Delete old rows (deleted_keys + modified_keys)
         if keys_to_delete:
-            ds = _lance.dataset(lance_path)
+            ds = _lance_branches.open_ref(lance_path, branch)
             escaped = [k.replace("'", "''") for k in keys_to_delete]
             in_clause = ", ".join(f"'{k}'" for k in escaped)
             ds.delete(f"primary_key IN ({in_clause})")
@@ -4623,10 +4823,15 @@ class GDSBuilder:
                 pat_meta.get("edge_dim_aggregations"),
             )
             deltas, delta_norms, shape_vectors = compute_entity_geometry(
-                changed_entities, mu, sigma,
-                enriched_relations, event_dims_meta, dim_weights,
+                changed_entities,
+                mu,
+                sigma,
+                enriched_relations,
+                event_dims_meta,
+                dim_weights,
                 prop_columns=prop_cols,
                 edge_dim_agg_labels=edge_dim_agg_labels,
+                cholesky_inv=cholesky_inv,
             )
 
             # Incremental ingest reconstructs geometry from the GLOBAL
@@ -4675,9 +4880,7 @@ class GDSBuilder:
 
             # 7. Build geometry rows
             n_new = len(changed_entities)
-            is_anomaly = (
-                (theta_norm > 0.0) & (delta_norms >= theta_norm)
-            )
+            is_anomaly = (theta_norm > 0.0) & (delta_norms >= theta_norm)
 
             # Conformal p-values. Use the right-tail population contract
             # (p = fraction with delta_norm >= this row's norm, so lower = more
@@ -4687,14 +4890,25 @@ class GDSBuilder:
             # the full population on the default path / at finalize_incremental,
             # exactly like delta_rank_pct. delta_rank_pcts keeps its own
             # higher = more anomalous convention (left-rank × 100).
-            sorted_norms = np.sort(delta_norms)
-            ranks = np.searchsorted(sorted_norms, delta_norms, side="left")
+            from hypertopos.builder._stats import population_left_ranks
+
+            ranks = population_left_ranks(delta_norms)
             right_ranks = n_new - ranks
             conformal_p = (right_ranks / max(n_new, 1)).astype(np.float32)
             delta_rank_pcts = (ranks / max(n_new, 1) * 100).astype(np.float32)
 
-            # Per-dimension anomaly count
-            n_anom_dims = np.sum(np.abs(deltas) > 2.576, axis=1).astype(np.int32)
+            # Per-dimension anomaly count against the thresholds the full build
+            # used (population P99 of |delta| per dim). Spheres built before the
+            # thresholds were persisted fall back to the two-sided 1% normal cut.
+            from hypertopos.builder._stats import compute_per_dim_anomaly_count
+
+            stored_thresholds = pat_meta.get("n_anomalous_dims_thresholds")
+            if stored_thresholds is not None:
+                n_anom_dims = compute_per_dim_anomaly_count(
+                    deltas, thresholds=np.asarray(stored_thresholds, dtype=np.float64)
+                )
+            else:
+                n_anom_dims = np.sum(np.abs(deltas) > 2.576, axis=1).astype(np.int32)
 
             # Build entity_keys (positional list per relation)
             pk_arr = changed_entities["primary_key"].cast(pa.string()).combine_chunks()
@@ -4723,7 +4937,8 @@ class GDSBuilder:
                 delta_col = delta_col.cast(pa.list_(pa.float32()))
             else:
                 delta_col = pa.array(
-                    [[] for _ in range(n_new)], type=pa.list_(pa.float32()),
+                    [[] for _ in range(n_new)],
+                    type=pa.list_(pa.float32()),
                 )
 
             geom_cols = {
@@ -4736,7 +4951,12 @@ class GDSBuilder:
                 "conformal_p": pa.array(conformal_p, type=pa.float32()),
                 "bregman_divergence": pa.array(
                     self._compute_incremental_bregman(
-                        deltas, mu, sigma, pat_meta, n_new,
+                        shape_vectors,
+                        mu,
+                        sigma,
+                        pat_meta,
+                        n_new,
+                        weights=dim_weights,
                     ),
                     type=pa.float32(),
                 ),
@@ -4757,23 +4977,23 @@ class GDSBuilder:
                 geom_table = pa.table(geom_cols, schema=GEOMETRY_EVENT_SCHEMA)
             else:
                 # Anchor patterns need edges column — build simplified edges
-                edge_rows: list[list[dict]] = []
+                edge_rows: list[list[dict[str, Any]]] = []
                 for i in range(n_new):
                     row_edges = []
                     for j_rel, rel in enumerate(enriched_relations):
                         fk_col = rel.get("fk_col")
                         direction = rel.get("direction", "in")
                         ek_row = entity_key_lists[i]
-                        point_key = (
-                            ek_row[j_rel] if j_rel < len(ek_row) else ""
-                        )
+                        point_key = ek_row[j_rel] if j_rel < len(ek_row) else ""
                         status = "alive" if point_key else "dead"
-                        row_edges.append({
-                            "line_id": rel["line_id"],
-                            "point_key": point_key,
-                            "status": status,
-                            "direction": direction,
-                        })
+                        row_edges.append(
+                            {
+                                "line_id": rel["line_id"],
+                                "point_key": point_key,
+                                "status": status,
+                                "direction": direction,
+                            }
+                        )
                     edge_rows.append(row_edges)
                 edges_col = pa.array(edge_rows, type=pa.list_(EDGE_STRUCT_TYPE))
                 geom_cols["edges"] = edges_col
@@ -4781,15 +5001,20 @@ class GDSBuilder:
 
             # 8. Prepare and append geometry
             prepared, _list_size = _prepare_geometry_for_lance(geom_table)
-            mode = "append" if Path(lance_path).exists() else "create"
-            _write_lance(prepared, lance_path, mode=mode)
+            if branch:
+                _write_lance(prepared, _lance_branches.open_ref(lance_path, branch), mode="append")
+            else:
+                mode = "append" if Path(lance_path).exists() else "create"
+                _write_lance(prepared, lance_path, mode=mode)
 
             # 9. Update CalibrationTracker
             if tracker is not None:
                 tracker.update(shape_vectors)
                 tracker.update_norms(delta_norms)
 
-        writer = GDSWriter(str(self.output_path))
+        writer = GDSWriter(str(self.output_path), branch=branch)
+        # Metadata goes to the branch directory on a branch.
+        meta_writer = GDSWriter(str(meta_root)) if branch else writer
 
         # 10. Recompute delta_rank_pct (O(N) global population percentile).
         # delta_rank_pct is a whole-population rank, so adding rows shifts the
@@ -4802,47 +5027,83 @@ class GDSBuilder:
             writer.recompute_rank_stats(pattern_id)
 
         # 10b. Maybe rebuild the ANN index so appended rows are visible to
-        # ANN-dependent navigation. Runs AFTER recompute_delta_rank_pct: the
-        # rank recompute's merge_insert rewrites matched rows into new
-        # fragments, dropping them out of any pre-existing index — reindexing
-        # first would leave the index covering zero current rows. reindex=True
+        # ANN-dependent navigation. Runs after the rank recompute so the
+        # rebuild sees the final fragments (the recompute rewrites only the
+        # rank columns and leaves the vector index intact). reindex=True
         # forces a rebuild; otherwise the 10% unindexed-fraction threshold
         # gates it.
         writer._maybe_reindex_geometry(
-            pattern_id, threshold=0.0 if reindex else 0.1, version=version,
+            pattern_id,
+            threshold=0.0 if reindex else 0.1,
+            version=version,
         )
 
         # 11. Compute new population size
-        ds = _lance.dataset(lance_path)
+        ds = _lance_branches.open_ref(lance_path, branch)
         new_pop = ds.count_rows()
 
         # 12. Auto-recalibrate check
         recalibrated = False
         current_drift = tracker.drift_pct if tracker else 0.0
-        if recalibrate == "force" or (
+        need_recalibrate = recalibrate == "force" or (
             recalibrate == "auto" and tracker is not None and tracker.is_stale
-        ):
-            recalibrated = True
-            # Full recalibration not implemented inline — mark as stale
-            # The caller should trigger a full rebuild for proper recalibration
+        )
 
         # 13. Update sphere.json
         pat_meta["population_size"] = new_pop
         pat_meta["computed_at"] = datetime.now(UTC).isoformat()
         sphere_data["patterns"][pattern_id] = pat_meta
-        sphere_path.write_text(json.dumps(sphere_data, indent=2))
+        from hypertopos.storage.writer import write_sphere_json
+
+        write_sphere_json(sphere_path.parent, sphere_data)
 
         # 14. Rewrite geometry_stats
         all_norms_tbl = ds.to_table(columns=["delta_norm"])
         all_norms = all_norms_tbl["delta_norm"].to_numpy(zero_copy_only=False)
-        writer.write_geometry_stats(
-            pattern_id, version=version,
-            delta_norms=all_norms, theta_norm=theta_norm,
+        meta_writer.write_geometry_stats(
+            pattern_id,
+            version=version,
+            delta_norms=all_norms,
+            theta_norm=theta_norm,
         )
 
         # 15. Persist updated calibration tracker
         if tracker is not None:
-            writer.write_calibration_tracker(pattern_id, tracker)
+            meta_writer.write_calibration_tracker(pattern_id, tracker)
+
+        if branch:
+            self._record_ingest_recipe(
+                branch,
+                pattern_id,
+                changed_entities,
+                deleted_keys=list(deleted_keys or []),
+                recalibrate=recalibrate,
+                reindex=reindex,
+                recompute_ranks=recompute_ranks,
+                result={
+                    "added": added_count,
+                    "modified": modified_count,
+                    "deleted": deleted_count,
+                    "population_size": new_pop,
+                },
+            )
+
+        # 16. Full recalibration — runs after all incremental writes so the
+        # geometry table already includes the new rows. HyperSession.recalibrate
+        # reads the current geometry, recomputes mu/sigma/theta from the full
+        # population, rewrites geometry, updates sphere.json and resets the
+        # tracker. Local import avoids a module-level circular dependency.
+        if need_recalibrate:
+            from hypertopos.sphere import HyperSphere
+
+            hs = HyperSphere.open(str(self.output_path))
+            session = hs.session("_recalibrate_agent", branch=branch)
+            try:
+                recal_result = session.recalibrate(pattern_id)
+            finally:
+                session.close()
+            theta_norm = recal_result["new_theta_norm"]
+            recalibrated = True
 
         return IncrementalUpdateResult(
             pattern_id=pattern_id,
@@ -4855,7 +5116,48 @@ class GDSBuilder:
             population_size=new_pop,
         )
 
-    def finalize_incremental(self, pattern_id: str) -> None:
+    def _record_ingest_recipe(
+        self,
+        branch: str,
+        pattern_id: str,
+        changed_entities: pa.Table | None,
+        **entry: Any,
+    ) -> None:
+        """Append an ``incremental_update`` recipe, keeping a copy of the rows."""
+        import hashlib
+
+        from hypertopos.storage import _lance_branches
+
+        base = Path(self.output_path).resolve()
+        seq = len(_lance_branches.read_branch_json(base, branch)["recipes"]) + 1
+        points_file = points_sha256 = None
+        if changed_entities is not None and len(changed_entities) > 0:
+            points_file = f"recipes/{seq}.arrow"
+            target = _lance_branches.overlay_dir(base, branch) / points_file
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with (
+                pa.OSFile(str(target), "wb") as sink,
+                pa.ipc.new_file(sink, changed_entities.schema) as ipc,
+            ):
+                ipc.write_table(changed_entities)
+            points_sha256 = "sha256:" + hashlib.sha256(target.read_bytes()).hexdigest()
+        lance_path = base / "geometry" / pattern_id / "data.lance"
+        _lance_branches.append_recipe(
+            base,
+            branch,
+            {
+                "op": "incremental_update",
+                "pattern_id": pattern_id,
+                "points_file": points_file,
+                "points_sha256": points_sha256,
+                **entry,
+                "lance_version_after": {
+                    pattern_id: _lance_branches.open_ref(lance_path, branch).version
+                },
+            },
+        )
+
+    def finalize_incremental(self, pattern_id: str, branch: str | None = None) -> None:
         """Finalize a batched incremental-ingest session for one pattern.
 
         Recomputes the global ``delta_rank_pct`` percentile once across the
@@ -4866,36 +5168,55 @@ class GDSBuilder:
         recompute on every individual append.
 
         Idempotent and safe to call after ``recompute_ranks=True`` updates too.
+        With ``branch`` it finalizes the branch and is recorded in its recipe log.
         """
+        from hypertopos.storage import _lance_branches
         from hypertopos.storage.writer import GDSWriter
 
-        writer = GDSWriter(str(self.output_path))
+        if branch:
+            _lance_branches.verify_branch(self.output_path, branch)
+        writer = GDSWriter(str(self.output_path), branch=branch)
         writer.recompute_rank_stats(pattern_id)
-        # Reindex AFTER the rank recompute — the recompute's merge_insert
-        # rewrites matched rows into new fragments, dropping them out of any
-        # pre-existing index.
+        # Reindex after the rank recompute so the rebuild sees the final
+        # fragments.
         writer._maybe_reindex_geometry(pattern_id, threshold=0.0, version=1)
+        if branch:
+            lance_path = Path(self.output_path).resolve() / "geometry" / pattern_id / "data.lance"
+            _lance_branches.append_recipe(
+                self.output_path,
+                branch,
+                {
+                    "op": "finalize_incremental",
+                    "pattern_id": pattern_id,
+                    "lance_version_after": {
+                        pattern_id: _lance_branches.open_ref(lance_path, branch).version
+                    },
+                },
+            )
 
     @staticmethod
     def _compute_incremental_bregman(
-        deltas: np.ndarray,
+        shapes: np.ndarray,
         mu: np.ndarray,
         sigma: np.ndarray,
-        pat_meta: dict,
+        pat_meta: dict[str, Any],
         n: int,
+        weights: np.ndarray | None = None,
     ) -> np.ndarray:
         """Compute Bregman norms for incrementally-added entities.
 
-        Reconstructs shape vectors from deltas and the stored mu/sigma,
-        then scores against the pattern's dimension_kinds. Returns zeros
-        when dimension_kinds is unavailable (pre-0.4 spheres).
+        Scores the entities' shape vectors against the stored mu/sigma, the
+        pattern's dimension_kinds and its dimension_weights (as the full
+        build does). Returns zeros when dimension_kinds is unavailable
+        (pre-0.4 spheres).
         """
         dim_kinds = pat_meta.get("dimension_kinds")
         if dim_kinds is not None:
             from hypertopos.builder._bregman import bregman_norms as _bregman_norms_fn
 
-            shapes = (deltas * sigma + mu).astype(np.float32)
-            return _bregman_norms_fn(shapes, mu, sigma, dim_kinds).astype(np.float32)
+            return _bregman_norms_fn(
+                shapes.astype(np.float32), mu, sigma, dim_kinds, weights=weights
+            ).astype(np.float32)
         return np.zeros(n, dtype=np.float32)
 
     def _build_and_write_chunked(
@@ -4903,8 +5224,7 @@ class GDSBuilder:
         pat_id: str,
         pat: _PatternReg,
         stats_writer: Any,
-        write_chunk_fn: Any,
-        finalize_fn: Any,
+        write_chunks_fn: Any,
     ) -> tuple[str, PatternBuildResult]:
         """Chunked geometry build: compute stats once, write in chunks.
 
@@ -4952,33 +5272,41 @@ class GDSBuilder:
                 seed=42,
             )
 
-        # 2. Write geometry in chunks
-        for start in range(0, n, GEOMETRY_CHUNK_SIZE):
-            end = min(start + GEOMETRY_CHUNK_SIZE, n)
-            chunk_table = self._build_geometry_slice(
-                pat, start, end,
-                ps.deltas, ps.delta_norms, ps.delta_rank_pcts,
-                theta_norm, ps.fk_arrays, ps.conformal_p,
-                ps.is_anomaly_arr, ps.n_anom_dims,
-                bregman_norms_arr=ps.bregman_norms,
-                anomaly_confidence_arr=confidence_arr,
-            )
-            chunk_table = self._inject_fdr_hierarchy_carriers(pat, chunk_table)
-            chunk_table = self._inject_fdr_temporal_buckets(pat, chunk_table)
-            _validate_fdr_hierarchy_columns(
-                pat, list(chunk_table.column_names),
-            )
-            write_chunk_fn(
-                self.output_path, pat_id, chunk_table, version=1,
-            )
+        # 2. Write geometry in chunks (one streamed write, then indices)
+        def _geometry_chunks() -> Iterator[pa.Table]:
+            for start in range(0, n, GEOMETRY_CHUNK_SIZE):
+                end = min(start + GEOMETRY_CHUNK_SIZE, n)
+                chunk_table = self._build_geometry_slice(
+                    pat,
+                    start,
+                    end,
+                    ps.deltas,
+                    ps.delta_norms,
+                    ps.delta_rank_pcts,
+                    theta_norm,
+                    ps.fk_arrays,
+                    ps.conformal_p,
+                    ps.is_anomaly_arr,
+                    ps.n_anom_dims,
+                    bregman_norms_arr=ps.bregman_norms,
+                    anomaly_confidence_arr=confidence_arr,
+                )
+                chunk_table = self._inject_fdr_hierarchy_carriers(pat, chunk_table)
+                chunk_table = self._inject_fdr_temporal_buckets(pat, chunk_table)
+                _validate_fdr_hierarchy_columns(
+                    pat,
+                    list(chunk_table.column_names),
+                )
+                yield chunk_table
 
-        # 3. Finalize: compact fragments, build indices
-        finalize_fn(self.output_path, pat_id, version=1)
+        write_chunks_fn(self.output_path, pat_id, _geometry_chunks(), version=1)
 
-        # 4. Persist geometry stats cache
+        # 3. Persist geometry stats cache
         stats_writer.write_geometry_stats(
-            pat_id, version=1,
-            delta_norms=ps.delta_norms, theta_norm=theta_norm,
+            pat_id,
+            version=1,
+            delta_norms=ps.delta_norms,
+            theta_norm=theta_norm,
             is_anomaly_arr=ps.is_anomaly_arr,
         )
 
@@ -4990,18 +5318,24 @@ class GDSBuilder:
                 stats_writer.write_edges(pat_id, edge_table)
                 # Cache edge stats
                 import pyarrow.compute as _pc
-                stats_writer.write_edge_stats(pat_id, {
-                    "row_count": edge_table.num_rows,
-                    "unique_from": _pc.count_distinct(edge_table["from_key"]).as_py(),
-                    "unique_to": _pc.count_distinct(edge_table["to_key"]).as_py(),
-                    "timestamp_min": float(_pc.min(edge_table["timestamp"]).as_py()),
-                    "timestamp_max": float(_pc.max(edge_table["timestamp"]).as_py()),
-                    "amount_min": float(_pc.min(edge_table["amount"]).as_py()),
-                    "amount_max": float(_pc.max(edge_table["amount"]).as_py()),
-                })
+
+                stats_writer.write_edge_stats(
+                    pat_id,
+                    {
+                        "row_count": edge_table.num_rows,
+                        "unique_from": _pc.count_distinct(edge_table["from_key"]).as_py(),
+                        "unique_to": _pc.count_distinct(edge_table["to_key"]).as_py(),
+                        "timestamp_min": float(_pc.min(edge_table["timestamp"]).as_py()),
+                        "timestamp_max": float(_pc.max(edge_table["timestamp"]).as_py()),
+                        "amount_min": float(_pc.min(edge_table["amount"]).as_py()),
+                        "amount_max": float(_pc.max(edge_table["amount"]).as_py()),
+                    },
+                )
 
         return pat_id, PatternBuildResult(
-            mu=ps.mu, sigma=ps.sigma, theta=ps.theta,
+            mu=ps.mu,
+            sigma=ps.sigma,
+            theta=ps.theta,
             population_size=n,
             prop_columns=ps.prop_columns,
             excluded_properties=ps.excluded_properties,
@@ -5025,6 +5359,7 @@ class GDSBuilder:
                 edge_dim_agg_labels=ps.edge_dim_agg_labels,
             ),
             edge_dim_names=ps.edge_dim_names,
+            n_anomalous_dims_thresholds=ps.n_anom_dims_thresholds,
             **self._unpack_lac_bundle(lac, ps.deltas),
         )
 
@@ -5032,7 +5367,7 @@ class GDSBuilder:
         self,
         pat: _PatternReg,
         chunk_table: pa.Table,
-    ) -> tuple[np.ndarray, list]:
+    ) -> tuple[np.ndarray, list[Any]]:
         """Build shape vectors and FK arrays for a chunk of entity table.
 
         Returns:
@@ -5052,9 +5387,13 @@ class GDSBuilder:
                 fk_slices.append(None)
             elif rel.edge_max is not None:
                 col = chunk_table[rel.fk_col]
-                count_arr = pc.fill_null(col, 0).to_numpy(
-                    zero_copy_only=False,
-                ).astype(np.float32)
+                count_arr = (
+                    pc.fill_null(col, 0)
+                    .to_numpy(
+                        zero_copy_only=False,
+                    )
+                    .astype(np.float32)
+                )
                 shapes[:, j] = np.clip(count_arr, 0, rel.edge_max) / rel.edge_max
                 fk_slices.append(count_arr)
             else:
@@ -5074,9 +5413,13 @@ class GDSBuilder:
         # Event dimensions — continuous values from entity columns
         for k, edim in enumerate(pat.event_dimensions):
             col = chunk_table[edim.column]
-            raw_arr = pc.fill_null(col, 0).to_numpy(
-                zero_copy_only=False,
-            ).astype(np.float32)
+            raw_arr = (
+                pc.fill_null(col, 0)
+                .to_numpy(
+                    zero_copy_only=False,
+                )
+                .astype(np.float32)
+            )
             em = edim.edge_max
             if isinstance(em, (int, float)) and em > 0:
                 shapes[:, D_rel + k] = np.clip(raw_arr / em, 0.0, 3.0)
@@ -5106,9 +5449,13 @@ class GDSBuilder:
             if prop not in schema_names:
                 continue
             col = chunk_table[prop]
-            fill_vec = pc.is_valid(col).to_numpy(
-                zero_copy_only=False,
-            ).astype(np.float32)
+            fill_vec = (
+                pc.is_valid(col)
+                .to_numpy(
+                    zero_copy_only=False,
+                )
+                .astype(np.float32)
+            )
             fill_matrix[:, j] = fill_vec
         return fill_matrix
 
@@ -5117,8 +5464,7 @@ class GDSBuilder:
         pat_id: str,
         pat: _PatternReg,
         stats_writer: Any,
-        write_chunk_fn: Any,
-        finalize_fn: Any,
+        write_chunks_fn: Any,
     ) -> tuple[str, PatternBuildResult]:
         """Three-pass streaming geometry build with O(chunk) peak RAM.
 
@@ -5135,6 +5481,7 @@ class GDSBuilder:
             SIGMA_EPS,
             SIGMA_EPS_PROP,
             compute_conformal_p,
+            population_left_ranks,
             reservoir_update,
             welford_batch_update,
         )
@@ -5194,11 +5541,7 @@ class GDSBuilder:
 
             dims_cfg = dict(pat.edge_dimensions.dims)
             tsl = dims_cfg.get("time_since_pair_last_edge")
-            if (
-                tsl is not None
-                and isinstance(tsl, dict)
-                and tsl.get("dormant_seconds") == "auto"
-            ):
+            if tsl is not None and isinstance(tsl, dict) and tsl.get("dormant_seconds") == "auto":
                 if edges_tbl.num_rows > 0:
                     ts = edges_tbl["timestamp"].to_numpy()
                     span = float(ts.max() - ts.min())
@@ -5206,54 +5549,46 @@ class GDSBuilder:
                 else:
                     span = 1.0
                 dims_cfg["time_since_pair_last_edge"] = {
-                    **tsl, "dormant_seconds": span,
+                    **tsl,
+                    "dormant_seconds": span,
                 }
 
             features = compute_all_edge_dims(edges_tbl, dims_cfg)
-            edge_dim_names = [
-                c for c in features.column_names if c != "event_key"
-            ]
+            edge_dim_names = [c for c in features.column_names if c != "event_key"]
             edge_dim_kinds = [EDGE_DIM_KINDS[name] for name in edge_dim_names]
             if edge_dim_names and edges_tbl.num_rows > 0:
-                pk_to_idx = {
-                    pk: i
-                    for i, pk in enumerate(
-                        entity_table["primary_key"].to_pylist(),
-                    )
-                }
+                from hypertopos.builder._scatter import scatter_columns
+
                 edge_dim_matrix = np.zeros(
-                    (n, len(edge_dim_names)), dtype=np.float32,
+                    (n, len(edge_dim_names)),
+                    dtype=np.float32,
                 )
-                event_keys = features["event_key"].to_pylist()
-                for col_idx, name in enumerate(edge_dim_names):
-                    vals = features[name].to_numpy()
-                    for row_idx, ek in enumerate(event_keys):
-                        ent_idx = pk_to_idx.get(ek)
-                        if ent_idx is not None:
-                            edge_dim_matrix[ent_idx, col_idx] = vals[row_idx]
+                scatter_columns(
+                    edge_dim_matrix,
+                    entity_table["primary_key"].combine_chunks(),
+                    features["event_key"],
+                    [features[name] for name in edge_dim_names],
+                )
             elif edge_dim_names:
                 edge_dim_matrix = np.zeros(
-                    (n, len(edge_dim_names)), dtype=np.float32,
+                    (n, len(edge_dim_names)),
+                    dtype=np.float32,
                 )
 
             if edge_dim_names:
+                from hypertopos.storage.writer import _write_lance
+
+                # Anchor patterns' edge_dim_aggregations read this sidecar later in
+                # the build: a failed write must stop the build here, at its cause.
+                sidecar_dir = self.output_path / "_gds_meta" / "edge_features" / pat.pattern_id
                 try:
-                    import lance
-                    sidecar_dir = (
-                        self.output_path
-                        / "_gds_meta" / "edge_features" / pat.pattern_id
-                    )
                     sidecar_dir.mkdir(parents=True, exist_ok=True)
-                    lance.write_dataset(
-                        features,
-                        str(sidecar_dir / "data.lance"),
-                        mode="overwrite",
-                    )
+                    _write_lance(features, str(sidecar_dir / "data.lance"), mode="overwrite")
                 except Exception as exc:
-                    logger.warning(
-                        "edge_features sidecar write failed for %s: %s",
-                        pat.pattern_id, exc,
-                    )
+                    raise RuntimeError(
+                        f"edge_features sidecar write failed for {pat.pattern_id!r} "
+                        f"at {sidecar_dir}: {exc}"
+                    ) from exc
 
         D_edge = len(edge_dim_names)
 
@@ -5261,12 +5596,8 @@ class GDSBuilder:
         edge_dim_agg_matrix = np.empty((n, 0), dtype=np.float32)
         edge_dim_agg_kinds: list[str] = []
         edge_dim_agg_labels: list[str] = []
-        if (
-            pat.edge_dim_aggregations is not None
-            and pat.pattern_type == "anchor"
-        ):
+        if pat.edge_dim_aggregations is not None and pat.pattern_type == "anchor":
             from hypertopos.engine.edge_features import (
-                AGGREGATE_NAMES,
                 EDGE_DIM_KINDS,
                 aggregate_edge_dims_for_anchor,
                 aggregate_kind,
@@ -5286,8 +5617,11 @@ class GDSBuilder:
                     f"={cfg.from_event_pattern!r} has no edge_table",
                 )
             sidecar_path = (
-                self.output_path / "_gds_meta" / "edge_features"
-                / cfg.from_event_pattern / "data.lance"
+                self.output_path
+                / "_gds_meta"
+                / "edge_features"
+                / cfg.from_event_pattern
+                / "data.lance"
             )
             if not sidecar_path.exists():
                 raise ValueError(
@@ -5297,6 +5631,7 @@ class GDSBuilder:
                     f"anchor pattern in YAML so it is built first",
                 )
             import lance
+
             sidecar_tbl = lance.dataset(str(sidecar_path)).to_table()
             avail = [c for c in sidecar_tbl.column_names if c != "event_key"]
             agg_dims = list(cfg.dims) if cfg.dims is not None else avail
@@ -5304,8 +5639,7 @@ class GDSBuilder:
 
             src_lines = {r.line_id for r in src_pat.relations}
             composite_match = next(
-                (cs for cs in self._composite_lines
-                 if cs.line_id == pat.entity_line),
+                (cs for cs in self._composite_lines if cs.line_id == pat.entity_line),
                 None,
             )
             chain_events_col: list[str] | None = None
@@ -5366,10 +5700,10 @@ class GDSBuilder:
                 )
 
             primary_keys = entity_table["primary_key"].to_pylist()
-            edge_dim_thresholds_resolved = (
-                self._resolve_and_persist_edge_dim_thresholds(
-                    pat.pattern_id, sidecar_tbl, agg_dims,
-                )
+            edge_dim_thresholds_resolved = self._resolve_and_persist_edge_dim_thresholds(
+                pat.pattern_id,
+                sidecar_tbl,
+                agg_dims,
             )
             aggregates_per_dim = cfg.aggregates_per_dim
             extra = aggregate_edge_dims_for_anchor(
@@ -5391,9 +5725,7 @@ class GDSBuilder:
             for d in agg_dims:
                 src_kind = EDGE_DIM_KINDS[d]
                 for agg in aggregates_per_dim[d]:
-                    edge_dim_agg_matrix[:, col_idx] = (
-                        extra[f"{d}_{agg}"].to_numpy()
-                    )
+                    edge_dim_agg_matrix[:, col_idx] = extra[f"{d}_{agg}"].to_numpy()
                     edge_dim_agg_kinds.append(aggregate_kind(src_kind, agg))
                     edge_dim_agg_labels.append(f"{d}_{agg}")
                     col_idx += 1
@@ -5404,13 +5736,16 @@ class GDSBuilder:
         for edim in pat.event_dimensions:
             if edim.edge_max is None or edim.edge_max == "auto":
                 col = entity_table[edim.column]
-                raw_arr = pc.fill_null(col, 0).to_numpy(
-                    zero_copy_only=False,
-                ).astype(np.float32)
+                raw_arr = (
+                    pc.fill_null(col, 0)
+                    .to_numpy(
+                        zero_copy_only=False,
+                    )
+                    .astype(np.float32)
+                )
                 positive = raw_arr[raw_arr > 0]
                 computed = (
-                    float(np.percentile(positive, edim.percentile))
-                    if len(positive) > 0 else 1.0
+                    float(np.percentile(positive, edim.percentile)) if len(positive) > 0 else 1.0
                 )
                 edim.edge_max = max(computed, 1e-9)
 
@@ -5443,13 +5778,15 @@ class GDSBuilder:
             # Append edge_dim slice
             if D_edge > 0:
                 shapes = np.concatenate(
-                    [shapes, edge_dim_matrix[start:end]], axis=1,
+                    [shapes, edge_dim_matrix[start:end]],
+                    axis=1,
                 )
 
             # Append edge_dim aggregations slice (S1 ext)
             if D_edge_agg > 0:
                 shapes = np.concatenate(
-                    [shapes, edge_dim_agg_matrix[start:end]], axis=1,
+                    [shapes, edge_dim_agg_matrix[start:end]],
+                    axis=1,
                 )
 
             # Prop fill for this chunk (all tracked, not yet filtered)
@@ -5460,11 +5797,16 @@ class GDSBuilder:
                     if prop not in schema_names:
                         continue
                     col = chunk_table[prop]
-                    fill_vec = pc.is_valid(col).to_numpy(
-                        zero_copy_only=False,
-                    ).astype(np.float32)
+                    fill_vec = (
+                        pc.is_valid(col)
+                        .to_numpy(
+                            zero_copy_only=False,
+                        )
+                        .astype(np.float32)
+                    )
                     prop_fill[:, j] = fill_vec
-                    prop_fill_sums[j] += fill_vec.sum()
+                    # prop_fill_sums is allocated whenever tracked is non-empty
+                    cast(np.ndarray, prop_fill_sums)[j] += fill_vec.sum()
 
                 full_chunk = np.concatenate([shapes, prop_fill], axis=1)
             else:
@@ -5483,13 +5825,14 @@ class GDSBuilder:
         prop_indices: list[int] = []  # indices into tracked list
 
         if tracked:
-            fill_rates = prop_fill_sums / n
+            fill_rates = cast(np.ndarray, prop_fill_sums) / n  # allocated when tracked
             for j, prop in enumerate(tracked):
                 if fill_rates[j] < MIN_FILL_RATE:
                     excluded_properties.append(prop)
                     logger.info(
                         "Excluding '%s': fill_rate=%.3f < MIN_FILL_RATE",
-                        prop, fill_rates[j],
+                        prop,
+                        fill_rates[j],
                     )
                 elif fill_rates[j] >= MAX_FILL_RATE and not _is_textual_or_binary_col(
                     chunk_table.schema.field(prop)
@@ -5497,15 +5840,17 @@ class GDSBuilder:
                     excluded_properties.append(prop)
                     logger.info(
                         "Excluding '%s': fill_rate=%.3f >= MAX_FILL_RATE (zero-variance)",
-                        prop, fill_rates[j],
+                        prop,
+                        fill_rates[j],
                     )
                 else:
                     prop_columns.append(prop)
                     prop_indices.append(j)
 
         # Trim mu/sigma to included prop dims only
-        # Dims order: [relations] + [event dims] + [edge dims] + [included props]
-        D_base = D_rel + D_event + D_edge
+        # Dims order: [relations] + [event dims] + [edge dims] + [edge-dim aggregations]
+        # + [included props]
+        D_base = D_rel + D_event + D_edge + D_edge_agg
         if prop_columns:
             keep_dims = list(range(D_base)) + [D_base + j for j in prop_indices]
             mu = mu_full[keep_dims]
@@ -5518,7 +5863,7 @@ class GDSBuilder:
         D_full = len(mu)
 
         # Apply SIGMA_EPS_PROP for binary prop columns.
-        # In the streaming path D_base = n_rel + n_event + n_dim_block, and
+        # In the streaming path D_base = n_rel + n_event + n_edge + n_edge_agg, and
         # sigma[D_base:] covers only prop_columns (no additional dim blocks
         # are appended after props in this path).
         if prop_columns:
@@ -5538,43 +5883,52 @@ class GDSBuilder:
                 shapes, _ = self._build_shape_chunk(pat, chunk_table)
                 if D_edge > 0:
                     shapes = np.concatenate(
-                        [shapes, edge_dim_matrix[start:end]], axis=1,
+                        [shapes, edge_dim_matrix[start:end]],
+                        axis=1,
                     )
                 if D_edge_agg > 0:
                     shapes = np.concatenate(
-                        [shapes, edge_dim_agg_matrix[start:end]], axis=1,
+                        [shapes, edge_dim_agg_matrix[start:end]],
+                        axis=1,
                     )
                 if prop_columns:
                     prop_fill = self._build_prop_fill_chunk(
-                        pat, chunk_table, prop_columns,
+                        pat,
+                        chunk_table,
+                        prop_columns,
                     )
                     full_chunk = np.concatenate([shapes, prop_fill], axis=1)
                 else:
                     full_chunk = shapes
                 z = ((full_chunk - mu) / sigma).astype(np.float64)
-                kurt_sum_z4 += (z ** 4).sum(axis=0)
+                kurt_sum_z4 += (z**4).sum(axis=0)
 
             kurt_mean_z4 = kurt_sum_z4 / n
             # excess_kurtosis = mean(z^4) - 3; weight = max(1.0, (kurt+3)/3)
             dim_weights = np.maximum(
-                1.0, kurt_mean_z4 / 3.0,
+                1.0,
+                kurt_mean_z4 / 3.0,
             ).astype(np.float32)
             logger.info(
                 "Auto-computed dimension weights for %s: %s",
-                pat.pattern_id, dim_weights.tolist(),
+                pat.pattern_id,
+                dim_weights.tolist(),
             )
         elif isinstance(pat.dimension_weights, list):
             dim_weights = np.array(pat.dimension_weights, dtype=np.float32)
             if len(dim_weights) != D_full:
                 raise ValueError(
-                    f"dimension_weights length ({len(dim_weights)}) != "
-                    f"shape dimensions ({D_full})"
+                    f"dimension_weights length ({len(dim_weights)}) != shape dimensions ({D_full})"
                 )
 
         # ── Detect dimension kinds (needed for Bregman norms in Pass 3) ──
         from hypertopos.builder._bregman import (
             bregman_norms as _bregman_norms_fn,
+        )
+        from hypertopos.builder._bregman import (
             detect_kind_for_column as _detect_kind_for_column,
+        )
+        from hypertopos.builder._bregman import (
             format_kinds_summary,
         )
 
@@ -5610,7 +5964,7 @@ class GDSBuilder:
                 em = rel.edge_max
                 if isinstance(em, (int, float)) and int(em) == 1:
                     dimension_kinds.append("bernoulli")
-                elif em is not None and em != "auto":
+                elif em is not None:
                     dimension_kinds.append("poisson")
                 else:
                     dimension_kinds.append("bernoulli")
@@ -5622,9 +5976,13 @@ class GDSBuilder:
                 dimension_kinds.append(kind_override)
             else:
                 col = entity_table[edim.column]
-                vals = pc.fill_null(col, 0).to_numpy(
-                    zero_copy_only=False,
-                ).astype(np.float64)
+                vals = (
+                    pc.fill_null(col, 0)
+                    .to_numpy(
+                        zero_copy_only=False,
+                    )
+                    .astype(np.float64)
+                )
                 dimension_kinds.append(_detect_kind_for_column(vals))
 
         # Edge-derived dimensions
@@ -5640,13 +5998,17 @@ class GDSBuilder:
             logger.warning(
                 "Bregman kind count (%d) != shape dim count (%d) for %s — "
                 "falling back to uniform gaussian kinds",
-                len(dimension_kinds), D_full, pat.pattern_id,
+                len(dimension_kinds),
+                D_full,
+                pat.pattern_id,
             )
             dimension_kinds = ["gaussian"] * D_full
 
         logger.info(
             "Bregman kinds for %s (streaming): %s (D=%d)",
-            pat.pattern_id, format_kinds_summary(dimension_kinds), D_full,
+            pat.pattern_id,
+            format_kinds_summary(dimension_kinds),
+            D_full,
         )
 
         # ── Pass 2: Compute all norms (O(N) float32) + reservoir ──
@@ -5654,7 +6016,8 @@ class GDSBuilder:
         RESERVOIR_K = 10_000
         all_norms = np.zeros(n, dtype=np.float32)
         reservoir = np.zeros(
-            (min(RESERVOIR_K, n), D_full), dtype=np.float32,
+            (min(RESERVOIR_K, n), D_full),
+            dtype=np.float32,
         )
         reservoir_count = 0
         rng = np.random.default_rng(42)
@@ -5665,15 +6028,19 @@ class GDSBuilder:
             shapes, _ = self._build_shape_chunk(pat, chunk_table)
             if D_edge > 0:
                 shapes = np.concatenate(
-                    [shapes, edge_dim_matrix[start:end]], axis=1,
+                    [shapes, edge_dim_matrix[start:end]],
+                    axis=1,
                 )
             if D_edge_agg > 0:
                 shapes = np.concatenate(
-                    [shapes, edge_dim_agg_matrix[start:end]], axis=1,
+                    [shapes, edge_dim_agg_matrix[start:end]],
+                    axis=1,
                 )
             if prop_columns:
                 prop_fill = self._build_prop_fill_chunk(
-                    pat, chunk_table, prop_columns,
+                    pat,
+                    chunk_table,
+                    prop_columns,
                 )
                 full_chunk = np.concatenate([shapes, prop_fill], axis=1)
             else:
@@ -5683,14 +6050,17 @@ class GDSBuilder:
             if dim_weights is not None:
                 chunk_deltas = (chunk_deltas * dim_weights).astype(np.float32)
             chunk_norms = np.sqrt(
-                np.einsum('ij,ij->i', chunk_deltas, chunk_deltas),
+                np.einsum("ij,ij->i", chunk_deltas, chunk_deltas),
             ).astype(np.float32)
             all_norms[start:end] = chunk_norms
 
             # Reservoir sampling of absolute deltas for per-dim thresholds
             abs_deltas = np.abs(chunk_deltas)
             reservoir_count = reservoir_update(
-                reservoir, reservoir_count, abs_deltas, rng,
+                reservoir,
+                reservoir_count,
+                abs_deltas,
+                rng,
             )
 
         # Compute theta from percentile of all norms
@@ -5699,19 +6069,21 @@ class GDSBuilder:
         theta = np.full(D_full, component_val, dtype=np.float32)
         theta_norm = float(np.linalg.norm(theta))
 
-        # Delta rank pcts from sorted norms
+        # Delta rank pcts (sorted_norms also feeds theta sensitivity below)
         sorted_norms = np.sort(all_norms)
-        ranks = np.searchsorted(sorted_norms, all_norms, side="left")
+        ranks = population_left_ranks(all_norms)
         delta_rank_pcts = (ranks / n * 100).astype(np.float32)
 
         # Conformal p-values
-        conformal_p = compute_conformal_p(all_norms)
+        conformal_p = compute_conformal_p(all_norms, left_ranks=ranks)
 
         # Per-dim anomaly thresholds from reservoir
-        actual_reservoir = reservoir[:min(reservoir_count, RESERVOIR_K)]
+        actual_reservoir = reservoir[: min(reservoir_count, RESERVOIR_K)]
         if len(actual_reservoir) > 0:
             per_dim_thresholds = np.percentile(
-                actual_reservoir, 99.0, axis=0,
+                actual_reservoir,
+                99.0,
+                axis=0,
             ).astype(np.float32)
         else:
             per_dim_thresholds = np.zeros(D_full, dtype=np.float32)
@@ -5720,93 +6092,99 @@ class GDSBuilder:
         entity_table_full = entity_line.table
         all_is_anomaly = np.empty(n, dtype=bool)
 
-        for start in range(0, n, chunk_size):
-            end = min(start + chunk_size, n)
-            chunk_entity_table = entity_table_full.slice(
-                start, end - start,
-            )
-            cn = end - start
-            shapes, fk_slices = self._build_shape_chunk(
-                pat, chunk_entity_table,
-            )
-            if D_edge > 0:
-                shapes = np.concatenate(
-                    [shapes, edge_dim_matrix[start:end]], axis=1,
+        def _geometry_chunks() -> Iterator[pa.Table]:
+            for start in range(0, n, chunk_size):
+                end = min(start + chunk_size, n)
+                chunk_entity_table = entity_table_full.slice(
+                    start,
+                    end - start,
                 )
-            if D_edge_agg > 0:
-                shapes = np.concatenate(
-                    [shapes, edge_dim_agg_matrix[start:end]], axis=1,
+                cn = end - start
+                shapes, fk_slices = self._build_shape_chunk(
+                    pat,
+                    chunk_entity_table,
                 )
-            if prop_columns:
-                prop_fill = self._build_prop_fill_chunk(
-                    pat, chunk_entity_table, prop_columns,
+                if D_edge > 0:
+                    shapes = np.concatenate(
+                        [shapes, edge_dim_matrix[start:end]],
+                        axis=1,
+                    )
+                if D_edge_agg > 0:
+                    shapes = np.concatenate(
+                        [shapes, edge_dim_agg_matrix[start:end]],
+                        axis=1,
+                    )
+                if prop_columns:
+                    prop_fill = self._build_prop_fill_chunk(
+                        pat,
+                        chunk_entity_table,
+                        prop_columns,
+                    )
+                    full_chunk = np.concatenate(
+                        [shapes, prop_fill],
+                        axis=1,
+                    )
+                else:
+                    full_chunk = shapes
+
+                chunk_deltas = ((full_chunk - mu) / sigma).astype(np.float32)
+                if dim_weights is not None:
+                    chunk_deltas = (chunk_deltas * dim_weights).astype(np.float32)
+                chunk_norms = all_norms[start:end]
+                chunk_ranks = delta_rank_pcts[start:end]
+                chunk_conformal = conformal_p[start:end]
+
+                is_anomaly_arr = (theta_norm > 0.0) & (chunk_norms >= theta_norm)
+                all_is_anomaly[start:end] = is_anomaly_arr
+
+                abs_chunk_deltas = np.abs(chunk_deltas)
+                exceeds = (abs_chunk_deltas > per_dim_thresholds).astype(np.int32)
+                chunk_n_anom_dims = exceeds.sum(axis=1).astype(np.int32)
+
+                chunk_bregman: np.ndarray | None = None
+                if dimension_kinds is not None:
+                    chunk_bregman = _bregman_norms_fn(
+                        full_chunk,
+                        mu,
+                        sigma,
+                        dimension_kinds,
+                        weights=dim_weights,
+                    ).astype(np.float32)
+
+                geom_table = self._build_geometry_slice(
+                    pat,
+                    start=0,
+                    end=cn,
+                    deltas=chunk_deltas,
+                    delta_norms=chunk_norms,
+                    delta_rank_pcts=chunk_ranks,
+                    theta_norm=theta_norm,
+                    fk_arrays=fk_slices,
+                    conformal_p=chunk_conformal,
+                    is_anomaly_precomputed=is_anomaly_arr,
+                    n_anom_dims=chunk_n_anom_dims,
+                    bregman_norms_arr=chunk_bregman,
+                    anomaly_confidence_arr=None,
+                    entity_table_override=chunk_entity_table,
                 )
-                full_chunk = np.concatenate(
-                    [shapes, prop_fill], axis=1,
+                geom_table = self._inject_fdr_hierarchy_carriers(pat, geom_table)
+                geom_table = self._inject_fdr_temporal_buckets(pat, geom_table)
+                _validate_fdr_hierarchy_columns(
+                    pat,
+                    list(geom_table.column_names),
                 )
-            else:
-                full_chunk = shapes
 
-            chunk_deltas = (
-                (full_chunk - mu) / sigma
-            ).astype(np.float32)
-            if dim_weights is not None:
-                chunk_deltas = (
-                    chunk_deltas * dim_weights
-                ).astype(np.float32)
-            chunk_norms = all_norms[start:end]
-            chunk_ranks = delta_rank_pcts[start:end]
-            chunk_conformal = conformal_p[start:end]
+                yield geom_table
 
-            is_anomaly_arr = (
-                (theta_norm > 0.0) & (chunk_norms >= theta_norm)
-            )
-            all_is_anomaly[start:end] = is_anomaly_arr
-
-            abs_chunk_deltas = np.abs(chunk_deltas)
-            exceeds = (
-                abs_chunk_deltas > per_dim_thresholds
-            ).astype(np.int32)
-            chunk_n_anom_dims = exceeds.sum(axis=1).astype(np.int32)
-
-            chunk_bregman: np.ndarray | None = None
-            if dimension_kinds is not None:
-                chunk_bregman = _bregman_norms_fn(
-                    full_chunk, mu, sigma, dimension_kinds,
-                    weights=dim_weights,
-                ).astype(np.float32)
-
-            geom_table = self._build_geometry_slice(
-                pat, start=0, end=cn,
-                deltas=chunk_deltas,
-                delta_norms=chunk_norms,
-                delta_rank_pcts=chunk_ranks,
-                theta_norm=theta_norm,
-                fk_arrays=fk_slices,
-                conformal_p=chunk_conformal,
-                is_anomaly_precomputed=is_anomaly_arr,
-                n_anom_dims=chunk_n_anom_dims,
-                bregman_norms_arr=chunk_bregman,
-                anomaly_confidence_arr=None,
-                entity_table_override=chunk_entity_table,
-            )
-            geom_table = self._inject_fdr_hierarchy_carriers(pat, geom_table)
-            geom_table = self._inject_fdr_temporal_buckets(pat, geom_table)
-            _validate_fdr_hierarchy_columns(
-                pat, list(geom_table.column_names),
-            )
-
-            write_chunk_fn(
-                self.output_path, pat_id, geom_table, version=1,
-            )
-
-        # Finalize: compact fragments, build indices
-        finalize_fn(self.output_path, pat_id, version=1)
+        # One streamed write of every chunk, then indices.
+        write_chunks_fn(self.output_path, pat_id, _geometry_chunks(), version=1)
 
         # Persist geometry stats cache — use in-memory is_anomaly from Pass 3
         stats_writer.write_geometry_stats(
-            pat_id, version=1,
-            delta_norms=all_norms, theta_norm=theta_norm,
+            pat_id,
+            version=1,
+            delta_norms=all_norms,
+            theta_norm=theta_norm,
             is_anomaly_arr=all_is_anomaly,
         )
 
@@ -5818,21 +6196,28 @@ class GDSBuilder:
                 stats_writer.write_edges(pat_id, edge_table)
                 # Cache edge stats
                 import pyarrow.compute as _pc
-                stats_writer.write_edge_stats(pat_id, {
-                    "row_count": edge_table.num_rows,
-                    "unique_from": _pc.count_distinct(edge_table["from_key"]).as_py(),
-                    "unique_to": _pc.count_distinct(edge_table["to_key"]).as_py(),
-                    "timestamp_min": float(_pc.min(edge_table["timestamp"]).as_py()),
-                    "timestamp_max": float(_pc.max(edge_table["timestamp"]).as_py()),
-                    "amount_min": float(_pc.min(edge_table["amount"]).as_py()),
-                    "amount_max": float(_pc.max(edge_table["amount"]).as_py()),
-                })
+
+                stats_writer.write_edge_stats(
+                    pat_id,
+                    {
+                        "row_count": edge_table.num_rows,
+                        "unique_from": _pc.count_distinct(edge_table["from_key"]).as_py(),
+                        "unique_to": _pc.count_distinct(edge_table["to_key"]).as_py(),
+                        "timestamp_min": float(_pc.min(edge_table["timestamp"]).as_py()),
+                        "timestamp_max": float(_pc.max(edge_table["timestamp"]).as_py()),
+                        "amount_min": float(_pc.min(edge_table["amount"]).as_py()),
+                        "amount_max": float(_pc.max(edge_table["amount"]).as_py()),
+                    },
+                )
 
         from hypertopos.builder._theta_sensitivity import (
             compute_theta_sensitivity_from_sorted,
         )
+
         return pat_id, PatternBuildResult(
-            mu=mu, sigma=sigma, theta=theta,
+            mu=mu,
+            sigma=sigma,
+            theta=theta,
             population_size=n,
             prop_columns=prop_columns,
             excluded_properties=excluded_properties,
@@ -5843,26 +6228,21 @@ class GDSBuilder:
             dim_percentiles=self._compute_dim_percentiles(
                 pat.entity_line,
                 edge_dim_agg_matrix=(
-                    edge_dim_agg_matrix
-                    if edge_dim_agg_matrix.shape[1] > 0 else None
+                    edge_dim_agg_matrix if edge_dim_agg_matrix.shape[1] > 0 else None
                 ),
-                edge_dim_agg_labels=(
-                    edge_dim_agg_labels if edge_dim_agg_labels else None
-                ),
+                edge_dim_agg_labels=(edge_dim_agg_labels if edge_dim_agg_labels else None),
             ),
             dimension_kinds=dimension_kinds,
             theta_sensitivity=compute_theta_sensitivity_from_sorted(sorted_norms),
             dim_normality_pvalues=self._compute_dim_normality_pvalues(
                 pat.entity_line,
                 edge_dim_agg_matrix=(
-                    edge_dim_agg_matrix
-                    if edge_dim_agg_matrix.shape[1] > 0 else None
+                    edge_dim_agg_matrix if edge_dim_agg_matrix.shape[1] > 0 else None
                 ),
-                edge_dim_agg_labels=(
-                    edge_dim_agg_labels if edge_dim_agg_labels else None
-                ),
+                edge_dim_agg_labels=(edge_dim_agg_labels if edge_dim_agg_labels else None),
             ),
             edge_dim_names=edge_dim_names,
+            n_anomalous_dims_thresholds=per_dim_thresholds,
         )
 
     @staticmethod
@@ -5870,32 +6250,24 @@ class GDSBuilder:
         event_table: pa.Table,
         time_col: str,
         time_window: str,
-    ) -> tuple[np.ndarray, int, float, float]:
-        """Parse timestamps into bucket indices. Returns (bucket_np, n_buckets, min_ts, window_secs)."""
+    ) -> tuple[pa.Table, np.ndarray, int, float, float]:
+        """Parse timestamps into bucket indices.
+
+        Events without a timestamp are dropped. Returns (event_table, bucket_np,
+        n_buckets, min_ts, window_secs); ``bucket_np`` aligns with the returned table.
+        """
         from hypertopos.builder.derived import _parse_time_window
+        from hypertopos.utils.time import to_epoch_seconds
 
-        ts_col = event_table[time_col]
-        if pa.types.is_timestamp(ts_col.type):
-            unit = ts_col.type.unit
-            divisors = {"s": 1.0, "ms": 1e3, "us": 1e6, "ns": 1e9}
-            divisor = divisors.get(unit, 1e6)
-            epoch_arr = pc.divide(
-                pc.cast(pc.cast(ts_col, pa.int64()), pa.float64()),
-                divisor,
-            )
-        elif pa.types.is_floating(ts_col.type) or pa.types.is_integer(ts_col.type):
-            epoch_arr = pc.cast(ts_col, pa.float64())
-        else:
-            from hypertopos.engine.chains import parse_timestamps_to_epoch
-            epoch_arr = pa.chunked_array([pa.array(
-                parse_timestamps_to_epoch(ts_col.to_pylist()),
-                type=pa.float64(),
-            )])
-
+        epoch_arr = to_epoch_seconds(event_table[time_col])
+        if epoch_arr.null_count:
+            valid = pc.is_valid(epoch_arr)
+            event_table = event_table.filter(valid)
+            epoch_arr = epoch_arr.filter(valid)
         window_secs = _parse_time_window(time_window)
         min_ts = pc.min(epoch_arr).as_py()
         if min_ts is None:
-            return np.array([], dtype=np.int64), 0, 0.0, window_secs
+            return event_table, np.array([], dtype=np.int64), 0, 0.0, window_secs
         diff = pc.subtract(epoch_arr, min_ts)
         bucket_arr = pc.cast(
             pc.floor(pc.divide(pc.cast(diff, pa.float64()), window_secs)),
@@ -5903,7 +6275,7 @@ class GDSBuilder:
         )
         bucket_np = bucket_arr.to_numpy(zero_copy_only=False).astype(np.int64)
         n_buckets = int(bucket_np.max()) + 1
-        return bucket_np, n_buckets, min_ts, window_secs
+        return event_table, bucket_np, n_buckets, min_ts, window_secs
 
     @staticmethod
     def _build_pat_meta_for_temporal(
@@ -5930,6 +6302,10 @@ class GDSBuilder:
             "mu": pbr.mu.tolist(),
             "sigma_diag": pbr.sigma.tolist(),
             "theta": pbr.theta.tolist(),
+            "dimension_weights": (
+                pbr.dimension_weights.tolist() if pbr.dimension_weights is not None else None
+            ),
+            "cholesky_inv": pbr.cholesky_inv.tolist() if pbr.cholesky_inv is not None else None,
         }
 
     def _build_temporal_one(
@@ -5976,102 +6352,145 @@ class GDSBuilder:
 
         mem_budget = self._detect_available_memory()
         chunk_size = self._compute_chunk_size(
-            n_anchor, n_buckets, D, int(mem_budget * 0.5),
+            n_anchor,
+            n_buckets,
+            D,
+            int(mem_budget * 0.5),
         )
 
-        all_bkt_ts = [
-            datetime.fromtimestamp(min_ts + b * window_secs, tz=UTC)
-            for b in range(n_buckets)
+        stored_bkt_ts = [
+            datetime.fromtimestamp(min_ts + int(b) * window_secs, tz=UTC) for b in non_empty_buckets
         ]
-        _mu_arr = (
-            np.array(pat_meta["mu"], dtype=np.float32)
-            if pat_meta.get("mu") else None
-        )
+        _mu_arr = np.array(pat_meta["mu"], dtype=np.float32) if pat_meta.get("mu") else None
         _sig_arr = (
             np.array(pat_meta["sigma_diag"], dtype=np.float32)
-            if pat_meta.get("sigma_diag") else None
+            if pat_meta.get("sigma_diag")
+            else None
         )
+        _chol_arr = (
+            np.array(pat_meta["cholesky_inv"], dtype=np.float32)
+            if pat_meta.get("cholesky_inv")
+            else None
+        )
+        _w_arr = (
+            np.array(pat_meta["dimension_weights"], dtype=np.float32)
+            if pat_meta.get("dimension_weights")
+            else None
+        )
+        from hypertopos.engine.geometry import calibrated_deltas
+
+        _mu_full = np.array(pat_meta["mu"], dtype=np.float32)
+        _sig_full = np.array(pat_meta["sigma_diag"], dtype=np.float32)
+
+        def _deltas(shapes: np.ndarray) -> np.ndarray:
+            # Same metric as the stored polygon delta (Mahalanobis / weights).
+            return calibrated_deltas(
+                shapes,
+                mu=_mu_full,
+                sigma_diag=_sig_full,
+                cholesky_inv=_chol_arr,
+                dimension_weights=_w_arr,
+            )
 
         if chunk_size >= n_anchor:
             # ── Single-pass (fits in RAM) ──
             shape_tensor = self._precompute_shape_tensor(
-                pat_id, event_table, bucket_np, n_buckets,
-                anchor_keys, anchor_keys_list, n_anchor,
-                relations_meta, prop_columns,
+                pat_id,
+                event_table,
+                bucket_np,
+                n_buckets,
+                anchor_keys,
+                anchor_keys_list,
+                n_anchor,
+                relations_meta,
+                prop_columns,
             )
             _temporal_tensor_to_lance(
-                shape_tensor, anchor_keys_list, n_anchor,
-                non_empty_buckets, lance_path, min_ts, window_secs, D,
+                shape_tensor,
+                anchor_keys_list,
+                n_anchor,
+                non_empty_buckets,
+                lance_path,
+                min_ts,
+                window_secs,
+                D,
             )
 
             if slices_written > 0:
-                mu = np.array(pat_meta["mu"], dtype=np.float32)
-                sigma = np.array(pat_meta["sigma_diag"], dtype=np.float32)
-                sigma_safe = np.where(sigma < 1e-6, 1.0, sigma)
                 # Temporal shape_tensor covers only the time-varying dims
-                # (relations + event/prop). When the pattern has time-invariant
-                # build-time aggregates (edge_dim_aggregations, S1 ext) those
-                # tail dims are NOT in the tensor — slice mu/sigma to match.
+                # (relations + event/prop); _deltas clamps calibration to them.
                 D_shape = shape_tensor.shape[2]
-                mu = mu[:D_shape]
-                sigma_safe = sigma_safe[:D_shape]
-                theta_norm = float(np.linalg.norm(
-                    np.array(pat_meta["theta"], dtype=np.float32)[:D_shape],
-                ))
-                centroids: list[dict] = []
+                theta_norm = float(
+                    np.linalg.norm(
+                        np.array(pat_meta["theta"], dtype=np.float32)[:D_shape],
+                    )
+                )
+                centroids: list[dict[str, Any]] = []
                 for b in range(n_buckets):
                     ws = shape_tensor[:, b, :]
                     am = np.any(ws != 0, axis=1)
                     na = int(am.sum())
                     if na == 0:
                         continue
-                    ad = (ws[am] - mu) / sigma_safe
+                    ad = _deltas(ws[am])
                     c = ad.mean(axis=0).tolist()
                     ar = 0.0
                     if theta_norm > 0:
-                        nr = np.sqrt(np.einsum('ij,ij->i', ad, ad))
+                        nr = np.sqrt(np.einsum("ij,ij->i", ad, ad))
                         ar = float((nr > theta_norm).sum() / len(nr))
-                    centroids.append({
-                        "window_start": datetime.fromtimestamp(
-                            min_ts + b * window_secs, tz=UTC),
-                        "window_end": datetime.fromtimestamp(
-                            min_ts + (b + 1) * window_secs, tz=UTC),
-                        "centroid": c, "entity_count": na,
-                        "anomaly_rate": ar,
-                    })
+                    centroids.append(
+                        {
+                            "window_start": datetime.fromtimestamp(
+                                min_ts + b * window_secs, tz=UTC
+                            ),
+                            "window_end": datetime.fromtimestamp(
+                                min_ts + (b + 1) * window_secs, tz=UTC
+                            ),
+                            "centroid": c,
+                            "entity_count": na,
+                            "anomaly_rate": ar,
+                        }
+                    )
                 if centroids:
                     writer.write_temporal_centroids(pat_id, centroids)
 
             if slices_written >= 3:
                 mz = self._compute_max_rolling_z(
-                    shape_tensor, n_anchor, n_buckets,
+                    shape_tensor,
+                    n_anchor,
+                    n_buckets,
                 )
                 self._write_max_rolling_z(pat_id, anchor_keys_list, mz)
 
             if slices_written >= 2:
                 am = np.any(
-                    shape_tensor.reshape(n_anchor, -1) != 0, axis=1,
+                    shape_tensor.reshape(n_anchor, -1) != 0,
+                    axis=1,
                 )
                 if am.any():
+                    # The stored windows only, as drift reads them back.
+                    stored = shape_tensor[np.ix_(am, non_empty_buckets)]
                     writer.write_trajectory_from_tensor(
-                        pat_id, shape_tensor[am],
+                        pat_id,
+                        _deltas(stored),
                         [anchor_keys_list[i] for i in np.flatnonzero(am)],
-                        bucket_timestamps=all_bkt_ts,
-                        mu=_mu_arr, sigma_diag=_sig_arr,
+                        bucket_timestamps=stored_bkt_ts,
+                        raw_shapes=stored,
                     )
 
         else:
             # ── Chunked path (adaptive memory) ──
             logger.info(
                 "Temporal %s: chunking %d entities into chunks of %d",
-                pat_id, n_anchor, chunk_size,
+                pat_id,
+                n_anchor,
+                chunk_size,
             )
-            mu = np.array(pat_meta["mu"], dtype=np.float32)
-            sigma = np.array(pat_meta["sigma_diag"], dtype=np.float32)
-            sigma_safe = np.where(sigma < 1e-6, 1.0, sigma)
-            theta_norm = float(np.linalg.norm(
-                np.array(pat_meta["theta"], dtype=np.float32),
-            ))
+            theta_norm = float(
+                np.linalg.norm(
+                    np.array(pat_meta["theta"], dtype=np.float32)[:D],
+                )
+            )
 
             c_n_active = np.zeros(n_buckets, dtype=np.int64)
             c_sum_delta = np.zeros((n_buckets, D), dtype=np.float64)
@@ -6080,11 +6499,18 @@ class GDSBuilder:
             traj_tables: list[pa.Table] = []
 
             _pre_grouped = self._precompute_derived_grouped(
-                pat_id, event_table, bucket_np, relations_meta,
+                pat_id,
+                event_table,
+                bucket_np,
+                relations_meta,
             )
             _pre_graph = self._precompute_graph_features(
-                pat_id, event_table, anchor_keys, bucket_np,
-                n_buckets, relations_meta,
+                pat_id,
+                event_table,
+                anchor_keys,
+                bucket_np,
+                n_buckets,
+                relations_meta,
             )
 
             for cs in range(0, n_anchor, chunk_size):
@@ -6100,17 +6526,29 @@ class GDSBuilder:
                     _chunk_graph[sk] = full_t[cs:ce]
 
                 ct = self._precompute_shape_tensor(
-                    pat_id, event_table, bucket_np, n_buckets,
-                    cka, ckl, nc,
-                    relations_meta, prop_columns,
+                    pat_id,
+                    event_table,
+                    bucket_np,
+                    n_buckets,
+                    cka,
+                    ckl,
+                    nc,
+                    relations_meta,
+                    prop_columns,
                     pre_grouped=_pre_grouped,
                     pre_graph=_chunk_graph,
                     anchor_table_override=chunk_table,
                 )
 
                 _temporal_tensor_to_lance(
-                    ct, ckl, nc, non_empty_buckets,
-                    lance_path, min_ts, window_secs, D,
+                    ct,
+                    ckl,
+                    nc,
+                    non_empty_buckets,
+                    lance_path,
+                    min_ts,
+                    window_secs,
+                    D,
                 )
 
                 for b in range(n_buckets):
@@ -6118,10 +6556,8 @@ class GDSBuilder:
                     act = np.any(sh != 0, axis=1)
                     if not act.any():
                         continue
-                    ad = ((sh[act] - mu) / sigma_safe).astype(
-                        np.float64,
-                    )
-                    nr = np.sqrt(np.einsum('ij,ij->i', ad, ad))
+                    ad = _deltas(sh[act])
+                    nr = np.sqrt(np.einsum("ij,ij->i", ad, ad))
                     c_n_active[b] += int(act.sum())
                     c_sum_delta[b] += ad.sum(axis=0)
                     if theta_norm > 0:
@@ -6130,18 +6566,26 @@ class GDSBuilder:
                         )
 
                 all_max_z[cs:ce] = self._compute_max_rolling_z(
-                    ct, nc, n_buckets,
+                    ct,
+                    nc,
+                    n_buckets,
                 )
 
                 if slices_written >= 2:
                     am = np.any(
-                        ct.reshape(nc, -1) != 0, axis=1,
+                        ct.reshape(nc, -1) != 0,
+                        axis=1,
                     )
                     if am.any():
                         _build_traj_chunk(
-                            traj_tables, ct[am],
+                            traj_tables,
+                            ct[np.ix_(am, non_empty_buckets)],
                             [ckl[i] for i in np.flatnonzero(am)],
-                            all_bkt_ts, _mu_arr, _sig_arr,
+                            stored_bkt_ts,
+                            _mu_arr,
+                            _sig_arr,
+                            _chol_arr,
+                            _w_arr,
                         )
 
                 del ct
@@ -6153,29 +6597,32 @@ class GDSBuilder:
                         continue
                     cv = (c_sum_delta[b] / c_n_active[b]).tolist()
                     ar = float(c_n_anom[b] / c_n_active[b])
-                    centroids.append({
-                        "window_start": datetime.fromtimestamp(
-                            min_ts + b * window_secs, tz=UTC),
-                        "window_end": datetime.fromtimestamp(
-                            min_ts + (b + 1) * window_secs, tz=UTC),
-                        "centroid": cv,
-                        "entity_count": int(c_n_active[b]),
-                        "anomaly_rate": ar,
-                    })
+                    centroids.append(
+                        {
+                            "window_start": datetime.fromtimestamp(
+                                min_ts + b * window_secs, tz=UTC
+                            ),
+                            "window_end": datetime.fromtimestamp(
+                                min_ts + (b + 1) * window_secs, tz=UTC
+                            ),
+                            "centroid": cv,
+                            "entity_count": int(c_n_active[b]),
+                            "anomaly_rate": ar,
+                        }
+                    )
                 if centroids:
                     writer.write_temporal_centroids(pat_id, centroids)
 
             if slices_written >= 3:
                 self._write_max_rolling_z(
-                    pat_id, anchor_keys_list, all_max_z,
+                    pat_id,
+                    anchor_keys_list,
+                    all_max_z,
                 )
 
             if traj_tables:
                 ct_traj = pa.concat_tables(traj_tables)
-                tp = (
-                    self.output_path / "_gds_meta" / "trajectory"
-                    / f"{pat_id}.lance"
-                )
+                tp = self.output_path / "_gds_meta" / "trajectory" / f"{pat_id}.lance"
                 tp.parent.mkdir(parents=True, exist_ok=True)
                 _write_lance(ct_traj, str(tp), mode="overwrite")
                 nt = ct_traj.num_rows
@@ -6198,7 +6645,8 @@ class GDSBuilder:
                     logger.info(
                         "trajectory %s: %d rows below ANN training "
                         "threshold (%d) — using full-scan fallback",
-                        pat_id, nt,
+                        pat_id,
+                        nt,
                         _ivf_num_partitions(nt) * _IVF_MIN_ROWS_PER_PARTITION,
                     )
 
@@ -6246,25 +6694,20 @@ class GDSBuilder:
 
         # 3. Identify event line
         if event_line is None:
-            event_lines = [
-                lid for lid, lr in self._lines.items() if lr.role == "event"
-            ]
+            event_lines = [lid for lid, lr in self._lines.items() if lr.role == "event"]
             if len(event_lines) == 0:
                 raise ValueError("No event lines registered")
             if len(event_lines) > 1:
                 raise ValueError(
-                    f"Multiple event lines found: {event_lines}. "
-                    "Specify event_line explicitly."
+                    f"Multiple event lines found: {event_lines}. Specify event_line explicitly."
                 )
             event_line = event_lines[0]
 
         if event_line not in self._lines:
             raise ValueError(f"Event line '{event_line}' not registered")
-        event_table = self._lines[event_line].table
-
         # 4-5. Parse timestamps and compute bucket IDs
-        bucket_np, n_buckets, min_ts, window_secs = (
-            self._parse_event_buckets(event_table, time_col, time_window)
+        event_table, bucket_np, n_buckets, min_ts, window_secs = self._parse_event_buckets(
+            self._lines[event_line].table, time_col, time_window
         )
         if n_buckets == 0:
             return {}
@@ -6300,16 +6743,20 @@ class GDSBuilder:
             if pat_meta is None:
                 return pid, 0
             return self._build_temporal_one(
-                pid, p, pat_meta, event_table,
-                bucket_np, n_buckets, min_ts, window_secs, writer,
+                pid,
+                p,
+                pat_meta,
+                event_table,
+                bucket_np,
+                n_buckets,
+                min_ts,
+                window_secs,
+                writer,
             )
 
         if len(patterns_to_process) > 1:
             with ThreadPoolExecutor(max_workers=len(patterns_to_process)) as pool:
-                futures = [
-                    pool.submit(_run_one, pid, p)
-                    for pid, p in patterns_to_process.items()
-                ]
+                futures = [pool.submit(_run_one, pid, p) for pid, p in patterns_to_process.items()]
                 for fut in futures:
                     pid, n_slices = fut.result()
                     result[pid] = n_slices
@@ -6340,16 +6787,11 @@ class GDSBuilder:
         available_ram: int,
     ) -> tuple[int, dict[str, int]]:
         budget = int(available_ram * 0.5)
-        pattern_sizes = {
-            pid: n * b * d * 4
-            for pid, (n, b, d) in patterns_info.items()
-        }
+        pattern_sizes = {pid: n * b * d * 4 for pid, (n, b, d) in patterns_info.items()}
         total_full = sum(pattern_sizes.values())
 
         if total_full <= budget:
-            return len(patterns_info), {
-                pid: info[0] for pid, info in patterns_info.items()
-            }
+            return len(patterns_info), {pid: info[0] for pid, info in patterns_info.items()}
 
         largest = max(pattern_sizes.values()) if pattern_sizes else 1
         n_workers = max(1, min(budget // max(largest, 1), len(patterns_info)))
@@ -6365,7 +6807,9 @@ class GDSBuilder:
     def _detect_available_memory() -> int:
         try:
             import ctypes
+
             if hasattr(ctypes, "windll"):
+
                 class _MEMORYSTATUSEX(ctypes.Structure):
                     _fields_ = [
                         ("dwLength", ctypes.c_ulong),
@@ -6378,6 +6822,7 @@ class GDSBuilder:
                         ("ullAvailVirtual", ctypes.c_ulonglong),
                         ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
                     ]
+
                 stat = _MEMORYSTATUSEX()
                 stat.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
                 ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
@@ -6386,8 +6831,10 @@ class GDSBuilder:
             pass
         try:
             import os
-            pages = os.sysconf("SC_AVPHYS_PAGES")
-            page_size = os.sysconf("SC_PAGE_SIZE")
+
+            # os.sysconf is POSIX-only; on Windows the AttributeError is caught below
+            pages: int = os.sysconf("SC_AVPHYS_PAGES")  # type: ignore[attr-defined,unused-ignore]
+            page_size: int = os.sysconf("SC_PAGE_SIZE")  # type: ignore[attr-defined,unused-ignore]
             return pages * page_size
         except Exception:
             pass
@@ -6444,9 +6891,7 @@ class GDSBuilder:
         """Write max_rolling_z column to existing geometry Lance dataset."""
         import lance as _lance
 
-        geo_path = (
-            self.output_path / "geometry" / pat_id / "data.lance"
-        )
+        geo_path = self.output_path / "geometry" / pat_id / "data.lance"
         if not geo_path.exists():
             return
 
@@ -6457,7 +6902,8 @@ class GDSBuilder:
         # Align rolling_z to geometry order
         key_to_z: dict[str, float] = dict(zip(anchor_keys, max_rolling_z.tolist(), strict=False))
         aligned_z = pa.array(
-            [key_to_z.get(k, 0.0) for k in geo_keys], type=pa.float32(),
+            [key_to_z.get(k, 0.0) for k in geo_keys],
+            type=pa.float32(),
         )
         ds.merge(
             pa.table({"primary_key": geo_table["primary_key"], "max_rolling_z": aligned_z}),
@@ -6482,7 +6928,8 @@ class GDSBuilder:
                 derived_dim_names[spec.dimension_name] = spec
 
         from collections import defaultdict as _ddict
-        fk_batches: dict[str, list] = _ddict(list)
+
+        fk_batches: dict[str, list[Any]] = _ddict(list)
         for _j, rel_meta in enumerate(relations_meta):
             direction = rel_meta.get("direction", "in")
             line_id = rel_meta.get("line_id", "")
@@ -6509,7 +6956,7 @@ class GDSBuilder:
         if not fk_batches:
             return {}
 
-        _agg_map = {
+        _agg_map: dict[str, Callable[[Any], tuple[str, str]]] = {
             "count": lambda _mc: ("primary_key", "count"),
             "count_distinct": lambda mc: (mc, "count_distinct"),
             "sum": lambda mc: (mc, "sum"),
@@ -6523,7 +6970,7 @@ class GDSBuilder:
 
         result: dict[str, pa.Table] = {}
         # Collect all specs per fk_key, then compute
-        fk_to_specs: dict[str, list] = _ddict(list)
+        fk_to_specs: dict[str, list[Any]] = _ddict(list)
         for _j, rel_meta in enumerate(relations_meta):
             direction = rel_meta.get("direction", "in")
             line_id = rel_meta.get("line_id", "")
@@ -6556,15 +7003,14 @@ class GDSBuilder:
                     if cs.line_id == sample_spec.anchor_line:
                         separator = cs.separator
                         break
-                str_cols = [
-                    pc.cast(work_table[col], pa.string())
-                    for col in anchor_fk
-                ]
+                str_cols = [pc.cast(work_table[col], pa.string()) for col in anchor_fk]
                 composite_fk = pc.binary_join_element_wise(
-                    *str_cols, separator,
+                    *str_cols,
+                    separator,
                 )
                 gb_table = work_table.append_column(
-                    "_composite_fk", composite_fk,
+                    "_composite_fk",
+                    composite_fk,
                 )
                 fk_group_col = "_composite_fk"
             else:
@@ -6611,7 +7057,7 @@ class GDSBuilder:
                     graph_feature_names[feat] = spec
 
         # Classify graph dims (mirroring _precompute_shape_tensor logic)
-        graph_dims: list[tuple[int, dict, Any, Any]] = []
+        graph_dims: list[tuple[int, dict[str, Any], Any, Any]] = []
         for j, rel_meta in enumerate(relations_meta):
             direction = rel_meta.get("direction", "in")
             line_id = rel_meta.get("line_id", "")
@@ -6626,14 +7072,13 @@ class GDSBuilder:
                 continue
             if matching_rel.fk_col in graph_feature_names:
                 graph_dims.append(
-                    (j, rel_meta, matching_rel,
-                     graph_feature_names[matching_rel.fk_col]),
+                    (j, rel_meta, matching_rel, graph_feature_names[matching_rel.fk_col]),
                 )
 
         if not graph_dims:
             return {}
 
-        spec_to_dims: dict[int, list[tuple[int, dict, Any]]] = {}
+        spec_to_dims: dict[int, list[tuple[int, dict[str, Any], Any]]] = {}
         spec_map: dict[int, Any] = {}
         for j, rel_meta, rel, gf_spec in graph_dims:
             spec_key = id(gf_spec)
@@ -6647,9 +7092,13 @@ class GDSBuilder:
             gf_spec = spec_map[spec_key]
             all_features = [rel.fk_col for _, _, rel in dims_list]
             result[spec_key] = compute_graph_features_temporal(
-                event_table, anchor_keys,
-                gf_spec.from_col, gf_spec.to_col,
-                all_features, bucket_np, n_buckets,
+                event_table,
+                anchor_keys,
+                gf_spec.from_col,
+                gf_spec.to_col,
+                all_features,
+                bucket_np,
+                n_buckets,
             )
 
         return result
@@ -6695,7 +7144,6 @@ class GDSBuilder:
         )
 
         # Build lookup maps: dim_index, derived specs, graph feature specs
-        key_to_idx = {k: i for i, k in enumerate(anchor_keys_list)}
 
         # Classify each relation dimension
         derived_dim_names: dict[str, Any] = {}
@@ -6710,9 +7158,9 @@ class GDSBuilder:
                     graph_feature_names[feat] = spec
 
         # Categorize dimensions by type for efficient processing
-        static_dims: list[tuple[int, dict, Any]] = []  # (j, rel_meta, rel)
-        derived_dims: list[tuple[int, dict, Any, Any]] = []  # (j, rel_meta, rel, spec)
-        graph_dims: list[tuple[int, dict, Any, Any]] = []  # (j, rel_meta, rel, spec)
+        static_dims: list[tuple[int, dict[str, Any], Any]] = []  # (j, rel_meta, rel)
+        derived_dims: list[tuple[int, dict[str, Any], Any, Any]] = []  # (j, rel_meta, rel, spec)
+        graph_dims: list[tuple[int, dict[str, Any], Any, Any]] = []  # (j, rel_meta, rel, spec)
 
         for j, rel_meta in enumerate(relations_meta):
             direction = rel_meta.get("direction", "in")
@@ -6754,9 +7202,13 @@ class GDSBuilder:
                     continue
                 if edge_max is not None:
                     col = anchor_table[fk_col_name]
-                    count_arr = pc.fill_null(col, 0).to_numpy(
-                        zero_copy_only=False,
-                    ).astype(np.float32)
+                    count_arr = (
+                        pc.fill_null(col, 0)
+                        .to_numpy(
+                            zero_copy_only=False,
+                        )
+                        .astype(np.float32)
+                    )
                     static_vals = np.clip(count_arr, 0, edge_max) / edge_max
                 else:
                     col_arrow = anchor_table[fk_col_name]
@@ -6780,16 +7232,21 @@ class GDSBuilder:
                 col_idx = n_rel + p_idx
                 if prop in anchor_table.schema.names:
                     col = anchor_table[prop]
-                    fill_vec = pc.is_valid(col).to_numpy(
-                        zero_copy_only=False,
-                    ).astype(np.float32)
+                    fill_vec = (
+                        pc.is_valid(col)
+                        .to_numpy(
+                            zero_copy_only=False,
+                        )
+                        .astype(np.float32)
+                    )
                     shape_tensor[:, :, col_idx] = fill_vec[:, np.newaxis]
 
         # --- C. Derived dims: batched groupby(anchor_fk, bucket) ---
         # Group derived dims by FK column, one multi-aggregate group_by per FK
         if derived_dims:
             from collections import defaultdict as _ddict
-            fk_batches: dict[str, list] = _ddict(list)
+
+            fk_batches: dict[str, list[Any]] = _ddict(list)
             for j, rel_meta, rel, spec in derived_dims:
                 if spec.metric.startswith("iet_"):
                     continue
@@ -6797,7 +7254,7 @@ class GDSBuilder:
                 fk_key = "|".join(anchor_fk) if isinstance(anchor_fk, list) else anchor_fk
                 fk_batches[fk_key].append((j, rel_meta, rel, spec))
 
-            _agg_map = {
+            _agg_map: dict[str, Callable[[Any], tuple[str, str]]] = {
                 "count": lambda _mc: ("primary_key", "count"),
                 "count_distinct": lambda mc: (mc, "count_distinct"),
                 "sum": lambda mc: (mc, "sum"),
@@ -6829,10 +7286,7 @@ class GDSBuilder:
                 # Use pre-computed grouped table or compute fresh
                 if pre_grouped is not None and _fk_key in pre_grouped:
                     grouped = pre_grouped[_fk_key]
-                    fk_group_col = (
-                        "_composite_fk"
-                        if isinstance(anchor_fk, list) else anchor_fk
-                    )
+                    fk_group_col = "_composite_fk" if isinstance(anchor_fk, list) else anchor_fk
                 else:
                     bucket_pa = pa.array(bucket_np, type=pa.int64())
                     work_table = event_table.append_column("_bucket", bucket_pa)
@@ -6843,15 +7297,14 @@ class GDSBuilder:
                             if cs.line_id == sample_spec.anchor_line:
                                 separator = cs.separator
                                 break
-                        str_cols = [
-                            pc.cast(work_table[col], pa.string())
-                            for col in anchor_fk
-                        ]
+                        str_cols = [pc.cast(work_table[col], pa.string()) for col in anchor_fk]
                         composite_fk = pc.binary_join_element_wise(
-                            *str_cols, separator,
+                            *str_cols,
+                            separator,
                         )
                         gb_table = work_table.append_column(
-                            "_composite_fk", composite_fk,
+                            "_composite_fk",
+                            composite_fk,
                         )
                         fk_group_col = "_composite_fk"
                     else:
@@ -6868,6 +7321,8 @@ class GDSBuilder:
                 anchor_keys_arr = pa.array(anchor_keys_list)
                 gk_col = grouped[fk_group_col]
                 gb_col = grouped["_bucket"]
+                # One key lookup for every value column of this grouped table.
+                entity_idx = pc.index_in(gk_col, anchor_keys_arr) if len(gk_col) else None
 
                 for j, (result_col, em) in dim_to_result.items():
                     vectorized_scatter(
@@ -6878,13 +7333,14 @@ class GDSBuilder:
                         grouped_fk_col=gk_col,
                         grouped_bucket_col=gb_col,
                         grouped_values_col=grouped[result_col],
+                        entity_idx=entity_idx,
                     )
 
         # --- D. Graph features: batched across all windows ---
         if graph_dims:
             from hypertopos.builder.derived import compute_graph_features_temporal
 
-            spec_to_dims: dict[int, list[tuple[int, dict, Any]]] = {}
+            spec_to_dims: dict[int, list[tuple[int, dict[str, Any], Any]]] = {}
             spec_map: dict[int, Any] = {}
             for j, rel_meta, rel, gf_spec in graph_dims:
                 spec_key = id(gf_spec)
@@ -6901,17 +7357,26 @@ class GDSBuilder:
                     tensor_block = pre_graph[spec_key]
                 else:
                     tensor_block = compute_graph_features_temporal(
-                        event_table, anchor_keys,
-                        gf_spec.from_col, gf_spec.to_col,
-                        all_features, bucket_np, n_buckets,
+                        event_table,
+                        anchor_keys,
+                        gf_spec.from_col,
+                        gf_spec.to_col,
+                        all_features,
+                        bucket_np,
+                        n_buckets,
                     )
 
-                for f_idx, (j, rel_meta, rel) in enumerate(dims_list):
+                for f_idx, (j, rel_meta, _rel) in enumerate(dims_list):
                     edge_max = rel_meta.get("edge_max")
                     em = edge_max if edge_max is not None else 1
-                    shape_tensor[:, :, j] = np.clip(
-                        tensor_block[:, :, f_idx], 0, em,
-                    ) / em
+                    shape_tensor[:, :, j] = (
+                        np.clip(
+                            tensor_block[:, :, f_idx],
+                            0,
+                            em,
+                        )
+                        / em
+                    )
 
         return shape_tensor
 
@@ -6947,9 +7412,7 @@ class GDSBuilder:
                                 f"edge_max must be >= 1, got {rel.edge_max}."
                             )
                         col_type = entity_table.schema.field(rel.fk_col).type
-                        if not (
-                            pa.types.is_integer(col_type) or pa.types.is_floating(col_type)
-                        ):
+                        if not (pa.types.is_integer(col_type) or pa.types.is_floating(col_type)):
                             raise ValueError(
                                 f"Pattern '{pat_id}' relation '{rel.line_id}': "
                                 f"edge_max requires a numeric count column, "
@@ -6959,12 +7422,8 @@ class GDSBuilder:
             # Validate mixed edge_max: all non-self relations must agree
             non_self = [r for r in pat.relations if r.direction != "self"]
             if non_self:
-                has_continuous = any(
-                    r.edge_max is not None for r in non_self
-                )
-                has_binary = any(
-                    r.edge_max is None for r in non_self
-                )
+                has_continuous = any(r.edge_max is not None for r in non_self)
+                has_binary = any(r.edge_max is None for r in non_self)
                 if has_continuous and has_binary:
                     raise ValueError(
                         f"Pattern '{pat_id}': mixed edge_max — "
@@ -6993,11 +7452,7 @@ class GDSBuilder:
             # geometry without dimensions is meaningless regardless of the storage
             # format. Tracked properties count as dimension sources because they
             # become prop_columns in the resolved delta width.
-            if (
-                not pat.relations
-                and not pat.event_dimensions
-                and not pat.tracked_properties
-            ):
+            if not pat.relations and not pat.event_dimensions and not pat.tracked_properties:
                 # Chain anchor with zero extracted chains lands here because
                 # `_resolve_chain_dims` had no `_chain_dims` tuples to inject
                 # (the empty-chains short-circuit in `add_chain_line` returns

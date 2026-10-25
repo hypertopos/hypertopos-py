@@ -10,6 +10,7 @@ navigator dependency. Functions in this module operate on the
 calibration pass and return JSON-serialisable dicts the builder can
 persist on the pattern node.
 """
+
 from __future__ import annotations
 
 from typing import Any

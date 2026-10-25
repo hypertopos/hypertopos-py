@@ -1,6 +1,7 @@
 # Copyright (C) 2026 Karol Kędzia
 # SPDX-License-Identifier: Apache-2.0
 """Tests for graph algorithms on AdjacencyIndex."""
+
 from __future__ import annotations
 
 import pytest
@@ -27,12 +28,14 @@ def _make_adj(edges: list[tuple[str, str]]) -> AdjacencyIndex:
 
 # --- Triangle graph: A-B, B-C, C-A ---
 
+
 @pytest.fixture
 def triangle():
     return _make_adj([("A", "B"), ("B", "C"), ("C", "A")])
 
 
 # --- Chain graph: A->B->C->D ---
+
 
 @pytest.fixture
 def chain():
@@ -41,6 +44,7 @@ def chain():
 
 # --- Two disconnected components: {A,B,C} triangle + {D,E} edge ---
 
+
 @pytest.fixture
 def two_components():
     return _make_adj([("A", "B"), ("B", "C"), ("C", "A"), ("D", "E")])
@@ -48,12 +52,14 @@ def two_components():
 
 # --- Star: hub H connected to S1,S2,S3,S4 ---
 
+
 @pytest.fixture
 def star():
     return _make_adj([("H", "S1"), ("H", "S2"), ("H", "S3"), ("H", "S4")])
 
 
 # ---- PageRank ----
+
 
 class TestPageRank:
     def test_triangle_uniform(self, triangle):
@@ -79,6 +85,7 @@ class TestPageRank:
 
 # ---- Connected Components ----
 
+
 class TestConnectedComponents:
     def test_triangle_single(self, triangle):
         cc = connected_components(triangle)
@@ -100,6 +107,7 @@ class TestConnectedComponents:
 
 
 # ---- Clustering Coefficient ----
+
 
 class TestClusteringCoefficient:
     def test_triangle_perfect(self, triangle):
@@ -126,6 +134,7 @@ class TestClusteringCoefficient:
 
 # ---- Label Propagation ----
 
+
 class TestLabelPropagation:
     def test_two_components_separate(self, two_components):
         lp = label_propagation(two_components)
@@ -143,6 +152,7 @@ class TestLabelPropagation:
 
 # ---- Betweenness Centrality ----
 
+
 class TestBetweennessCentrality:
     def test_chain_middle_highest(self, chain):
         bc = betweenness_centrality(chain)
@@ -155,6 +165,11 @@ class TestBetweennessCentrality:
         # Hub is on all shortest paths between spokes
         assert bc["H"] > bc["S1"]
         assert bc["H"] > bc["S2"]
+
+    def test_star_hub_is_normalised_to_one(self, star):
+        # Undirected betweenness counts each unordered pair once; the hub of a
+        # star lies on every spoke-to-spoke path, so its normalised value is 1.
+        assert betweenness_centrality(star)["H"] == pytest.approx(1.0)
 
     def test_empty(self):
         adj = _make_adj([])

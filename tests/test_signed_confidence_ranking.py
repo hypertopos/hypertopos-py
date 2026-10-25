@@ -23,6 +23,7 @@ These tests cover:
   "signed_confidence")`` raises ``GDSNavigationError`` (not ``ValueError``)
   with the explicit message documented in the brief.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -31,6 +32,7 @@ from types import SimpleNamespace
 import numpy as np
 import pyarrow as pa
 import pytest
+
 from hypertopos.builder import GDSBuilder, RelationSpec
 from hypertopos.cli.schema import LabelAuditConfig
 from hypertopos.model.objects import Polygon
@@ -86,29 +88,37 @@ def _build_signed_confidence_fixture(
     noise_score = np.concatenate([noise_pos, noise_neg, noise_anti])
 
     pks = [f"T-{i:04d}" for i in range(n)]
-    labels_pyarr = (
-        ["anom"] * n_pos + ["norm"] * n_per_class + ["norm"] * n_anti_aligned
-    )
+    labels_pyarr = ["anom"] * n_pos + ["norm"] * n_per_class + ["norm"] * n_anti_aligned
     labels_arr = np.array(
-        [1] * n_pos + [0] * n_per_class + [0] * n_anti_aligned, dtype=np.int32,
+        [1] * n_pos + [0] * n_per_class + [0] * n_anti_aligned,
+        dtype=np.int32,
     )
 
-    tx = pa.table({
-        "tx_id": pks,
-        "account_id": ["A-shared"] * n,
-        "sep_score": sep_score,
-        "noise_score": noise_score,
-        "label": labels_pyarr,
-    })
+    tx = pa.table(
+        {
+            "tx_id": pks,
+            "account_id": ["A-shared"] * n,
+            "sep_score": sep_score,
+            "noise_score": noise_score,
+            "label": labels_pyarr,
+        }
+    )
     accounts = pa.table({"account_id": ["A-shared"]})
 
     out_path = tmp_path / out_dir_name
     b = GDSBuilder("signed_conf_fixture", str(out_path))
     b.add_line(
-        "accounts", accounts, key_col="account_id", source_id="test",
+        "accounts",
+        accounts,
+        key_col="account_id",
+        source_id="test",
     )
     b.add_line(
-        "tx", tx, key_col="tx_id", source_id="test", role="event",
+        "tx",
+        tx,
+        key_col="tx_id",
+        source_id="test",
+        role="event",
     )
     b.add_pattern(
         "tx_pattern",
@@ -116,17 +126,23 @@ def _build_signed_confidence_fixture(
         entity_line="tx",
         relations=[
             RelationSpec(
-                line_id="accounts", fk_col="account_id",
-                direction="in", required=True,
+                line_id="accounts",
+                fk_col="account_id",
+                direction="in",
+                required=True,
             ),
         ],
         anomaly_percentile=80.0,
     )
     b.add_event_dimension(
-        "tx_pattern", column="sep_score", edge_max="auto",
+        "tx_pattern",
+        column="sep_score",
+        edge_max="auto",
     )
     b.add_event_dimension(
-        "tx_pattern", column="noise_score", edge_max="auto",
+        "tx_pattern",
+        column="noise_score",
+        edge_max="auto",
     )
 
     b._label_aware_calibration = True
@@ -169,18 +185,18 @@ def test_signed_confidence_lifts_positive_class_recall(tmp_path):
     _sphere, nav = _open_navigator(out)
     top_n = 20
     polys_delta, _, _, _ = nav.π5_attract_anomaly(
-        "tx_pattern", top_n=top_n, rank_by="delta_norm",
+        "tx_pattern",
+        top_n=top_n,
+        rank_by="delta_norm",
     )
     polys_signed, _, _, _ = nav.π5_attract_anomaly(
-        "tx_pattern", top_n=top_n, rank_by="signed_confidence",
+        "tx_pattern",
+        top_n=top_n,
+        rank_by="signed_confidence",
     )
 
-    recall_delta = sum(
-        1 for p in polys_delta if pk_to_label.get(p.primary_key) == 1
-    )
-    recall_signed = sum(
-        1 for p in polys_signed if pk_to_label.get(p.primary_key) == 1
-    )
+    recall_delta = sum(1 for p in polys_delta if pk_to_label.get(p.primary_key) == 1)
+    recall_signed = sum(1 for p in polys_signed if pk_to_label.get(p.primary_key) == 1)
     # Acceptance: signed_confidence captures at least 0.1 (in absolute
     # recall@top_n) more positive-class polygons than the delta_norm
     # baseline on the same data.
@@ -245,21 +261,24 @@ def test_signed_confidence_formula_deterministic_ranking():
     #     score = 10 * 1.0 * 1.0 = 10.0
     p1 = _make_polygon("P1", [10.0, 0.0])
     p1.reliability_flags = {
-        "single_dim_driven": False, "low_confidence_bucket": False,
+        "single_dim_driven": False,
+        "low_confidence_bucket": False,
     }
     # P2: aligned but single-dim-driven penalty.
     #     delta = [10, 0] → signed = 10, alignment = 1.0, penalty = 0.5
     #     score = 10 * 1.0 * 0.5 = 5.0
     p2 = _make_polygon("P2", [10.0, 0.0])
     p2.reliability_flags = {
-        "single_dim_driven": True, "low_confidence_bucket": False,
+        "single_dim_driven": True,
+        "low_confidence_bucket": False,
     }
     # P3: high magnitude but orthogonal to LDA direction.
     #     delta = [0, 10] → signed = 0, alignment = 0.0, penalty = 0.0
     #     score = 0
     p3 = _make_polygon("P3", [0.0, 10.0])
     p3.reliability_flags = {
-        "single_dim_driven": False, "low_confidence_bucket": False,
+        "single_dim_driven": False,
+        "low_confidence_bucket": False,
     }
 
     polys = [p1, p2, p3]
@@ -307,12 +326,14 @@ def test_signed_confidence_sign_preserves_anti_aligned():
     # Positive-aligned polygon.
     pos = _make_polygon("POS", [5.0, 0.0])
     pos.reliability_flags = {
-        "single_dim_driven": False, "low_confidence_bucket": False,
+        "single_dim_driven": False,
+        "low_confidence_bucket": False,
     }
     # Anti-aligned polygon (delta on negative side of the LDA axis).
     neg = _make_polygon("NEG", [-5.0, 0.0])
     neg.reliability_flags = {
-        "single_dim_driven": False, "low_confidence_bucket": False,
+        "single_dim_driven": False,
+        "low_confidence_bucket": False,
     }
     GDSNavigator._attach_signed_confidence_fields([pos, neg], pattern=pattern)
     assert pos.signed_confidence_score == pytest.approx(5.0, abs=1e-6)
@@ -331,7 +352,8 @@ def test_signed_confidence_zero_norm_safe():
     )
     zero = _make_polygon("Z0", [0.0, 0.0])
     zero.reliability_flags = {
-        "single_dim_driven": False, "low_confidence_bucket": False,
+        "single_dim_driven": False,
+        "low_confidence_bucket": False,
     }
     GDSNavigator._attach_signed_confidence_fields([zero], pattern=pattern)
     assert zero.lda_alignment == 0.0
@@ -349,11 +371,13 @@ def test_signed_confidence_requires_label_aware_calibration(tmp_path):
     n = 60
     rng = np.random.RandomState(0)
     pks = [f"T-{i:04d}" for i in range(n)]
-    tx = pa.table({
-        "tx_id": pks,
-        "account_id": ["A-shared"] * n,
-        "sep_score": rng.normal(0, 1, n).astype(np.float32),
-    })
+    tx = pa.table(
+        {
+            "tx_id": pks,
+            "account_id": ["A-shared"] * n,
+            "sep_score": rng.normal(0, 1, n).astype(np.float32),
+        }
+    )
     accounts = pa.table({"account_id": ["A-shared"]})
     out_path = tmp_path / "gds_no_label_audit"
     b = GDSBuilder("no_label_audit", str(out_path))
@@ -365,8 +389,10 @@ def test_signed_confidence_requires_label_aware_calibration(tmp_path):
         entity_line="tx",
         relations=[
             RelationSpec(
-                line_id="accounts", fk_col="account_id",
-                direction="in", required=True,
+                line_id="accounts",
+                fk_col="account_id",
+                direction="in",
+                required=True,
             ),
         ],
         anomaly_percentile=80.0,
@@ -377,7 +403,9 @@ def test_signed_confidence_requires_label_aware_calibration(tmp_path):
     _sphere, nav = _open_navigator(out)
     with pytest.raises(GDSNavigationError) as excinfo:
         nav.π5_attract_anomaly(
-            "tx_pattern", top_n=5, rank_by="signed_confidence",
+            "tx_pattern",
+            top_n=5,
+            rank_by="signed_confidence",
         )
     msg = str(excinfo.value)
     assert "signed_confidence ranking requires" in msg

@@ -14,12 +14,15 @@ Algorithm: open 3-hop chains with
   ts_ab < ts_bc < ts_cd, ts_cd - ts_ab <= time_window_sec,
   D, C ∉ {A, B} and D != C, no null/non-positive amounts at any hop.
 """
+
 from __future__ import annotations
 
 from collections import defaultdict
 from typing import Any
 
 import pyarrow as pa
+
+from hypertopos.utils.gc_pause import without_cyclic_gc
 
 
 def _build_outgoing_index(
@@ -32,7 +35,12 @@ def _build_outgoing_index(
     amounts = edges["amount"].to_pylist()
     event_keys = edges["event_key"].to_pylist()
     for fk, tk, ts, amt, ek in zip(
-        from_keys, to_keys, timestamps, amounts, event_keys, strict=False,
+        from_keys,
+        to_keys,
+        timestamps,
+        amounts,
+        event_keys,
+        strict=False,
     ):
         out[fk].append((tk, ts, amt, ek))
     return out
@@ -62,35 +70,38 @@ def enumerate_structuring_for_seed(
         return []
 
     results: list[dict[str, Any]] = []
-    for (b, ts_ab, amt_ab, ek_ab) in large_first:
-        for (c, ts_bc, amt_bc, ek_bc) in out_idx.get(b, []):
+    for b, ts_ab, amt_ab, ek_ab in large_first:
+        for c, ts_bc, amt_bc, ek_bc in out_idx.get(b, []):
             if c in (seed, b):
                 continue
             if ts_bc <= ts_ab or ts_bc - ts_ab > time_window_sec:
                 continue
             if amt_bc is None or amt_bc <= 0 or amt_bc > amt2_max:
                 continue
-            for (d, ts_cd, amt_cd, ek_cd) in out_idx.get(c, []):
+            for d, ts_cd, amt_cd, ek_cd in out_idx.get(c, []):
                 if d in (seed, b, c):
                     continue
                 if ts_cd <= ts_bc or ts_cd - ts_ab > time_window_sec:
                     continue
                 if amt_cd is None or amt_cd <= 0 or amt_cd > amt2_max:
                     continue
-                results.append({
-                    "edges": [
-                        (seed, b, ek_ab),
-                        (b, c, ek_bc),
-                        (c, d, ek_cd),
-                    ],
-                    "timestamps": [ts_ab, ts_bc, ts_cd],
-                    "amounts": [amt_ab, amt_bc, amt_cd],
-                })
+                results.append(
+                    {
+                        "edges": [
+                            (seed, b, ek_ab),
+                            (b, c, ek_bc),
+                            (c, d, ek_cd),
+                        ],
+                        "timestamps": [ts_ab, ts_bc, ts_cd],
+                        "amounts": [amt_ab, amt_bc, amt_cd],
+                    }
+                )
                 if len(results) >= max_instances:
                     return results
     return results
 
 
+@without_cyclic_gc
 def enumerate_structuring_event_keys(
     edges: pa.Table,
     *,
@@ -110,15 +121,15 @@ def enumerate_structuring_event_keys(
             for (b, ts, amt, ek) in out1
             if b != seed and amt is not None and amt > 0 and amt >= amt1_min
         ]
-        for (b, ts_ab, _amt_ab, ek_ab) in large_first:
-            for (c, ts_bc, amt_bc, ek_bc) in out_idx.get(b, []):
+        for b, ts_ab, _amt_ab, ek_ab in large_first:
+            for c, ts_bc, amt_bc, ek_bc in out_idx.get(b, []):
                 if c in (seed, b):
                     continue
                 if ts_bc <= ts_ab or ts_bc - ts_ab > time_window_sec:
                     continue
                 if amt_bc is None or amt_bc <= 0 or amt_bc > amt2_max:
                     continue
-                for (d, ts_cd, amt_cd, ek_cd) in out_idx.get(c, []):
+                for d, ts_cd, amt_cd, ek_cd in out_idx.get(c, []):
                     if d in (seed, b, c):
                         continue
                     if ts_cd <= ts_bc or ts_cd - ts_ab > time_window_sec:

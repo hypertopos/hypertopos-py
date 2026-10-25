@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import warnings
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 
 import lance as _lance
@@ -77,9 +78,7 @@ def _prepare_geometry_for_lance(table: pa.Table) -> tuple[pa.Table, int]:
         list_size = len(delta_col[0])  # ListScalar supports len() natively
         fixed_type = pa.list_(pa.float32(), list_size)
         fixed_delta = delta_col.cast(fixed_type)
-        table = table.set_column(
-            table.schema.get_field_index("delta"), "delta", fixed_delta
-        )
+        table = table.set_column(table.schema.get_field_index("delta"), "delta", fixed_delta)
 
         # Per-dimension scalar columns for Lance predicate pushdown
         if list_size > 0:
@@ -121,8 +120,12 @@ def write_geometry(
     if sorted_table.num_rows > 0 and list_size > 0:
         sample_size = min(sorted_table.num_rows, 5000)
         sample_tbl = sorted_table.slice(0, sample_size)
-        delta_flat = sample_tbl["delta"].combine_chunks().values.to_numpy(
-            zero_copy_only=False,
+        delta_flat = (
+            sample_tbl["delta"]
+            .combine_chunks()
+            .values.to_numpy(
+                zero_copy_only=False,
+            )
         )
         sample_deltas = delta_flat.reshape(len(sample_tbl), -1)
         n_unique = len(np.unique(sample_deltas, axis=0))
@@ -135,59 +138,60 @@ def write_geometry(
 
     writer = GDSWriter(str(base_path))
     writer.build_index_if_needed(
-        pattern_id, version, _ds=ds, skip_vector_index=skip_vector,
+        pattern_id,
+        version,
+        _ds=ds,
+        skip_vector_index=skip_vector,
     )
-    # Tag the just-written internal Lance version as calibration epoch 1.
-    # Re-open after build_index_if_needed so latest_version reflects any
-    # index manifest commits Lance may emit during create_index.
-    tag_epoch(_lance.dataset(str(lance_path)), 1)
+    _tag_initial_epoch(lance_path)
 
 
-def write_geometry_chunk(
+def _tag_initial_epoch(lance_path: Path) -> None:
+    """Tag the dataset's latest Lance version as calibration epoch 1.
+
+    Re-opens the dataset so latest_version reflects any index manifest
+    commits Lance emits during create_index. The path is resolved first:
+    Lance percent-encodes the ``~`` of a Windows 8.3 short path segment when
+    it creates the refs directory, and the tag write then fails.
+    """
+    tag_epoch(_lance.dataset(str(lance_path.resolve())), 1)
+
+
+_GEOMETRY_ROWS_PER_FILE = 4_194_304
+
+
+def write_geometry_chunks(
     base_path: Path,
     pattern_id: str,
-    table: pa.Table,
+    chunks: Iterable[pa.Table],
     version: int,
 ) -> None:
-    """Append a geometry chunk to the Lance dataset (no sorting, no indexing).
+    """Write a pattern's geometry from a stream of chunk tables, then index it.
 
-    Used by chunked geometry builds. Caller must call
-    finalize_geometry_chunks() after all chunks are written.
+    Every chunk goes through one Lance write with fragments of up to
+    ``_GEOMETRY_ROWS_PER_FILE`` rows, so no compaction pass is needed; memory
+    stays at one chunk. All chunks must share one schema.
     """
-    prepared, _list_size = _prepare_geometry_for_lance(table)
-
-    lance_path = (
-        base_path / "geometry" / pattern_id / "data.lance"
-    )
-    lance_path.parent.mkdir(parents=True, exist_ok=True)
-    mode = "append" if lance_path.exists() else "create"
-    _write_lance(prepared, str(lance_path), mode=mode)
-
-
-def finalize_geometry_chunks(
-    base_path: Path,
-    pattern_id: str,
-    version: int,
-) -> None:
-    """Compact fragments and build indices after chunked geometry writes.
-
-    Call once after all write_geometry_chunk() calls for a pattern.
-    """
-    lance_path = (
-        base_path / "geometry" / pattern_id / "data.lance"
-    )
-    if not lance_path.exists():
+    prepared = (_prepare_geometry_for_lance(table)[0] for table in chunks)
+    first = next(prepared, None)
+    if first is None:
         return
-    ds = _lance.dataset(str(lance_path))
+
+    def _batches() -> Iterator[pa.RecordBatch]:
+        yield from first.to_batches()
+        for table in prepared:
+            yield from table.to_batches()
+
+    lance_path = base_path / "geometry" / pattern_id / "data.lance"
+    lance_path.parent.mkdir(parents=True, exist_ok=True)
+    ds = _write_lance(
+        pa.RecordBatchReader.from_batches(first.schema, _batches()),
+        str(lance_path),
+        max_rows_per_file=_GEOMETRY_ROWS_PER_FILE,
+    )
     n_rows = ds.count_rows()
     if n_rows == 0:
         return
-
-    # Compact fragments from multiple appends into fewer files.
-    # target_rows_per_fragment=4M merges small chunks into large fragments
-    # for better sequential scan performance (fewer random I/O ops).
-    ds.optimize.compact_files(target_rows_per_fragment=4_194_304)
-    ds = _lance.dataset(str(lance_path))  # re-open after compaction
 
     # Detect list_size for index building
     delta_field = ds.schema.field("delta")
@@ -197,9 +201,10 @@ def finalize_geometry_chunks(
 
     # Detect binary/low-cardinality — skip IVF_FLAT
     skip_vector = False
-    if list_size is not None and n_rows > 0:
+    if list_size is not None:
         sample_size = min(n_rows, 5000)
-        sample_tbl = ds.head(sample_size, columns=["delta"])
+        # lance's LanceDataset.head is unannotated
+        sample_tbl = ds.head(sample_size, columns=["delta"])  # type: ignore[no-untyped-call]
         delta_col = sample_tbl["delta"].combine_chunks()
         # ds.head may return variable-length list; use field metadata for reshape
         effective_list_size = list_size
@@ -213,12 +218,12 @@ def finalize_geometry_chunks(
 
     writer = GDSWriter(str(base_path))
     writer.build_index_if_needed(
-        pattern_id, version, _ds=ds, skip_vector_index=skip_vector,
+        pattern_id,
+        version,
+        _ds=ds,
+        skip_vector_index=skip_vector,
     )
-    # Tag the just-written internal Lance version as calibration epoch 1.
-    # Re-open after build_index_if_needed so latest_version reflects any
-    # index manifest commits Lance may emit during create_index.
-    tag_epoch(_lance.dataset(str(lance_path)), 1)
+    _tag_initial_epoch(lance_path)
 
 
 def update_points(
@@ -235,10 +240,9 @@ def update_points(
             "Run build() first to create the initial dataset."
         )
     ds = _lance.dataset(str(lance_path))
-    ds.merge_insert("primary_key") \
-        .when_matched_update_all() \
-        .when_not_matched_insert_all() \
-        .execute(table)
+    ds.merge_insert("primary_key").when_matched_update_all().when_not_matched_insert_all().execute(
+        table
+    )
 
 
 def delete_points(

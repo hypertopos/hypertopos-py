@@ -2,16 +2,14 @@
 # Licensed under the Business Source License 1.1 (the "License");
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
-"""Tag timestamp abstraction — forward-compatible across Lance versions.
+"""Tag timestamp abstraction — native per-tag timestamps with a version-scan fallback.
 
-Pre-7.0 Lance does NOT carry a per-tag timestamp; the timestamp lives on the
-underlying version. Tag → timestamp resolution costs an O(versions) scan plus
-the O(1) `tags.get_version` lookup.
-
-Lance 7.0 exposes the per-tag creation time directly on ``tags.list()``: each
-entry is a dict carrying ``created_at`` (a tz-aware UTC ``datetime``). The
-resolution collapses to an O(1) dict lookup. The public surface here stays the
-same — only the internal lookup swaps based on whether the entry carries
+Lance exposes the per-tag creation time directly on ``tags.list()``: each
+entry is a dict carrying ``created_at`` (a tz-aware UTC ``datetime``), so the
+resolution is an O(1) dict lookup. Tags written by a pre-7.0 Lance writer do
+NOT carry that field; for them the timestamp lives on the underlying version
+and resolution costs an O(versions) scan plus the O(1) `tags.get_version`
+lookup. The internal lookup swaps based on whether the entry carries
 ``created_at``.
 
 Single public API; the native path is preferred when ``tags.list()`` returns
@@ -26,25 +24,21 @@ calibration epoch tag is created immediately after the calibration version is
 committed — and tag-creation time is the correct semantic for "when the tag was
 created" (matching the public docstring below).
 """
+
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-import lance as _lance  # type: ignore[import-untyped]
-from packaging.version import Version
-
-_LANCE_VERSION = Version(_lance.__version__)
-_NATIVE_TAG_TIMESTAMP_VERSION = Version("7.0.0")
+import lance as _lance
 
 
 def tag_timestamp(ds: _lance.LanceDataset, tag: str) -> datetime:
     """Return the datetime at which ``tag`` was created on ``ds``.
 
-    Single public API. On Lance ≥ 7.0 we read the native ``created_at`` field
-    carried on each ``tags.list()`` entry — an O(1) dict lookup. On older Lance
-    (or for a tag written by a pre-7.0 writer that lacks ``created_at``) we look
-    up the version that the tag points to and pull its commit timestamp from
-    ``ds.versions()``.
+    Single public API. We read the native ``created_at`` field carried on each
+    ``tags.list()`` entry — an O(1) dict lookup. For a tag written by a pre-7.0
+    writer that lacks ``created_at`` we look up the version that the tag points
+    to and pull its commit timestamp from ``ds.versions()``.
 
     The returned datetime is tz-aware UTC on the native path and tz-naive on the
     version-scan path (Lance's ``versions()`` timestamps are tz-naive). Callers
@@ -54,10 +48,9 @@ def tag_timestamp(ds: _lance.LanceDataset, tag: str) -> datetime:
     Raises ``KeyError`` if the tag is unknown or the version is not in the
     dataset's version history (corrupt manifest case).
     """
-    if _LANCE_VERSION >= _NATIVE_TAG_TIMESTAMP_VERSION:
-        native = _tag_timestamp_native(ds, tag)
-        if native is not None:
-            return native
+    native = _tag_timestamp_native(ds, tag)
+    if native is not None:
+        return native
     return _tag_timestamp_from_versions(ds, tag)
 
 
@@ -67,7 +60,7 @@ def cleanup_calibration_epochs(
     older_than: datetime,
     delete_unverified: bool = False,
 ) -> int:
-    """Drop calibration-epoch tags older than ``older_than``, then run
+    """Drop calibration-epoch tags (``epoch_*``) older than ``older_than``, then run
     Lance's native ``cleanup_old_versions``. Returns the count of tags
     dropped.
 
@@ -79,6 +72,9 @@ def cleanup_calibration_epochs(
     """
     dropped = 0
     for tag_name in list(ds.tags.list().keys()):
+        # Only calibration-epoch tags (``epoch_<N>``); other tags are not ours.
+        if not tag_name.startswith("epoch_"):
+            continue
         try:
             ts = tag_timestamp(ds, tag_name)
         except KeyError:
@@ -115,9 +111,10 @@ def _as_comparable(value: datetime, reference: datetime) -> datetime:
 
 
 def _tag_timestamp_from_versions(
-    ds: _lance.LanceDataset, tag: str,
+    ds: _lance.LanceDataset,
+    tag: str,
 ) -> datetime:
-    """Lance 6.0 path — derive tag timestamp from versions() scan.
+    """Fallback path — derive tag timestamp from versions() scan.
 
     Reads ``tags.get_version(tag)`` then matches against ``ds.versions()``.
     O(N versions) per call; acceptable because callers (calibration epoch
@@ -131,8 +128,9 @@ def _tag_timestamp_from_versions(
         raise KeyError(f"Tag {tag!r} not found on dataset")
     for v in ds.versions():
         if v.get("version") == version:
+            # versions() converts the raw int nanosecond timestamp to datetime.
             ts = v.get("timestamp")
-            if ts is None:
+            if not isinstance(ts, datetime):
                 raise KeyError(
                     f"Tag {tag!r} → version {version} has no timestamp",
                 )
@@ -143,9 +141,10 @@ def _tag_timestamp_from_versions(
 
 
 def _tag_timestamp_native(
-    ds: _lance.LanceDataset, tag: str,
+    ds: _lance.LanceDataset,
+    tag: str,
 ) -> datetime | None:
-    """Lance 7.0 path — read the native per-tag ``created_at``.
+    """Native path — read the per-tag ``created_at``.
 
     Each ``tags.list()`` entry is a dict carrying ``created_at`` (tz-aware UTC
     ``datetime``). Returns that value, or ``None`` to signal the caller to fall

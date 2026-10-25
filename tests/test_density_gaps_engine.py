@@ -1,4 +1,5 @@
 """Unit tests for engine.density_gaps building blocks."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -30,12 +31,14 @@ def test_ecdf_inverse_roundtrip_within_quantile_resolution():
 
 
 def test_select_pairs_by_corr_respects_window():
-    corr = np.array([
-        [1.0, 0.05, 0.5, 0.9],
-        [0.05, 1.0, 0.3, 0.8],
-        [0.5, 0.3, 1.0, 0.4],
-        [0.9, 0.8, 0.4, 1.0],
-    ])
+    corr = np.array(
+        [
+            [1.0, 0.05, 0.5, 0.9],
+            [0.05, 1.0, 0.3, 0.8],
+            [0.5, 0.3, 1.0, 0.4],
+            [0.9, 0.8, 0.4, 1.0],
+        ]
+    )
     pairs = select_pairs_by_corr(corr, r_min=0.1, r_max=0.7, top_k=10)
     pair_set = {(i, j) for (i, j, _r) in pairs}
     assert (0, 2) in pair_set
@@ -51,13 +54,16 @@ def test_density_gaps_flags_planted_hole():
     mask = ~((u_i > 0.3) & (u_i < 0.6) & (u_j > 0.3) & (u_j < 0.6))
     u_i, u_j = u_i[mask], u_j[mask]
     cells = compute_density_gaps_for_pair(
-        u_i, u_j, n=len(u_i), bins=10, alpha=0.05,
+        u_i,
+        u_j,
+        n=len(u_i),
+        bins=10,
+        alpha=0.05,
     )
     flagged = [c for c in cells if c["is_gap"]]
     assert len(flagged) >= 4
     in_hole = [
-        c for c in flagged
-        if 0.3 <= c["u_range_i"][0] < 0.6 and 0.3 <= c["u_range_j"][0] < 0.6
+        c for c in flagged if 0.3 <= c["u_range_i"][0] < 0.6 and 0.3 <= c["u_range_j"][0] < 0.6
     ]
     assert len(in_hole) >= 4
 
@@ -81,19 +87,25 @@ def test_density_gaps_independence_null_yields_few_rejections():
     u_i = rng.uniform(size=n)
     u_j = rng.uniform(size=n)
     cells = compute_density_gaps_for_pair(
-        u_i, u_j, n=n, bins=10, alpha=0.05,
+        u_i,
+        u_j,
+        n=n,
+        bins=10,
+        alpha=0.05,
     )
     flagged = [c for c in cells if c["is_gap"]]
     assert len(flagged) <= 5
 
 
 def test_select_pairs_by_corr_top_k_truncation():
-    corr = np.array([
-        [1.0, 0.2, 0.3, 0.4],
-        [0.2, 1.0, 0.5, 0.6],
-        [0.3, 0.5, 1.0, 0.55],
-        [0.4, 0.6, 0.55, 1.0],
-    ])
+    corr = np.array(
+        [
+            [1.0, 0.2, 0.3, 0.4],
+            [0.2, 1.0, 0.5, 0.6],
+            [0.3, 0.5, 1.0, 0.55],
+            [0.4, 0.6, 0.55, 1.0],
+        ]
+    )
     pairs = select_pairs_by_corr(corr, r_min=0.1, r_max=0.7, top_k=2)
     assert len(pairs) == 2
     assert pairs[0][2] >= pairs[1][2]
@@ -104,8 +116,47 @@ def test_density_gaps_returns_q_values_in_unit_interval():
     u_i = rng.uniform(size=2000)
     u_j = rng.uniform(size=2000)
     cells = compute_density_gaps_for_pair(
-        u_i, u_j, n=2000, bins=10, alpha=0.05,
+        u_i,
+        u_j,
+        n=2000,
+        bins=10,
+        alpha=0.05,
     )
     for c in cells:
         assert 0.0 <= c["q_value"] <= 1.0
         assert 0.0 <= c["p_value"] <= 1.0
+
+
+def _pit(x: np.ndarray) -> np.ndarray:
+    return ECDFEntry.from_values(x).transform(x)
+
+
+def test_density_gaps_tied_dims_produce_no_false_gap():
+    # Zero-inflated counts: the PIT of a tied dim is a point mass, so some
+    # quantile bins are empty by construction, not because the joint
+    # population has a hole. Independent dims must yield no gap.
+    rng = np.random.default_rng(3)
+    n = 20000
+    zero_inflated = np.where(rng.uniform(size=n) < 0.7, 0.0, rng.poisson(3.0, size=n) + 1.0)
+    other_counts = np.where(rng.uniform(size=n) < 0.5, 0.0, rng.poisson(2.0, size=n) + 1.0)
+    continuous = rng.standard_normal(n)
+    for u_i, u_j in (
+        (_pit(zero_inflated), _pit(continuous)),
+        (_pit(zero_inflated), _pit(other_counts)),
+    ):
+        cells = compute_density_gaps_for_pair(u_i, u_j, n=n, bins=10, alpha=0.05)
+        assert [c for c in cells if c["is_gap"]] == []
+        assert all(c["expected"] > 0 for c in cells)
+
+
+def test_density_gaps_tied_dim_still_flags_planted_hole():
+    rng = np.random.default_rng(4)
+    n = 20000
+    tied = np.where(rng.uniform(size=n) < 0.5, 0.0, rng.uniform(1.0, 2.0, size=n))
+    continuous = rng.uniform(size=n)
+    keep = ~((tied > 1.2) & (tied < 1.6) & (continuous > 0.3) & (continuous < 0.6))
+    tied, continuous = tied[keep], continuous[keep]
+    cells = compute_density_gaps_for_pair(
+        _pit(tied), _pit(continuous), n=len(tied), bins=10, alpha=0.05
+    )
+    assert any(c["is_gap"] for c in cells)

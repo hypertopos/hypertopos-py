@@ -7,9 +7,7 @@
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import lance
 import numpy as np
@@ -22,7 +20,6 @@ from hypertopos.engine.heredity import (
     compute_novelty_score,
 )
 
-
 # ---------------------------------------------------------------------------
 # Pure function tests
 # ---------------------------------------------------------------------------
@@ -31,14 +28,16 @@ from hypertopos.engine.heredity import (
 class TestComputeExpectedDelta:
     def test_expected_delta_from_neighbors(self) -> None:
         neighbor_deltas = np.array(
-            [[1.0, 2.0, 3.0], [3.0, 4.0, 5.0]], dtype=np.float32,
+            [[1.0, 2.0, 3.0], [3.0, 4.0, 5.0]],
+            dtype=np.float32,
         )
         expected = compute_expected_delta(neighbor_deltas)
         np.testing.assert_allclose(expected, [2.0, 3.0, 4.0])
 
     def test_expected_delta_weighted(self) -> None:
         neighbor_deltas = np.array(
-            [[1.0, 0.0], [3.0, 0.0]], dtype=np.float32,
+            [[1.0, 0.0], [3.0, 0.0]],
+            dtype=np.float32,
         )
         weights = np.array([3.0, 1.0], dtype=np.float32)
         expected = compute_expected_delta(neighbor_deltas, weights=weights)
@@ -56,7 +55,8 @@ class TestComputeExpectedDelta:
 
     def test_expected_delta_zero_weights_returns_zeros(self) -> None:
         neighbor_deltas = np.array(
-            [[1.0, 2.0], [3.0, 4.0]], dtype=np.float32,
+            [[1.0, 2.0], [3.0, 4.0]],
+            dtype=np.float32,
         )
         weights = np.array([0.0, 0.0], dtype=np.float32)
         expected = compute_expected_delta(neighbor_deltas, weights=weights)
@@ -184,17 +184,19 @@ def _build_edge_sphere(tmp_path: Path) -> Path:
 
     # Geometry for account_pattern — 5 accounts with 2D deltas
     # A is in the centre, B/C/D are neighbors of A, E is far away
-    edge_struct_type = pa.struct([
-        pa.field("line_id", pa.string()),
-        pa.field("point_key", pa.string()),
-        pa.field("status", pa.string()),
-        pa.field("direction", pa.string()),
-    ])
+    edge_struct_type = pa.struct(
+        [
+            pa.field("line_id", pa.string()),
+            pa.field("point_key", pa.string()),
+            pa.field("status", pa.string()),
+            pa.field("direction", pa.string()),
+        ]
+    )
     deltas = [
-        [1.0, 1.0],   # A — neighbors B,C,D avg=[2,2] → score=sqrt(2)≈1.414
-        [2.0, 2.0],   # B — neighbor of A
-        [2.0, 2.0],   # C — neighbor of A
-        [2.0, 2.0],   # D — neighbor of A
+        [1.0, 1.0],  # A — neighbors B,C,D avg=[2,2] → score=sqrt(2)≈1.414
+        [2.0, 2.0],  # B — neighbor of A
+        [2.0, 2.0],  # C — neighbor of A
+        [2.0, 2.0],  # D — neighbor of A
         [10.0, 10.0],  # E — neighbor of A, very different
     ]
     delta_norms = [float(np.linalg.norm(d)) for d in deltas]
@@ -209,24 +211,28 @@ def _build_edge_sphere(tmp_path: Path) -> Path:
     ts = datetime(2024, 1, 1, tzinfo=UTC)
     empty_edges = [[] for _ in range(5)]
 
-    geo_table = pa.table({
-        "primary_key": ["A", "B", "C", "D", "E"],
-        "scale": [1, 1, 1, 1, 1],
-        "delta": [d for d in deltas],
-        "delta_norm": pa.array(delta_norms, type=pa.float32()),
-        "delta_rank_pct": pa.array(rank_pcts, type=pa.float32()),
-        "is_anomaly": is_anomaly,
-        "edges": pa.array(empty_edges, type=pa.list_(edge_struct_type)),
-        "last_refresh_at": [ts] * 5,
-        "updated_at": [ts] * 5,
-    })
+    geo_table = pa.table(
+        {
+            "primary_key": ["A", "B", "C", "D", "E"],
+            "scale": [1, 1, 1, 1, 1],
+            "delta": list(deltas),
+            "delta_norm": pa.array(delta_norms, type=pa.float32()),
+            "delta_rank_pct": pa.array(rank_pcts, type=pa.float32()),
+            "is_anomaly": is_anomaly,
+            "edges": pa.array(empty_edges, type=pa.list_(edge_struct_type)),
+            "last_refresh_at": [ts] * 5,
+            "updated_at": [ts] * 5,
+        }
+    )
     # Per-dimension scalar columns
     delta_col = geo_table["delta"]
     list_size = 2
     fixed_type = pa.list_(pa.float32(), list_size)
     fixed_delta = delta_col.cast(fixed_type)
     geo_table = geo_table.set_column(
-        geo_table.schema.get_field_index("delta"), "delta", fixed_delta,
+        geo_table.schema.get_field_index("delta"),
+        "delta",
+        fixed_delta,
     )
     flat = fixed_delta.combine_chunks().values.to_numpy(zero_copy_only=False)
     matrix = flat.reshape(-1, list_size)
@@ -251,25 +257,29 @@ def _build_edge_sphere(tmp_path: Path) -> Path:
     )
 
     # Edge table for tx_pattern: A↔B, A↔C, A↔D, A↔E, B↔C
-    edge_table = pa.table({
-        "from_key": ["A", "A", "A", "A", "B"],
-        "to_key": ["B", "C", "D", "E", "C"],
-        "event_key": ["tx1", "tx2", "tx3", "tx4", "tx5"],
-        "timestamp": pa.array([1.0, 2.0, 3.0, 4.0, 5.0], type=pa.float64()),
-        "amount": pa.array([100.0, 200.0, 300.0, 400.0, 50.0], type=pa.float64()),
-    })
+    edge_table = pa.table(
+        {
+            "from_key": ["A", "A", "A", "A", "B"],
+            "to_key": ["B", "C", "D", "E", "C"],
+            "event_key": ["tx1", "tx2", "tx3", "tx4", "tx5"],
+            "timestamp": pa.array([1.0, 2.0, 3.0, 4.0, 5.0], type=pa.float64()),
+            "amount": pa.array([100.0, 200.0, 300.0, 400.0, 50.0], type=pa.float64()),
+        }
+    )
     edge_path = sphere_dir / "edges" / "tx_pattern" / "data.lance"
     edge_path.parent.mkdir(parents=True, exist_ok=True)
     lance.write_dataset(edge_table, str(edge_path), mode="overwrite")
 
     # Points for accounts (minimal)
-    pts_table = pa.table({
-        "primary_key": ["A", "B", "C", "D", "E"],
-        "version": [1, 1, 1, 1, 1],
-        "status": ["active"] * 5,
-        "created_at": [ts] * 5,
-        "changed_at": [ts] * 5,
-    })
+    pts_table = pa.table(
+        {
+            "primary_key": ["A", "B", "C", "D", "E"],
+            "version": [1, 1, 1, 1, 1],
+            "status": ["active"] * 5,
+            "created_at": [ts] * 5,
+            "changed_at": [ts] * 5,
+        }
+    )
     pts_path = sphere_dir / "points" / "accounts" / "v=1" / "data.lance"
     pts_path.parent.mkdir(parents=True, exist_ok=True)
     lance.write_dataset(pts_table, str(pts_path), mode="overwrite")

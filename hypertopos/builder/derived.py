@@ -7,16 +7,17 @@
 Aggregates event-level data into per-anchor-entity features
 that become continuous dimensions in the shape vector.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal, cast
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from hypertopos.engine.chains import parse_timestamps_to_epoch
+from hypertopos.utils.time import to_epoch_seconds
 
 
 @dataclass
@@ -26,8 +27,9 @@ class DerivedDimSpec:
     anchor_line: str
     event_line: str
     anchor_fk: str | list[str]
-    metric: Literal["count", "count_distinct", "sum", "max", "std", "mean",
-                    "iet_mean", "iet_std", "iet_min"]
+    metric: Literal[
+        "count", "count_distinct", "sum", "max", "std", "mean", "iet_mean", "iet_std", "iet_min"
+    ]
     metric_col: str | None
     dimension_name: str
     edge_max: int | str  # int = fixed, "auto" = p99
@@ -105,24 +107,12 @@ def _apply_temporal_windowing(
     key_to_idx = {k: i for i, k in enumerate(anchor_list)}
 
     # --- 1. Convert timestamps to epoch seconds (PyArrow-native) ----------
-    ts_col = event_table[time_col]
-
-    if pa.types.is_timestamp(ts_col.type):
-        unit = ts_col.type.unit
-        divisors = {"s": 1.0, "ms": 1e3, "us": 1e6, "ns": 1e9}
-        divisor = divisors.get(unit, 1e6)
-        epoch_arr = pc.cast(ts_col, pa.int64())
-        epoch_arr = pc.divide(pc.cast(epoch_arr, pa.float64()), divisor)
-    elif pa.types.is_floating(ts_col.type) or pa.types.is_integer(ts_col.type):
-        epoch_arr = pc.cast(ts_col, pa.float64())
-    else:
-        # String / other — fall back to parse_timestamps_to_epoch
-        epoch_arr = pa.chunked_array(
-            [pa.array(
-                parse_timestamps_to_epoch(ts_col.to_pylist()),
-                type=pa.float64(),
-            )]
-        )
+    epoch_arr = to_epoch_seconds(event_table[time_col])
+    if epoch_arr.null_count:
+        # Events without a timestamp belong to no window.
+        valid = pc.is_valid(epoch_arr)
+        event_table = event_table.filter(valid)
+        epoch_arr = epoch_arr.filter(valid)
 
     # --- 2. Compute time buckets: floor((ts - min_ts) / window_secs) ------
     min_ts = pc.min(epoch_arr).as_py()
@@ -151,9 +141,7 @@ def _apply_temporal_windowing(
         raise ValueError(f"Unknown metric: {metric}")
 
     agg_col, agg_func = _agg_map[metric]
-    grouped = work_table.group_by([anchor_fk, "_bucket"]).aggregate(
-        [(agg_col, agg_func)]
-    )
+    grouped = work_table.group_by([anchor_fk, "_bucket"]).aggregate([(agg_col, agg_func)])
     metric_result_col = f"{agg_col}_{agg_func}"
 
     # --- 5. Aggregate across buckets per anchor (window_aggregation) -------
@@ -185,9 +173,7 @@ def _apply_temporal_windowing(
         raise ValueError(f"Unknown window_aggregation: {window_aggregation}")
 
     win_func = _win_agg_map[window_aggregation]
-    final = grouped.group_by(anchor_fk).aggregate(
-        [(metric_result_col, win_func)]
-    )
+    final = grouped.group_by(anchor_fk).aggregate([(metric_result_col, win_func)])
     final_col = f"{metric_result_col}_{win_func}"
 
     # --- 6. Map results back to anchor array ------------------------------
@@ -228,17 +214,29 @@ def compute_derived_dimension(
         )
     if time_col and time_window and isinstance(anchor_fk, str):
         return _apply_temporal_windowing(
-            event_table, anchor_keys, anchor_fk, metric, metric_col,
-            time_col, time_window, window_aggregation,
-            edge_max, percentile,
+            event_table,
+            anchor_keys,
+            anchor_fk,
+            metric,
+            metric_col,
+            time_col,
+            time_window,
+            window_aggregation,
+            edge_max,
+            percentile,
         )
 
     if isinstance(anchor_fk, list):
         return _compute_composite_derived(
-            event_table, anchor_keys, anchor_fk, metric, metric_col,
-            edge_max, percentile, separator=separator,
+            event_table,
+            anchor_keys,
+            anchor_fk,
+            metric,
+            metric_col,
+            edge_max,
+            percentile,
+            separator=separator,
         )
-
 
     fk_col = event_table[anchor_fk]
     n_anchor = len(anchor_keys)
@@ -252,9 +250,7 @@ def compute_derived_dimension(
     # Fast path: PyArrow group_by for count (most common case)
     if metric == "count":
         try:
-            grouped = event_table.group_by(anchor_fk).aggregate(
-                [("primary_key", "count")]
-            )
+            grouped = event_table.group_by(anchor_fk).aggregate([("primary_key", "count")])
             gk = grouped[anchor_fk].to_pylist()
             gc = grouped["primary_key_count"].to_pylist()
             for k, c in zip(gk, gc, strict=False):
@@ -265,9 +261,7 @@ def compute_derived_dimension(
             _aggregate_count(fk_col, key_to_idx, values)
     elif metric == "count_distinct":
         try:
-            grouped = event_table.group_by(anchor_fk).aggregate(
-                [(metric_col, "count_distinct")]
-            )
+            grouped = event_table.group_by(anchor_fk).aggregate([(metric_col, "count_distinct")])
             gk = grouped[anchor_fk].to_pylist()
             gc = grouped[f"{metric_col}_count_distinct"].to_pylist()
             for k, c in zip(gk, gc, strict=False):
@@ -280,9 +274,7 @@ def compute_derived_dimension(
         pa_agg_map = {"sum": "sum", "max": "max", "mean": "mean", "std": "stddev"}
         pa_func = pa_agg_map[metric]
         try:
-            grouped = event_table.group_by(anchor_fk).aggregate(
-                [(metric_col, pa_func)]
-            )
+            grouped = event_table.group_by(anchor_fk).aggregate([(metric_col, pa_func)])
             gk = grouped[anchor_fk].to_pylist()
             gc = grouped[f"{metric_col}_{pa_func}"].to_pylist()
             for k, c in zip(gk, gc, strict=False):
@@ -296,7 +288,11 @@ def compute_derived_dimension(
             raise ValueError(f"IET metric '{metric}' requires time_col")
         agg = metric.split("_", 1)[1]  # "mean", "std", or "min"
         values = _aggregate_iet(
-            event_table, anchor_keys, anchor_fk, time_col, agg, key_to_idx,
+            event_table,
+            anchor_keys,
+            anchor_fk,
+            time_col,
+            agg,
         )
     else:
         raise ValueError(f"Unknown metric: {metric}")
@@ -306,32 +302,8 @@ def compute_derived_dimension(
 
 
 def _ts_column_to_epoch_array(col: pa.ChunkedArray) -> pa.Array:
-    """Convert an Arrow column to float64 epoch seconds.
-
-    Handles Arrow timestamp types (via cast to int64 microseconds → divide),
-    integer/float types (passthrough or unit conversion), and string types
-    (fromisoformat fallback via parse_timestamps_to_epoch).
-    """
-    flat = col.combine_chunks() if isinstance(col, pa.ChunkedArray) else col
-    t = flat.type
-
-    if pa.types.is_timestamp(t):
-        # Cast to int64 (unit preserved), then convert to seconds
-        as_int = pc.cast(flat, pa.int64())
-        unit = t.unit  # "s", "ms", "us", "ns"
-        divisors = {"s": 1.0, "ms": 1e3, "us": 1e6, "ns": 1e9}
-        divisor = divisors.get(unit, 1e6)
-        return pc.cast(pc.divide(pc.cast(as_int, pa.float64()), divisor), pa.float64())
-
-    if pa.types.is_integer(t):
-        return pc.cast(flat, pa.float64())
-
-    if pa.types.is_floating(t):
-        return pc.cast(flat, pa.float64())
-
-    # String or other — parse via Python helper (single pylist call, unavoidable)
-    epoch_list = parse_timestamps_to_epoch(flat.to_pylist())
-    return pa.array(epoch_list, type=pa.float64())
+    """Convert an Arrow column to float64 epoch seconds; nulls stay null."""
+    return to_epoch_seconds(col)
 
 
 def _aggregate_iet(
@@ -340,7 +312,6 @@ def _aggregate_iet(
     anchor_fk: str,
     time_col: str,
     agg: str,
-    key_to_idx: dict[str, int],
 ) -> np.ndarray:
     """Compute inter-event-time aggregates per anchor entity (Arrow-native).
 
@@ -366,74 +337,64 @@ def _aggregate_iet(
     ts_valid = pc.is_valid(epoch_col)
     mask = pc.and_(fk_valid, ts_valid)
 
-    mini = pa.table(
-        {"fk": pc.filter(fk_flat, mask), "epoch": pc.filter(epoch_col, mask)}
-    )
+    mini = pa.table({"fk": pc.filter(fk_flat, mask), "epoch": pc.filter(epoch_col, mask)})
 
     if len(mini) == 0:
         return values
 
-    # --- 2. Sort by (fk, epoch) using Arrow sort ---
-    sort_indices = pc.sort_indices(
-        mini, sort_keys=[("fk", "ascending"), ("epoch", "ascending")]
+    # --- 2. Anchor row per event; order by (anchor row, epoch) ---
+    anchors = (
+        anchor_keys.combine_chunks() if isinstance(anchor_keys, pa.ChunkedArray) else anchor_keys
     )
-    sorted_mini = mini.take(sort_indices)
-
-    fk_np = sorted_mini["fk"].to_pylist()  # string list — used for entity key lookup per group
-    epoch_col_sorted = sorted_mini["epoch"]
-    if isinstance(epoch_col_sorted, pa.ChunkedArray):
-        epoch_col_sorted = epoch_col_sorted.combine_chunks()
-    epoch_np = epoch_col_sorted.to_numpy().astype(np.float64)
-
-    n = len(epoch_np)
-    if n < 2:
+    rows = np.asarray(
+        pc.fill_null(pc.index_in(mini["fk"], value_set=anchors), -1).to_numpy(zero_copy_only=False),
+        dtype=np.int64,
+    )
+    epoch_np = np.asarray(mini["epoch"].to_numpy(), dtype=np.float64)
+    on_anchor = rows >= 0
+    rows, epoch_np = rows[on_anchor], epoch_np[on_anchor]
+    if len(rows) < 2:
         return values
+    order = np.argsort(epoch_np, kind="stable")
+    order = order[np.argsort(rows[order], kind="stable")]
+    rows, epoch_np = rows[order], epoch_np[order]
 
-    # --- 3. Compute consecutive diffs; find group boundaries ---
-    diffs = np.empty(n, dtype=np.float64)
-    diffs[0] = 0.0
-    diffs[1:] = epoch_np[1:] - epoch_np[:-1]
+    # --- 3. Consecutive diffs inside each anchor's run ---
+    same = rows[1:] == rows[:-1]
+    gap_rows = rows[1:][same]
+    gaps = (epoch_np[1:] - epoch_np[:-1])[same]
+    if len(gaps) == 0:
+        return values  # every anchor has at most one event — IET stays 0.0
 
-    # Detect entity-change boundaries via Arrow comparison on the fk column —
-    # compare fk[:-1] vs fk[1:] without materializing Python objects per row.
-    fk_arr = sorted_mini["fk"]
-    if isinstance(fk_arr, pa.ChunkedArray):
-        fk_arr = fk_arr.combine_chunks()
-    is_new_entity = pc.not_equal(fk_arr[1:], fk_arr[:-1])  # BooleanArray length n-1
-    # boundary[i] True means row i starts a new entity group
-    boundary_np = np.empty(n, dtype=bool)
-    boundary_np[0] = True   # first row always starts a group
-    boundary_np[1:] = is_new_entity.to_numpy(zero_copy_only=False)
-
-    # Group start indices: where boundary_np is True
-    group_starts = np.flatnonzero(boundary_np)
-    # Group end indices (exclusive): next start or n
-    group_ends = np.empty(len(group_starts), dtype=np.intp)
-    group_ends[:-1] = group_starts[1:]
-    group_ends[-1] = n
-
-    # --- 4. Aggregate per entity ---
-    # Each entity spans rows [start, end); valid diffs are diffs[start+1 : end]
-    for g_start, g_end in zip(group_starts, group_ends, strict=False):
-        entity = fk_np[g_start]
-        idx = key_to_idx.get(entity)
-        if idx is None:
-            continue
-        entity_diffs = diffs[g_start + 1 : g_end]  # within-entity consecutive diffs
-        if len(entity_diffs) == 0:
-            continue  # only 1 event — IET stays 0.0
-        if agg == "mean":
-            values[idx] = float(entity_diffs.mean())
-        elif agg == "std":
-            values[idx] = float(entity_diffs.std())
-        elif agg == "min":
-            values[idx] = float(entity_diffs.min())
-
+    # --- 4. Aggregate per anchor ---
+    counts = np.bincount(gap_rows, minlength=n_anchor)
+    has_gaps = counts > 0
+    if agg == "min":
+        starts = np.flatnonzero(np.r_[True, gap_rows[1:] != gap_rows[:-1]])
+        values[gap_rows[starts]] = np.minimum.reduceat(gaps, starts)
+        return values
+    safe = np.maximum(counts, 1)
+    if agg == "mean":
+        values[has_gaps] = (np.bincount(gap_rows, weights=gaps, minlength=n_anchor) / safe)[
+            has_gaps
+        ]
+        return values
+    if agg == "std":
+        # Two-pass population std shifted by a member of each group, so a
+        # constant gap sequence is exactly 0.
+        shift = np.zeros(n_anchor, dtype=np.float64)
+        shift[gap_rows] = gaps
+        d = gaps - shift[gap_rows]
+        mean = np.bincount(gap_rows, weights=d, minlength=n_anchor) / safe
+        var = np.bincount(gap_rows, weights=(d - mean[gap_rows]) ** 2, minlength=n_anchor) / safe
+        values[has_gaps] = np.sqrt(var)[has_gaps]
     return values
 
 
 def _aggregate_count(
-    fk_col: pa.ChunkedArray, key_to_idx: dict[str, int], out: np.ndarray,
+    fk_col: pa.ChunkedArray,
+    key_to_idx: dict[str, int],
+    out: np.ndarray,
 ) -> None:
     """Count events per anchor key."""
     counts: dict[str, int] = {}
@@ -454,7 +415,7 @@ def _aggregate_count_distinct(
     out: np.ndarray,
 ) -> None:
     """Count distinct metric_col values per anchor key."""
-    sets: dict[str, set] = {}
+    sets: dict[str, set[Any]] = {}
     fk_chunks = fk_col.chunks
     mc_chunks = metric_col.chunks
 
@@ -571,6 +532,57 @@ def _is_batchable(spec: DerivedDimSpec) -> bool:
     return not (spec.time_col and spec.time_window)
 
 
+def _exact_group_metric(
+    position: pa.Array | pa.ChunkedArray,
+    values: pa.Array | pa.ChunkedArray,
+    n: int,
+    metric: str,
+) -> np.ndarray:
+    """``sum`` / ``mean`` / population ``std`` per anchor, the same on every run.
+
+    ``position`` is each row's anchor index (``pc.index_in``). Arrow's
+    multi-threaded float aggregates merge partial sums in a run-dependent
+    order, so their low bits change between builds; ``np.bincount`` sums in
+    one fixed order. ``std`` shifts every value by one member of its group
+    before a two-pass variance, so a group of identical values is exactly 0
+    (Arrow returned a tiny run-dependent value there). Anchors without values
+    are 0; NaN results are 0 and infinite sums / means stay infinite, as in
+    the Arrow scatter path (a non-finite ``std`` is 0).
+    """
+    out = np.zeros(n, dtype=np.float64)
+    keep = pc.and_(pc.is_valid(position), pc.is_valid(values))
+    rows = pc.filter(position, keep).to_numpy(zero_copy_only=False).astype(np.intp)
+    if len(rows) == 0:
+        return out
+    x = pc.filter(values, keep).to_numpy(zero_copy_only=False).astype(np.float64)
+    counts = np.bincount(rows, minlength=n)
+    safe = np.maximum(counts, 1)
+    if metric == "sum":
+        out = np.bincount(rows, weights=x, minlength=n).astype(np.float64)
+        out[np.isnan(out)] = 0.0
+        return out
+    if metric == "mean":
+        out = np.bincount(rows, weights=x, minlength=n) / safe
+        out[np.isnan(out)] = 0.0
+        return out
+    shift = np.zeros(n, dtype=np.float64)
+    shift[rows] = x  # any member of the group will do; this one costs O(n)
+    d = x - shift[rows]
+    mean = np.bincount(rows, weights=d, minlength=n) / safe
+    out = np.sqrt(np.bincount(rows, weights=(d - mean[rows]) ** 2, minlength=n) / safe)
+    out[~np.isfinite(out)] = 0.0
+    return out
+
+
+def _uses_exact_path(spec: DerivedDimSpec, event_table: pa.Table) -> bool:
+    """std always; sum / mean on floating-point columns (integer sums are exact in Arrow)."""
+    if spec.metric == "std":
+        return True
+    if spec.metric in ("sum", "mean") and spec.metric_col in event_table.column_names:
+        return bool(pa.types.is_floating(event_table.schema.field(spec.metric_col).type))
+    return False
+
+
 def compute_derived_batch(
     event_table: pa.Table,
     anchor_keys: pa.Array,
@@ -588,7 +600,6 @@ def compute_derived_batch(
     """
     n_anchor = len(anchor_keys)
     anchor_list = anchor_keys.to_pylist()
-    key_to_idx: dict[str, int] = {k: i for i, k in enumerate(anchor_list)}
 
     # For composite FK, build a synthetic string column and group by that
     if isinstance(anchor_fk, list):
@@ -606,6 +617,8 @@ def compute_derived_batch(
     spec_to_result_col: dict[str, str] = {}
 
     for spec in specs:
+        if _uses_exact_path(spec, event_table):
+            continue  # computed below with _exact_group_metric
         if spec.metric == "count":
             agg_col = group_col
             agg_func = "count"
@@ -625,25 +638,38 @@ def compute_derived_batch(
             agg_exprs.append(expr_key)
 
     # Single group_by with all aggregate expressions
-    grouped = event_table.group_by(group_col).aggregate(agg_exprs)
+    grouped = event_table.group_by(group_col).aggregate(agg_exprs) if agg_exprs else None
 
     # Build result for each spec — vectorized scatter via Arrow pc.index_in
     from hypertopos.builder._scatter import vectorized_scatter_1d
 
     results: dict[str, tuple[np.ndarray, int]] = {}
     anchor_keys_arr = pa.array(anchor_list)
-    grouped_fk_pa = grouped[group_col]
+    # One key lookup for every value column of the grouped table.
+    entity_idx = (
+        pc.index_in(grouped[group_col], anchor_keys_arr)
+        if grouped is not None and grouped.num_rows
+        else None
+    )
 
+    row_position: pa.Array | pa.ChunkedArray | None = None
     for spec in specs:
-        result_col_name = spec_to_result_col[spec.dimension_name]
-
-        values = np.zeros(n_anchor, dtype=np.float64)
-        vectorized_scatter_1d(
-            values,
-            anchor_keys_arr=anchor_keys_arr,
-            grouped_fk_col=grouped_fk_pa,
-            grouped_values_col=grouped[result_col_name],
-        )
+        if _uses_exact_path(spec, event_table):
+            if row_position is None:
+                row_position = pc.index_in(event_table[group_col], value_set=anchor_keys_arr)
+            values = _exact_group_metric(
+                row_position, event_table[cast(str, spec.metric_col)], n_anchor, spec.metric
+            )
+        else:
+            values = np.zeros(n_anchor, dtype=np.float64)
+            table = cast("pa.Table", grouped)  # a non-std spec always adds an aggregate
+            vectorized_scatter_1d(
+                values,
+                anchor_keys_arr=anchor_keys_arr,
+                grouped_fk_col=table[group_col],
+                grouped_values_col=table[spec_to_result_col[spec.dimension_name]],
+                entity_idx=entity_idx,
+            )
 
         em = _resolve_edge_max(values, spec.edge_max, spec.percentile)
         results[spec.dimension_name] = (values, em)
@@ -759,8 +785,7 @@ def compute_graph_features(
     f_col = event_table[from_col]
     t_col = event_table[to_col]
     both_valid = pc.and_(pc.is_valid(f_col), pc.is_valid(t_col))
-    edges = pa.table({"_f": pc.filter(f_col, both_valid),
-                       "_t": pc.filter(t_col, both_valid)})
+    edges = pa.table({"_f": pc.filter(f_col, both_valid), "_t": pc.filter(t_col, both_valid)})
 
     results: dict[str, tuple[np.ndarray, int]] = {}
 
@@ -769,8 +794,7 @@ def compute_graph_features(
     if need_out or need_overlap:
         out_grouped = edges.group_by("_f").aggregate([("_t", "count_distinct")])
         if need_out:
-            vals = _scatter_grouped(out_grouped, "_f", "_t_count_distinct",
-                                    key_to_idx, n)
+            vals = _scatter_grouped(out_grouped, "_f", "_t_count_distinct", key_to_idx, n)
             results["out_degree"] = (vals, _resolve_edge_max(vals, "auto", 99.0))
 
     # --- in_degree: count_distinct(from) GROUP BY to ---
@@ -778,8 +802,7 @@ def compute_graph_features(
     if need_in or need_overlap:
         in_grouped = edges.group_by("_t").aggregate([("_f", "count_distinct")])
         if need_in:
-            vals = _scatter_grouped(in_grouped, "_t", "_f_count_distinct",
-                                    key_to_idx, n)
+            vals = _scatter_grouped(in_grouped, "_t", "_f_count_distinct", key_to_idx, n)
             results["in_degree"] = (vals, _resolve_edge_max(vals, "auto", 99.0))
 
     # --- reciprocity: 1.0 if entity is both sender AND receiver ---
@@ -799,9 +822,17 @@ def compute_graph_features(
     # --- counterpart_overlap: Jaccard(out_targets, in_sources) per entity ---
     if need_overlap:
         # Unique directed edges
-        unique_edges = pa.table({
-            "_f": edges["_f"], "_t": edges["_t"],
-        }).group_by(["_f", "_t"]).aggregate([("_f", "count")]).select(["_f", "_t"])
+        unique_edges = (
+            pa.table(
+                {
+                    "_f": edges["_f"],
+                    "_t": edges["_t"],
+                }
+            )
+            .group_by(["_f", "_t"])
+            .aggregate([("_f", "count")])
+            .select(["_f", "_t"])
+        )
 
         # out_edges: (entity, counterparty) where entity sends to counterparty
         # in_edges:  (entity, counterparty) where entity receives from counterparty
@@ -811,18 +842,19 @@ def compute_graph_features(
         # Bidirectional: inner join → pairs that exist in BOTH directions
         bidir = unique_edges.join(in_edges, keys=["_f", "_t"], join_type="inner")
         bidir_grouped = bidir.group_by("_f").aggregate([("_t", "count_distinct")])
-        bidir_vals = _scatter_grouped(bidir_grouped, "_f", "_t_count_distinct",
-                                      key_to_idx, n)
+        bidir_vals = _scatter_grouped(bidir_grouped, "_f", "_t_count_distinct", key_to_idx, n)
 
         # out_degree and in_degree (reuse if already computed)
-        out_vals = (_scatter_grouped(out_grouped, "_f", "_t_count_distinct",
-                                     key_to_idx, n)
-                    if out_grouped is not None
-                    else np.zeros(n, dtype=np.float64))
-        in_vals = (_scatter_grouped(in_grouped, "_t", "_f_count_distinct",
-                                    key_to_idx, n)
-                   if in_grouped is not None
-                   else np.zeros(n, dtype=np.float64))
+        out_vals = (
+            _scatter_grouped(out_grouped, "_f", "_t_count_distinct", key_to_idx, n)
+            if out_grouped is not None
+            else np.zeros(n, dtype=np.float64)
+        )
+        in_vals = (
+            _scatter_grouped(in_grouped, "_t", "_f_count_distinct", key_to_idx, n)
+            if in_grouped is not None
+            else np.zeros(n, dtype=np.float64)
+        )
 
         # Jaccard = |intersection| / |union| = bidir / (out + in - bidir)
         union_size = out_vals + in_vals - bidir_vals
@@ -832,39 +864,40 @@ def compute_graph_features(
 
     # --- Graph algorithm features (computed on AdjacencyIndex) ---
     _ALGO_FEATURES = {
-        "pagerank", "connected_component", "clustering_coefficient",
-        "community", "community_id", "betweenness",
+        "pagerank",
+        "connected_component",
+        "clustering_coefficient",
+        "community",
+        "community_id",
+        "betweenness",
     }
     needed_algos = _ALGO_FEATURES & set(features)
     if needed_algos:
-        f_list = edges["_f"].to_pylist()
-        t_list = edges["_t"].to_pylist()
+        from hypertopos.engine.graph import edge_arrays_from_columns
+
+        # One node table and edge list for every algorithm, straight from Arrow.
+        nodes, src_idx, dst_idx = edge_arrays_from_columns(edges["_f"], edges["_t"])
 
         # pagerank / community_id / connected_component go through engine.graph
         # (pure-numpy / igraph→NetworkX fallback chain). Remaining algos
-        # (clustering_coefficient, betweenness, label-prop "community") stay
-        # on the igraph fast path in graph_algorithms.
-        algo_results: dict[str, dict] = {}
+        # (clustering_coefficient, betweenness, label-prop "community") stay on
+        # the igraph fast path in graph_algorithms.
+        algo_results: dict[str, dict[str, Any]] = {}
         _GRAPH_HELPERS = {"pagerank", "community_id", "connected_component"}
         helper_algos = _GRAPH_HELPERS & needed_algos
         if helper_algos:
-            from hypertopos.engine.adjacency import AdjacencyIndex
-            from hypertopos.engine.graph import compute_from_adjacency
-            n_edges_lance = len(f_list)
-            adj_for_helpers = AdjacencyIndex.from_edge_lists(
-                f_list, t_list,
-                [0.0] * n_edges_lance, [0.0] * n_edges_lance,
-                [f"_e{i}" for i in range(n_edges_lance)],
-            )
+            from hypertopos.engine.graph import compute_from_edge_arrays
+
             algo_results.update(
-                compute_from_adjacency(adj_for_helpers, helper_algos),
+                compute_from_edge_arrays(nodes, src_idx, dst_idx, helper_algos),
             )
 
         remaining_algos = needed_algos - _GRAPH_HELPERS
         if remaining_algos:
-            from hypertopos.engine.graph_algorithms import compute_all_from_lists
+            from hypertopos.engine.graph_algorithms import compute_all_from_edge_arrays
+
             algo_results.update(
-                compute_all_from_lists(f_list, t_list, remaining_algos),
+                compute_all_from_edge_arrays(nodes, src_idx, dst_idx, remaining_algos),
             )
 
         _EDGE_MAX_OVERRIDES = {
@@ -921,17 +954,21 @@ def compute_graph_features_temporal(
     # Graph algo features are static-only — skip in temporal (per-window
     # PageRank/betweenness is meaningless and extremely expensive)
     STATIC_ONLY_FEATURES = {
-        "pagerank", "connected_component", "clustering_coefficient",
-        "community", "community_id", "betweenness",
+        "pagerank",
+        "connected_component",
+        "clustering_coefficient",
+        "community",
+        "community_id",
+        "betweenness",
     }
     fast_indices = [i for i, f in enumerate(features) if f in FAST_FEATURES]
     need_recip = "reciprocity" in features
     need_overlap = "counterpart_overlap" in features
     need_numpy = need_recip or need_overlap
     unknown_indices = [
-        i for i, f in enumerate(features)
-        if f not in FAST_FEATURES and f not in NUMPY_FEATURES
-        and f not in STATIC_ONLY_FEATURES
+        i
+        for i, f in enumerate(features)
+        if f not in FAST_FEATURES and f not in NUMPY_FEATURES and f not in STATIC_ONLY_FEATURES
     ]
 
     # --- Shared: null-filter and integer-encode once ---
@@ -965,9 +1002,14 @@ def compute_graph_features_temporal(
                 [("_t", "count_distinct")],
             )
             _scatter_temporal(
-                result, features.index("out_degree"), out_grouped,
-                "_f", "_b", "_t_count_distinct",
-                anchor_keys_arr, n,
+                result,
+                features.index("out_degree"),
+                out_grouped,
+                "_f",
+                "_b",
+                "_t_count_distinct",
+                anchor_keys_arr,
+                n,
             )
 
         if "in_degree" in features:
@@ -975,9 +1017,14 @@ def compute_graph_features_temporal(
                 [("_f", "count_distinct")],
             )
             _scatter_temporal(
-                result, features.index("in_degree"), in_grouped,
-                "_t", "_b", "_f_count_distinct",
-                anchor_keys_arr, n,
+                result,
+                features.index("in_degree"),
+                in_grouped,
+                "_t",
+                "_b",
+                "_f_count_distinct",
+                anchor_keys_arr,
+                n,
             )
 
     # --- NumPy fast path for reciprocity / counterpart_overlap ---
@@ -987,12 +1034,20 @@ def compute_graph_features_temporal(
         # Anchor-space integer indices via pc.index_in (null → NaN → -1)
         f_anchor_raw = pc.index_in(f_arr, anchor_keys_arr)
         t_anchor_raw = pc.index_in(t_arr, anchor_keys_arr)
-        f_anchor_idx = pc.fill_null(f_anchor_raw, -1).to_numpy(
-            zero_copy_only=False,
-        ).astype(np.intp)
-        t_anchor_idx = pc.fill_null(t_anchor_raw, -1).to_numpy(
-            zero_copy_only=False,
-        ).astype(np.intp)
+        f_anchor_idx = (
+            pc.fill_null(f_anchor_raw, -1)
+            .to_numpy(
+                zero_copy_only=False,
+            )
+            .astype(np.intp)
+        )
+        t_anchor_idx = (
+            pc.fill_null(t_anchor_raw, -1)
+            .to_numpy(
+                zero_copy_only=False,
+            )
+            .astype(np.intp)
+        )
         f_anchor = f_anchor_idx
         t_anchor = t_anchor_idx
 
@@ -1006,24 +1061,46 @@ def compute_graph_features_temporal(
         # Global integer encoding for overlap (all entities, not just anchors)
         if need_overlap:
             # f_arr/t_arr may be ChunkedArray from pc.filter
-            f_flat = f_arr.combine_chunks() if hasattr(f_arr, "combine_chunks") else f_arr
-            t_flat = t_arr.combine_chunks() if hasattr(t_arr, "combine_chunks") else t_arr
+            # both are set by the shared null-filter block whenever need_numpy
+            f_flat = (
+                cast(pa.ChunkedArray, f_arr).combine_chunks()
+                if hasattr(f_arr, "combine_chunks")
+                else f_arr
+            )
+            t_flat = (
+                cast(pa.ChunkedArray, t_arr).combine_chunks()
+                if hasattr(t_arr, "combine_chunks")
+                else t_arr
+            )
             all_uniq = pc.unique(pa.concat_arrays([f_flat, t_flat]))
             n_global = len(all_uniq)
             # Map from/to → global int via pc.index_in
-            f_global = pc.index_in(f_arr, all_uniq).to_numpy(
-                zero_copy_only=False,
-            ).astype(np.int64)
-            t_global = pc.index_in(t_arr, all_uniq).to_numpy(
-                zero_copy_only=False,
-            ).astype(np.int64)
+            f_global = (
+                pc.index_in(f_arr, all_uniq)
+                .to_numpy(
+                    zero_copy_only=False,
+                )
+                .astype(np.int64)
+            )
+            t_global = (
+                pc.index_in(t_arr, all_uniq)
+                .to_numpy(
+                    zero_copy_only=False,
+                )
+                .astype(np.int64)
+            )
             sorted_f_global = f_global[sort_order]
             sorted_t_global = t_global[sort_order]
             # Anchor mapping: global_idx → anchor_idx (-1 if not anchor)
             global_to_anchor = np.full(n_global, -1, dtype=np.intp)
-            anchor_global = pc.fill_null(
-                pc.index_in(anchor_keys_arr, all_uniq), -1,
-            ).to_numpy(zero_copy_only=False).astype(np.intp)
+            anchor_global = (
+                pc.fill_null(
+                    pc.index_in(anchor_keys_arr, all_uniq),
+                    -1,
+                )
+                .to_numpy(zero_copy_only=False)
+                .astype(np.intp)
+            )
             for ai in range(n):
                 gi = anchor_global[ai]
                 if gi >= 0:
@@ -1061,7 +1138,8 @@ def compute_graph_features_temporal(
                 fwd_s_anchor = global_to_anchor[fwd_senders]
                 valid_fwd = fwd_s_anchor >= 0
                 out_count = np.bincount(
-                    fwd_s_anchor[valid_fwd], minlength=n,
+                    fwd_s_anchor[valid_fwd],
+                    minlength=n,
                 ).astype(np.float32)
 
                 # in_degree: unique sources per anchor receiver
@@ -1069,7 +1147,8 @@ def compute_graph_features_temporal(
                 fwd_t_anchor = global_to_anchor[fwd_targets]
                 valid_in = fwd_t_anchor >= 0
                 in_count = np.bincount(
-                    fwd_t_anchor[valid_in], minlength=n,
+                    fwd_t_anchor[valid_in],
+                    minlength=n,
                 ).astype(np.float32)
 
                 # bidir_count: per anchor sender in bidirectional edges
@@ -1078,7 +1157,8 @@ def compute_graph_features_temporal(
                     bidir_s_anchor = global_to_anchor[bidir_senders]
                     valid_bidir = bidir_s_anchor >= 0
                     bidir_count = np.bincount(
-                        bidir_s_anchor[valid_bidir], minlength=n,
+                        bidir_s_anchor[valid_bidir],
+                        minlength=n,
                     ).astype(np.float32)
                 else:
                     bidir_count = np.zeros(n, dtype=np.float32)
@@ -1095,7 +1175,8 @@ def compute_graph_features_temporal(
         sort_order_fb = np.argsort(bucket_assignments)
         sorted_buckets_fb = bucket_assignments[sort_order_fb]
         boundaries_fb = np.searchsorted(
-            sorted_buckets_fb, np.arange(n_buckets + 1),
+            sorted_buckets_fb,
+            np.arange(n_buckets + 1),
         )
 
         for bucket_idx in range(n_buckets):
@@ -1107,10 +1188,16 @@ def compute_graph_features_temporal(
             indices = sort_order_fb[b_start:b_end]
             filtered = event_table.take(pa.array(indices, type=pa.int64()))
             feature_results = compute_graph_features(
-                filtered, anchor_keys, from_col, to_col, unknown_features,
+                filtered,
+                anchor_keys,
+                from_col,
+                to_col,
+                unknown_features,
             )
             for fi, feat in zip(
-                unknown_indices, unknown_features, strict=False,
+                unknown_indices,
+                unknown_features,
+                strict=False,
             ):
                 if feat in feature_results:
                     values, _ = feature_results[feat]
@@ -1139,24 +1226,10 @@ def _scatter_temporal(
         pc.is_valid(grouped[val_col]),
     )
 
-    entity_indices = (
-        entity_idx_arr.filter(valid)
-        .to_numpy(zero_copy_only=False)
-        .astype(np.intp)
-    )
+    entity_indices = entity_idx_arr.filter(valid).to_numpy(zero_copy_only=False).astype(np.intp)
     bucket_indices = (
-        grouped[bucket_col]
-        .filter(valid)
-        .to_numpy(zero_copy_only=False)
-        .astype(np.intp)
+        grouped[bucket_col].filter(valid).to_numpy(zero_copy_only=False).astype(np.intp)
     )
-    values = (
-        grouped[val_col]
-        .filter(valid)
-        .to_numpy(zero_copy_only=False)
-        .astype(np.float32)
-    )
+    values = grouped[val_col].filter(valid).to_numpy(zero_copy_only=False).astype(np.float32)
 
     tensor[entity_indices, bucket_indices, feat_idx] = values
-
-

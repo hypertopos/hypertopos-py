@@ -15,10 +15,12 @@ Tests cover:
 - Determinism: same seed produces identical bootstrap output
 - Cheap path equivalence: from_sorted ≡ compute(n_bootstraps=0)
 """
+
 from __future__ import annotations
 
 import numpy as np
 import pytest
+
 from hypertopos.builder._theta_sensitivity import (
     CLIFF_RATIO_THRESHOLD,
     STABLE_BAND_RATIO_THRESHOLD,
@@ -43,7 +45,9 @@ def test_output_keys_match_custom_percentiles():
     rng = np.random.default_rng(0)
     delta_norms = rng.normal(loc=0.0, scale=1.0, size=10_000)
     out = compute_theta_sensitivity(
-        delta_norms, percentiles=(85, 90, 95, 99), n_bootstraps=20,
+        delta_norms,
+        percentiles=(85, 90, 95, 99),
+        n_bootstraps=20,
     )
     assert set(out.keys()) == {"p85", "p90", "p95", "p99"}
 
@@ -53,8 +57,10 @@ def test_output_value_fields():
     delta_norms = rng.normal(loc=0.0, scale=1.0, size=10_000)
     out = compute_theta_sensitivity(delta_norms, n_bootstraps=20)
     expected_fields = {
-        "theta_mean", "theta_std",
-        "anomaly_count_mean", "anomaly_count_std",
+        "theta_mean",
+        "theta_std",
+        "anomaly_count_mean",
+        "anomaly_count_std",
         "anomaly_rate",
     }
     for p_key, stats in out.items():
@@ -116,14 +122,8 @@ def test_heavy_tail_shows_cliff_at_upper_percentiles():
     # robust against RNG noise within the test
     base = np.concatenate([base, rng.exponential(scale=10.0, size=200) + 5.0])
     out = compute_theta_sensitivity(base, n_bootstraps=50)
-    ratio_low = (
-        out["p90"]["anomaly_count_mean"]
-        / max(out["p91"]["anomaly_count_mean"], 1e-9)
-    )
-    ratio_high = (
-        out["p98"]["anomaly_count_mean"]
-        / max(out["p99"]["anomaly_count_mean"], 1e-9)
-    )
+    ratio_low = out["p90"]["anomaly_count_mean"] / max(out["p91"]["anomaly_count_mean"], 1e-9)
+    ratio_high = out["p98"]["anomaly_count_mean"] / max(out["p99"]["anomaly_count_mean"], 1e-9)
     assert ratio_high >= ratio_low, (
         f"heavy-tail should produce ratio_high ≥ ratio_low; got "
         f"ratio_low={ratio_low:.3f}, ratio_high={ratio_high:.3f}"
@@ -176,8 +176,10 @@ def test_same_seed_produces_identical_output():
     out_b = compute_theta_sensitivity(delta_norms, n_bootstraps=20, seed=42)
     for p in range(90, 100):
         for field in (
-            "theta_mean", "theta_std",
-            "anomaly_count_mean", "anomaly_count_std",
+            "theta_mean",
+            "theta_std",
+            "anomaly_count_mean",
+            "anomaly_count_std",
         ):
             assert out_a[f"p{p}"][field] == out_b[f"p{p}"][field], (
                 f"determinism broken at p{p}.{field}"
@@ -245,8 +247,10 @@ def test_from_sorted_matches_compute_with_zero_bootstraps():
     delegated = compute_theta_sensitivity(delta_norms, n_bootstraps=0)
     for p in range(90, 100):
         for field in (
-            "theta_mean", "theta_std",
-            "anomaly_count_mean", "anomaly_count_std",
+            "theta_mean",
+            "theta_std",
+            "anomaly_count_mean",
+            "anomaly_count_std",
             "anomaly_rate",
         ):
             assert direct[f"p{p}"][field] == delegated[f"p{p}"][field], (
@@ -259,8 +263,10 @@ def test_from_sorted_empty_array_returns_zeros():
     out = compute_theta_sensitivity_from_sorted(np.array([], dtype=np.float64))
     for p in range(90, 100):
         for field in (
-            "theta_mean", "theta_std",
-            "anomaly_count_mean", "anomaly_count_std",
+            "theta_mean",
+            "theta_std",
+            "anomaly_count_mean",
+            "anomaly_count_std",
             "anomaly_rate",
         ):
             assert out[f"p{p}"][field] == 0.0
@@ -277,8 +283,7 @@ def test_cheap_path_anomaly_rate_complement():
     for p in (90, 95, 99):
         expected = (100 - p) / 100.0
         assert abs(out[f"p{p}"]["anomaly_rate"] - expected) < 0.005, (
-            f"p{p} anomaly_rate {out[f'p{p}']['anomaly_rate']} far from "
-            f"expected {expected}"
+            f"p{p} anomaly_rate {out[f'p{p}']['anomaly_rate']} far from expected {expected}"
         )
 
 
@@ -317,7 +322,7 @@ def test_derive_smooth_distribution_full_band_no_cliffs():
     increase per percentile. All adjacent ratios < 1.30 → stable band
     covers all 10 percentiles, no cliffs."""
     # Geometric increase ratio 1.05 per step (~5 % theta jump per percentile)
-    thetas = [1.0 * (1.05 ** i) for i in range(10)]
+    thetas = [1.0 * (1.05**i) for i in range(10)]
     out = derive_stable_band_and_cliffs(_build_ts_from_thetas(thetas))
     assert out["stable_band"] == {"from": "p90", "to": "p99", "length": 10}
     assert out["cliffs"] == []
@@ -357,7 +362,7 @@ def test_derive_heavy_tail_pattern_band_seven_two_cliffs():
 def test_derive_all_cliffs_returns_zero_band():
     """Every adjacent theta ratio >= 1.50 → no smooth transition → stable
     band length 0 (rather than the degenerate 'one percentile alone')."""
-    thetas = [1.0 * (2.0 ** i) for i in range(10)]  # ratio 2.0 everywhere
+    thetas = [1.0 * (2.0**i) for i in range(10)]  # ratio 2.0 everywhere
     out = derive_stable_band_and_cliffs(_build_ts_from_thetas(thetas))
     assert out["stable_band_length"] == 0
     assert out["stable_band"]["from"] is None
@@ -407,7 +412,7 @@ def test_derive_count_ratios_alone_do_not_create_cliffs():
     derivation flagged every distribution with the same false
     cliffs at p97-p98 + p98-p99."""
     # Theta increases by exactly 5 % per percentile end-to-end
-    thetas = [1.0 * (1.05 ** i) for i in range(10)]
+    thetas = [1.0 * (1.05**i) for i in range(10)]
     ts = _build_ts_from_thetas(thetas)
     # Verify the underlying count ratios DO cross thresholds (would
     # trigger cliffs under the old design)

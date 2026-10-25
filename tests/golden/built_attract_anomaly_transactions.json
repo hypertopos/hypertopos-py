@@ -1,0 +1,117 @@
+{
+  "clusters": null,
+  "meta": null,
+  "ranking": [
+    {
+      "anomaly_confidence": 1.0,
+      "delta": [
+        0.0,
+        14.68196297
+      ],
+      "delta_norm": 14.68196297,
+      "delta_rank_pct": 99.91666412,
+      "is_anomaly": true,
+      "primary_key": "TX-00552"
+    },
+    {
+      "anomaly_confidence": 1.0,
+      "delta": [
+        0.0,
+        13.125453
+      ],
+      "delta_norm": 13.125453,
+      "delta_rank_pct": 99.83333588,
+      "is_anomaly": true,
+      "primary_key": "TX-00210"
+    },
+    {
+      "anomaly_confidence": 1.0,
+      "delta": [
+        0.0,
+        8.491706848
+      ],
+      "delta_norm": 8.491706848,
+      "delta_rank_pct": 99.75,
+      "is_anomaly": true,
+      "primary_key": "TX-01047"
+    },
+    {
+      "anomaly_confidence": 1.0,
+      "delta": [
+        0.0,
+        7.968487263
+      ],
+      "delta_norm": 7.968487263,
+      "delta_rank_pct": 99.66666412,
+      "is_anomaly": true,
+      "primary_key": "TX-01038"
+    },
+    {
+      "anomaly_confidence": 1.0,
+      "delta": [
+        0.0,
+        7.147213936
+      ],
+      "delta_norm": 7.147213936,
+      "delta_rank_pct": 99.58333588,
+      "is_anomaly": true,
+      "primary_key": "TX-00362"
+    },
+    {
+      "anomaly_confidence": 1.0,
+      "delta": [
+        0.0,
+        7.11359787
+      ],
+      "delta_norm": 7.11359787,
+      "delta_rank_pct": 99.5,
+      "is_anomaly": true,
+      "primary_key": "TX-00420"
+    },
+    {
+      "anomaly_confidence": 1.0,
+      "delta": [
+        0.0,
+        6.686235428
+      ],
+      "delta_norm": 6.686235428,
+      "delta_rank_pct": 99.41666412,
+      "is_anomaly": true,
+      "primary_key": "TX-00699"
+    },
+    {
+      "anomaly_confidence": 1.0,
+      "delta": [
+        0.0,
+        6.499014854
+      ],
+      "delta_norm": 6.499014854,
+      "delta_rank_pct": 99.33333588,
+      "is_anomaly": true,
+      "primary_key": "TX-00207"
+    },
+    {
+      "anomaly_confidence": 1.0,
+      "delta": [
+        0.0,
+        6.039201736
+      ],
+      "delta_norm": 6.039201736,
+      "delta_rank_pct": 99.25,
+      "is_anomaly": true,
+      "primary_key": "TX-00719"
+    },
+    {
+      "anomaly_confidence": 1.0,
+      "delta": [
+        0.0,
+        5.809378147
+      ],
+      "delta_norm": 5.809378147,
+      "delta_rank_pct": 99.16666412,
+      "is_anomaly": true,
+      "primary_key": "TX-00735"
+    }
+  ],
+  "total_found": 60
+}

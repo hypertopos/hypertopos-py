@@ -1,0 +1,605 @@
+{
+  "chains": [
+    {
+      "amount_decay": 81.8959754,
+      "amounts": [
+        74.79,
+        117.7,
+        154.2,
+        6125.0
+      ],
+      "banks": [],
+      "categories": [
+        "cash",
+        "card",
+        "wire",
+        "wire"
+      ],
+      "chain_id": "CHAIN-000000",
+      "event_keys": [
+        "TX-01083",
+        "TX-01093",
+        "TX-01102",
+        "TX-01158"
+      ],
+      "hop_count": 4,
+      "is_cyclic": false,
+      "keys": [
+        "A030",
+        "A015",
+        "A019",
+        "A003",
+        "A007"
+      ],
+      "time_span_hours": 21.85
+    },
+    {
+      "amount_decay": 1.034469614,
+      "amounts": [
+        183.64,
+        100.64,
+        134.69,
+        189.97
+      ],
+      "banks": [],
+      "categories": [
+        "wire",
+        "wire",
+        "cash",
+        "card"
+      ],
+      "chain_id": "CHAIN-000001",
+      "event_keys": [
+        "TX-01024",
+        "TX-01033",
+        "TX-01036",
+        "TX-01045"
+      ],
+      "hop_count": 4,
+      "is_cyclic": false,
+      "keys": [
+        "A015",
+        "A001",
+        "A039",
+        "A007",
+        "A028"
+      ],
+      "time_span_hours": 42.36666667
+    },
+    {
+      "amount_decay": 0.4062019731,
+      "amounts": [
+        403.42,
+        69.16,
+        81.96,
+        163.87
+      ],
+      "banks": [],
+      "categories": [
+        "cash",
+        "cash",
+        "wire",
+        "wire"
+      ],
+      "chain_id": "CHAIN-000002",
+      "event_keys": [
+        "TX-00770",
+        "TX-00777",
+        "TX-00785",
+        "TX-00796"
+      ],
+      "hop_count": 4,
+      "is_cyclic": false,
+      "keys": [
+        "A006",
+        "A005",
+        "A028",
+        "A039",
+        "A013"
+      ],
+      "time_span_hours": 49.46666667
+    },
+    {
+      "amount_decay": 0.24520351,
+      "amounts": [
+        403.42,
+        69.16,
+        81.96,
+        98.92
+      ],
+      "banks": [],
+      "categories": [
+        "cash",
+        "cash",
+        "wire",
+        "card"
+      ],
+      "chain_id": "CHAIN-000003",
+      "event_keys": [
+        "TX-00770",
+        "TX-00777",
+        "TX-00785",
+        "TX-00794"
+      ],
+      "hop_count": 4,
+      "is_cyclic": false,
+      "keys": [
+        "A006",
+        "A005",
+        "A028",
+        "A039",
+        "A009"
+      ],
+      "time_span_hours": 43.65
+    },
+    {
+      "amount_decay": 4.25210146,
+      "amounts": [
+        135.62,
+        225.53,
+        126.01,
+        576.67
+      ],
+      "banks": [],
+      "categories": [
+        "card",
+        "cash",
+        "cash",
+        "card"
+      ],
+      "chain_id": "CHAIN-000004",
+      "event_keys": [
+        "TX-00985",
+        "TX-00996",
+        "TX-00999",
+        "TX-01008"
+      ],
+      "hop_count": 4,
+      "is_cyclic": false,
+      "keys": [
+        "A005",
+        "A002",
+        "A008",
+        "A015",
+        "A023"
+      ],
+      "time_span_hours": 37.4
+    },
+    {
+      "amount_decay": 1.286268218,
+      "amounts": [
+        74.79,
+        249.64,
+        96.2
+      ],
+      "banks": [],
+      "categories": [
+        "cash",
+        "wire",
+        "cash"
+      ],
+      "chain_id": "CHAIN-000005",
+      "event_keys": [
+        "TX-01083",
+        "TX-01095",
+        "TX-01107"
+      ],
+      "hop_count": 3,
+      "is_cyclic": false,
+      "keys": [
+        "A030",
+        "A015",
+        "A011",
+        "A032"
+      ],
+      "time_span_hours": 22.25
+    },
+    {
+      "amount_decay": 2.047198823,
+      "amounts": [
+        74.79,
+        249.64,
+        153.11
+      ],
+      "banks": [],
+      "categories": [
+        "cash",
+        "wire",
+        "card"
+      ],
+      "chain_id": "CHAIN-000006",
+      "event_keys": [
+        "TX-01083",
+        "TX-01095",
+        "TX-01099"
+      ],
+      "hop_count": 3,
+      "is_cyclic": false,
+      "keys": [
+        "A030",
+        "A015",
+        "A011",
+        "A002"
+      ],
+      "time_span_hours": 17.65
+    },
+    {
+      "amount_decay": 2.643822289,
+      "amounts": [
+        92.51,
+        138.73,
+        244.58
+      ],
+      "banks": [],
+      "categories": [
+        "card",
+        "wire",
+        "cash"
+      ],
+      "chain_id": "CHAIN-000007",
+      "event_keys": [
+        "TX-00832",
+        "TX-00843",
+        "TX-00851"
+      ],
+      "hop_count": 3,
+      "is_cyclic": false,
+      "keys": [
+        "A008",
+        "A030",
+        "A020",
+        "A026"
+      ],
+      "time_span_hours": 38.71666667
+    },
+    {
+      "amount_decay": 1.291118948,
+      "amounts": [
+        62.38,
+        99.72,
+        80.54
+      ],
+      "banks": [],
+      "categories": [
+        "wire",
+        "wire",
+        "wire"
+      ],
+      "chain_id": "CHAIN-000008",
+      "event_keys": [
+        "TX-00712",
+        "TX-00715",
+        "TX-00724"
+      ],
+      "hop_count": 3,
+      "is_cyclic": false,
+      "keys": [
+        "A008",
+        "A022",
+        "A038",
+        "A036"
+      ],
+      "time_span_hours": 22.25
+    },
+    {
+      "amount_decay": 0.4598160736,
+      "amounts": [
+        175.07,
+        2152.58,
+        80.5
+      ],
+      "banks": [],
+      "categories": [
+        "cash",
+        "card",
+        "wire"
+      ],
+      "chain_id": "CHAIN-000009",
+      "event_keys": [
+        "TX-00610",
+        "TX-00618",
+        "TX-00621"
+      ],
+      "hop_count": 3,
+      "is_cyclic": false,
+      "keys": [
+        "A008",
+        "A031",
+        "A036",
+        "A029"
+      ],
+      "time_span_hours": 23.08333333
+    },
+    {
+      "amount_decay": 1.080623227,
+      "amounts": [
+        257.37,
+        10643.4,
+        278.12
+      ],
+      "banks": [],
+      "categories": [
+        "card",
+        "wire",
+        "card"
+      ],
+      "chain_id": "CHAIN-000010",
+      "event_keys": [
+        "TX-01089",
+        "TX-01047",
+        "TX-01118"
+      ],
+      "hop_count": 3,
+      "is_cyclic": false,
+      "keys": [
+        "A001",
+        "A029",
+        "A008",
+        "A007"
+      ],
+      "time_span_hours": 33.38333333
+    },
+    {
+      "amount_decay": 1.141780316,
+      "amounts": [
+        257.37,
+        10643.4,
+        293.86
+      ],
+      "banks": [],
+      "categories": [
+        "card",
+        "wire",
+        "card"
+      ],
+      "chain_id": "CHAIN-000011",
+      "event_keys": [
+        "TX-01089",
+        "TX-01047",
+        "TX-01104"
+      ],
+      "hop_count": 3,
+      "is_cyclic": false,
+      "keys": [
+        "A001",
+        "A029",
+        "A008",
+        "A005"
+      ],
+      "time_span_hours": 11.53333333
+    },
+    {
+      "amount_decay": 0.404942301,
+      "amounts": [
+        257.37,
+        1665.2,
+        104.22
+      ],
+      "banks": [],
+      "categories": [
+        "card",
+        "wire",
+        "card"
+      ],
+      "chain_id": "CHAIN-000012",
+      "event_keys": [
+        "TX-01089",
+        "TX-01009",
+        "TX-01109"
+      ],
+      "hop_count": 3,
+      "is_cyclic": false,
+      "keys": [
+        "A001",
+        "A029",
+        "A006",
+        "A002"
+      ],
+      "time_span_hours": 14.26666667
+    },
+    {
+      "amount_decay": 52.03908241,
+      "amounts": [
+        117.7,
+        154.2,
+        6125.0
+      ],
+      "banks": [],
+      "categories": [
+        "card",
+        "wire",
+        "wire"
+      ],
+      "chain_id": "CHAIN-000013",
+      "event_keys": [
+        "TX-01093",
+        "TX-01102",
+        "TX-01158"
+      ],
+      "hop_count": 3,
+      "is_cyclic": false,
+      "keys": [
+        "A015",
+        "A019",
+        "A003",
+        "A007"
+      ],
+      "time_span_hours": 9.316666667
+    },
+    {
+      "amount_decay": 0.4965048832,
+      "amounts": [
+        403.42,
+        69.16,
+        200.3
+      ],
+      "banks": [],
+      "categories": [
+        "cash",
+        "cash",
+        "wire"
+      ],
+      "chain_id": "CHAIN-000014",
+      "event_keys": [
+        "TX-00770",
+        "TX-00777",
+        "TX-00786"
+      ],
+      "hop_count": 3,
+      "is_cyclic": false,
+      "keys": [
+        "A006",
+        "A005",
+        "A028",
+        "A019"
+      ],
+      "time_span_hours": 29.55
+    },
+    {
+      "amount_decay": 0.9487346648,
+      "amounts": [
+        337.46,
+        1010.31,
+        320.16
+      ],
+      "banks": [],
+      "categories": [
+        "card",
+        "card",
+        "cash"
+      ],
+      "chain_id": "CHAIN-000015",
+      "event_keys": [
+        "TX-00101",
+        "TX-00103",
+        "TX-00110"
+      ],
+      "hop_count": 3,
+      "is_cyclic": false,
+      "keys": [
+        "A032",
+        "A014",
+        "A027",
+        "A030"
+      ],
+      "time_span_hours": 15.31666667
+    },
+    {
+      "amount_decay": 7.822961215,
+      "amounts": [
+        135.62,
+        225.53,
+        1060.95
+      ],
+      "banks": [],
+      "categories": [
+        "card",
+        "cash",
+        "card"
+      ],
+      "chain_id": "CHAIN-000016",
+      "event_keys": [
+        "TX-00985",
+        "TX-00996",
+        "TX-01002"
+      ],
+      "hop_count": 3,
+      "is_cyclic": false,
+      "keys": [
+        "A005",
+        "A002",
+        "A008",
+        "A019"
+      ],
+      "time_span_hours": 30.46666667
+    },
+    {
+      "amount_decay": 2.369433198,
+      "amounts": [
+        69.16,
+        81.96,
+        163.87
+      ],
+      "banks": [],
+      "categories": [
+        "cash",
+        "wire",
+        "wire"
+      ],
+      "chain_id": "CHAIN-000017",
+      "event_keys": [
+        "TX-00777",
+        "TX-00785",
+        "TX-00796"
+      ],
+      "hop_count": 3,
+      "is_cyclic": false,
+      "keys": [
+        "A005",
+        "A028",
+        "A039",
+        "A013"
+      ],
+      "time_span_hours": 34.51666667
+    },
+    {
+      "amount_decay": 0.06618689044,
+      "amounts": [
+        1079.67,
+        161.64,
+        71.46
+      ],
+      "banks": [],
+      "categories": [
+        "cash",
+        "card",
+        "wire"
+      ],
+      "chain_id": "CHAIN-000018",
+      "event_keys": [
+        "TX-00218",
+        "TX-00226",
+        "TX-00227"
+      ],
+      "hop_count": 3,
+      "is_cyclic": false,
+      "keys": [
+        "A026",
+        "A025",
+        "A005",
+        "A033"
+      ],
+      "time_span_hours": 20.43333333
+    },
+    {
+      "amount_decay": 3.290883392,
+      "amounts": [
+        70.75,
+        456.87,
+        232.83
+      ],
+      "banks": [],
+      "categories": [
+        "cash",
+        "wire",
+        "cash"
+      ],
+      "chain_id": "CHAIN-000019",
+      "event_keys": [
+        "TX-00150",
+        "TX-00153",
+        "TX-00167"
+      ],
+      "hop_count": 3,
+      "is_cyclic": false,
+      "keys": [
+        "A026",
+        "A038",
+        "A028",
+        "A033"
+      ],
+      "time_span_hours": 23.13333333
+    }
+  ],
+  "n_chains": 20
+}

@@ -96,15 +96,17 @@ class SolidSlice:
     delta_norm_frozen_pop: float | None = None
 
     def prop_column_states(self, pattern: Pattern) -> dict[str, bool]:
-        """Inverse z-score: recover boolean property states from delta_snapshot."""
+        """Recover boolean property states from delta_snapshot (shape > 0.5)."""
+        from hypertopos.engine.geometry import shapes_from_deltas
+
+        prop_columns = list(pattern.prop_columns)
+        if not prop_columns:
+            return {}
         n_rel = len(pattern.relations)
+        shape = shapes_from_deltas(np.asarray(self.delta_snapshot), pattern)
         return {
-            name: (
-                float(self.delta_snapshot[n_rel + j])
-                * float(pattern.sigma_diag[n_rel + j])
-                + float(pattern.mu[n_rel + j])
-            ) > 0.5
-            for j, name in enumerate(pattern.prop_columns)
+            name: float(shape[n_rel + j]) > 0.5
+            for j, name in enumerate(prop_columns)
             if (n_rel + j) < len(self.delta_snapshot)
         }
 

@@ -8,6 +8,7 @@ incident event timestamps. Used by the builder when a Pattern declares
 `fdr_temporal_hierarchy:` with a slice_dimension that does not yet exist
 as a column on the geometry table.
 """
+
 from __future__ import annotations
 
 import re
@@ -34,6 +35,22 @@ def parse_bucket_duration(duration: str) -> int:
         )
     n, unit = int(m.group(1)), m.group(2)
     return n * _UNIT_SECONDS[unit]
+
+
+def _sorted_by_group(codes: np.ndarray, ts: np.ndarray, n_groups: int) -> np.ndarray:
+    """``ts`` ordered by (group code, ts).
+
+    Sorting one combined int64 key is several times faster than a two-key
+    lexsort; the lexsort stays for timestamp spans too wide to combine.
+    """
+    if len(ts) == 0:
+        return ts
+    t_min = int(ts.min())
+    span = int(ts.max()) - t_min + 1
+    if n_groups * span < 2**63:
+        combined = np.sort(codes * span + (ts - t_min))
+        return combined % span + t_min
+    return ts[np.lexsort((ts, codes))]
 
 
 def materialise_temporal_bucket(
@@ -110,37 +127,31 @@ def materialise_temporal_bucket(
             continue
         pieces.append(pa.table({"anchor_key": event_table[col], "ts": ts_int}))
     if not pieces:
-        return pa.table({
-            "primary_key": anchor_keys,
-            "temporal_bucket": pa.array(
-                [None] * len(anchor_keys), type=pa.string()),
-        })
+        return pa.table(
+            {
+                "primary_key": anchor_keys,
+                "temporal_bucket": pa.array([None] * len(anchor_keys), type=pa.string()),
+            }
+        )
     long = pa.concat_tables(pieces)
+    long = long.filter(pc.is_valid(long["anchor_key"]))
 
-    # Per-anchor median timestamp — PyArrow groupby doesn't expose median;
-    # collect into per-anchor lists and use numpy.
-    grouped = long.group_by(["anchor_key"]).aggregate([("ts", "list")])
-    anchor_keys_seen = grouped["anchor_key"].to_pylist()
-    ts_lists = grouped["ts_list"].to_pylist()
+    # Per-anchor median timestamp in one sort: order rows by (anchor, ts); a
+    # group's median is the mean of its two middle rows, truncated like
+    # int(np.median(...)).
+    encoded = pc.dictionary_encode(long["anchor_key"].combine_chunks())
+    codes = encoded.indices.to_numpy().astype(np.int64)
+    ts = long["ts"].to_numpy()
+    sorted_ts = _sorted_by_group(codes, ts, len(encoded.dictionary))
+    counts = np.bincount(codes, minlength=len(encoded.dictionary))
+    starts = np.cumsum(counts) - counts
+    lo = sorted_ts[starts + (counts - 1) // 2].astype(np.float64)
+    hi = sorted_ts[starts + counts // 2].astype(np.float64)
+    centroids = np.trunc((lo + hi) / 2).astype(np.int64)
+    labels = pc.binary_join_element_wise(
+        "b", pa.array(centroids // bucket_seconds).cast(pa.string()), ""
+    )
 
-    centroid_by_anchor: dict[str, int] = {}
-    for k, lst in zip(anchor_keys_seen, ts_lists, strict=True):
-        if not lst:
-            continue
-        centroid_by_anchor[k] = int(np.median(np.asarray(lst, dtype=np.int64)))
-
-    out_keys: list[str] = []
-    out_buckets: list[str | None] = []
-    for k in anchor_keys:
-        c = centroid_by_anchor.get(k)
-        if c is None:
-            out_keys.append(k)
-            out_buckets.append(None)
-            continue
-        bucket_idx = c // bucket_seconds
-        out_keys.append(k)
-        out_buckets.append(f"b{bucket_idx}")
-    return pa.table({
-        "primary_key": out_keys,
-        "temporal_bucket": pa.array(out_buckets, type=pa.string()),
-    })
+    keys = pa.array(anchor_keys, type=pa.string())
+    position = pc.index_in(keys, value_set=encoded.dictionary.cast(pa.string()))
+    return pa.table({"primary_key": keys, "temporal_bucket": pc.take(labels, position)})

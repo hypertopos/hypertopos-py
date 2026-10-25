@@ -9,6 +9,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+
 from hypertopos.builder.mapping import (
     LineMapping,
     MappingSpec,

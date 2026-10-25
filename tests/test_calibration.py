@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+
 from hypertopos.engine.calibration import (
     CalibrationTracker,
 )
@@ -127,6 +128,7 @@ class TestBuilderInitializesTracker:
     def test_build_creates_tracker(self, tmp_path: Path):
         """After GDSBuilder.build(), calibration tracker exists for each pattern."""
         import pyarrow as pa
+
         from hypertopos.builder.builder import GDSBuilder
         from hypertopos.storage.reader import GDSReader
 
@@ -223,6 +225,7 @@ class TestRecalibrate:
         import json
 
         import pyarrow as pa
+
         from hypertopos.builder._stats import SIGMA_EPS_PROP
         from hypertopos.builder.builder import GDSBuilder
         from hypertopos.sphere import HyperSphere

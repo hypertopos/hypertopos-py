@@ -11,19 +11,23 @@ Smaller queries and queries that combine the new path with filters
 ``event_filters`` / ``entity_filters``) drop into the in-process pyarrow
 handlers below — those are sibling code paths, not legacy fallbacks.
 """
+
 from __future__ import annotations
 
+import dataclasses
 import time
 from collections import defaultdict
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from hypertopos.engine.geometry import GDSEngine
     from hypertopos.model.manifest import Manifest
-    from hypertopos.model.sphere import Sphere
+    from hypertopos.model.sphere import RelationDef, Sphere
     from hypertopos.storage.reader import GDSReader
 
 # Lance SQL fast path threshold — geometry tables above this row count
@@ -38,28 +42,64 @@ _SUBPROCESS_THRESHOLD = 500_000
 _REVERSED_SCAN_MAX_GROUPS = 500
 
 
-def _apply_comparison_filter(table: Any, column: str, spec: dict) -> Any:
-    """Apply comparison filter: {"gt": 5}, {"lt": 10}, {"gte": 0, "lte": 100}."""
+def _rank_groups(items: Any, ascending: bool) -> list[tuple[Any, Any]]:
+    """Order ``(group_key, value)`` pairs by value; equal values by key, ascending.
+
+    Group rows arrive in join / thread order, which changes between calls; the
+    key tiebreak makes the page cut ``[offset : offset + top_n]`` reproducible.
+    """
+    by_key = sorted(items, key=lambda x: str(x[0]))
+    return sorted(by_key, key=lambda x: x[1], reverse=not ascending)
+
+
+def _date_aware_scalar(value: Any, col_type: Any) -> Any:
+    """ISO date strings become date scalars on date columns; other values pass through."""
+    import pyarrow as pa
+
+    if isinstance(value, str) and pa.types.is_date(col_type):
+        from datetime import date
+
+        return pa.scalar(date.fromisoformat(value), type=col_type)
+    return value
+
+
+def _apply_comparison_mask_in(table: Any, column: str, values: Any) -> Any:
+    """Boolean mask for ``column IN values``; ``values`` must be a non-empty list."""
     import pyarrow as pa
     import pyarrow.compute as pc
-    _OPS = {"gt": pc.greater, "gte": pc.greater_equal,
-            "lt": pc.less, "lte": pc.less_equal, "eq": pc.equal}
+
+    if not isinstance(values, list | tuple) or not values:
+        raise RuntimeError(f"'in' expects a non-empty list of values for '{column}'")
+    col_type = table.schema.field(column).type
+    value_set = pa.array([_date_aware_scalar(v, col_type) for v in values]).cast(col_type)
+    return pc.is_in(table[column], value_set=value_set)
+
+
+def _apply_comparison_filter(table: Any, column: str, spec: dict[str, Any]) -> Any:
+    """Apply comparison filter: {"gt": 5}, {"lt": 10}, {"gte": 0, "lte": 100}, {"in": [...]}."""
+    import pyarrow.compute as pc
+
+    _OPS = {
+        "gt": pc.greater,
+        "gte": pc.greater_equal,
+        "lt": pc.less,
+        "lte": pc.less_equal,
+        "eq": pc.equal,
+    }
     mask = None
     col_type = table.schema.field(column).type
     for op_name, value in spec.items():
-        if op_name not in _OPS:
-            raise RuntimeError(f"Unknown comparison op '{op_name}'. Supported: {list(_OPS)}")
-        if isinstance(value, str) and pa.types.is_date(col_type):
-            from datetime import date
-            scalar = pa.scalar(date.fromisoformat(value), type=col_type)
+        if op_name == "in":
+            pred = _apply_comparison_mask_in(table, column, value)
+        elif op_name in _OPS:
+            pred = _OPS[op_name](table[column], _date_aware_scalar(value, col_type))
         else:
-            scalar = value
-        pred = _OPS[op_name](table[column], scalar)
+            raise RuntimeError(f"Unknown comparison op '{op_name}'. Supported: {[*_OPS, 'in']}")
         mask = pred if mask is None else pc.and_(mask, pred)
     return table.filter(mask)
 
 
-def _apply_event_filters(table: Any, event_filters: dict) -> Any:
+def _apply_event_filters(table: Any, event_filters: dict[str, Any]) -> Any:
     """Apply column predicates to an event-line table.
 
     Format: {"col": value} for equality, {"col": {"gt": v, "lt": v}} for comparison,
@@ -67,6 +107,7 @@ def _apply_event_filters(table: Any, event_filters: dict) -> Any:
     Multiple columns = AND. Multiple ops per column = AND.
     """
     import pyarrow.compute as pc
+
     for col, spec in event_filters.items():
         if col not in table.schema.names:
             raise RuntimeError(
@@ -91,26 +132,38 @@ def _apply_event_filters(table: Any, event_filters: dict) -> Any:
 
 
 def _build_property_filter_mask(
-    table: Any, property_filters: dict, context: str = "entity line",
+    table: Any,
+    property_filters: dict[str, Any],
+    context: str = "entity line",
 ) -> Any:
     import pyarrow as pa
     import pyarrow.compute as pc
-    _OPS = {"=": pc.equal, "<": pc.less, "<=": pc.less_equal,
-            ">": pc.greater, ">=": pc.greater_equal, "!=": pc.not_equal}
+
+    _OPS = {
+        "=": pc.equal,
+        "<": pc.less,
+        "<=": pc.less_equal,
+        ">": pc.greater,
+        ">=": pc.greater_equal,
+        "!=": pc.not_equal,
+    }
     masks = []
     for prop, spec in property_filters.items():
         if prop not in table.schema.names:
             raise RuntimeError(
-                f"Property '{prop}' not found in {context}. "
-                f"Available: {list(table.schema.names)}"
+                f"Property '{prop}' not found in {context}. Available: {list(table.schema.names)}"
             )
         col = table[prop]
         op, val = ("=", spec) if not isinstance(spec, dict) else (spec["op"], spec["value"])
+        if op == "in":
+            masks.append(_apply_comparison_mask_in(table, prop, val))
+            continue
         if op not in _OPS:
-            raise RuntimeError(f"Unsupported op '{op}'. Use one of: {list(_OPS)}")
+            raise RuntimeError(f"Unsupported op '{op}'. Use one of: {[*_OPS, 'in']}")
         col_type = table.schema.field(prop).type
         if isinstance(val, str) and pa.types.is_date(col_type):
             from datetime import date
+
             scalar = pa.scalar(date.fromisoformat(val), type=col_type)
         else:
             scalar = pa.scalar(val, type=col_type)
@@ -129,6 +182,7 @@ def _resolve_filter_keys(reader: Any, s: Any, line_id: str, key: str) -> set[str
     if ":" not in key:
         return {key}
     import pyarrow.compute as pc
+
     col, target = key.split(":", 1)
     line = s.lines.get(line_id)
     if line is None:
@@ -137,12 +191,15 @@ def _resolve_filter_keys(reader: Any, s: Any, line_id: str, key: str) -> set[str
     if col not in table.schema.names:
         return {key}  # not a column name — treat as plain primary_key
     import pyarrow as pa
+
     col_type = table.schema.field(col).type
     scalar = pa.array([target]).cast(col_type)[0]
     return set(table.filter(pc.equal(table[col], scalar))["primary_key"].to_pylist())
 
 
-def _make_edge_map_fn(geo: Any, relations: list | None = None):
+def _make_edge_map_fn(
+    geo: Any, relations: list[RelationDef] | None = None
+) -> Callable[[int], dict[str, Any]]:
     """Return a closure that builds {line_id: point_key} for polygon i.
 
     Uses edges struct column when present, otherwise falls back to
@@ -150,28 +207,28 @@ def _make_edge_map_fn(geo: Any, relations: list | None = None):
     """
     if "edges" in geo.schema.names:
         _edges = geo["edges"].to_pylist()
-        def _from_edges(i: int) -> dict:
+
+        def _from_edges(i: int) -> dict[str, Any]:
             return {
-                e["line_id"]: e["point_key"]
-                for e in (_edges[i] or [])
-                if e["status"] == "alive"
+                e["line_id"]: e["point_key"] for e in (_edges[i] or []) if e["status"] == "alive"
             }
+
         return _from_edges
     elif "entity_keys" in geo.schema.names and relations:
         _ek = geo["entity_keys"].to_pylist()
-        def _from_entity_keys(i: int) -> dict:
+
+        def _from_entity_keys(i: int) -> dict[str, Any]:
             keys = _ek[i] or []
             return {
-                rel.line_id: keys[j]
-                for j, rel in enumerate(relations)
-                if j < len(keys) and keys[j]
+                rel.line_id: keys[j] for j, rel in enumerate(relations) if j < len(keys) and keys[j]
             }
+
         return _from_entity_keys
     else:
         return lambda i: {}
 
 
-def _edge_arrays(geo: Any, relations: list | None = None) -> tuple:
+def _edge_arrays(geo: Any, relations: list[RelationDef] | None = None) -> tuple[Any, Any, Any, Any]:
     """Extract flat edge arrays from geometry table.
 
     Supports both edges struct column (anchor) and entity_keys fallback (event).
@@ -216,13 +273,14 @@ def _gbl_edge_arrays(
     flat_line_ids: Any,
     flat_pt_keys: Any,
     alive_mask: Any,
-) -> tuple:
+) -> tuple[Any, Any]:
     """Filter flat edge arrays to (gbl_row_idx, gbl_keys) for the given line.
 
     Dead edges are excluded via alive_mask.
     Returns (gbl_row_idx, gbl_keys): row indices and point keys for edges on group_by_line.
     """
     import pyarrow.compute as pc
+
     mask = pc.equal(flat_line_ids, group_by_line)
     if alive_mask is not None:
         mask = pc.and_(mask, alive_mask)
@@ -232,9 +290,9 @@ def _gbl_edge_arrays(
 def _vectorized_count_with_warning(
     geo: Any,
     group_by_line: str,
-    geometry_filters: dict | None,
-    relations: list | None = None,
-) -> tuple[dict, str | None]:
+    geometry_filters: dict[str, Any] | None,
+    relations: list[RelationDef] | None = None,
+) -> tuple[dict[Any, Any], str | None]:
     """Vectorized count of edges to group_by_line.
 
     Returns (computed, warning):
@@ -278,9 +336,9 @@ def _vectorized_sample_count(
     sample_size: int | None = None,
     sample_pct: float | None = None,
     seed: int | None = None,
-    geometry_filters: dict | None = None,
-    relations: list | None = None,
-) -> tuple[dict, str | None]:
+    geometry_filters: dict[str, Any] | None = None,
+    relations: list[RelationDef] | None = None,
+) -> tuple[dict[Any, Any], str | None]:
     """
     Fast vectorized count with sampling. Avoids O(n) Python loop by:
     1. Sampling row indices with numpy (index array only, no string conversion)
@@ -305,7 +363,9 @@ def _vectorized_sample_count(
     chosen = np.sort(rng.choice(total, size=n, replace=False))
     geo_sampled = geo.take(pa.array(chosen, type=pa.int64()))
 
-    return _vectorized_count_with_warning(geo_sampled, group_by_line, geometry_filters, relations=relations)
+    return _vectorized_count_with_warning(
+        geo_sampled, group_by_line, geometry_filters, relations=relations
+    )
 
 
 def aggregate(
@@ -316,22 +376,23 @@ def aggregate(
     *,
     event_pattern_id: str,
     group_by_line: str,
+    group_by_relation: str | None = None,
     group_by_line_2: str | None = None,
     metric: str = "count",
     # context_line removed — metrics read from event entity line
-    filters: list[dict] | None = None,
+    filters: list[dict[str, Any]] | None = None,
     group_by_property: str | None = None,
     distinct: bool = False,
     collapse_by_property: bool = False,
-    geometry_filters: dict | None = None,
-    property_filters: dict | None = None,
-    entity_filters: dict | None = None,
-    event_filters: dict | None = None,
+    geometry_filters: dict[str, Any] | None = None,
+    property_filters: dict[str, Any] | None = None,
+    entity_filters: dict[str, Any] | None = None,
+    event_filters: dict[str, Any] | None = None,
     time_from: str | None = None,
     time_to: str | None = None,
     filter_by_keys: list[str] | None = None,
     missing_edge_to: str | None = None,
-    having: dict | None = None,
+    having: dict[str, Any] | None = None,
     pivot_event_field: str | None = None,
     sample_size: int | None = None,
     sample_pct: float | None = None,
@@ -340,8 +401,15 @@ def aggregate(
     offset: int = 0,
     sort: str = "desc",
     **kwargs: Any,
-) -> dict:
+) -> dict[str, Any]:
     """Aggregate event polygons — count, count_distinct, sum, avg, min, max, median, pct<N>.
+
+    ``group_by_relation`` selects one relation by its display name when the
+    event pattern relates to ``group_by_line`` more than once (e.g. sender /
+    receiver accounts). Grouping then uses only that relation; other uses of
+    ``group_by_line`` (``filters``, ``count_distinct:<line>``,
+    ``group_by_line_2``) refer to the remaining relation(s) to that line, and a
+    ``group_by_property`` on ``group_by_line`` reads the grouped entity.
 
     Returns a dict with aggregation results. MCP layer handles enrichment
     (entity names, include_properties, pivot_labels) and serialization.
@@ -377,11 +445,11 @@ def aggregate(
             if val is not None:
                 try:
                     datetime.fromisoformat(val)
-                except ValueError:
+                except ValueError as err:
                     raise ValueError(
                         f"{label}='{val}' is not a valid ISO-8601 date. "
                         f"Expected format: YYYY-MM-DD (e.g. '1995-01-01')."
-                    )
+                    ) from err
         event_pat = sphere.patterns.get(event_pattern_id)
         ts_col = event_pat.timestamp_col if event_pat else None
         if not ts_col:
@@ -390,7 +458,7 @@ def aggregate(
                 f"timestamp_col in sphere.json (set via temporal config in sphere.yaml). "
                 f"Use event_filters directly instead."
             )
-        time_pred: dict = {}
+        time_pred: dict[str, Any] = {}
         if time_from is not None:
             time_pred["gte"] = time_from
         if time_to is not None:
@@ -437,16 +505,50 @@ def aggregate(
             f"'{event_pattern_id}'. "
             f"Valid relation lines: {_valid_lines}."
         )
-    # Ambiguous: multiple relations to the same line (e.g. pickup/dropoff zones)
-    _gbl_count = sum(1 for r in pattern.relations if r.line_id == group_by_line)
-    if _gbl_count > 1:
+    # Several relations to the same line (e.g. sender / receiver accounts):
+    # group_by_relation picks one by display name. The selected relation is
+    # relabelled to a private edge label (gbl_edge) on a pattern copy, so every
+    # path that matches relations by line id (in-process edge arrays and the
+    # Lance SQL slot lookup) sees only that slot under gbl_edge.
+    _gbl_rels = [i for i, r in enumerate(pattern.relations) if r.line_id == group_by_line]
+    _gbl_names = [pattern.relations[i].role or pattern.relations[i].display_name for i in _gbl_rels]
+    gbl_edge = group_by_line
+    # Dim names resolve against the declared relations, not the relabelled copy.
+    dims_pattern = pattern
+    if group_by_relation is not None:
+        _sel = [
+            i
+            for i, name in zip(_gbl_rels, _gbl_names, strict=True)
+            if group_by_relation in (name, pattern.relations[i].display_name)
+        ]
+        if not _sel:
+            raise RuntimeError(
+                f"group_by_relation='{group_by_relation}' is not a relation of "
+                f"'{event_pattern_id}' to '{group_by_line}'. Valid values: "
+                f"{[n for n in _gbl_names if n]}."
+            )
+        if pattern.pattern_type != "event":
+            raise RuntimeError("group_by_relation is supported on event patterns only.")
+        gbl_edge = f"{group_by_line}[{group_by_relation}]"
+        pattern = dataclasses.replace(
+            pattern,
+            relations=[
+                dataclasses.replace(r, line_id=gbl_edge) if i == _sel[0] else r
+                for i, r in enumerate(pattern.relations)
+            ],
+        )
+    elif len(_gbl_rels) > 1:
+        _named = [n for n in _gbl_names if n]
+        _how = (
+            f"Pick one with group_by_relation: {', '.join(repr(n) for n in _named)}."
+            if len(set(_named)) == len(_gbl_rels)
+            else "Declare a unique display_name on each of these relations in "
+            "sphere.yaml to make them selectable with group_by_relation."
+        )
         raise RuntimeError(
             f"group_by_line='{group_by_line}' is ambiguous — pattern "
-            f"'{event_pattern_id}' has {_gbl_count} relations to "
-            f"'{group_by_line}'. Use group_by_property='<entity_line>:<column>' "
-            f"to group on a specific column of the event entity line instead, "
-            f"or use a non-ambiguous relation line: "
-            f"{sorted(set(r.line_id for r in pattern.relations) - {group_by_line})}."
+            f"'{event_pattern_id}' has {len(_gbl_rels)} relations to "
+            f"'{group_by_line}'. {_how}"
         )
 
     # Validate group_by_line_2
@@ -458,22 +560,16 @@ def aggregate(
                 f"group_by_line_2='{group_by_line_2}' is not a relation in "
                 f"'{event_pattern_id}'. Valid relation lines: {_valid_lines}."
             )
-        if group_by_line_2 == group_by_line:
-            raise RuntimeError(
-                "group_by_line_2 must differ from group_by_line."
-            )
+        if group_by_line_2 == gbl_edge:
+            raise RuntimeError("group_by_line_2 must differ from group_by_line.")
         if group_by_property:
-            raise RuntimeError(
-                "group_by_line_2 cannot be combined with group_by_property."
-            )
+            raise RuntimeError("group_by_line_2 cannot be combined with group_by_property.")
         if pivot_event_field:
-            raise RuntimeError(
-                "group_by_line_2 cannot be combined with pivot_event_field."
-            )
+            raise RuntimeError("group_by_line_2 cannot be combined with pivot_event_field.")
 
     # --- A: Resolve filters BEFORE read_geometry for point_keys pushdown ---
     resolved_filters: list[tuple[str, set[str]]] = []
-    for f in (filters or []):
+    for f in filters or []:
         keys = _resolve_filter_keys(reader, s, f["line"], f["key"])
         resolved_filters.append((f["line"], keys))
 
@@ -504,6 +600,7 @@ def aggregate(
         and missing_edge_to is None
         and having is None
         and entity_filters is None
+        and group_by_relation is None
     )
     if use_reversed_scan:
         gbl = s.lines.get(group_by_line)
@@ -539,13 +636,13 @@ def aggregate(
                             for op_name, value in spec.items():
                                 if op_name in _SQL_OPS:
                                     parts.append(
-                        f"delta_rank_pct {_SQL_OPS[op_name]} {float(value)}"
-                    )
+                                        f"delta_rank_pct {_SQL_OPS[op_name]} {float(value)}"
+                                    )
                         else:
                             parts.append(f"delta_rank_pct = {float(spec)}")
                     if "delta_dim" in geometry_filters:
                         for dim_name, predicates in geometry_filters["delta_dim"].items():
-                            idx = pattern.dim_index(dim_name)
+                            idx = dims_pattern.dim_index(dim_name)
                             for op_name, value in predicates.items():
                                 if op_name in _SQL_OPS:
                                     parts.append(
@@ -556,12 +653,13 @@ def aggregate(
             try:
                 if len(all_group_keys) > _REVERSED_SCAN_MAX_GROUPS:
                     raise RuntimeError("high-cardinality group_by — use vectorized path")
-                computed: dict = {}
-                group_values: dict = {}
+                computed: dict[Any, Any] = {}
+                group_values: dict[Any, Any] = {}
                 for gk in all_group_keys:
                     lance_filter = _build_lance_filter(gk)
                     cnt = reader.count_geometry_rows(
-                        event_pattern_id, filter=lance_filter,
+                        event_pattern_id,
+                        filter=lance_filter,
                     )
                     if cnt > 0:
                         computed[gk] = cnt
@@ -569,14 +667,12 @@ def aggregate(
 
                 ascending = sort == "asc"
 
-                top = sorted(
-                    computed.items(), key=lambda x: x[1], reverse=not ascending,
-                )[offset:offset + limit]
+                top = _rank_groups(computed.items(), ascending)[offset : offset + limit]
                 results = [
                     {"key": key, "value": round(val, 2), "count": len(group_values[key])}
                     for key, val in top
                 ]
-                result = {
+                result: dict[str, Any] = {
                     "event_pattern_id": event_pattern_id,
                     "group_by_line": group_by_line,
                     "group_by_property": group_by_property,
@@ -608,7 +704,7 @@ def aggregate(
                             _d_gf_parts.append(f"delta_rank_pct = {float(_d_spec)}")
                     if "delta_dim" in geometry_filters:
                         for _d_dim, _d_preds in geometry_filters["delta_dim"].items():
-                            _d_idx = pattern.dim_index(_d_dim)
+                            _d_idx = dims_pattern.dim_index(_d_dim)
                             for _d_op, _d_v in _d_preds.items():
                                 if _d_op in _SQL_OPS:
                                     _d_gf_parts.append(
@@ -625,7 +721,8 @@ def aggregate(
                                 _d_gf_parts.append(f"array_has_any(entity_keys, [{_d_keys_str}])")
                     _d_geo_filter = " AND ".join(_d_gf_parts) if _d_gf_parts else None
                     _d_geo_total = reader.count_geometry_rows(
-                        event_pattern_id, filter=_d_geo_filter,
+                        event_pattern_id,
+                        filter=_d_geo_filter,
                     )
                     _d_total = sum(computed.values())
                     _d_dropped = _d_geo_total - _d_total
@@ -642,11 +739,19 @@ def aggregate(
                 # fast path so the field is uniformly present regardless of which
                 # execution branch produced the counts.
                 if _should_emit_per_group_anomaly_rate(
-                    False, metric, group_by_property, pivot_event_field,
-                    group_by_line_2, distinct, result,
+                    False,
+                    metric,
+                    group_by_property,
+                    pivot_event_field,
+                    group_by_line_2,
+                    distinct,
+                    result,
                 ):
                     _enrich_per_group_anomaly_rate(
-                        reader, event_pattern_id, pattern, group_by_line,
+                        reader,
+                        event_pattern_id,
+                        pattern,
+                        group_by_line,
                         edge_col="entity_keys",
                         result=result,
                     )
@@ -687,7 +792,7 @@ def aggregate(
                 _lance_parts.append(f"delta_rank_pct = {float(spec)}")
         if "delta_dim" in geometry_filters:
             for dim_name, predicates in geometry_filters["delta_dim"].items():
-                idx = pattern.dim_index(dim_name)
+                idx = dims_pattern.dim_index(dim_name)
                 for op_name, value in predicates.items():
                     if op_name in _SQL_OPS:
                         _lance_parts.append(f"delta_dim_{idx} {_SQL_OPS[op_name]} {float(value)}")
@@ -695,8 +800,10 @@ def aggregate(
             lance_prefilter = " AND ".join(_lance_parts)
 
     geo = reader.read_geometry(
-        event_pattern_id, pattern.version,
-        point_keys=pushdown_keys, columns=columns,
+        event_pattern_id,
+        pattern.version,
+        point_keys=pushdown_keys,
+        columns=columns,
         filter=lance_prefilter,
     )
 
@@ -711,7 +818,8 @@ def aggregate(
             if "alias_inside" in geometry_filters:
                 fallback_cols.append("delta")
         geo = reader.read_geometry(
-            event_pattern_id, pattern.version,
+            event_pattern_id,
+            pattern.version,
             point_keys=pushdown_keys,
             columns=fallback_cols,
             filter=lance_prefilter,
@@ -723,14 +831,13 @@ def aggregate(
     # --- Geometry pre-filter ---
     if geometry_filters:
         import pyarrow.compute as pc
+
         supported = {"is_anomaly", "delta_rank_pct", "delta_dim", "alias_inside"}
         unknown = set(geometry_filters) - supported
         if unknown:
             raise RuntimeError(f"Unknown geometry_filters keys: {unknown}")
         if "is_anomaly" in geometry_filters:
-            geo = geo.filter(
-                pc.equal(geo["is_anomaly"], bool(geometry_filters["is_anomaly"]))
-            )
+            geo = geo.filter(pc.equal(geo["is_anomaly"], bool(geometry_filters["is_anomaly"])))
         if "delta_rank_pct" in geometry_filters:
             spec = geometry_filters["delta_rank_pct"]
             if isinstance(spec, dict):
@@ -741,19 +848,21 @@ def aggregate(
         # correctness when reader doesn't execute Lance predicates (e.g. mocked storage).
         if "delta_dim" in geometry_filters:
             _pc_ops = {
-                "gt": pc.greater, "gte": pc.greater_equal,
-                "lt": pc.less, "lte": pc.less_equal, "eq": pc.equal,
+                "gt": pc.greater,
+                "gte": pc.greater_equal,
+                "lt": pc.less,
+                "lte": pc.less_equal,
+                "eq": pc.equal,
             }
             for dim_name, predicates in geometry_filters["delta_dim"].items():
-                idx = pattern.dim_index(dim_name)
+                idx = dims_pattern.dim_index(dim_name)
                 col_name = f"delta_dim_{idx}"
                 if col_name in geo.schema.names:
                     col = geo[col_name]
                     for op_name, threshold in predicates.items():
                         if op_name not in _pc_ops:
                             raise ValueError(
-                                f"Unknown comparison op '{op_name}'. "
-                                f"Supported: {list(_pc_ops)}"
+                                f"Unknown comparison op '{op_name}'. Supported: {list(_pc_ops)}"
                             )
                         geo = geo.filter(_pc_ops[op_name](col, float(threshold)))
                         col = geo[col_name]
@@ -778,6 +887,7 @@ def aggregate(
     if filter_by_keys is not None:
         import pyarrow as pa
         import pyarrow.compute as pc
+
         _fbk_pre_count = geo.num_rows
         _fbk_set = pa.array(filter_by_keys, type=pa.string())
         geo = geo.filter(pc.is_in(geo["primary_key"], value_set=_fbk_set))
@@ -817,8 +927,10 @@ def aggregate(
     _met_pre_sampled = False
     if missing_edge_to is not None and use_sampling and geo.num_rows > 0:
         import pyarrow as pa  # noqa: F811
+
         _met_n = (
-            sample_size if sample_size is not None
+            sample_size
+            if sample_size is not None
             else max(1, int(geo.num_rows * (sample_pct or 1.0)))
         )
         _met_n = min(_met_n, geo.num_rows)
@@ -832,14 +944,14 @@ def aggregate(
     if missing_edge_to is not None and geo.num_rows > 0:
         import pyarrow as pa  # noqa: F811
         import pyarrow.compute as pc  # noqa: F811
-        _met_pat = sphere.patterns.get(event_pattern_id)
-        _met_rels = _met_pat.relations if _met_pat else None
+
+        _met_pat_opt = sphere.patterns.get(event_pattern_id)
+        _met_rels = _met_pat_opt.relations if _met_pat_opt else None
         _met_row_idx, _met_fl, _met_fp, _met_am = _edge_arrays(
-            geo, relations=_met_rels,
+            geo,
+            relations=_met_rels,
         )
-        _has_edge_ri, _ = _gbl_edge_arrays(
-            missing_edge_to, _met_row_idx, _met_fl, _met_fp, _met_am
-        )
+        _has_edge_ri, _ = _gbl_edge_arrays(missing_edge_to, _met_row_idx, _met_fl, _met_fp, _met_am)
         _all_idx = pa.array(range(geo.num_rows), type=pa.int64())
         _absent_mask = pc.invert(pc.is_in(_all_idx, value_set=_has_edge_ri))
         geo = geo.filter(_absent_mask)
@@ -855,28 +967,27 @@ def aggregate(
     # --- event_filters ---
     _ctx_table_filtered: Any = None
     if event_filters:
-        _ef_cols: list[str] = ["primary_key"] + [
-            c for c in event_filters if c != "primary_key"
-        ]
+        _ef_cols: list[str] = ["primary_key"] + [c for c in event_filters if c != "primary_key"]
         if ":" in metric and not metric.startswith("count_distinct"):
             _maybe_col = metric.split(":", 1)[1]
             _ef_schema = reader.read_points_schema(event_line_id, event_version)
             if _maybe_col in _ef_schema.names and _maybe_col not in _ef_cols:
                 _ef_cols.append(_maybe_col)
         _cf_table = reader.read_points(
-            event_line_id, event_version, columns=_ef_cols,
+            event_line_id,
+            event_version,
+            columns=_ef_cols,
         )
         _ctx_table_filtered = _apply_event_filters(_cf_table, event_filters)
         import pyarrow as pa
         import pyarrow.compute as pc
-        _cf_pk_set = pa.array(
-            _ctx_table_filtered["primary_key"].to_pylist(), type=pa.string()
-        )
+
+        _cf_pk_set = pa.array(_ctx_table_filtered["primary_key"].to_pylist(), type=pa.string())
         geo = geo.filter(pc.is_in(geo["primary_key"], value_set=_cf_pk_set))
 
     # Build allowed_group_keys for property_filters.
     allowed_group_keys: set[str] | None = None
-    group_props_lookup: dict[str, dict] = {}
+    group_props_lookup: dict[str, dict[str, Any]] = {}
     if property_filters:
         gbl_line = s.lines.get(group_by_line)
         if gbl_line is None:
@@ -890,21 +1001,25 @@ def aggregate(
     # Build property lookup for cross-tab grouping
     prop_line_id: str | None = None
     prop_name: str | None = None
-    prop_lookup: dict = {}
+    prop_edge: str | None = None
+    prop_lookup: dict[Any, Any] = {}
     if group_by_property:
         prop_line_id, prop_name = group_by_property.split(":", 1)
+        # A property of group_by_line belongs to the grouped entity.
+        prop_edge = gbl_edge if prop_line_id == group_by_line else prop_line_id
         prop_line = s.lines.get(prop_line_id)
         if prop_line is None:
             raise RuntimeError(f"Property line '{prop_line_id}' not found.")
         prop_table = reader.read_points(prop_line_id, prop_line.versions[-1])
         if prop_name not in prop_table.schema.names:
-            raise RuntimeError(
-                f"Property '{prop_name}' not found in line '{prop_line_id}'."
+            raise RuntimeError(f"Property '{prop_name}' not found in line '{prop_line_id}'.")
+        prop_lookup = dict(
+            zip(
+                prop_table["primary_key"].to_pylist(),
+                prop_table[prop_name].to_pylist(),
+                strict=False,
             )
-        prop_lookup = dict(zip(
-            prop_table["primary_key"].to_pylist(),
-            prop_table[prop_name].to_pylist(), strict=False,
-        ))
+        )
 
     # --- Internal timer for pivot slow-operation warning ---
     _t0_pivot = time.perf_counter()
@@ -913,7 +1028,7 @@ def aggregate(
     agg_func: str | None = None
     agg_col: str | None = None
     cd_target_line: str | None = None
-    context_map: dict = {}
+    context_map: dict[Any, Any] = {}
     _context_map_built = False
     _pct_n: int | None = None
     if metric == "count":
@@ -927,7 +1042,7 @@ def aggregate(
                     f"Unknown target line '{cd_target_line}' in count_distinct metric. "
                     f"Available lines: {sorted(s.lines.keys())}"
                 )
-            if cd_target_line == group_by_line:
+            if cd_target_line == gbl_edge:
                 raise RuntimeError(
                     f"count_distinct target '{cd_target_line}' is the same as group_by_line — "
                     "counting distinct X per X is not meaningful."
@@ -989,20 +1104,14 @@ def aggregate(
                 "count_distinct metric cannot be combined with collapse_by_property."
             )
         if pivot_event_field:
-            raise RuntimeError(
-                "count_distinct metric cannot be combined with pivot_event_field."
-            )
+            raise RuntimeError("count_distinct metric cannot be combined with pivot_event_field.")
         if event_filters:
-            raise RuntimeError(
-                "count_distinct metric does not use event_filters."
-            )
+            raise RuntimeError("count_distinct metric does not use event_filters.")
 
     if _pct_n is not None and pivot_event_field:
-        raise RuntimeError(
-            "median/pct<N> metrics cannot be combined with pivot_event_field."
-        )
+        raise RuntimeError("median/pct<N> metrics cannot be combined with pivot_event_field.")
 
-    pivot_lookup: dict = {}
+    pivot_lookup: dict[Any, str] = {}
 
     # --- C: Vectorized count fast path ---
     has_edges = "edges" in geo.schema.names
@@ -1147,13 +1256,16 @@ def aggregate(
             from hypertopos.engine.lance_sql_agg import (
                 aggregate_count as _lance_sql_count,
             )
+
             _base = reader._base.resolve()
-            _geo_lance = str(
-                _base / "geometry" / event_pattern_id
-                / "data.lance"
+            _geo_lance = str(_base / "geometry" / event_pattern_id / "data.lance")
+            computed = _lance_sql_count(
+                _geo_lance,
+                pattern,
+                gbl_edge,
+                lance_version=reader.pinned_geometry_version(event_pattern_id),
             )
-            computed = _lance_sql_count(_geo_lance, pattern, group_by_line)
-            group_values: dict = {k: [1] * v for k, v in computed.items()}
+            group_values = {k: [1] * v for k, v in computed.items()}
             actually_sampled = False
             _lance_sql_count_done = True
 
@@ -1166,19 +1278,19 @@ def aggregate(
                 for i in range(len(bk_list)):
                     edge_map = _edge_map_fn(i)
                     edge_map[event_line_id] = bk_list[i]
-                    pass_mask.append(
-                        all(edge_map.get(ln) in ks for ln, ks in resolved_filters)
-                    )
+                    pass_mask.append(all(edge_map.get(ln) in ks for ln, ks in resolved_filters))
                 geo_vc = geo.filter(pa.array(pass_mask, type=pa.bool_()))
 
             computed, _gbl_edge_warning = _vectorized_count_with_warning(
-                geo_vc, group_by_line, geometry_filters, relations=pattern.relations
+                geo_vc, gbl_edge, geometry_filters, relations=pattern.relations
             )
-            group_values: dict = {k: [1] * v for k, v in computed.items()}
+            group_values = {k: [1] * v for k, v in computed.items()}
             actually_sampled = False
 
     elif _use_vectorized_agg:
-        # --- E: sum/avg/min/max — Lance SQL for large tables, in-process pyarrow handler for small / filter-bearing queries ---
+        # --- E: sum/avg/min/max — Lance SQL for large tables,
+        # in-process pyarrow handler for small / filter-bearing queries ---
+        # _use_vectorized_agg guarantees agg_func and agg_col are set.
         _lance_sql_metric_done = False
         if (
             geo.num_rows > _SUBPROCESS_THRESHOLD
@@ -1190,23 +1302,21 @@ def aggregate(
             from hypertopos.engine.lance_sql_agg import (
                 aggregate_metric as _lance_sql_metric,
             )
+
             _base = reader._base.resolve()
-            _geo_lance = str(
-                _base / "geometry" / event_pattern_id
-                / "data.lance"
-            )
-            _ctx_lance = str(
-                _base / "points" / event_line_id
-                / f"v={event_version}" / "data.lance"
-            )
+            _geo_lance = str(_base / "geometry" / event_pattern_id / "data.lance")
+            _ctx_lance = str(_base / "points" / event_line_id / f"v={event_version}" / "data.lance")
             computed_metric, computed_counts = _lance_sql_metric(
-                _geo_lance, _ctx_lance, pattern, group_by_line,
-                agg_col, agg_func,
+                _geo_lance,
+                _ctx_lance,
+                pattern,
+                gbl_edge,
+                cast(str, agg_col),
+                cast(str, agg_func),
+                lance_version=reader.pinned_geometry_version(event_pattern_id),
             )
-            computed: dict = computed_metric
-            group_values: dict = {
-                k: range(v) for k, v in computed_counts.items()
-            }
+            computed = computed_metric
+            group_values = {k: range(v) for k, v in computed_counts.items()}
             actually_sampled = False
             _lance_sql_metric_done = True
 
@@ -1218,13 +1328,16 @@ def aggregate(
                 ctx_table = _ctx_table_filtered
             else:
                 ctx_table = reader.read_points(
-                    event_line_id, event_version,
-                    columns=["primary_key", agg_col],
+                    event_line_id,
+                    event_version,
+                    columns=["primary_key", cast(str, agg_col)],
                 )
 
-            row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v = _edge_arrays(geo, relations=pattern.relations)
+            row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v = _edge_arrays(
+                geo, relations=pattern.relations
+            )
             gbl_row_idx, gbl_keys = _gbl_edge_arrays(
-                group_by_line, row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v
+                gbl_edge, row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v
             )
 
             idx = pc.index_in(geo["primary_key"], ctx_table["primary_key"])
@@ -1233,25 +1346,27 @@ def aggregate(
 
             valid = pc.is_valid(edge_amounts)
             _agg_op_map = {"sum": "sum", "avg": "mean", "min": "min", "max": "max"}
-            agg_op = _agg_op_map[agg_func]
-            agg_tbl = pa.table({
-                "group_key": gbl_keys.filter(valid),
-                "amount": edge_amounts.filter(valid),
-            })
-            result_e = agg_tbl.group_by("group_key").aggregate([
-                ("amount", agg_op),
-                ("amount", "count"),
-            ])
+            agg_op = _agg_op_map[cast(str, agg_func)]
+            agg_tbl = pa.table(
+                {
+                    "group_key": gbl_keys.filter(valid),
+                    "amount": edge_amounts.filter(valid),
+                }
+            )
+            from hypertopos.engine.lance_sql_agg import group_aggregate
+
+            result_e = group_aggregate(agg_tbl, ["group_key"], "amount", agg_op)
             keys_e = result_e["group_key"].to_pylist()
             vals_e = result_e[f"amount_{agg_op}"].to_pylist()
             cnts_e = result_e["amount_count"].to_pylist()
-            computed: dict = dict(zip(keys_e, vals_e, strict=False))
-            group_values: dict = {k: range(c) for k, c in zip(keys_e, cnts_e, strict=False)}
+            computed = dict(zip(keys_e, vals_e, strict=False))
+            group_values = {k: range(c) for k, c in zip(keys_e, cnts_e, strict=False)}
             actually_sampled = False
 
     elif _use_vectorized_pct:
         # --- E-pct: median/pct<N> via Lance SQL approx_percentile_cont
         # for large tables, in-process pyarrow+numpy (exact) fallback below ---
+        # _use_vectorized_pct guarantees _pct_n, agg_func and agg_col are set.
         import pyarrow as pa
         import pyarrow.compute as pc
 
@@ -1259,8 +1374,9 @@ def aggregate(
             ctx_table = _ctx_table_filtered
         else:
             ctx_table = reader.read_points(
-                event_line_id, event_version,
-                columns=["primary_key", agg_col],
+                event_line_id,
+                event_version,
+                columns=["primary_key", cast(str, agg_col)],
             )
 
         _pct_done = False
@@ -1269,22 +1385,19 @@ def aggregate(
             from hypertopos.engine.lance_sql_agg import (
                 aggregate_percentile as _lance_sql_pct,
             )
-            _pct_frac = (
-                0.5 if agg_func == "median"
-                else int(agg_func[3:]) / 100.0
-            )
+
+            _pct_frac = 0.5 if agg_func == "median" else int(cast(str, agg_func)[3:]) / 100.0
             _base = reader._base.resolve()
-            _geo_lance = str(
-                _base / "geometry" / event_pattern_id
-                / "data.lance"
-            )
-            _ctx_lance = str(
-                _base / "points" / event_line_id
-                / f"v={event_version}" / "data.lance"
-            )
+            _geo_lance = str(_base / "geometry" / event_pattern_id / "data.lance")
+            _ctx_lance = str(_base / "points" / event_line_id / f"v={event_version}" / "data.lance")
             computed, _cnt_dict = _lance_sql_pct(
-                _geo_lance, _ctx_lance, pattern, group_by_line,
-                agg_col, _pct_frac,
+                _geo_lance,
+                _ctx_lance,
+                pattern,
+                gbl_edge,
+                cast(str, agg_col),
+                _pct_frac,
+                lance_version=reader.pinned_geometry_version(event_pattern_id),
             )
             group_values = {k: range(v) for k, v in _cnt_dict.items()}
             actually_sampled = False
@@ -1293,10 +1406,15 @@ def aggregate(
         # Exact pyarrow+numpy path for small tables and as the fallback
         if not _pct_done:
             row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v = _edge_arrays(
-                geo, relations=pattern.relations,
+                geo,
+                relations=pattern.relations,
             )
             gbl_row_idx, gbl_keys = _gbl_edge_arrays(
-                group_by_line, row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v,
+                gbl_edge,
+                row_idx,
+                flat_line_ids_v,
+                flat_pt_keys_v,
+                alive_mask_v,
             )
 
             idx = pc.index_in(geo["primary_key"], ctx_table["primary_key"])
@@ -1313,36 +1431,38 @@ def aggregate(
             computed = {}
             group_values = {}
             for k, group_list in _pct_groups.items():
-                computed[k] = float(np.percentile(group_list, _pct_n))
+                computed[k] = float(np.percentile(group_list, cast(int, _pct_n)))
                 group_values[k] = range(len(group_list))
             actually_sampled = False
 
     elif _use_filtered_lance_sql:
         # --- E2: filtered metric aggregate via Lance SQL ---
+        # _use_filtered_lance_sql guarantees agg_func and agg_col are set.
         from hypertopos.engine.lance_sql_agg import (
             aggregate_filtered_metric as _lance_sql_filtered_metric,
         )
+
         _base = reader._base.resolve()
-        _geo_lance = str(
-            _base / "geometry" / event_pattern_id
-            / "data.lance"
-        )
-        _ctx_lance = str(
-            _base / "points" / event_line_id
-            / f"v={event_version}" / "data.lance"
-        )
+        _geo_lance = str(_base / "geometry" / event_pattern_id / "data.lance")
+        _ctx_lance = str(_base / "points" / event_line_id / f"v={event_version}" / "data.lance")
         computed_metric, computed_counts = _lance_sql_filtered_metric(
-            _geo_lance, _ctx_lance, pattern, group_by_line,
-            agg_col, agg_func, resolved_filters, event_line_id,
+            _geo_lance,
+            _ctx_lance,
+            pattern,
+            gbl_edge,
+            cast(str, agg_col),
+            cast(str, agg_func),
+            resolved_filters,
+            event_line_id,
+            lance_version=reader.pinned_geometry_version(event_pattern_id),
         )
-        computed: dict = computed_metric
-        group_values: dict = {
-            k: range(v) for k, v in computed_counts.items()
-        }
+        computed = computed_metric
+        group_values = {k: range(v) for k, v in computed_counts.items()}
         actually_sampled = False
 
     elif _use_vectorized_pivot:
         # --- F: Vectorized pivot_event_field count via Lance SQL ---
+        # _use_vectorized_pivot guarantees pivot_event_field is set.
         _lance_sql_pivot_done = False
         if (
             geo.num_rows > _SUBPROCESS_THRESHOLD
@@ -1353,27 +1473,27 @@ def aggregate(
             from hypertopos.engine.lance_sql_agg import (
                 aggregate_pivot as _lance_sql_pivot,
             )
+
             _base = reader._base.resolve()
-            _geo_lance = str(
-                _base / "geometry" / event_pattern_id
-                / "data.lance"
-            )
+            _geo_lance = str(_base / "geometry" / event_pattern_id / "data.lance")
             _event_lance = str(
-                _base / "points" / event_line_id
-                / f"v={event_line.versions[-1]}" / "data.lance"
+                _base / "points" / event_line_id / f"v={event_line.versions[-1]}" / "data.lance"
             )
             _ctx_lance = None
             if agg_func:
                 _ctx_lance = str(
-                    _base / "points" / event_line_id
-                    / f"v={event_version}" / "data.lance"
+                    _base / "points" / event_line_id / f"v={event_version}" / "data.lance"
                 )
             results = _lance_sql_pivot(
-                _geo_lance, _event_lance, pattern, group_by_line,
-                pivot_event_field,
+                _geo_lance,
+                _event_lance,
+                pattern,
+                gbl_edge,
+                cast(str, pivot_event_field),
                 ctx_lance_path=_ctx_lance,
                 metric_col=agg_col if agg_func else None,
                 agg_fn=agg_func,
+                lance_version=reader.pinned_geometry_version(event_pattern_id),
             )
             computed = {}
             group_values = {}
@@ -1399,15 +1519,18 @@ def aggregate(
                 bk: str(pv)
                 for bk, pv in zip(
                     event_points["primary_key"].to_pylist(),
-                    event_points[pivot_event_field].to_pylist(), strict=False,
+                    event_points[pivot_event_field].to_pylist(),
+                    strict=False,
                 )
             }
             import pyarrow as pa
             import pyarrow.compute as pc
 
-            row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v = _edge_arrays(geo, relations=pattern.relations)
+            row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v = _edge_arrays(
+                geo, relations=pattern.relations
+            )
             gbl_row_idx, gbl_keys = _gbl_edge_arrays(
-                group_by_line, row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v
+                gbl_edge, row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v
             )
 
             # Per-polygon pivot values from pivot_lookup
@@ -1420,22 +1543,25 @@ def aggregate(
 
             # Filter valid (non-null group key and pivot val) -> group by both
             valid = pc.and_(pc.is_valid(gbl_keys), pc.is_valid(edge_pivot_vals))
-            pivot_agg_tbl = pa.table({
-                "group_key": gbl_keys.filter(valid),
-                "pivot_val": edge_pivot_vals.filter(valid),
-            })
+            pivot_agg_tbl = pa.table(
+                {
+                    "group_key": gbl_keys.filter(valid),
+                    "pivot_val": edge_pivot_vals.filter(valid),
+                }
+            )
             result_f = pivot_agg_tbl.group_by(["group_key", "pivot_val"]).aggregate(
                 [("group_key", "count")]
             )
-            computed: dict = {
+            computed = {
                 (row["group_key"], row["pivot_val"]): row["group_key_count"]
                 for row in result_f.to_pylist()
             }
-            group_values: dict = {k: range(v) for k, v in computed.items()}
+            group_values = {k: range(v) for k, v in computed.items()}
             actually_sampled = False
 
     elif (
-        _use_vectorized_gbp or _use_vectorized_gbp_distinct
+        _use_vectorized_gbp
+        or _use_vectorized_gbp_distinct
         or (
             metric == "count"
             and not agg_func
@@ -1449,6 +1575,7 @@ def aggregate(
         # --- G/G-distinct: Vectorized group_by_property count ---
         # Lance SQL fast path for large tables, in-process pyarrow handler
         # for small tables and queries with filter_by_keys / event_filters.
+        # Every gate of this branch requires group_by_property, so prop_line_id/prop_name are set.
         _sub_done = False
 
         if (
@@ -1461,35 +1588,41 @@ def aggregate(
             from hypertopos.engine.lance_sql_agg import (
                 aggregate_property as _lance_sql_property,
             )
+
             _base = reader._base.resolve()
-            _geo_lance = str(
-                _base / "geometry" / event_pattern_id
-                / "data.lance"
-            )
+            _geo_lance = str(_base / "geometry" / event_pattern_id / "data.lance")
             _prop_lance = str(
-                _base / "points" / prop_line_id
-                / f"v={s.lines[prop_line_id].versions[-1]}" / "data.lance"
+                _base
+                / "points"
+                / cast(str, prop_line_id)
+                / f"v={s.lines[cast(str, prop_line_id)].versions[-1]}"
+                / "data.lance"
             )
             _ctx_lance = None
             if agg_func:
                 _ctx_lance = str(
-                    _base / "points" / event_line_id
-                    / f"v={event_version}" / "data.lance"
+                    _base / "points" / event_line_id / f"v={event_version}" / "data.lance"
                 )
             sub_result = _lance_sql_property(
-                _geo_lance, _prop_lance, pattern, group_by_line,
-                prop_line_id, prop_name,
+                _geo_lance,
+                _prop_lance,
+                pattern,
+                gbl_edge,
+                cast(str, prop_edge),
+                cast(str, prop_name),
                 distinct=distinct,
                 ctx_lance_path=_ctx_lance,
                 metric_col=agg_col if agg_func else None,
                 agg_fn=agg_func,
+                lance_version=reader.pinned_geometry_version(event_pattern_id),
+                event_line_id=event_line_id,
             )
             if "distinct_results" in sub_result:
                 computed = sub_result["distinct_results"]
                 group_values = {}
             else:
-                computed: dict = {}
-                group_values: dict = {}
+                computed = {}
+                group_values = {}
                 for row in sub_result["results"]:
                     key = (row["group_key"], row["prop_val"])
                     cnt = row["count"]
@@ -1503,16 +1636,21 @@ def aggregate(
             import pyarrow as pa
             import pyarrow.compute as pc
 
-            row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v = _edge_arrays(geo, relations=pattern.relations)
+            row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v = _edge_arrays(
+                geo, relations=pattern.relations
+            )
             gbl_row_idx, gbl_keys = _gbl_edge_arrays(
-                group_by_line, row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v
+                gbl_edge, row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v
             )
 
-            if prop_line_id == group_by_line:
+            if prop_edge == gbl_edge:
                 prop_entity_keys_g = gbl_keys
+            elif prop_edge == event_line_id:
+                # Property of the event itself: the entity is the polygon.
+                prop_entity_keys_g = pc.take(geo["primary_key"], gbl_row_idx)
             else:
                 prop_row_idx, prop_entity_keys_raw = _gbl_edge_arrays(
-                    prop_line_id, row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v
+                    cast(str, prop_edge), row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v
                 )
                 gbl_join = pa.table({"row_idx": gbl_row_idx, "group_key": gbl_keys})
                 prop_join = pa.table({"row_idx": prop_row_idx, "prop_entity": prop_entity_keys_raw})
@@ -1520,31 +1658,26 @@ def aggregate(
                 gbl_keys = joined_g["group_key"]
                 prop_entity_keys_g = joined_g["prop_entity"]
 
-            prop_vals_g = pa.array(
-                [prop_lookup.get(k) for k in prop_entity_keys_g.to_pylist()]
-            )
+            prop_vals_g = pa.array([prop_lookup.get(k) for k in prop_entity_keys_g.to_pylist()])
             valid_g = pc.and_(pc.is_valid(gbl_keys), pc.is_valid(prop_vals_g))
-            gbp_agg_tbl = pa.table({
-                "group_key": gbl_keys.filter(valid_g),
-                "prop_val": prop_vals_g.filter(valid_g),
-            })
-            if collapse_by_property:
-                result_g = gbp_agg_tbl.group_by(["prop_val"]).aggregate(
-                    [("prop_val", "count")]
-                )
-                computed: dict = {
-                    row["prop_val"]: row["prop_val_count"]
-                    for row in result_g.to_pylist()
+            gbp_agg_tbl = pa.table(
+                {
+                    "group_key": gbl_keys.filter(valid_g),
+                    "prop_val": prop_vals_g.filter(valid_g),
                 }
+            )
+            if collapse_by_property:
+                result_g = gbp_agg_tbl.group_by(["prop_val"]).aggregate([("prop_val", "count")])
+                computed = {row["prop_val"]: row["prop_val_count"] for row in result_g.to_pylist()}
             else:
                 result_g = gbp_agg_tbl.group_by(["group_key", "prop_val"]).aggregate(
                     [("group_key", "count")]
                 )
-                computed: dict = {
+                computed = {
                     (row["group_key"], row["prop_val"]): row["group_key_count"]
                     for row in result_g.to_pylist()
                 }
-            group_values: dict = {k: range(v) for k, v in computed.items()}
+            group_values = {k: range(v) for k, v in computed.items()}
             actually_sampled = False
 
         elif not _sub_done and _use_vectorized_gbp_distinct:
@@ -1552,16 +1685,21 @@ def aggregate(
             import pyarrow as pa
             import pyarrow.compute as pc
 
-            row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v = _edge_arrays(geo, relations=pattern.relations)
+            row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v = _edge_arrays(
+                geo, relations=pattern.relations
+            )
             gbl_row_idx, gbl_keys = _gbl_edge_arrays(
-                group_by_line, row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v
+                gbl_edge, row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v
             )
 
-            if prop_line_id == group_by_line:
+            if prop_edge == gbl_edge:
                 prop_entity_keys_gd = gbl_keys
+            elif prop_edge == event_line_id:
+                # Property of the event itself: the entity is the polygon.
+                prop_entity_keys_gd = pc.take(geo["primary_key"], gbl_row_idx)
             else:
                 prop_row_idx, prop_entity_keys_raw = _gbl_edge_arrays(
-                    prop_line_id, row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v
+                    cast(str, prop_edge), row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v
                 )
                 gbl_join = pa.table({"row_idx": gbl_row_idx, "group_key": gbl_keys})
                 prop_join = pa.table({"row_idx": prop_row_idx, "prop_entity": prop_entity_keys_raw})
@@ -1569,20 +1707,19 @@ def aggregate(
                 gbl_keys = joined_gd["group_key"]
                 prop_entity_keys_gd = joined_gd["prop_entity"]
 
-            prop_vals_gd = pa.array(
-                [prop_lookup.get(k) for k in prop_entity_keys_gd.to_pylist()]
-            )
+            prop_vals_gd = pa.array([prop_lookup.get(k) for k in prop_entity_keys_gd.to_pylist()])
             valid_gd = pc.and_(pc.is_valid(gbl_keys), pc.is_valid(prop_vals_gd))
-            distinct_tbl = pa.table({
-                "group_key": gbl_keys.filter(valid_gd),
-                "prop_val": prop_vals_gd.filter(valid_gd),
-            })
+            distinct_tbl = pa.table(
+                {
+                    "group_key": gbl_keys.filter(valid_gd),
+                    "prop_val": prop_vals_gd.filter(valid_gd),
+                }
+            )
             result_gd = distinct_tbl.group_by("prop_val").aggregate(
                 [("group_key", "count_distinct")]
             )
             computed = {
-                row["prop_val"]: row["group_key_count_distinct"]
-                for row in result_gd.to_pylist()
+                row["prop_val"]: row["group_key_count_distinct"] for row in result_gd.to_pylist()
             }
             group_values = {}
             actually_sampled = False
@@ -1601,19 +1738,22 @@ def aggregate(
     )
 
     # --- CD block: count_distinct vectorized path ---
+    # _use_vectorized_cd guarantees cd_target_line is set.
     if _use_vectorized_cd:
         import pyarrow as pa  # noqa: F811
         import pyarrow.compute as pc  # noqa: F811
 
-        row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v = _edge_arrays(geo, relations=pattern.relations)
+        row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v = _edge_arrays(
+            geo, relations=pattern.relations
+        )
 
         # Group-by axis
         gbl_row_idx, gbl_keys = _gbl_edge_arrays(
-            group_by_line, row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v
+            gbl_edge, row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v
         )
         # Target axis
         tgt_row_idx, tgt_keys = _gbl_edge_arrays(
-            cd_target_line, row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v
+            cast(str, cd_target_line), row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v
         )
 
         # Join on row_idx: pair (group_key, target_key) for each polygon
@@ -1629,16 +1769,15 @@ def aggregate(
                 pairs_target.append(tk)
 
         if pairs_group:
-            cd_table = pa.table({
-                "group_key": pa.array(pairs_group, type=pa.string()),
-                "tgt_key": pa.array(pairs_target, type=pa.string()),
-            })
-            cd_agg = cd_table.group_by("group_key").aggregate(
-                [("tgt_key", "count_distinct")]
+            cd_table = pa.table(
+                {
+                    "group_key": pa.array(pairs_group, type=pa.string()),
+                    "tgt_key": pa.array(pairs_target, type=pa.string()),
+                }
             )
+            cd_agg = cd_table.group_by("group_key").aggregate([("tgt_key", "count_distinct")])
             computed = {
-                row["group_key"]: row["tgt_key_count_distinct"]
-                for row in cd_agg.to_pylist()
+                row["group_key"]: row["tgt_key_count_distinct"] for row in cd_agg.to_pylist()
             }
             group_values = {k: range(v) for k, v in computed.items()}
         else:
@@ -1649,8 +1788,11 @@ def aggregate(
     # --- ML: Multi-level GROUP BY (two anchor lines) ---
     _ml_done = False
     if _use_multi_level and not (
-        use_vectorized or _use_vectorized_agg or _use_vectorized_pivot
-        or _use_vectorized_gbp or _use_vectorized_gbp_distinct
+        use_vectorized
+        or _use_vectorized_agg
+        or _use_vectorized_pivot
+        or _use_vectorized_gbp
+        or _use_vectorized_gbp_distinct
         or _use_vectorized_cd
     ):
         # Multi-level GROUP BY runs in-process pyarrow only — there is no
@@ -1658,12 +1800,15 @@ def aggregate(
         import pyarrow as pa
         import pyarrow.compute as pc
 
-        row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v = _edge_arrays(geo, relations=pattern.relations)
+        # _use_multi_level guarantees group_by_line_2 is not None.
+        row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v = _edge_arrays(
+            geo, relations=pattern.relations
+        )
         gbl_row_idx, gbl_keys = _gbl_edge_arrays(
-            group_by_line, row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v
+            gbl_edge, row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v
         )
         gbl2_row_idx, gbl2_keys = _gbl_edge_arrays(
-            group_by_line_2, row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v
+            cast(str, group_by_line_2), row_idx, flat_line_ids_v, flat_pt_keys_v, alive_mask_v
         )
 
         # Join on row_idx to pair the two group keys per polygon
@@ -1671,36 +1816,40 @@ def aggregate(
         gbl2_join = pa.table({"row_idx": gbl2_row_idx, "key_2": gbl2_keys})
         joined = gbl_join.join(gbl2_join, keys="row_idx", join_type="inner")
 
+        # agg_col is set whenever agg_func is set (metric parsed as '<op>:<col>').
         if agg_func and agg_func in ("sum", "avg", "min", "max"):
             # Need metric values from event entity line
             if _ctx_table_filtered is not None:
                 ctx_table = _ctx_table_filtered
             else:
                 ctx_table = reader.read_points(
-                    event_line_id, event_version,
-                    columns=["primary_key", agg_col],
+                    event_line_id,
+                    event_version,
+                    columns=["primary_key", cast(str, agg_col)],
                 )
 
             idx = pc.index_in(geo["primary_key"], ctx_table["primary_key"])
-            polygon_amounts = pc.cast(
-                pc.take(ctx_table[agg_col], idx), pa.float64()
-            )
+            polygon_amounts = pc.cast(pc.take(ctx_table[agg_col], idx), pa.float64())
             edge_amounts = pc.take(polygon_amounts, joined["row_idx"])
 
             valid = pc.is_valid(edge_amounts)
             _agg_op_map = {
-                "sum": "sum", "avg": "mean", "min": "min", "max": "max",
+                "sum": "sum",
+                "avg": "mean",
+                "min": "min",
+                "max": "max",
             }
             agg_op = _agg_op_map[agg_func]
-            agg_tbl = pa.table({
-                "key_1": joined["key_1"].filter(valid),
-                "key_2": joined["key_2"].filter(valid),
-                "amount": edge_amounts.filter(valid),
-            })
-            result_ml = agg_tbl.group_by(["key_1", "key_2"]).aggregate([
-                ("amount", agg_op),
-                ("amount", "count"),
-            ])
+            agg_tbl = pa.table(
+                {
+                    "key_1": joined["key_1"].filter(valid),
+                    "key_2": joined["key_2"].filter(valid),
+                    "amount": edge_amounts.filter(valid),
+                }
+            )
+            from hypertopos.engine.lance_sql_agg import group_aggregate
+
+            result_ml = group_aggregate(agg_tbl, ["key_1", "key_2"], "amount", agg_op)
             computed = {
                 (row["key_1"], row["key_2"]): row[f"amount_{agg_op}"]
                 for row in result_ml.to_pylist()
@@ -1711,16 +1860,19 @@ def aggregate(
             }
         else:
             # Count metric (no context needed)
-            count_tbl = pa.table({
-                "key_1": joined["key_1"],
-                "key_2": joined["key_2"],
-            })
-            result_ml = count_tbl.group_by(["key_1", "key_2"]).aggregate([
-                ("key_1", "count"),
-            ])
+            count_tbl = pa.table(
+                {
+                    "key_1": joined["key_1"],
+                    "key_2": joined["key_2"],
+                }
+            )
+            result_ml = count_tbl.group_by(["key_1", "key_2"]).aggregate(
+                [
+                    ("key_1", "count"),
+                ]
+            )
             computed = {
-                (row["key_1"], row["key_2"]): row["key_1_count"]
-                for row in result_ml.to_pylist()
+                (row["key_1"], row["key_2"]): row["key_1_count"] for row in result_ml.to_pylist()
             }
             group_values = {k: [1] * v for k, v in computed.items()}
 
@@ -1733,9 +1885,12 @@ def aggregate(
     # mode), so each branch's gating boolean is sufficient — no need to thread
     # an internal "_sub_done" through.
     _agg_done = (
-        use_vectorized or _use_vectorized_agg or _use_vectorized_pct
+        use_vectorized
+        or _use_vectorized_agg
+        or _use_vectorized_pct
         or _use_vectorized_pivot
-        or _use_vectorized_gbp or _use_vectorized_gbp_distinct
+        or _use_vectorized_gbp
+        or _use_vectorized_gbp_distinct
         or _use_filtered_lance_sql
         or _use_vectorized_cd
         or _ml_done
@@ -1746,7 +1901,7 @@ def aggregate(
     elif _use_vectorized_sample:
         computed, _gbl_edge_warning = _vectorized_sample_count(
             geo,
-            group_by_line=group_by_line,
+            group_by_line=gbl_edge,
             sample_size=sample_size,
             sample_pct=sample_pct,
             seed=seed,
@@ -1755,7 +1910,8 @@ def aggregate(
         )
         total_eligible = geo.num_rows
         _n_sampled = (
-            sample_size if sample_size is not None
+            sample_size
+            if sample_size is not None
             else max(1, int(total_eligible * (sample_pct or 1.0)))
         )
         n = min(_n_sampled, total_eligible)
@@ -1765,13 +1921,15 @@ def aggregate(
     else:
         # --- Python loop fallback (complex cases) ---
         # Lazy context_map build — deferred from metric parsing.
+        # agg_col is set whenever agg_func is set (metric parsed as '<op>:<col>').
         if agg_func and agg_func != "count_distinct" and not _context_map_built:
             if _ctx_table_filtered is not None:
                 ctx_table = _ctx_table_filtered
             else:
                 ctx_table = reader.read_points(
-                    event_line_id, event_version,
-                    columns=["primary_key", agg_col],
+                    event_line_id,
+                    event_version,
+                    columns=["primary_key", cast(str, agg_col)],
                 )
             ctx_keys = ctx_table["primary_key"].to_pylist()
             ctx_vals = ctx_table[agg_col].to_pylist()
@@ -1781,34 +1939,32 @@ def aggregate(
         # This avoids the 37s edges.to_pylist() bottleneck on 1M-row legacy geometry tables.
         _loop_pre_total = geo.num_rows
         _loop_pre_sampled = False
-        if (
-            use_sampling
-            and not resolved_filters
-            and not pivot_event_field
-            and not distinct
-        ):
+        if use_sampling and not resolved_filters and not pivot_event_field and not distinct:
             _n_ps = (
-                sample_size if sample_size is not None
+                sample_size
+                if sample_size is not None
                 else max(1, int(_loop_pre_total * (sample_pct or 1.0)))
             )
             _n_ps = min(_n_ps, _loop_pre_total)
             _rng_ps = np.random.default_rng(seed)
             _idx_ps = np.sort(_rng_ps.choice(_loop_pre_total, size=_n_ps, replace=False))
             import pyarrow as _pa_pre
+
             geo = geo.take(_pa_pre.array(_idx_ps, type=_pa_pre.int64()))
             _loop_pre_sampled = _n_ps < _loop_pre_total
 
         bk_col = geo["primary_key"].to_pylist()
         _make_edge_map = _make_edge_map_fn(geo, pattern.relations)
         group_values = defaultdict(list)
-        distinct_sets: dict = defaultdict(set)
-        cd_sets: dict = defaultdict(set)
+        distinct_sets: dict[Any, set[Any]] = defaultdict(set)
+        cd_sets: dict[Any, set[Any]] = defaultdict(set)
         _cd_tgt_by_row: dict[int, list[str]] = defaultdict(list)
+        # cd_target_line is set whenever agg_func == 'count_distinct'.
         if agg_func == "count_distinct":
             if has_edges:
                 _cd_row, _cd_fl, _cd_fp, _cd_am = _edge_arrays(geo, relations=pattern.relations)
                 _cd_tgt_row, _cd_tgt_keys = _gbl_edge_arrays(
-                    cd_target_line, _cd_row, _cd_fl, _cd_fp, _cd_am
+                    cast(str, cd_target_line), _cd_row, _cd_fl, _cd_fp, _cd_am
                 )
                 for ri, tk in zip(_cd_tgt_row.to_pylist(), _cd_tgt_keys.to_pylist(), strict=False):
                     _cd_tgt_by_row[ri].append(tk)
@@ -1816,8 +1972,7 @@ def aggregate(
                 edges_col = geo["edges"]
                 for i in range(geo.num_rows):
                     for e in edges_col[i].as_py():
-                        if (e["line_id"] == cd_target_line
-                                and e.get("status", "alive") == "alive"):
+                        if e["line_id"] == cd_target_line and e.get("status", "alive") == "alive":
                             _cd_tgt_by_row[i].append(e["point_key"])
             elif "entity_keys" in geo.schema.names and pattern.relations:
                 _cd_ek = geo["entity_keys"].to_pylist()
@@ -1832,9 +1987,7 @@ def aggregate(
 
         if pivot_event_field and not pivot_lookup and bk_col:
             if event_line is None:
-                raise RuntimeError(
-                    "Cannot use pivot_event_field: event line not found in sphere."
-                )
+                raise RuntimeError("Cannot use pivot_event_field: event line not found in sphere.")
             _ep = reader.read_points(event_line_id, event_line.versions[-1])
             if pivot_event_field not in _ep.schema.names:
                 raise RuntimeError(
@@ -1844,11 +1997,12 @@ def aggregate(
                 bk: str(pv)
                 for bk, pv in zip(
                     _ep["primary_key"].to_pylist(),
-                    _ep[pivot_event_field].to_pylist(), strict=False,
+                    _ep[pivot_event_field].to_pylist(),
+                    strict=False,
                 )
             }
 
-        def _passes_filters(edge_map: dict) -> bool:
+        def _passes_filters(edge_map: dict[str, Any]) -> bool:
             return all(edge_map.get(line) in keys for line, keys in resolved_filters)
 
         if use_sampling and resolved_filters:
@@ -1867,12 +2021,12 @@ def aggregate(
         if _met_pre_sampled and not _loop_pre_sampled:
             n = total_eligible
             actually_sampled = True
-            sampled_indices = set(eligible_indices)
+            sampled_indices: set[int] = set(eligible_indices)
             total_eligible = _met_pre_total
         elif _loop_pre_sampled:
             n = total_eligible
             actually_sampled = True
-            sampled_indices: set[int] = set(eligible_indices)
+            sampled_indices = set(eligible_indices)
             total_eligible = _loop_pre_total
         elif sample_size is not None:
             n = min(sample_size, total_eligible)
@@ -1897,7 +2051,7 @@ def aggregate(
             actually_sampled = False
             sampled_indices = set(eligible_indices)
 
-        for i in (sampled_indices if use_sampling else range(len(bk_col))):
+        for i in sampled_indices if use_sampling else range(len(bk_col)):
             polygon_bk = bk_col[i]
             edge_map = _make_edge_map(i)
             edge_map[event_line_id] = polygon_bk
@@ -1905,7 +2059,7 @@ def aggregate(
             if not use_sampling and resolved_filters and not _passes_filters(edge_map):
                 continue
 
-            group_key = edge_map.get(group_by_line)
+            group_key = edge_map.get(gbl_edge)
             if group_key is None:
                 continue
 
@@ -1922,7 +2076,9 @@ def aggregate(
                 prop_val = prop_lookup.get(prop_entity)
                 if prop_val is None:
                     continue
-                effective_key = prop_val if (distinct or collapse_by_property) else (group_key, prop_val)  # noqa: E501
+                effective_key = (
+                    prop_val if (distinct or collapse_by_property) else (group_key, prop_val)
+                )  # noqa: E501
             elif group_by_line_2:
                 key_2 = edge_map.get(group_by_line_2)
                 if key_2 is None:
@@ -1964,8 +2120,9 @@ def aggregate(
                     computed[key] = max(vals)
                 elif agg_func == "median":
                     computed[key] = float(np.median(vals))
+                # _pct_n is set whenever agg_func is median / pct<N>.
                 elif agg_func is not None and agg_func.startswith("pct"):
-                    computed[key] = float(np.percentile(vals, _pct_n))
+                    computed[key] = float(np.percentile(vals, cast(int, _pct_n)))
                 else:
                     computed[key] = len(vals)
 
@@ -1974,10 +2131,12 @@ def aggregate(
     # conditions, but this safety net ensures correctness even if a fast path is
     # reached through unexpected conditions (e.g., future refactors).
     if allowed_group_keys is not None:
+
         def _key_matches(k: Any) -> bool:
             if isinstance(k, tuple):
                 return k[0] in allowed_group_keys
             return k in allowed_group_keys
+
         computed = {k: v for k, v in computed.items() if _key_matches(k)}
         group_values = {k: v for k, v in group_values.items() if _key_matches(k)}
 
@@ -1990,7 +2149,8 @@ def aggregate(
         _h_lt = having.get("lt", float("inf"))
         _h_lte = having.get("lte", float("inf"))
         computed = {
-            k: v for k, v in computed.items()
+            k: v
+            for k, v in computed.items()
             if v > _h_gt and v >= _h_gte and v < _h_lt and v <= _h_lte
         }
         group_values = {k: v for k, v in group_values.items() if k in computed}
@@ -1999,25 +2159,23 @@ def aggregate(
     ascending = sort == "asc"
 
     # Pre-sort to extract top-N keys.
-    _sort_key = lambda x: x[1]  # noqa: E731
-    _rev = not ascending
     if pivot_event_field:
-        _piv_grouped: dict = defaultdict(dict)
+        _piv_grouped: dict[Any, dict[Any, Any]] = defaultdict(dict)
         for (gk, pv), val in computed.items():
             _piv_grouped[gk][pv] = val
         _piv_totals = {gk: sum(pvs.values()) for gk, pvs in _piv_grouped.items()}
-        _piv_sorted: list = sorted(
-            _piv_totals.items(), key=_sort_key, reverse=_rev,
-        )[offset:offset + limit]
-        _pre_top: list | None = None
+        _piv_sorted: list[tuple[Any, Any]] = _rank_groups(_piv_totals.items(), ascending)[
+            offset : offset + limit
+        ]
+        _pre_top: list[tuple[Any, Any]] | None = None
     elif distinct:
         _pre_top = None  # computed fresh in result block
     elif collapse_by_property:
-        _pre_top = None         # sorted fresh in result block
+        _pre_top = None  # sorted fresh in result block
     elif group_by_property:
-        _pre_top = sorted(computed.items(), key=_sort_key, reverse=_rev)[offset:offset + limit]
+        _pre_top = _rank_groups(computed.items(), ascending)[offset : offset + limit]
     else:
-        _pre_top = sorted(computed.items(), key=_sort_key, reverse=_rev)[offset:offset + limit]
+        _pre_top = _rank_groups(computed.items(), ascending)[offset : offset + limit]
 
     if pivot_event_field:
         # Reuse pre-sorted structures computed above (no second sort needed).
@@ -2026,7 +2184,7 @@ def aggregate(
         all_pivot_vals = sorted({pv for pvs in grouped.values() for pv in pvs})
         results = []
         for gk, _ in sorted_groups:
-            row: dict = {"key": gk}
+            row = {"key": gk}
             for pv in all_pivot_vals:
                 val = grouped[gk].get(pv)
                 row[pv] = round(val, 2) if val is not None else None
@@ -2045,15 +2203,17 @@ def aggregate(
     else:
         # distinct has no pre_top (property values, not entity keys) — sort fresh.
         # All other cases reuse the pre-sorted slice from the enrichment step above.
+        # _pre_top is non-None on every non-pivot, non-distinct, non-collapse branch above.
         top = (
-            sorted(computed.items(), key=_sort_key, reverse=_rev)[offset:offset + limit]
+            _rank_groups(computed.items(), ascending)[offset : offset + limit]
             if (distinct or collapse_by_property)
-            else _pre_top
+            else cast("list[tuple[Any, Any]]", _pre_top)
         )
+        # prop_name is set whenever distinct / collapse_by_property / group_by_property is active.
         if distinct:
             results = [
                 {
-                    prop_name: pv,
+                    cast(str, prop_name): pv,
                     "value": round(val, 2),
                     "count": int(val) if metric == "count" else len(group_values.get(pv, [])),
                 }
@@ -2062,7 +2222,7 @@ def aggregate(
         elif collapse_by_property:
             results = [
                 {
-                    prop_name: pv,
+                    cast(str, prop_name): pv,
                     "value": round(val, 2),
                     "count": (
                         len(group_values.get(pv, []))
@@ -2075,7 +2235,8 @@ def aggregate(
         elif group_by_property:
             results = [
                 {
-                    "key": gk, prop_name: pv,
+                    "key": gk,
+                    cast(str, prop_name): pv,
                     "value": round(val, 2),
                     "count": len(group_values[(gk, pv)]),
                 }
@@ -2084,7 +2245,8 @@ def aggregate(
         elif group_by_line_2:
             results = [
                 {
-                    "key": k1, "key_2": k2,
+                    "key": k1,
+                    "key_2": k2,
                     "value": round(val, 2),
                     "count": len(group_values[(k1, k2)]),
                 }
@@ -2108,6 +2270,8 @@ def aggregate(
             "offset": offset,
             "results": results,
         }
+    if group_by_relation is not None:
+        result["group_by_relation"] = group_by_relation
     if group_by_line_2:
         result["group_by_line_2"] = group_by_line_2
     # When group_by_property is active (not distinct, not collapse_by_property), total_groups
@@ -2184,11 +2348,15 @@ def aggregate(
     if _anomaly_rate_requested and result.get("results"):
         _ar_cols = ["entity_keys"] if "entity_keys" in geo.schema.names else ["edges"]
         _ar_geo = reader.read_geometry(
-            event_pattern_id, pattern.version,
+            event_pattern_id,
+            pattern.version,
             columns=_ar_cols,
         )
         _ar_totals, _ = _vectorized_count_with_warning(
-            _ar_geo, group_by_line, geometry_filters=None, relations=pattern.relations,
+            _ar_geo,
+            gbl_edge,
+            geometry_filters=None,
+            relations=pattern.relations,
         )
         for row in result.get("results", []):
             key = row.get("key")
@@ -2207,11 +2375,19 @@ def aggregate(
     # group_by_line_2 — the row key is not a single group_by_line edge target),
     # and when no rows were returned.
     if _should_emit_per_group_anomaly_rate(
-        _anomaly_rate_requested, metric, group_by_property, pivot_event_field,
-        group_by_line_2, distinct, result,
+        _anomaly_rate_requested,
+        metric,
+        group_by_property,
+        pivot_event_field,
+        group_by_line_2,
+        distinct,
+        result,
     ):
         _enrich_per_group_anomaly_rate(
-            reader, event_pattern_id, pattern, group_by_line,
+            reader,
+            event_pattern_id,
+            pattern,
+            gbl_edge,
             edge_col=("entity_keys" if "entity_keys" in geo.schema.names else "edges"),
             result=result,
         )
@@ -2226,7 +2402,7 @@ def _should_emit_per_group_anomaly_rate(
     pivot_event_field: str | None,
     group_by_line_2: str | None,
     distinct: bool,
-    result: dict,
+    result: dict[str, Any],
 ) -> bool:
     """Predicate for the inverse anomaly_rate enrichment.
 
@@ -2252,7 +2428,7 @@ def _enrich_per_group_anomaly_rate(
     group_by_line: str,
     *,
     edge_col: str,
-    result: dict,
+    result: dict[str, Any],
 ) -> None:
     """Attach ``anomaly_rate = n_anomalous_in_group / total_in_group`` per row.
 
@@ -2267,7 +2443,8 @@ def _enrich_per_group_anomaly_rate(
     """
     try:
         raw = reader.read_geometry(
-            event_pattern_id, pattern.version,
+            event_pattern_id,
+            pattern.version,
             columns=["is_anomaly", edge_col],
             filter="is_anomaly = true",
         )
@@ -2276,7 +2453,8 @@ def _enrich_per_group_anomaly_rate(
         # back to a no-filter read; the in-process predicate below still
         # narrows to anomalous rows.
         raw = reader.read_geometry(
-            event_pattern_id, pattern.version,
+            event_pattern_id,
+            pattern.version,
             columns=["is_anomaly", edge_col],
         )
     if "is_anomaly" not in raw.schema.names:
@@ -2284,12 +2462,16 @@ def _enrich_per_group_anomaly_rate(
         # cannot compute the rate. Leave rows unannotated.
         return
     import pyarrow.compute as pc
+
     # Apply the predicate in-process too — Lance may or may not honour the
     # pushed-down filter (mock readers silently ignore it). This guarantees
     # ``anom_only`` is strictly the anomalous subset regardless.
     anom_only = raw.filter(pc.equal(raw["is_anomaly"], True))
     anom_per_group, _ = _vectorized_count_with_warning(
-        anom_only, group_by_line, geometry_filters=None, relations=pattern.relations,
+        anom_only,
+        group_by_line,
+        geometry_filters=None,
+        relations=pattern.relations,
     )
     for row in result.get("results", []):
         key = row.get("key")

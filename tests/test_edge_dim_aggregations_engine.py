@@ -11,24 +11,32 @@ from hypertopos.engine.edge_features import (
 
 
 def _sidecar(rows: list[tuple[str, float, float]]) -> pa.Table:
-    return pa.table({
-        "event_key": [r[0] for r in rows],
-        "pair_edge_count": pa.array([r[1] for r in rows], type=pa.float32()),
-        "find_motif_structuring": pa.array([r[2] for r in rows], type=pa.float32()),
-    })
+    return pa.table(
+        {
+            "event_key": [r[0] for r in rows],
+            "pair_edge_count": pa.array([r[1] for r in rows], type=pa.float32()),
+            "find_motif_structuring": pa.array([r[2] for r in rows], type=pa.float32()),
+        }
+    )
 
 
 def _edges(rows: list[tuple[str, str, str]]) -> pa.Table:
-    return pa.table({
-        "event_key": [r[0] for r in rows],
-        "from_key":  [r[1] for r in rows],
-        "to_key":    [r[2] for r in rows],
-    })
+    return pa.table(
+        {
+            "event_key": [r[0] for r in rows],
+            "from_key": [r[1] for r in rows],
+            "to_key": [r[2] for r in rows],
+        }
+    )
 
 
 def test_AGGREGATE_NAMES_constant():
     assert AGGREGATE_NAMES == (
-        "mean", "max", "std", "p95", "count_above_threshold",
+        "mean",
+        "max",
+        "std",
+        "p95",
+        "count_above_threshold",
     )
 
 
@@ -42,14 +50,24 @@ def test_aggregate_kind_count_above_threshold_is_poisson():
 
 def test_count_above_threshold_default_population_p95():
     """Default threshold = population p95 of source dim from sidecar."""
-    edges = _edges([
-        ("e1", "A", "B"), ("e2", "A", "B"), ("e3", "A", "B"),
-        ("e4", "A", "B"), ("e5", "A", "C"),
-    ])
-    side = _sidecar([
-        ("e1", 1.0, 0.0), ("e2", 2.0, 0.0), ("e3", 3.0, 0.0),
-        ("e4", 4.0, 0.0), ("e5", 100.0, 0.0),
-    ])
+    edges = _edges(
+        [
+            ("e1", "A", "B"),
+            ("e2", "A", "B"),
+            ("e3", "A", "B"),
+            ("e4", "A", "B"),
+            ("e5", "A", "C"),
+        ]
+    )
+    side = _sidecar(
+        [
+            ("e1", 1.0, 0.0),
+            ("e2", 2.0, 0.0),
+            ("e3", 3.0, 0.0),
+            ("e4", 4.0, 0.0),
+            ("e5", 100.0, 0.0),
+        ]
+    )
     # Population p95 of pair_edge_count = ~80 (between 4 and 100); only e5 (100)
     # crosses. e5 → A→C anchor, so A→C count_above_threshold = 1, A→B = 0.
     out = aggregate_edge_dims_for_anchor(
@@ -60,24 +78,30 @@ def test_count_above_threshold_default_population_p95():
         anchor_kind="pair",
     )
     pks = out["primary_key"].to_pylist()
-    assert (
-        out["pair_edge_count_count_above_threshold"][pks.index("A→C")].as_py()
-        == pytest.approx(1.0)
+    assert out["pair_edge_count_count_above_threshold"][pks.index("A→C")].as_py() == pytest.approx(
+        1.0
     )
-    assert (
-        out["pair_edge_count_count_above_threshold"][pks.index("A→B")].as_py()
-        == pytest.approx(0.0)
+    assert out["pair_edge_count_count_above_threshold"][pks.index("A→B")].as_py() == pytest.approx(
+        0.0
     )
 
 
 def test_count_above_threshold_user_override():
     """User-provided threshold overrides the default population p95."""
-    edges = _edges([
-        ("e1", "A", "B"), ("e2", "A", "B"), ("e3", "A", "B"),
-    ])
-    side = _sidecar([
-        ("e1", 1.0, 0.0), ("e2", 5.0, 0.0), ("e3", 10.0, 0.0),
-    ])
+    edges = _edges(
+        [
+            ("e1", "A", "B"),
+            ("e2", "A", "B"),
+            ("e3", "A", "B"),
+        ]
+    )
+    side = _sidecar(
+        [
+            ("e1", 1.0, 0.0),
+            ("e2", 5.0, 0.0),
+            ("e3", 10.0, 0.0),
+        ]
+    )
     # Threshold=4: e2 (5) and e3 (10) cross → A→B count = 2
     out = aggregate_edge_dims_for_anchor(
         anchor_keys=["A→B"],
@@ -87,15 +111,12 @@ def test_count_above_threshold_user_override():
         anchor_kind="pair",
         thresholds={"pair_edge_count": 4.0},
     )
-    assert (
-        out["pair_edge_count_count_above_threshold"][0].as_py()
-        == pytest.approx(2.0)
-    )
+    assert out["pair_edge_count_count_above_threshold"][0].as_py() == pytest.approx(2.0)
 
 
 def test_aggregate_single_key_anchor_takes_union_of_in_out():
     edges = _edges([("e1", "A", "B"), ("e2", "A", "C"), ("e3", "B", "A")])
-    side  = _sidecar([("e1", 2.0, 0.0), ("e2", 4.0, 1.0), ("e3", 1.0, 0.0)])
+    side = _sidecar([("e1", 2.0, 0.0), ("e2", 4.0, 1.0), ("e3", 1.0, 0.0)])
     out = aggregate_edge_dims_for_anchor(
         anchor_keys=["A", "B", "C", "D"],
         edges=edges,
@@ -128,7 +149,7 @@ def test_aggregate_single_key_anchor_takes_union_of_in_out():
 def test_aggregate_composite_key_anchor_default_separator():
     """Default separator is '→' (matches GDSBuilder.add_composite_line default)."""
     edges = _edges([("e1", "A", "B"), ("e2", "A", "C"), ("e3", "B", "A"), ("e4", "A", "B")])
-    side  = _sidecar([("e1", 2.0, 0.0), ("e2", 4.0, 1.0), ("e3", 1.0, 0.0), ("e4", 6.0, 1.0)])
+    side = _sidecar([("e1", 2.0, 0.0), ("e2", 4.0, 1.0), ("e3", 1.0, 0.0), ("e4", 6.0, 1.0)])
     out = aggregate_edge_dims_for_anchor(
         anchor_keys=["A→B", "A→C", "B→A"],
         edges=edges,
@@ -152,7 +173,7 @@ def test_aggregate_composite_key_anchor_custom_separator():
     PKs (with '__' separator).
     """
     edges = _edges([("e1", "A", "B"), ("e2", "A", "C"), ("e3", "B", "A")])
-    side  = _sidecar([("e1", 2.0, 0.0), ("e2", 4.0, 1.0), ("e3", 1.0, 0.0)])
+    side = _sidecar([("e1", 2.0, 0.0), ("e2", 4.0, 1.0), ("e3", 1.0, 0.0)])
     out = aggregate_edge_dims_for_anchor(
         anchor_keys=["A|B", "A|C", "B|A"],
         edges=edges,
@@ -182,7 +203,7 @@ def test_aggregate_kind_mapping():
 
 def test_aggregate_unknown_dim_raises():
     edges = _edges([("e1", "A", "B")])
-    side  = _sidecar([("e1", 2.0, 0.0)])
+    side = _sidecar([("e1", 2.0, 0.0)])
     with pytest.raises(ValueError, match="unknown edge dimension"):
         aggregate_edge_dims_for_anchor(
             anchor_keys=["A"],
@@ -196,10 +217,12 @@ def test_aggregate_unknown_dim_raises():
 def test_aggregate_dim_missing_from_sidecar_raises():
     edges = _edges([("e1", "A", "B")])
     # sidecar without find_motif_structuring column
-    side = pa.table({
-        "event_key": ["e1"],
-        "pair_edge_count": pa.array([2.0], type=pa.float32()),
-    })
+    side = pa.table(
+        {
+            "event_key": ["e1"],
+            "pair_edge_count": pa.array([2.0], type=pa.float32()),
+        }
+    )
     with pytest.raises(ValueError, match="not present in sidecar"):
         aggregate_edge_dims_for_anchor(
             anchor_keys=["A"],
@@ -212,7 +235,7 @@ def test_aggregate_dim_missing_from_sidecar_raises():
 
 def test_aggregate_invalid_anchor_kind_raises():
     edges = _edges([("e1", "A", "B")])
-    side  = _sidecar([("e1", 2.0, 0.0)])
+    side = _sidecar([("e1", 2.0, 0.0)])
     with pytest.raises(ValueError, match="anchor_kind must be"):
         aggregate_edge_dims_for_anchor(
             anchor_keys=["A"],
@@ -224,15 +247,19 @@ def test_aggregate_invalid_anchor_kind_raises():
 
 
 def test_aggregate_empty_edges_returns_zeros():
-    edges = pa.table({
-        "event_key": pa.array([], type=pa.string()),
-        "from_key":  pa.array([], type=pa.string()),
-        "to_key":    pa.array([], type=pa.string()),
-    })
-    side = pa.table({
-        "event_key": pa.array([], type=pa.string()),
-        "pair_edge_count": pa.array([], type=pa.float32()),
-    })
+    edges = pa.table(
+        {
+            "event_key": pa.array([], type=pa.string()),
+            "from_key": pa.array([], type=pa.string()),
+            "to_key": pa.array([], type=pa.string()),
+        }
+    )
+    side = pa.table(
+        {
+            "event_key": pa.array([], type=pa.string()),
+            "pair_edge_count": pa.array([], type=pa.float32()),
+        }
+    )
     out = aggregate_edge_dims_for_anchor(
         anchor_keys=["A", "B"],
         edges=edges,
@@ -246,17 +273,22 @@ def test_aggregate_empty_edges_returns_zeros():
 
 def test_aggregate_chain_kind_with_chain_events_works():
     """Chain regime aggregates dim values per chain via explosion+groupby."""
-    sidecar = pa.table({
-        "event_key": ["evt1", "evt2", "evt3", "evt4", "evt5"],
-        "find_motif_structuring": pa.array(
-            [1.0, 0.0, 1.0, 0.0, 1.0], type=pa.float32(),
-        ),
-    })
-    edges = pa.table({
-        "event_key": pa.array([], type=pa.string()),
-        "from_key": pa.array([], type=pa.string()),
-        "to_key":   pa.array([], type=pa.string()),
-    })
+    sidecar = pa.table(
+        {
+            "event_key": ["evt1", "evt2", "evt3", "evt4", "evt5"],
+            "find_motif_structuring": pa.array(
+                [1.0, 0.0, 1.0, 0.0, 1.0],
+                type=pa.float32(),
+            ),
+        }
+    )
+    edges = pa.table(
+        {
+            "event_key": pa.array([], type=pa.string()),
+            "from_key": pa.array([], type=pa.string()),
+            "to_key": pa.array([], type=pa.string()),
+        }
+    )
 
     result = aggregate_edge_dims_for_anchor(
         anchor_keys=["chain_a", "chain_b", "chain_c"],
@@ -269,23 +301,27 @@ def test_aggregate_chain_kind_with_chain_events_works():
 
     pks = result["primary_key"].to_pylist()
     means = result["find_motif_structuring_mean"].to_numpy()
-    maxs  = result["find_motif_structuring_max"].to_numpy()
+    maxs = result["find_motif_structuring_max"].to_numpy()
     assert pks == ["chain_a", "chain_b", "chain_c"]
     assert means == pytest.approx([2.0 / 3.0, 0.0, 1.0], abs=1e-6)
-    assert maxs  == pytest.approx([1.0, 0.0, 1.0], abs=1e-6)
+    assert maxs == pytest.approx([1.0, 0.0, 1.0], abs=1e-6)
 
 
 def test_aggregate_chain_kind_requires_chain_events_arg():
     """Engine raises when chain regime is requested without chain_events list."""
-    sidecar = pa.table({
-        "event_key": ["evt1"],
-        "find_motif_structuring": pa.array([1.0], type=pa.float32()),
-    })
-    edges = pa.table({
-        "event_key": pa.array([], type=pa.string()),
-        "from_key": pa.array([], type=pa.string()),
-        "to_key":   pa.array([], type=pa.string()),
-    })
+    sidecar = pa.table(
+        {
+            "event_key": ["evt1"],
+            "find_motif_structuring": pa.array([1.0], type=pa.float32()),
+        }
+    )
+    edges = pa.table(
+        {
+            "event_key": pa.array([], type=pa.string()),
+            "from_key": pa.array([], type=pa.string()),
+            "to_key": pa.array([], type=pa.string()),
+        }
+    )
     with pytest.raises(ValueError, match="chain regime requires chain_events"):
         aggregate_edge_dims_for_anchor(
             anchor_keys=["chain_a"],
@@ -299,15 +335,19 @@ def test_aggregate_chain_kind_requires_chain_events_arg():
 
 def test_aggregate_chain_kind_chain_events_length_mismatch():
     """Engine raises when len(chain_events) != len(anchor_keys)."""
-    sidecar = pa.table({
-        "event_key": ["evt1"],
-        "find_motif_structuring": pa.array([1.0], type=pa.float32()),
-    })
-    edges = pa.table({
-        "event_key": pa.array([], type=pa.string()),
-        "from_key": pa.array([], type=pa.string()),
-        "to_key":   pa.array([], type=pa.string()),
-    })
+    sidecar = pa.table(
+        {
+            "event_key": ["evt1"],
+            "find_motif_structuring": pa.array([1.0], type=pa.float32()),
+        }
+    )
+    edges = pa.table(
+        {
+            "event_key": pa.array([], type=pa.string()),
+            "from_key": pa.array([], type=pa.string()),
+            "to_key": pa.array([], type=pa.string()),
+        }
+    )
     with pytest.raises(ValueError, match="must match"):
         aggregate_edge_dims_for_anchor(
             anchor_keys=["chain_a", "chain_b"],
@@ -321,15 +361,19 @@ def test_aggregate_chain_kind_chain_events_length_mismatch():
 
 def test_aggregate_chain_kind_empty_chain_events_string_returns_zero():
     """Per-chain empty chain_events string defaults to 0.0 aggregates."""
-    sidecar = pa.table({
-        "event_key": ["evt1", "evt2"],
-        "find_motif_structuring": pa.array([1.0, 1.0], type=pa.float32()),
-    })
-    edges = pa.table({
-        "event_key": pa.array([], type=pa.string()),
-        "from_key": pa.array([], type=pa.string()),
-        "to_key":   pa.array([], type=pa.string()),
-    })
+    sidecar = pa.table(
+        {
+            "event_key": ["evt1", "evt2"],
+            "find_motif_structuring": pa.array([1.0, 1.0], type=pa.float32()),
+        }
+    )
+    edges = pa.table(
+        {
+            "event_key": pa.array([], type=pa.string()),
+            "from_key": pa.array([], type=pa.string()),
+            "to_key": pa.array([], type=pa.string()),
+        }
+    )
     result = aggregate_edge_dims_for_anchor(
         anchor_keys=["chain_with_edges", "chain_empty"],
         edges=edges,
@@ -339,22 +383,26 @@ def test_aggregate_chain_kind_empty_chain_events_string_returns_zero():
         chain_events=["evt1,evt2", ""],
     )
     means = result["find_motif_structuring_mean"].to_numpy()
-    maxs  = result["find_motif_structuring_max"].to_numpy()
+    maxs = result["find_motif_structuring_max"].to_numpy()
     assert means == pytest.approx([1.0, 0.0])
-    assert maxs  == pytest.approx([1.0, 0.0])
+    assert maxs == pytest.approx([1.0, 0.0])
 
 
 def test_aggregate_chain_kind_unknown_event_keys_skipped():
     """Chain event_keys not in sidecar contribute nothing to aggregates."""
-    sidecar = pa.table({
-        "event_key": ["evt1", "evt2"],
-        "find_motif_structuring": pa.array([1.0, 1.0], type=pa.float32()),
-    })
-    edges = pa.table({
-        "event_key": pa.array([], type=pa.string()),
-        "from_key": pa.array([], type=pa.string()),
-        "to_key":   pa.array([], type=pa.string()),
-    })
+    sidecar = pa.table(
+        {
+            "event_key": ["evt1", "evt2"],
+            "find_motif_structuring": pa.array([1.0, 1.0], type=pa.float32()),
+        }
+    )
+    edges = pa.table(
+        {
+            "event_key": pa.array([], type=pa.string()),
+            "from_key": pa.array([], type=pa.string()),
+            "to_key": pa.array([], type=pa.string()),
+        }
+    )
     result = aggregate_edge_dims_for_anchor(
         anchor_keys=["chain_with_unknown"],
         edges=edges,
@@ -370,14 +418,17 @@ def test_aggregate_chain_kind_unknown_event_keys_skipped():
 # k>2 composite anchor regime — F1.b
 # -----------------------------------------------------------------------------
 
+
 def test_aggregate_composite_kgt2_tripartite_uses_positional_key_cols():
     """Tripartite anchor: key_cols=[from_key, to_key, currency] builds 3-tuple PK."""
-    edges = pa.table({
-        "event_key": ["e1", "e2", "e3", "e4"],
-        "from_key":  ["A", "A", "B", "A"],
-        "to_key":    ["B", "C", "A", "B"],
-        "currency":  ["USD", "USD", "EUR", "EUR"],
-    })
+    edges = pa.table(
+        {
+            "event_key": ["e1", "e2", "e3", "e4"],
+            "from_key": ["A", "A", "B", "A"],
+            "to_key": ["B", "C", "A", "B"],
+            "currency": ["USD", "USD", "EUR", "EUR"],
+        }
+    )
     side = _sidecar([("e1", 2.0, 0.0), ("e2", 4.0, 1.0), ("e3", 1.0, 0.0), ("e4", 6.0, 1.0)])
     out = aggregate_edge_dims_for_anchor(
         anchor_keys=["A→B→USD", "A→B→EUR", "A→C→USD", "B→A→EUR"],
@@ -403,12 +454,14 @@ def test_aggregate_composite_kgt2_tripartite_uses_positional_key_cols():
 
 def test_aggregate_composite_kgt2_custom_separator():
     """Tripartite with custom separator '|' instead of default '→'."""
-    edges = pa.table({
-        "event_key": ["e1", "e2"],
-        "from_key":  ["A", "A"],
-        "to_key":    ["B", "B"],
-        "currency":  ["USD", "USD"],
-    })
+    edges = pa.table(
+        {
+            "event_key": ["e1", "e2"],
+            "from_key": ["A", "A"],
+            "to_key": ["B", "B"],
+            "currency": ["USD", "USD"],
+        }
+    )
     side = _sidecar([("e1", 3.0, 0.0), ("e2", 5.0, 1.0)])
     out = aggregate_edge_dims_for_anchor(
         anchor_keys=["A|B|USD"],
@@ -425,15 +478,18 @@ def test_aggregate_composite_kgt2_custom_separator():
 
 def test_aggregate_composite_kgt2_aggregates_across_groups():
     """4-tuple anchor with multiple events per group — verify mean/max correct."""
-    edges = pa.table({
-        "event_key": ["e1", "e2", "e3", "e4", "e5"],
-        "from_key":  ["A", "A", "A", "B", "A"],
-        "to_key":    ["B", "B", "B", "C", "C"],
-        "currency":  ["USD", "USD", "USD", "EUR", "USD"],
-        "channel":   ["wire", "wire", "wire", "ach", "ach"],
-    })
-    side = _sidecar([("e1", 2.0, 0.0), ("e2", 4.0, 1.0), ("e3", 6.0, 0.0),
-                     ("e4", 1.0, 0.0), ("e5", 8.0, 1.0)])
+    edges = pa.table(
+        {
+            "event_key": ["e1", "e2", "e3", "e4", "e5"],
+            "from_key": ["A", "A", "A", "B", "A"],
+            "to_key": ["B", "B", "B", "C", "C"],
+            "currency": ["USD", "USD", "USD", "EUR", "USD"],
+            "channel": ["wire", "wire", "wire", "ach", "ach"],
+        }
+    )
+    side = _sidecar(
+        [("e1", 2.0, 0.0), ("e2", 4.0, 1.0), ("e3", 6.0, 0.0), ("e4", 1.0, 0.0), ("e5", 8.0, 1.0)]
+    )
     out = aggregate_edge_dims_for_anchor(
         anchor_keys=["A→B→USD→wire", "A→C→USD→ach", "B→C→EUR→ach"],
         edges=edges,
@@ -455,7 +511,7 @@ def test_aggregate_composite_kgt2_aggregates_across_groups():
 def test_aggregate_composite_k2_backward_compat_no_key_cols():
     """k=2 callers without key_cols still work (default = from_key, to_key)."""
     edges = _edges([("e1", "A", "B"), ("e2", "A", "B"), ("e3", "B", "A")])
-    side  = _sidecar([("e1", 2.0, 0.0), ("e2", 4.0, 1.0), ("e3", 1.0, 0.0)])
+    side = _sidecar([("e1", 2.0, 0.0), ("e2", 4.0, 1.0), ("e3", 1.0, 0.0)])
     out = aggregate_edge_dims_for_anchor(
         anchor_keys=["A→B", "B→A"],
         edges=edges,
@@ -472,7 +528,7 @@ def test_aggregate_composite_k2_backward_compat_no_key_cols():
 def test_aggregate_composite_kgt2_missing_key_col_raises_without_event_table():
     """k>2 with property key_col not in joined and event_table=None raises."""
     edges = _edges([("e1", "A", "B")])
-    side  = _sidecar([("e1", 2.0, 0.0)])
+    side = _sidecar([("e1", 2.0, 0.0)])
     with pytest.raises(ValueError, match="not present in joined.*event_table=None"):
         aggregate_edge_dims_for_anchor(
             anchor_keys=["A→B→USD"],
@@ -487,11 +543,13 @@ def test_aggregate_composite_kgt2_missing_key_col_raises_without_event_table():
 def test_aggregate_composite_kgt2_property_from_event_table():
     """k>2 property column missing from edges is joined from event_table."""
     edges = _edges([("e1", "A", "B"), ("e2", "A", "B")])
-    side  = _sidecar([("e1", 2.0, 0.0), ("e2", 4.0, 1.0)])
-    event_table = pa.table({
-        "event_key": ["e1", "e2"],
-        "currency":  ["USD", "EUR"],
-    })
+    side = _sidecar([("e1", 2.0, 0.0), ("e2", 4.0, 1.0)])
+    event_table = pa.table(
+        {
+            "event_key": ["e1", "e2"],
+            "currency": ["USD", "EUR"],
+        }
+    )
     out = aggregate_edge_dims_for_anchor(
         anchor_keys=["A→B→USD", "A→B→EUR"],
         edges=edges,
@@ -509,11 +567,13 @@ def test_aggregate_composite_kgt2_property_from_event_table():
 def test_aggregate_composite_kgt2_event_table_uses_primary_key_alias():
     """event_table with primary_key (event line convention) instead of event_key works."""
     edges = _edges([("e1", "A", "B"), ("e2", "A", "B")])
-    side  = _sidecar([("e1", 2.0, 0.0), ("e2", 4.0, 1.0)])
-    event_table = pa.table({
-        "primary_key": ["e1", "e2"],  # event line uses primary_key, not event_key
-        "currency":    ["USD", "EUR"],
-    })
+    side = _sidecar([("e1", 2.0, 0.0), ("e2", 4.0, 1.0)])
+    event_table = pa.table(
+        {
+            "primary_key": ["e1", "e2"],  # event line uses primary_key, not event_key
+            "currency": ["USD", "EUR"],
+        }
+    )
     out = aggregate_edge_dims_for_anchor(
         anchor_keys=["A→B→USD", "A→B→EUR"],
         edges=edges,

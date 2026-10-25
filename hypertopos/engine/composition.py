@@ -7,10 +7,12 @@
 No scipy dependency — chi2 survival via regularized incomplete gamma (numpy + math only),
 Spearman via rank-transform + Pearson.
 """
+
 from __future__ import annotations
 
 import math
 from functools import lru_cache
+from typing import Any
 
 import numpy as np
 
@@ -33,9 +35,7 @@ def _chi2_sf(x: float, df: int) -> float:
     if df > 100:
         # Wilson-Hilferty normal approximation for large df
         k = df
-        z_wh = (math.pow(x / k, 1.0 / 3.0) - (1.0 - 2.0 / (9.0 * k))) / math.sqrt(
-            2.0 / (9.0 * k)
-        )
+        z_wh = (math.pow(x / k, 1.0 / 3.0) - (1.0 - 2.0 / (9.0 * k))) / math.sqrt(2.0 / (9.0 * k))
         # Standard normal survival: 0.5 * erfc(z / sqrt(2))
         return max(0.0, min(1.0, 0.5 * math.erfc(z_wh / math.sqrt(2.0))))
     a = df / 2.0
@@ -129,7 +129,7 @@ def _t_sf_two_sided(t: float, df: int) -> float:
     return max(0.0, min(1.0, 1.0 - i_x))
 
 
-def fisher_combine_pvalues(p_values: list[float]) -> dict:
+def fisher_combine_pvalues(p_values: list[float]) -> dict[str, Any]:
     """Combine independent p-values via Fisher's method.
 
     chi2_stat = -2 * sum(ln(p_i))
@@ -161,7 +161,7 @@ def co_dispersion(
     norms_a: np.ndarray,
     norms_b: np.ndarray,
     min_entities: int = 5,
-) -> dict:
+) -> dict[str, Any]:
     """Spearman rank correlation of delta_norms between two patterns."""
     n = min(len(norms_a), len(norms_b))
     if n < min_entities:
@@ -228,13 +228,15 @@ def harmonic_mean_p(
         w_arr = np.full(n, 1.0 / n, dtype=np.float64)
     else:
         w_arr = np.array(
-            [max(float(weights.get(k, 0.0)), 0.0) for k in keys], dtype=np.float64,
+            [max(float(weights.get(k, 0.0)), 0.0) for k in keys],
+            dtype=np.float64,
         )
     weight_sum = float(np.sum(w_arr))
     if weight_sum <= 0.0:
         return 1.0
     p_arr = np.array(
-        [_sanitize_p(float(p_values[k])) for k in keys], dtype=np.float64,
+        [_sanitize_p(float(p_values[k])) for k in keys],
+        dtype=np.float64,
     )
     denom = float(np.sum(w_arr / p_arr))
     if denom <= 0.0 or not math.isfinite(denom):
@@ -282,9 +284,7 @@ def hmp_threshold_at_alpha(
         )
 
     seed = (
-        int(L) * 0x9E3779B1
-        ^ int(n_simulation_draws) * 0x85EBCA77
-        ^ int(round(float(alpha) * 1e9))
+        int(L) * 0x9E3779B1 ^ int(n_simulation_draws) * 0x85EBCA77 ^ int(round(float(alpha) * 1e9))
     )
     rng = np.random.default_rng(seed & 0xFFFFFFFF)
     # Uniform(0, 1] (avoid exact zero).

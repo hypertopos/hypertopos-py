@@ -8,12 +8,14 @@ Test classes cover: motif scoring, motif registry dispatch, per-type
 enumerators (fan_out / cycle_2 / cycle_3 / structuring), ranking cache
 behaviour, and fixture-based end-to-end smoke.
 """
+
 from __future__ import annotations
 
 import math
 from unittest.mock import MagicMock
 
 import numpy as np
+import pyarrow as pa
 import pytest
 
 from hypertopos.navigation.navigator import (
@@ -65,9 +67,14 @@ class TestMotifRegistryContract:
         nav = GDSNavigator(MagicMock(), MagicMock(), MagicMock(), MagicMock())
         keys = set(nav._motif_registry.keys())
         assert keys == {
-            "fan_out", "cycle_2", "cycle_3",
-            "structuring", "fan_in", "chain_k",
-            "split_recombine", "bipartite_burst",
+            "fan_out",
+            "cycle_2",
+            "cycle_3",
+            "structuring",
+            "fan_in",
+            "chain_k",
+            "split_recombine",
+            "bipartite_burst",
         }
 
     def test_each_motif_has_positive_default_window(self) -> None:
@@ -85,9 +92,11 @@ class TestMotifScoring:
     """_score_motif_from_edges returns the product of edge_potentials."""
 
     def _nav_with_edge_pots(
-        self, edge_pot_map: dict[tuple[str, str], float],
+        self,
+        edge_pot_map: dict[tuple[str, str], float],
     ) -> GDSNavigator:
         import math
+
         from hypertopos.navigation.navigator import _MOTIF_SCORE_EPSILON, _MOTIF_SCORE_MAX
 
         nav = GDSNavigator(MagicMock(), MagicMock(), MagicMock(), MagicMock())
@@ -96,7 +105,7 @@ class TestMotifScoring:
         # _batch_read_deltas returns a stub map so _lean_score_motif sees all keys present.
         # Actual vector values are unused — _lean_score_motif is mocked below.
         nav._batch_read_deltas = MagicMock(  # type: ignore[assignment]
-            side_effect=lambda pid, ver, keys: {k: None for k in keys},
+            side_effect=lambda pid, ver, keys: dict.fromkeys(keys),
         )
         nav._storage.get_adjacency.return_value.pair_counts.return_value = {}
 
@@ -112,17 +121,19 @@ class TestMotifScoring:
             product = 1.0
             log_score_acc = 0.0
             saw_zero = False
-            for (u, v) in edges:
+            for u, v in edges:
                 if u not in delta_map or v not in delta_map:
                     return None
                 score = edge_pot_map[(u, v)]
-                breakdown.append({
-                    "edge": (u, v),
-                    "edge_potential": score,
-                    "delta_distance": score,
-                    "pair_tx_count": 1,
-                    "effective_weight": 1.0,
-                })
+                breakdown.append(
+                    {
+                        "edge": (u, v),
+                        "edge_potential": score,
+                        "delta_distance": score,
+                        "pair_tx_count": 1,
+                        "effective_weight": 1.0,
+                    }
+                )
                 if score == 0.0:
                     saw_zero = True
                 else:
@@ -152,41 +163,27 @@ class TestMotifScoring:
         return nav
 
     def test_score_is_product_of_edge_potentials(self) -> None:
-        nav = self._nav_with_edge_pots(
-            {("A", "B"): 2.0, ("B", "C"): 3.0, ("C", "A"): 4.0}
-        )
-        result = nav._score_motif_from_edges(
-            [("A", "B"), ("B", "C"), ("C", "A")], "p"
-        )
+        nav = self._nav_with_edge_pots({("A", "B"): 2.0, ("B", "C"): 3.0, ("C", "A"): 4.0})
+        result = nav._score_motif_from_edges([("A", "B"), ("B", "C"), ("C", "A")], "p")
         assert result["score"] == pytest.approx(24.0)
         assert len(result["breakdown"]) == 3
 
     def test_score_breakdown_order_matches_input(self) -> None:
-        nav = self._nav_with_edge_pots(
-            {("X", "Y"): 1.5, ("Y", "X"): 2.5}
-        )
+        nav = self._nav_with_edge_pots({("X", "Y"): 1.5, ("Y", "X"): 2.5})
         result = nav._score_motif_from_edges([("X", "Y"), ("Y", "X")], "p")
         edges = [entry["edge"] for entry in result["breakdown"]]
         assert edges == [("X", "Y"), ("Y", "X")]
 
     def test_score_underflow_clamped_to_epsilon(self) -> None:
-        nav = self._nav_with_edge_pots(
-            {("A", "B"): 1e-20, ("B", "C"): 1e-20, ("C", "A"): 1e-20}
-        )
-        result = nav._score_motif_from_edges(
-            [("A", "B"), ("B", "C"), ("C", "A")], "p"
-        )
+        nav = self._nav_with_edge_pots({("A", "B"): 1e-20, ("B", "C"): 1e-20, ("C", "A"): 1e-20})
+        result = nav._score_motif_from_edges([("A", "B"), ("B", "C"), ("C", "A")], "p")
         # Raw product = 1e-60, should be clamped to 1e-30 to keep sortability.
         assert result["score"] >= 1e-30
 
     def test_score_zero_when_any_edge_potential_is_zero(self) -> None:
         """Identical-delta endpoints produce edge_potential=0 → motif score=0."""
-        nav = self._nav_with_edge_pots(
-            {("A", "B"): 0.0, ("B", "C"): 5.0, ("C", "A"): 5.0}
-        )
-        result = nav._score_motif_from_edges(
-            [("A", "B"), ("B", "C"), ("C", "A")], "p"
-        )
+        nav = self._nav_with_edge_pots({("A", "B"): 0.0, ("B", "C"): 5.0, ("C", "A"): 5.0})
+        result = nav._score_motif_from_edges([("A", "B"), ("B", "C"), ("C", "A")], "p")
         # Zero dominates product → score == 0 (before underflow clamp, because
         # zero is semantically distinct from underflow).
         assert result["score"] == 0.0
@@ -207,18 +204,17 @@ class TestMotifScoring:
 
     def test_score_log_score_is_sum_of_logs(self) -> None:
         import math
-        nav = self._nav_with_edge_pots(
-            {("A", "B"): 2.0, ("B", "C"): 3.0, ("C", "A"): 4.0}
-        )
-        result = nav._score_motif_from_edges(
-            [("A", "B"), ("B", "C"), ("C", "A")], "p"
-        )
+
+        nav = self._nav_with_edge_pots({("A", "B"): 2.0, ("B", "C"): 3.0, ("C", "A"): 4.0})
+        result = nav._score_motif_from_edges([("A", "B"), ("B", "C"), ("C", "A")], "p")
         assert result["log_score"] == pytest.approx(math.log(24.0))
         assert result["score_clamped"] is False
 
     def test_score_clamped_on_overflow(self) -> None:
         import math
+
         from hypertopos.navigation.navigator import _MOTIF_SCORE_MAX
+
         pot_map = {("N", f"t{i}"): 10.0 for i in range(500)}
         nav = self._nav_with_edge_pots(pot_map)
         edges = [("N", f"t{i}") for i in range(500)]
@@ -230,22 +226,15 @@ class TestMotifScoring:
         assert result["log_score"] == pytest.approx(500.0 * math.log(10.0))
 
     def test_score_clamped_false_in_normal_range(self) -> None:
-        nav = self._nav_with_edge_pots(
-            {("A", "B"): 2.0, ("B", "C"): 3.0, ("C", "A"): 4.0}
-        )
-        result = nav._score_motif_from_edges(
-            [("A", "B"), ("B", "C"), ("C", "A")], "p"
-        )
+        nav = self._nav_with_edge_pots({("A", "B"): 2.0, ("B", "C"): 3.0, ("C", "A"): 4.0})
+        result = nav._score_motif_from_edges([("A", "B"), ("B", "C"), ("C", "A")], "p")
         assert result["score_clamped"] is False
 
     def test_score_zero_has_negative_inf_log(self) -> None:
         import math
-        nav = self._nav_with_edge_pots(
-            {("A", "B"): 0.0, ("B", "C"): 5.0, ("C", "A"): 5.0}
-        )
-        result = nav._score_motif_from_edges(
-            [("A", "B"), ("B", "C"), ("C", "A")], "p"
-        )
+
+        nav = self._nav_with_edge_pots({("A", "B"): 0.0, ("B", "C"): 5.0, ("C", "A"): 5.0})
+        result = nav._score_motif_from_edges([("A", "B"), ("B", "C"), ("C", "A")], "p")
         assert result["score"] == 0.0
         assert result["log_score"] == -math.inf
         assert result["score_clamped"] is False
@@ -253,7 +242,9 @@ class TestMotifScoring:
     def test_lean_score_exposes_log_score_and_clamp_flag(self) -> None:
         """Adjacency-path scorer mirrors the single-seed scorer return shape."""
         import math
+
         import numpy as np
+
         nav = GDSNavigator(MagicMock(), MagicMock(), MagicMock(), MagicMock())
         # Distinct delta vectors → non-zero distances; pair count=1 → weight 1.0.
         delta_map = {
@@ -263,13 +254,15 @@ class TestMotifScoring:
         }
         pair_counts = {("A", "B"): 1, ("B", "C"): 1}
         sc = nav._lean_score_motif(
-            [("A", "B"), ("B", "C")], delta_map, pair_counts,
+            [("A", "B"), ("B", "C")],
+            delta_map,
+            pair_counts,
         )
         assert sc is not None
         assert "log_score" in sc
         assert "score_clamped" in sc
         # distance(A,B)=2.0, distance(B,C)=sqrt(13); product ≈ 2*sqrt(13).
-        expected_product = 2.0 * (13.0 ** 0.5)
+        expected_product = 2.0 * (13.0**0.5)
         assert sc["score"] == pytest.approx(expected_product)
         assert sc["log_score"] == pytest.approx(math.log(expected_product))
         assert sc["score_clamped"] is False
@@ -294,18 +287,23 @@ class TestMotifScoring:
 
         def _fake_via_adj(seed, adj, window_sec, min_k):
             if seed == "X":
-                return [{
+                return [
+                    {
+                        "motif_type": "fan_out",
+                        "seed": "X",
+                        "k": 3,
+                        "edges": [("X", "t1"), ("X", "t2"), ("X", "t3")],
+                    }
+                ]
+            return [
+                {
                     "motif_type": "fan_out",
-                    "seed": "X",
+                    "seed": "Y",
                     "k": 3,
-                    "edges": [("X", "t1"), ("X", "t2"), ("X", "t3")],
-                }]
-            return [{
-                "motif_type": "fan_out",
-                "seed": "Y",
-                "k": 3,
-                "edges": [("Y", "t1"), ("Y", "t2"), ("Y", "t3")],
-            }]
+                    "edges": [("Y", "t1"), ("Y", "t2"), ("Y", "t3")],
+                }
+            ]
+
         nav._enum_fan_out_via_adj = _fake_via_adj  # type: ignore[assignment]
         nav._batch_read_deltas = MagicMock(return_value={})
 
@@ -325,10 +323,15 @@ class TestMotifScoring:
                 "score_clamped": True,
                 "breakdown": [],
             }
+
         nav._lean_score_motif = _fake_lean  # type: ignore[assignment]
 
         scored = nav._rank_motifs(
-            ["X", "Y"], "tx", "fan_out", window=168, min_k=None,
+            ["X", "Y"],
+            "tx",
+            "fan_out",
+            window=168,
+            min_k=None,
         )
         assert [r["seed"] for r in scored] == ["Y", "X"], (
             "log_score DESC must win over tied raw scores"
@@ -338,14 +341,13 @@ class TestMotifScoring:
 def dataclasses_frozen_error() -> type[Exception]:
     """Dataclass frozen mutation raises FrozenInstanceError at runtime."""
     import dataclasses
+
     return dataclasses.FrozenInstanceError
 
 
 # -----------------------------------------------------------------------------
 # Task 2/3/4: Enumerators (fan_out, cycle_2, cycle_3)
 # -----------------------------------------------------------------------------
-
-import pyarrow as pa
 
 
 def _hour_sec(h: float) -> float:
@@ -365,10 +367,7 @@ def _enum_nav(edges_rows: list[tuple]) -> GDSNavigator:
     from hypertopos.engine.adjacency import AdjacencyIndex
 
     n = len(edges_rows)
-    amounts = [
-        float(r[3]) if len(r) >= 4 else 1.0
-        for r in edges_rows
-    ]
+    amounts = [float(r[3]) if len(r) >= 4 else 1.0 for r in edges_rows]
     adj = AdjacencyIndex.from_edge_lists(
         from_keys=[r[0] for r in edges_rows],
         to_keys=[r[1] for r in edges_rows],
@@ -379,6 +378,7 @@ def _enum_nav(edges_rows: list[tuple]) -> GDSNavigator:
 
     storage = MagicMock()
     storage.get_adjacency = MagicMock(return_value=adj)
+    storage._adjacency_cache = {"tx": adj}  # warm: single-seed calls use it as is
 
     sphere = MagicMock()
     event_pattern = MagicMock()
@@ -393,21 +393,24 @@ def _enum_nav(edges_rows: list[tuple]) -> GDSNavigator:
 
 
 class TestFanOutEnumerator:
-
     def test_fan_out_below_min_k_returns_empty(self) -> None:
-        nav = _enum_nav([
-            ("H", "T1", _hour_sec(0)),
-            ("H", "T2", _hour_sec(10)),
-        ])
+        nav = _enum_nav(
+            [
+                ("H", "T1", _hour_sec(0)),
+                ("H", "T2", _hour_sec(10)),
+            ]
+        )
         result = nav._enumerate_fan_out("H", "tx", time_window_hours=168, min_k=3)
         assert result == []
 
     def test_fan_out_meets_min_k_returns_one_motif(self) -> None:
-        nav = _enum_nav([
-            ("H", "T1", _hour_sec(0)),
-            ("H", "T2", _hour_sec(1)),
-            ("H", "T3", _hour_sec(2)),
-        ])
+        nav = _enum_nav(
+            [
+                ("H", "T1", _hour_sec(0)),
+                ("H", "T2", _hour_sec(1)),
+                ("H", "T3", _hour_sec(2)),
+            ]
+        )
         result = nav._enumerate_fan_out("H", "tx", time_window_hours=168, min_k=3)
         assert len(result) == 1
         assert result[0]["motif_type"] == "fan_out"
@@ -418,24 +421,28 @@ class TestFanOutEnumerator:
 
     def test_fan_out_filters_outside_time_window(self) -> None:
         # Window = 24h. Targets T1,T2 in window, T3 5 days back.
-        nav = _enum_nav([
-            ("H", "T1", _hour_sec(100)),
-            ("H", "T2", _hour_sec(105)),
-            ("H", "T3", _hour_sec(0)),
-        ])
+        nav = _enum_nav(
+            [
+                ("H", "T1", _hour_sec(100)),
+                ("H", "T2", _hour_sec(105)),
+                ("H", "T3", _hour_sec(0)),
+            ]
+        )
         result = nav._enumerate_fan_out("H", "tx", time_window_hours=24, min_k=2)
         assert len(result) == 1
         edges_to = {e[1] for e in result[0]["edges"]}
         assert edges_to == {"T1", "T2"}
 
     def test_fan_out_deduplicates_repeated_tx_to_same_target(self) -> None:
-        nav = _enum_nav([
-            ("H", "T1", _hour_sec(0)),
-            ("H", "T1", _hour_sec(1)),
-            ("H", "T1", _hour_sec(2)),
-            ("H", "T2", _hour_sec(3)),
-            ("H", "T3", _hour_sec(4)),
-        ])
+        nav = _enum_nav(
+            [
+                ("H", "T1", _hour_sec(0)),
+                ("H", "T1", _hour_sec(1)),
+                ("H", "T1", _hour_sec(2)),
+                ("H", "T2", _hour_sec(3)),
+                ("H", "T3", _hour_sec(4)),
+            ]
+        )
         result = nav._enumerate_fan_out("H", "tx", time_window_hours=168, min_k=3)
         assert result[0]["k"] == 3
 
@@ -446,12 +453,14 @@ class TestFanOutEnumerator:
         # never be exceeded by seconds-scale deltas → filter disabled →
         # all four targets would pass.
         max_ts = 1_708_000_000  # Feb 2024, float seconds
-        nav = _enum_nav([
-            ("H", "T1", max_ts),
-            ("H", "T2", max_ts),
-            ("H", "T3", max_ts),
-            ("H", "T4", max_ts - 2 * 3600),
-        ])
+        nav = _enum_nav(
+            [
+                ("H", "T1", max_ts),
+                ("H", "T2", max_ts),
+                ("H", "T3", max_ts),
+                ("H", "T4", max_ts - 2 * 3600),
+            ]
+        )
         result = nav._enumerate_fan_out("H", "tx", time_window_hours=1, min_k=3)
         assert len(result) == 1
         targets = {e[1] for e in result[0]["edges"]}
@@ -462,17 +471,18 @@ class TestFanOutEnumerator:
 
 
 class TestCycle2Enumerator:
-
     def test_cycle_2_requires_both_directions(self) -> None:
         nav = _enum_nav([("A", "B", _hour_sec(0))])
         result = nav._enumerate_cycle_2("A", "tx", time_window_hours=24)
         assert result == []
 
     def test_cycle_2_finds_bidirectional_pair_in_window(self) -> None:
-        nav = _enum_nav([
-            ("A", "B", _hour_sec(0)),
-            ("B", "A", _hour_sec(5)),
-        ])
+        nav = _enum_nav(
+            [
+                ("A", "B", _hour_sec(0)),
+                ("B", "A", _hour_sec(5)),
+            ]
+        )
         result = nav._enumerate_cycle_2("A", "tx", time_window_hours=24)
         assert len(result) == 1
         assert result[0]["motif_type"] == "cycle_2"
@@ -481,10 +491,12 @@ class TestCycle2Enumerator:
         assert set(result[0]["edges"]) == {("A", "B"), ("B", "A")}
 
     def test_cycle_2_time_window_enforced(self) -> None:
-        nav = _enum_nav([
-            ("A", "B", _hour_sec(0)),
-            ("B", "A", _hour_sec(48)),
-        ])
+        nav = _enum_nav(
+            [
+                ("A", "B", _hour_sec(0)),
+                ("B", "A", _hour_sec(48)),
+            ]
+        )
         result = nav._enumerate_cycle_2("A", "tx", time_window_hours=24)
         assert result == []
 
@@ -494,12 +506,19 @@ class TestCycle2Enumerator:
         assert result == []
 
     def test_cycle_2_with_counterparty_filter(self) -> None:
-        nav = _enum_nav([
-            ("A", "B", _hour_sec(0)), ("B", "A", _hour_sec(1)),
-            ("A", "C", _hour_sec(2)), ("C", "A", _hour_sec(3)),
-        ])
+        nav = _enum_nav(
+            [
+                ("A", "B", _hour_sec(0)),
+                ("B", "A", _hour_sec(1)),
+                ("A", "C", _hour_sec(2)),
+                ("C", "A", _hour_sec(3)),
+            ]
+        )
         result = nav._enumerate_cycle_2(
-            "A", "tx", time_window_hours=24, counterparty="C",
+            "A",
+            "tx",
+            time_window_hours=24,
+            counterparty="C",
         )
         assert len(result) == 1
         assert result[0]["counterparty"] == "C"
@@ -508,10 +527,12 @@ class TestCycle2Enumerator:
         # Unit-mismatch regression guard:A→B at max_ts, B→A 2h earlier.
         # time_window_hours=1 → closest_span = 2h > 1h → reject.
         max_ts = 1_708_000_000
-        nav = _enum_nav([
-            ("A", "B", max_ts),
-            ("B", "A", max_ts - 2 * 3600),
-        ])
+        nav = _enum_nav(
+            [
+                ("A", "B", max_ts),
+                ("B", "A", max_ts - 2 * 3600),
+            ]
+        )
         result = nav._enumerate_cycle_2("A", "tx", time_window_hours=1)
         assert result == [], (
             f"Expected 2h pair rejected by 1h window but got {result} — "
@@ -520,13 +541,14 @@ class TestCycle2Enumerator:
 
 
 class TestCycle3Enumerator:
-
     def test_cycle_3_finds_triad_with_temporal_ordering(self) -> None:
-        nav = _enum_nav([
-            ("A", "B", _hour_sec(0)),
-            ("B", "C", _hour_sec(1)),
-            ("C", "A", _hour_sec(2)),
-        ])
+        nav = _enum_nav(
+            [
+                ("A", "B", _hour_sec(0)),
+                ("B", "C", _hour_sec(1)),
+                ("C", "A", _hour_sec(2)),
+            ]
+        )
         result = nav._enumerate_cycle_3("A", "tx", time_window_hours=72)
         assert len(result) == 1
         assert result[0]["motif_type"] == "cycle_3"
@@ -535,30 +557,36 @@ class TestCycle3Enumerator:
 
     def test_cycle_3_rejects_non_monotonic_timestamps(self) -> None:
         # A→B at t=10, B→C at t=5, C→A at t=20 — not strictly increasing.
-        nav = _enum_nav([
-            ("A", "B", _hour_sec(10)),
-            ("B", "C", _hour_sec(5)),
-            ("C", "A", _hour_sec(20)),
-        ])
+        nav = _enum_nav(
+            [
+                ("A", "B", _hour_sec(10)),
+                ("B", "C", _hour_sec(5)),
+                ("C", "A", _hour_sec(20)),
+            ]
+        )
         result = nav._enumerate_cycle_3("A", "tx", time_window_hours=72)
         assert result == []
 
     def test_cycle_3_enforces_window_span(self) -> None:
         # Span = 100h > window 72h.
-        nav = _enum_nav([
-            ("A", "B", _hour_sec(0)),
-            ("B", "C", _hour_sec(50)),
-            ("C", "A", _hour_sec(100)),
-        ])
+        nav = _enum_nav(
+            [
+                ("A", "B", _hour_sec(0)),
+                ("B", "C", _hour_sec(50)),
+                ("C", "A", _hour_sec(100)),
+            ]
+        )
         result = nav._enumerate_cycle_3("A", "tx", time_window_hours=72)
         assert result == []
 
     def test_cycle_3_rejects_self_loop_second_hop(self) -> None:
         # A→B, B→A, A→A would be "cycle" — reject (self-loop at step 3 is not a triad).
-        nav = _enum_nav([
-            ("A", "B", _hour_sec(0)),
-            ("B", "A", _hour_sec(1)),
-        ])
+        nav = _enum_nav(
+            [
+                ("A", "B", _hour_sec(0)),
+                ("B", "A", _hour_sec(1)),
+            ]
+        )
         result = nav._enumerate_cycle_3("A", "tx", time_window_hours=72)
         # This is a cycle_2 pattern, not cycle_3. Should return empty.
         assert result == []
@@ -580,11 +608,13 @@ class TestCycle3Enumerator:
         # Unit-mismatch regression guard:triad spans 30h; time_window_hours=24
         # must reject under correct seconds math (30h > 24h).
         max_ts = 1_708_000_000
-        nav = _enum_nav([
-            ("A", "B", max_ts),
-            ("B", "C", max_ts + 15 * 3600),
-            ("C", "A", max_ts + 30 * 3600),
-        ])
+        nav = _enum_nav(
+            [
+                ("A", "B", max_ts),
+                ("B", "C", max_ts + 15 * 3600),
+                ("C", "A", max_ts + 30 * 3600),
+            ]
+        )
         result = nav._enumerate_cycle_3("A", "tx", time_window_hours=24)
         assert result == [], (
             f"Expected 30h triad rejected by 24h window but got {result} — "
@@ -610,11 +640,9 @@ def _nav_with_mocked_pipeline(
     # amounts honored when provided via `amounts` (keyed by (from_key,
     # to_key)); default 1.0.
     from hypertopos.engine.adjacency import AdjacencyIndex
+
     if edges_rows:
-        edge_amounts = [
-            (amounts.get((r[0], r[1]), 1.0) if amounts else 1.0)
-            for r in edges_rows
-        ]
+        edge_amounts = [(amounts.get((r[0], r[1]), 1.0) if amounts else 1.0) for r in edges_rows]
         adj = AdjacencyIndex.from_edge_lists(
             from_keys=[r[0] for r in edges_rows],
             to_keys=[r[1] for r in edges_rows],
@@ -641,19 +669,18 @@ def _nav_with_mocked_pipeline(
     # but none of the _nav_with_mocked_pipeline tests use triangular edge_pot_maps.
     def _delta_map_from_pot_map(pattern_id: str, version: int, keys: set[str]):  # type: ignore[no-untyped-def]
         import numpy as _np
+
         result: dict = {}
         for (u, v), s_uv in edge_pot_map.items():
             s_vu = edge_pot_map.get((v, u))
-            if s_vu is not None:
-                # bidirectional: distance = 2 * sqrt(s_uv * s_vu)
-                dist = 2.0 * (s_uv * s_vu) ** 0.5
-            else:
-                dist = float(s_uv)
+            # bidirectional: distance = 2 * sqrt(s_uv * s_vu)
+            dist = 2.0 * (s_uv * s_vu) ** 0.5 if s_vu is not None else float(s_uv)
             if u not in result:
                 result[u] = _np.asarray([0.0])
             if v not in result:
                 result[v] = _np.asarray([result[u][0] + dist])
         return {k: result[k] for k in keys if k in result}
+
     nav._batch_read_deltas = _delta_map_from_pot_map  # type: ignore[assignment]
     nav._resolve_version = MagicMock(return_value=1)
 
@@ -661,7 +688,6 @@ def _nav_with_mocked_pipeline(
 
 
 class TestScoreMotifDispatch:
-
     def test_invalid_motif_type_raises_with_valid_values(self) -> None:
         nav = _nav_with_mocked_pipeline([], {})
         with pytest.raises(GDSNavigationError) as exc:
@@ -701,12 +727,16 @@ class TestScoreMotifDispatch:
     def test_score_motif_picks_best_instance_when_multiple(self) -> None:
         nav = _nav_with_mocked_pipeline(
             [
-                ("A", "B", _hour_sec(0)), ("B", "A", _hour_sec(1)),
-                ("A", "C", _hour_sec(2)), ("C", "A", _hour_sec(3)),
+                ("A", "B", _hour_sec(0)),
+                ("B", "A", _hour_sec(1)),
+                ("A", "C", _hour_sec(2)),
+                ("C", "A", _hour_sec(3)),
             ],
             {
-                ("A", "B"): 2.0, ("B", "A"): 3.0,       # score = 6
-                ("A", "C"): 10.0, ("C", "A"): 10.0,     # score = 100
+                ("A", "B"): 2.0,
+                ("B", "A"): 3.0,  # score = 6
+                ("A", "C"): 10.0,
+                ("C", "A"): 10.0,  # score = 100
             },
         )
         result = nav.score_motif("A", motif_type="cycle_2", pattern_id="tx")
@@ -720,8 +750,8 @@ class TestScoreMotifDispatch:
         # Timestamps are float-seconds to match EDGE_TABLE_SCHEMA.
         rows_with_amt = [
             ("A", "B", 0.0, 15000.0),
-            ("B", "C", 720.0, 5000.0),       # 12 min after A→B
-            ("C", "D", 1440.0, 5000.0),      # 24 min after B→C (total 24 min within 1h window)
+            ("B", "C", 720.0, 5000.0),  # 12 min after A→B
+            ("C", "D", 1440.0, 5000.0),  # 24 min after B→C (total 24 min within 1h window)
         ]
 
         nav = _enum_nav(rows_with_amt)
@@ -730,7 +760,9 @@ class TestScoreMotifDispatch:
         nav._batch_read_deltas = MagicMock(side_effect=_uniform_delta_batch(2.0))  # type: ignore[assignment]
 
         result = nav.score_motif(
-            "A", motif_type="structuring", pattern_id="tx",
+            "A",
+            motif_type="structuring",
+            pattern_id="tx",
             time_window_hours=1,
         )
         assert result["found"] is True
@@ -757,27 +789,35 @@ class TestScoreMotifDispatch:
         enumerator. Pre-fix, min_k was hardcoded to the enumerator default 3."""
         # 5 distinct sources — enough for default min_k=3 but not min_k=10.
         # _enumerate_fan_in now delegates to get_adjacency; build real AdjacencyIndex.
-        nav = _enum_nav([
-            ("A", "SINK", 0.0),
-            ("B", "SINK", 0.0),
-            ("C", "SINK", 0.0),
-            ("D", "SINK", 0.0),
-            ("E", "SINK", 0.0),
-        ])
+        nav = _enum_nav(
+            [
+                ("A", "SINK", 0.0),
+                ("B", "SINK", 0.0),
+                ("C", "SINK", 0.0),
+                ("D", "SINK", 0.0),
+                ("E", "SINK", 0.0),
+            ]
+        )
         # _score_motif_from_edges uses _batch_read_deltas; any non-zero distance works.
         nav._batch_read_deltas = MagicMock(side_effect=_uniform_delta_batch(1.0))  # type: ignore[assignment]
 
         # Default: found (5 >= 3).
         result_default = nav.score_motif(
-            "SINK", motif_type="fan_in", pattern_id="tx", time_window_hours=168,
+            "SINK",
+            motif_type="fan_in",
+            pattern_id="tx",
+            time_window_hours=168,
         )
         assert result_default["found"] is True
         assert result_default["k"] == 5
 
         # min_k=10: not found (5 < 10).
         result_strict = nav.score_motif(
-            "SINK", motif_type="fan_in", pattern_id="tx",
-            time_window_hours=168, min_k=10,
+            "SINK",
+            motif_type="fan_in",
+            pattern_id="tx",
+            time_window_hours=168,
+            min_k=10,
         )
         assert result_strict["found"] is False
 
@@ -785,11 +825,17 @@ class TestScoreMotifDispatch:
         nav = GDSNavigator(MagicMock(), MagicMock(), MagicMock(), MagicMock())
         with pytest.raises(GDSNavigationError, match="min_k"):
             nav.score_motif(
-                "SINK", motif_type="fan_in", pattern_id="p", min_k=0,
+                "SINK",
+                motif_type="fan_in",
+                pattern_id="p",
+                min_k=0,
             )
         with pytest.raises(GDSNavigationError, match="min_k"):
             nav.score_motif(
-                "SINK", motif_type="fan_in", pattern_id="p", min_k=-1,
+                "SINK",
+                motif_type="fan_in",
+                pattern_id="p",
+                min_k=-1,
             )
 
     def test_score_motif_min_k_none_matches_default(self) -> None:
@@ -797,15 +843,20 @@ class TestScoreMotifDispatch:
         fan_out/fan_in default to enumerator's min_k=3."""
         # 3 sources — exactly at default threshold.
         # _enumerate_fan_in now delegates to get_adjacency; build real AdjacencyIndex.
-        nav = _enum_nav([
-            ("A", "SINK", 0.0),
-            ("B", "SINK", 0.0),
-            ("C", "SINK", 0.0),
-        ])
+        nav = _enum_nav(
+            [
+                ("A", "SINK", 0.0),
+                ("B", "SINK", 0.0),
+                ("C", "SINK", 0.0),
+            ]
+        )
         # _score_motif_from_edges uses _batch_read_deltas; any non-zero distance works.
         nav._batch_read_deltas = MagicMock(side_effect=_uniform_delta_batch(1.0))  # type: ignore[assignment]
         result = nav.score_motif(
-            "SINK", motif_type="fan_in", pattern_id="tx", time_window_hours=168,
+            "SINK",
+            motif_type="fan_in",
+            pattern_id="tx",
+            time_window_hours=168,
         )
         assert result["found"] is True
         assert result["k"] == 3
@@ -817,16 +868,19 @@ class TestScoreMotifDispatch:
 
 
 class TestFindHighPotentialMotifs:
-
     def test_global_ranking_returns_sorted_desc(self) -> None:
         nav = _nav_with_mocked_pipeline(
             [
-                ("A", "B", _hour_sec(0)), ("B", "A", _hour_sec(1)),
-                ("C", "D", _hour_sec(0)), ("D", "C", _hour_sec(1)),
+                ("A", "B", _hour_sec(0)),
+                ("B", "A", _hour_sec(1)),
+                ("C", "D", _hour_sec(0)),
+                ("D", "C", _hour_sec(1)),
             ],
             {
-                ("A", "B"): 1.0, ("B", "A"): 1.0,   # score = 1
-                ("C", "D"): 5.0, ("D", "C"): 5.0,   # score = 25
+                ("A", "B"): 1.0,
+                ("B", "A"): 1.0,  # score = 1
+                ("C", "D"): 5.0,
+                ("D", "C"): 5.0,  # score = 25
             },
         )
         # Patch geometry read for seed discovery; return all unique from_keys.
@@ -836,7 +890,9 @@ class TestFindHighPotentialMotifs:
         # And resolve_version stub.
         nav._resolve_version = MagicMock(return_value=1)
         result = nav.find_high_potential_motifs(
-            "tx", motif_type="cycle_2", top_n=10,
+            "tx",
+            motif_type="cycle_2",
+            top_n=10,
         )
         assert len(result) >= 2
         scores = [r["score"] for r in result]
@@ -848,9 +904,7 @@ class TestFindHighPotentialMotifs:
             [("A", "B", _hour_sec(0)), ("B", "A", _hour_sec(1))],
             {("A", "B"): 1.0, ("B", "A"): 1.0},
         )
-        nav._storage.read_geometry = MagicMock(
-            return_value=pa.table({"primary_key": ["A", "B"]})
-        )
+        nav._storage.read_geometry = MagicMock(return_value=pa.table({"primary_key": ["A", "B"]}))
         nav._resolve_version = MagicMock(return_value=1)
         nav.find_high_potential_motifs("tx", motif_type="cycle_2")
         # Spy on get_adjacency — a ranking-cache hit skips the body entirely
@@ -869,25 +923,29 @@ class TestFindHighPotentialMotifs:
             [("A", "B", _hour_sec(0)), ("B", "A", _hour_sec(1))],
             {("A", "B"): 1.0, ("B", "A"): 1.0},
         )
-        nav._storage.read_geometry = MagicMock(
-            return_value=pa.table({"primary_key": ["A", "B"]})
-        )
+        nav._storage.read_geometry = MagicMock(return_value=pa.table({"primary_key": ["A", "B"]}))
         nav._resolve_version = MagicMock(return_value=1)
         for window in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
             nav.find_high_potential_motifs(
-                "tx", motif_type="cycle_2", time_window_hours=window,
+                "tx",
+                motif_type="cycle_2",
+                time_window_hours=window,
             )
         assert len(nav._motif_ranking_cache) == 8
 
     def test_ranking_adds_score_rank_pct_and_is_high_potential(self) -> None:
         nav = _nav_with_mocked_pipeline(
             [
-                ("A", "B", _hour_sec(0)), ("B", "A", _hour_sec(1)),
-                ("C", "D", _hour_sec(0)), ("D", "C", _hour_sec(1)),
+                ("A", "B", _hour_sec(0)),
+                ("B", "A", _hour_sec(1)),
+                ("C", "D", _hour_sec(0)),
+                ("D", "C", _hour_sec(1)),
             ],
             {
-                ("A", "B"): 1.0, ("B", "A"): 1.0,
-                ("C", "D"): 5.0, ("D", "C"): 5.0,
+                ("A", "B"): 1.0,
+                ("B", "A"): 1.0,
+                ("C", "D"): 5.0,
+                ("D", "C"): 5.0,
             },
         )
         nav._storage.read_geometry = MagicMock(
@@ -910,9 +968,7 @@ class TestFindHighPotentialMotifs:
             [("A", "B", _hour_sec(0)), ("B", "A", _hour_sec(1))],
             {("A", "B"): 1.0, ("B", "A"): 1.0},
         )
-        nav._storage.read_geometry = MagicMock(
-            return_value=pa.table({"primary_key": ["A", "B"]})
-        )
+        nav._storage.read_geometry = MagicMock(return_value=pa.table({"primary_key": ["A", "B"]}))
         nav._resolve_version = MagicMock(return_value=1)
         result = nav.find_high_potential_motifs("tx", motif_type="cycle_2", top_n=10)
         assert len(result) == 1
@@ -928,9 +984,7 @@ class TestAdjacencyReuseRegression:
             [("A", "B", _hour_sec(0)), ("B", "A", _hour_sec(1))],
             {("A", "B"): 1.0, ("B", "A"): 1.0},
         )
-        nav._storage.read_geometry = MagicMock(
-            return_value=pa.table({"primary_key": ["A", "B"]})
-        )
+        nav._storage.read_geometry = MagicMock(return_value=pa.table({"primary_key": ["A", "B"]}))
         nav._resolve_version = MagicMock(return_value=1)
         nav._storage.read_edges.reset_mock()
         nav.find_high_potential_motifs("tx", motif_type="cycle_2", top_n=10)
@@ -943,18 +997,17 @@ class TestAdjacencyReuseRegression:
             {},
         )
         nav._resolve_version = MagicMock(return_value=1)
-        counts = nav._pair_count_for_pattern("tx", 1)
-        assert counts == {("A", "B"): 2, ("C", "D"): 1}
+        nav._storage._adjacency_cache = {"tx": object()}
+        assert nav._pair_tx_count("tx", "A", "B") == 2
+        assert nav._pair_tx_count("tx", "C", "D") == 1
         assert nav._storage.get_adjacency.call_count >= 1
 
     def test_rank_motifs_inherits_adj_temporal_window(self) -> None:
         # Window = 24h; 10 outgoing edges spread 20h apart.
         # Only edges with ts >= max_ts - 24h survive: T8 (h=160) and T9 (h=180).
         import numpy as _np
-        rows = [
-            ("H", f"T{i}", _hour_sec(float(i * 20)))
-            for i in range(10)
-        ]
+
+        rows = [("H", f"T{i}", _hour_sec(float(i * 20))) for i in range(10)]
         nav = _nav_with_mocked_pipeline(rows, {})
         nav._storage.read_geometry = MagicMock(
             return_value=pa.table({"primary_key": ["H"] + [f"T{i}" for i in range(10)]})
@@ -963,10 +1016,15 @@ class TestAdjacencyReuseRegression:
 
         def _deltas(pattern_id, version, keys):  # type: ignore[no-untyped-def]
             return {k: _np.asarray([0.0, 1.0]) for k in keys}
+
         nav._batch_read_deltas = _deltas  # type: ignore[assignment]
 
         result = nav.find_high_potential_motifs(
-            "tx", motif_type="fan_out", time_window_hours=24, min_k=2, top_n=5,
+            "tx",
+            motif_type="fan_out",
+            time_window_hours=24,
+            min_k=2,
+            top_n=5,
         )
         assert len(result) == 1
         targets = {v for (_u, v) in result[0]["edges"]}
@@ -975,9 +1033,9 @@ class TestAdjacencyReuseRegression:
     def test_rank_motifs_empty_adjacency_returns_empty_without_crash(self) -> None:
         nav = _nav_with_mocked_pipeline([], {})
         nav._storage.read_geometry = MagicMock(
-            return_value=pa.table({"primary_key": []}, schema=pa.schema(
-                [("primary_key", pa.string())]
-            ))
+            return_value=pa.table(
+                {"primary_key": []}, schema=pa.schema([("primary_key", pa.string())])
+            )
         )
         nav._resolve_version = MagicMock(return_value=1)
         result = nav.find_high_potential_motifs("tx", motif_type="cycle_2", top_n=10)
@@ -994,6 +1052,7 @@ class TestStructuringEnumerator:
 
     def _mk_nav(self, amounts, hours=(0.0, 0.2, 0.4), extra_rows=None):
         import numpy as _np
+
         rows = [
             ("A", "B", _hour_sec(hours[0])),
             ("B", "C", _hour_sec(hours[1])),
@@ -1006,15 +1065,20 @@ class TestStructuringEnumerator:
             return_value=pa.table({"primary_key": ["A", "B", "C", "D"]})
         )
         nav._resolve_version = MagicMock(return_value=1)
+
         def _deltas(pattern_id, version, keys):  # type: ignore[no-untyped-def]
             return {k: _np.asarray([0.0, 1.0]) for k in keys}
+
         nav._batch_read_deltas = _deltas  # type: ignore[assignment]
         return nav
 
     def test_structuring_basic_match(self) -> None:
         nav = self._mk_nav({("A", "B"): 15000, ("B", "C"): 5000, ("C", "D"): 5000})
         result = nav.find_high_potential_motifs(
-            "tx", motif_type="structuring", time_window_hours=1, top_n=10,
+            "tx",
+            motif_type="structuring",
+            time_window_hours=1,
+            top_n=10,
         )
         assert len(result) == 1
         assert result[0]["motif_type"] == "structuring"
@@ -1027,7 +1091,10 @@ class TestStructuringEnumerator:
         # hop1 < amt1_min=10000 → no match
         nav = self._mk_nav({("A", "B"): 5000, ("B", "C"): 5000, ("C", "D"): 5000})
         result = nav.find_high_potential_motifs(
-            "tx", motif_type="structuring", time_window_hours=1, top_n=10,
+            "tx",
+            motif_type="structuring",
+            time_window_hours=1,
+            top_n=10,
         )
         assert result == []
 
@@ -1035,7 +1102,10 @@ class TestStructuringEnumerator:
         # hop2 above amt2_max=10000 → no match
         nav = self._mk_nav({("A", "B"): 15000, ("B", "C"): 15000, ("C", "D"): 5000})
         result = nav.find_high_potential_motifs(
-            "tx", motif_type="structuring", time_window_hours=1, top_n=10,
+            "tx",
+            motif_type="structuring",
+            time_window_hours=1,
+            top_n=10,
         )
         assert result == []
 
@@ -1046,7 +1116,10 @@ class TestStructuringEnumerator:
             hours=(0.5, 0.1, 0.4),  # ts_bc=0.1h < ts_ab=0.5h
         )
         result = nav.find_high_potential_motifs(
-            "tx", motif_type="structuring", time_window_hours=1, top_n=10,
+            "tx",
+            motif_type="structuring",
+            time_window_hours=1,
+            top_n=10,
         )
         assert result == []
 
@@ -1057,7 +1130,10 @@ class TestStructuringEnumerator:
             hours=(0.0, 1.5, 3.0),
         )
         result = nav.find_high_potential_motifs(
-            "tx", motif_type="structuring", time_window_hours=1, top_n=10,
+            "tx",
+            motif_type="structuring",
+            time_window_hours=1,
+            top_n=10,
         )
         assert result == []
 
@@ -1065,6 +1141,7 @@ class TestStructuringEnumerator:
         # Two (A,B) edge rows with same endpoints at different ts produce
         # the same canonical path A→B→C→D; dedup keeps 1.
         import numpy as _np
+
         rows = [
             ("A", "B", _hour_sec(0.0)),
             ("A", "B", _hour_sec(0.1)),  # duplicate pair at different ts
@@ -1077,11 +1154,16 @@ class TestStructuringEnumerator:
             return_value=pa.table({"primary_key": ["A", "B", "C", "D"]})
         )
         nav._resolve_version = MagicMock(return_value=1)
+
         def _deltas(pattern_id, version, keys):  # type: ignore[no-untyped-def]
             return {k: _np.asarray([0.0, 1.0]) for k in keys}
+
         nav._batch_read_deltas = _deltas  # type: ignore[assignment]
         result = nav.find_high_potential_motifs(
-            "tx", motif_type="structuring", time_window_hours=1, top_n=10,
+            "tx",
+            motif_type="structuring",
+            time_window_hours=1,
+            top_n=10,
         )
         assert len(result) == 1
 
@@ -1090,21 +1172,28 @@ class TestStructuringEnumerator:
         # With amt1_min=50000 should still match. With amt1_min=100000 should reject.
         nav = self._mk_nav({("A", "B"): 60000, ("B", "C"): 5000, ("C", "D"): 5000})
         with_default = nav.find_high_potential_motifs(
-            "tx", motif_type="structuring", time_window_hours=1, top_n=10,
+            "tx",
+            motif_type="structuring",
+            time_window_hours=1,
+            top_n=10,
         )
         assert len(with_default) == 1
 
         # Fresh nav for re-run to bypass motif ranking LRU cache
         nav2 = self._mk_nav({("A", "B"): 60000, ("B", "C"): 5000, ("C", "D"): 5000})
         with_high_min = nav2.find_high_potential_motifs(
-            "tx", motif_type="structuring", time_window_hours=1,
-            amt1_min=100000.0, top_n=10,
+            "tx",
+            motif_type="structuring",
+            time_window_hours=1,
+            amt1_min=100000.0,
+            top_n=10,
         )
         assert with_high_min == []
 
     def test_structuring_no_self_visits(self) -> None:
         # D = A (loop back to seed) — reject per guard
         import numpy as _np
+
         rows = [
             ("A", "B", _hour_sec(0.0)),
             ("B", "C", _hour_sec(0.2)),
@@ -1116,11 +1205,16 @@ class TestStructuringEnumerator:
             return_value=pa.table({"primary_key": ["A", "B", "C"]})
         )
         nav._resolve_version = MagicMock(return_value=1)
+
         def _deltas(pattern_id, version, keys):  # type: ignore[no-untyped-def]
             return {k: _np.asarray([0.0, 1.0]) for k in keys}
+
         nav._batch_read_deltas = _deltas  # type: ignore[assignment]
         result = nav.find_high_potential_motifs(
-            "tx", motif_type="structuring", time_window_hours=1, top_n=10,
+            "tx",
+            motif_type="structuring",
+            time_window_hours=1,
+            top_n=10,
         )
         assert result == []
 
@@ -1131,6 +1225,7 @@ class TestStructuringEnumerator:
         #   (b) treat None as 0.0 and falsely pass `<= amt2_max`.
         # Only the valid non-null path should survive.
         import numpy as _np
+
         from hypertopos.engine.adjacency import AdjacencyIndex
 
         rows = [
@@ -1153,14 +1248,19 @@ class TestStructuringEnumerator:
             return_value=pa.table({"primary_key": ["A", "B", "C", "D"]})
         )
         nav._resolve_version = MagicMock(return_value=1)
+
         def _deltas(pattern_id, version, keys):  # type: ignore[no-untyped-def]
             return {k: _np.asarray([0.0, 1.0]) for k in keys}
+
         nav._batch_read_deltas = _deltas  # type: ignore[assignment]
 
         # Should not crash. Should return 0 matches because the B→C hop
         # is NULL-amount and gets skipped, breaking the chain.
         result = nav.find_high_potential_motifs(
-            "tx", motif_type="structuring", time_window_hours=1, top_n=10,
+            "tx",
+            motif_type="structuring",
+            time_window_hours=1,
+            top_n=10,
         )
         assert result == []
 
@@ -1169,33 +1269,41 @@ class TestStructuringEnumerator:
         nav = self._mk_nav({("A", "B"): 15000, ("B", "C"): 5000, ("C", "D"): 5000})
         with pytest.raises(GDSNavigationError):
             nav.find_high_potential_motifs(
-                "tx", motif_type="structuring", time_window_hours=1,
-                amt1_min=0.0, top_n=10,
+                "tx",
+                motif_type="structuring",
+                time_window_hours=1,
+                amt1_min=0.0,
+                top_n=10,
             )
         with pytest.raises(GDSNavigationError):
             nav.find_high_potential_motifs(
-                "tx", motif_type="structuring", time_window_hours=1,
-                amt2_max=-100.0, top_n=10,
+                "tx",
+                motif_type="structuring",
+                time_window_hours=1,
+                amt2_max=-100.0,
+                top_n=10,
             )
 
     def test_structuring_rejects_nonpositive_hop_amounts(self) -> None:
         # Refund/reversal amount (≤ 0) on hop 2 must be rejected even though
         # it would otherwise satisfy "≤ amt2_max". Structuring is a positive
         # money flow by definition.
-        nav = self._mk_nav(
-            {("A", "B"): 15000, ("B", "C"): -500, ("C", "D"): 5000}
-        )
+        nav = self._mk_nav({("A", "B"): 15000, ("B", "C"): -500, ("C", "D"): 5000})
         result = nav.find_high_potential_motifs(
-            "tx", motif_type="structuring", time_window_hours=1, top_n=10,
+            "tx",
+            motif_type="structuring",
+            time_window_hours=1,
+            top_n=10,
         )
         assert result == []
 
         # Same for zero-amount hop 3.
-        nav2 = self._mk_nav(
-            {("A", "B"): 15000, ("B", "C"): 5000, ("C", "D"): 0}
-        )
+        nav2 = self._mk_nav({("A", "B"): 15000, ("B", "C"): 5000, ("C", "D"): 0})
         result2 = nav2.find_high_potential_motifs(
-            "tx", motif_type="structuring", time_window_hours=1, top_n=10,
+            "tx",
+            motif_type="structuring",
+            time_window_hours=1,
+            top_n=10,
         )
         assert result2 == []
 
@@ -1208,6 +1316,7 @@ class TestFanInEnumerator:
         for the given (from_key, timestamp) rows, all pointing at 'SINK'.
         """
         from hypertopos.engine.adjacency import AdjacencyIndex
+
         n = len(to_key_rows)
         adj = AdjacencyIndex.from_edge_lists(
             from_keys=[r[0] for r in to_key_rows],
@@ -1241,12 +1350,14 @@ class TestFanInEnumerator:
         one_hour_sec = 3600
         eight_day_sec = 8 * 24 * 3600
         max_ts = 10 * eight_day_sec
-        nav = self._nav_with_edges([
-            ("A", max_ts),
-            ("B", max_ts),
-            ("C", max_ts),
-            ("D", max_ts - eight_day_sec - one_hour_sec),
-        ])
+        nav = self._nav_with_edges(
+            [
+                ("A", max_ts),
+                ("B", max_ts),
+                ("C", max_ts),
+                ("D", max_ts - eight_day_sec - one_hour_sec),
+            ]
+        )
         result = nav._enumerate_fan_in("SINK", "p", time_window_hours=168, min_k=3)
         assert len(result) == 1
         sources = {e[0] for e in result[0]["edges"]}
@@ -1261,18 +1372,19 @@ class TestFanInEnumerator:
         # catches the bug: D is 2h behind max_ts, so under correct seconds
         # math D is excluded; under broken µs math D would remain.
         max_ts = 1_708_000_000  # arbitrary epoch seconds (Feb 2024)
-        nav = self._nav_with_edges([
-            ("A", max_ts),
-            ("B", max_ts),
-            ("C", max_ts),
-            ("D", max_ts - 2 * 3600),
-        ])
+        nav = self._nav_with_edges(
+            [
+                ("A", max_ts),
+                ("B", max_ts),
+                ("C", max_ts),
+                ("D", max_ts - 2 * 3600),
+            ]
+        )
         result = nav._enumerate_fan_in("SINK", "p", time_window_hours=1, min_k=3)
         assert len(result) == 1
         sources = {e[0] for e in result[0]["edges"]}
         assert sources == {"A", "B", "C"}, (
-            f"Expected D excluded by 1h window but got {sources} — "
-            "unit mismatch regression?"
+            f"Expected D excluded by 1h window but got {sources} — unit mismatch regression?"
         )
 
     def test_fan_in_deduplicates_repeated_tx_from_same_source(self):
@@ -1297,6 +1409,7 @@ class TestFanInViaAdj:
 
     def _adj(self, edges: list[tuple[str, str, float, float, str]]):
         from hypertopos.engine.adjacency import AdjacencyIndex
+
         return AdjacencyIndex.from_edge_lists(
             from_keys=[e[0] for e in edges],
             to_keys=[e[1] for e in edges],
@@ -1306,11 +1419,13 @@ class TestFanInViaAdj:
         )
 
     def test_enum_fan_in_via_adj_returns_one_motif(self):
-        adj = self._adj([
-            ("A", "SINK", 0.0, 1.0, "e1"),
-            ("B", "SINK", 0.0, 1.0, "e2"),
-            ("C", "SINK", 0.0, 1.0, "e3"),
-        ])
+        adj = self._adj(
+            [
+                ("A", "SINK", 0.0, 1.0, "e1"),
+                ("B", "SINK", 0.0, 1.0, "e2"),
+                ("C", "SINK", 0.0, 1.0, "e3"),
+            ]
+        )
         res = GDSNavigator._enum_fan_in_via_adj("SINK", adj, 168 * 3600.0, min_k=3)
         assert len(res) == 1
         assert res[0]["motif_type"] == "fan_in"
@@ -1319,33 +1434,39 @@ class TestFanInViaAdj:
         assert sorted(res[0]["edges"]) == [("A", "SINK"), ("B", "SINK"), ("C", "SINK")]
 
     def test_enum_fan_in_via_adj_below_min_k(self):
-        adj = self._adj([
-            ("A", "SINK", 0.0, 1.0, "e1"),
-            ("B", "SINK", 0.0, 1.0, "e2"),
-        ])
+        adj = self._adj(
+            [
+                ("A", "SINK", 0.0, 1.0, "e1"),
+                ("B", "SINK", 0.0, 1.0, "e2"),
+            ]
+        )
         res = GDSNavigator._enum_fan_in_via_adj("SINK", adj, 168 * 3600.0, min_k=3)
         assert res == []
 
     def test_enum_fan_in_via_adj_temporal_window(self):
         # Three sources recent, one old — window filters the old one
         one_week = 168 * 3600.0
-        adj = self._adj([
-            ("A", "SINK", 100.0, 1.0, "e1"),
-            ("B", "SINK", 100.0, 1.0, "e2"),
-            ("C", "SINK", 100.0, 1.0, "e3"),
-            ("D", "SINK", 100.0 - one_week - 3600.0, 1.0, "e4"),
-        ])
+        adj = self._adj(
+            [
+                ("A", "SINK", 100.0, 1.0, "e1"),
+                ("B", "SINK", 100.0, 1.0, "e2"),
+                ("C", "SINK", 100.0, 1.0, "e3"),
+                ("D", "SINK", 100.0 - one_week - 3600.0, 1.0, "e4"),
+            ]
+        )
         res = GDSNavigator._enum_fan_in_via_adj("SINK", adj, one_week, min_k=3)
         assert len(res) == 1
         assert res[0]["k"] == 3
 
     def test_enum_fan_in_via_adj_skips_self_loop(self):
-        adj = self._adj([
-            ("SINK", "SINK", 0.0, 1.0, "e0"),  # self-loop must be skipped
-            ("A", "SINK", 0.0, 1.0, "e1"),
-            ("B", "SINK", 0.0, 1.0, "e2"),
-            ("C", "SINK", 0.0, 1.0, "e3"),
-        ])
+        adj = self._adj(
+            [
+                ("SINK", "SINK", 0.0, 1.0, "e0"),  # self-loop must be skipped
+                ("A", "SINK", 0.0, 1.0, "e1"),
+                ("B", "SINK", 0.0, 1.0, "e2"),
+                ("C", "SINK", 0.0, 1.0, "e3"),
+            ]
+        )
         res = GDSNavigator._enum_fan_in_via_adj("SINK", adj, 168 * 3600.0, min_k=3)
         assert len(res) == 1
         sources = {e[0] for e in res[0]["edges"]}
@@ -1357,6 +1478,7 @@ class TestFanInActiveSeedsFilter:
 
     def _adj(self, edges):
         from hypertopos.engine.adjacency import AdjacencyIndex
+
         return AdjacencyIndex.from_edge_lists(
             from_keys=[e[0] for e in edges],
             to_keys=[e[1] for e in edges],
@@ -1366,16 +1488,21 @@ class TestFanInActiveSeedsFilter:
         )
 
     def test_active_seeds_fan_in_filters_low_in_degree(self):
-        adj = self._adj([
-            ("A", "S1", 0.0, 1.0, "e1"),
-            ("B", "S1", 0.0, 1.0, "e2"),
-            ("C", "S1", 0.0, 1.0, "e3"),
-            ("A", "S2", 0.0, 1.0, "e4"),
-            ("B", "S2", 0.0, 1.0, "e5"),
-            # S2 has in-degree 2 (below min_k=3); S1 has 3 distinct sources
-        ])
+        adj = self._adj(
+            [
+                ("A", "S1", 0.0, 1.0, "e1"),
+                ("B", "S1", 0.0, 1.0, "e2"),
+                ("C", "S1", 0.0, 1.0, "e3"),
+                ("A", "S2", 0.0, 1.0, "e4"),
+                ("B", "S2", 0.0, 1.0, "e5"),
+                # S2 has in-degree 2 (below min_k=3); S1 has 3 distinct sources
+            ]
+        )
         seeds = GDSNavigator._active_seeds_for_motif(
-            adj, all_seeds=["S1", "S2"], motif_type="fan_in", effective_min_k=3,
+            adj,
+            all_seeds=["S1", "S2"],
+            motif_type="fan_in",
+            effective_min_k=3,
         )
         assert set(seeds) == {"S1"}
 
@@ -1386,11 +1513,13 @@ class TestFanInEndToEnd:
     def test_score_motif_fan_in_smoke(self, monkeypatch):
         """score_motif(motif_type='fan_in') composes edge_potential product."""
         # _enumerate_fan_in delegates to get_adjacency; build real AdjacencyIndex.
-        nav = _enum_nav([
-            ("A", "SINK", 0.0),
-            ("B", "SINK", 0.0),
-            ("C", "SINK", 0.0),
-        ])
+        nav = _enum_nav(
+            [
+                ("A", "SINK", 0.0),
+                ("B", "SINK", 0.0),
+                ("C", "SINK", 0.0),
+            ]
+        )
         # _score_motif_from_edges uses _batch_read_deltas + _lean_score_motif.
         # Uniform distance 2.0 → 3 edges × 2.0 = 8.0 (all unidirectional, effective=1).
         nav._batch_read_deltas = MagicMock(side_effect=_uniform_delta_batch(2.0))  # type: ignore[assignment]
@@ -1411,11 +1540,12 @@ class TestChainKEnumerator:
         constructed from the given edges_by_from map.
         """
         from hypertopos.engine.adjacency import AdjacencyIndex
+
         from_keys: list[str] = []
         to_keys: list[str] = []
         timestamps: list[float] = []
         for fk, targets in edges_by_from.items():
-            for (tk, ts) in targets:
+            for tk, ts in targets:
                 from_keys.append(fk)
                 to_keys.append(tk)
                 timestamps.append(float(ts))
@@ -1434,11 +1564,13 @@ class TestChainKEnumerator:
 
     def test_chain_k_k4_returns_one_open_chain(self):
         # A → B → C → D, monotone, within window. k=4 → 3 edges.
-        nav = self._nav_with_edges_by_from({
-            "A": [("B", 100.0)],
-            "B": [("C", 200.0)],
-            "C": [("D", 300.0)],
-        })
+        nav = self._nav_with_edges_by_from(
+            {
+                "A": [("B", 100.0)],
+                "B": [("C", 200.0)],
+                "C": [("D", 300.0)],
+            }
+        )
         res = nav._enumerate_chain_k("A", "p", time_window_hours=168, k=4)
         assert len(res) == 1
         assert res[0]["motif_type"] == "chain_k"
@@ -1448,51 +1580,61 @@ class TestChainKEnumerator:
 
     def test_chain_k_rejects_cycle_closure(self):
         # A → B → C → A (cycle, not open chain) — must not emit chain_k
-        nav = self._nav_with_edges_by_from({
-            "A": [("B", 100.0)],
-            "B": [("C", 200.0)],
-            "C": [("A", 300.0)],  # closes back to seed
-        })
+        nav = self._nav_with_edges_by_from(
+            {
+                "A": [("B", 100.0)],
+                "B": [("C", 200.0)],
+                "C": [("A", 300.0)],  # closes back to seed
+            }
+        )
         res = nav._enumerate_chain_k("A", "p", time_window_hours=168, k=4)
         assert res == []
 
     def test_chain_k_rejects_revisit(self):
         # A → B → A → D attempted — A revisited in middle, reject
-        nav = self._nav_with_edges_by_from({
-            "A": [("B", 100.0)],
-            "B": [("A", 200.0)],
-            # If revisit allowed, A at step 2 could extend to D; we disallow.
-        })
+        nav = self._nav_with_edges_by_from(
+            {
+                "A": [("B", 100.0)],
+                "B": [("A", 200.0)],
+                # If revisit allowed, A at step 2 could extend to D; we disallow.
+            }
+        )
         res = nav._enumerate_chain_k("A", "p", time_window_hours=168, k=3)
         assert res == []
 
     def test_chain_k_rejects_non_monotone_timestamps(self):
-        nav = self._nav_with_edges_by_from({
-            "A": [("B", 300.0)],
-            "B": [("C", 200.0)],  # earlier than AB — reject
-            "C": [("D", 400.0)],
-        })
+        nav = self._nav_with_edges_by_from(
+            {
+                "A": [("B", 300.0)],
+                "B": [("C", 200.0)],  # earlier than AB — reject
+                "C": [("D", 400.0)],
+            }
+        )
         res = nav._enumerate_chain_k("A", "p", time_window_hours=168, k=4)
         assert res == []
 
     def test_chain_k_enforces_window_span(self):
         # Timestamps are epoch seconds per EDGE_TABLE_SCHEMA (timestamp: pa.float64).
         # AB=0s, BC=1h, CD=200h → span 200h > 168h window, reject.
-        nav = self._nav_with_edges_by_from({
-            "A": [("B", 0.0)],
-            "B": [("C", 3600.0)],
-            "C": [("D", 200.0 * 3600.0)],
-        })
+        nav = self._nav_with_edges_by_from(
+            {
+                "A": [("B", 0.0)],
+                "B": [("C", 3600.0)],
+                "C": [("D", 200.0 * 3600.0)],
+            }
+        )
         res = nav._enumerate_chain_k("A", "p", time_window_hours=168, k=4)
         assert res == []
 
     def test_chain_k_k3_open_chain(self):
         # k=3 is the minimum. Open chain A→B→C must NOT close to A.
-        nav = self._nav_with_edges_by_from({
-            "A": [("B", 100.0)],
-            "B": [("C", 200.0)],
-            # C has no outgoing edge back to A
-        })
+        nav = self._nav_with_edges_by_from(
+            {
+                "A": [("B", 100.0)],
+                "B": [("C", 200.0)],
+                # C has no outgoing edge back to A
+            }
+        )
         res = nav._enumerate_chain_k("A", "p", time_window_hours=168, k=3)
         assert len(res) == 1
         assert res[0]["path"] == ["A", "B", "C"]
@@ -1500,13 +1642,15 @@ class TestChainKEnumerator:
     def test_chain_k_multiple_branches_dedupe_by_path(self):
         # A→B, A→B' (two first-hops); each has a valid chain. Distinct paths
         # should each emit an instance (path tuple is canonical).
-        nav = self._nav_with_edges_by_from({
-            "A": [("B", 100.0), ("B2", 100.0)],
-            "B": [("C", 200.0)],
-            "B2": [("C2", 200.0)],
-            "C": [("D", 300.0)],
-            "C2": [("D2", 300.0)],
-        })
+        nav = self._nav_with_edges_by_from(
+            {
+                "A": [("B", 100.0), ("B2", 100.0)],
+                "B": [("C", 200.0)],
+                "B2": [("C2", 200.0)],
+                "C": [("D", 300.0)],
+                "C2": [("D2", 300.0)],
+            }
+        )
         res = nav._enumerate_chain_k("A", "p", time_window_hours=168, k=4)
         paths = {tuple(r["path"]) for r in res}
         assert paths == {("A", "B", "C", "D"), ("A", "B2", "C2", "D2")}
@@ -1524,7 +1668,9 @@ class TestChainKEnumerator:
         # _enumerate_chain_k picks up the override regardless of which path
         # resolves the cap.
         monkeypatch.setattr(GDSNavigator, "_CHAIN_K_MAX_FRONTIER", 5)
-        monkeypatch.setattr(GDSNavigator, "_CHAIN_K_MAX_FRONTIER_PER_K", {3: 5, 4: 5, 5: 5, 6: 5, 7: 5, 8: 5})
+        monkeypatch.setattr(
+            GDSNavigator, "_CHAIN_K_MAX_FRONTIER_PER_K", {3: 5, 4: 5, 5: 5, 6: 5, 7: 5, 8: 5}
+        )
         edges_by_from: dict[str, list[tuple[str, float]]] = {
             "A": [(f"B{i}", 100.0 + i) for i in range(6)],
         }
@@ -1535,16 +1681,17 @@ class TestChainKEnumerator:
         res = nav._enumerate_chain_k("A", "p", time_window_hours=168, k=4)
         assert res, "expected at least one chain"
         assert all(r["frontier_truncated"] is True for r in res), (
-            f"expected every result truncated; got flags "
-            f"{[r['frontier_truncated'] for r in res]}"
+            f"expected every result truncated; got flags {[r['frontier_truncated'] for r in res]}"
         )
 
     def test_chain_k_frontier_not_truncated_on_sparse_graph(self):
-        nav = self._nav_with_edges_by_from({
-            "A": [("B", 100.0)],
-            "B": [("C", 200.0)],
-            "C": [("D", 300.0)],
-        })
+        nav = self._nav_with_edges_by_from(
+            {
+                "A": [("B", 100.0)],
+                "B": [("C", 200.0)],
+                "C": [("D", 300.0)],
+            }
+        )
         res = nav._enumerate_chain_k("A", "p", time_window_hours=168, k=4)
         assert len(res) == 1
         assert res[0]["frontier_truncated"] is False
@@ -1555,15 +1702,16 @@ class TestChainKEnumerator:
         # epoch-seconds timestamps produce sub-second deltas that never
         # exceed the µs-scaled window threshold, silently disabling the
         # filter. A 2h chain span on a 1h window catches it.
-        nav = self._nav_with_edges_by_from({
-            "A": [("B", 0.0)],
-            "B": [("C", 3600.0)],          # AB+1h, within any window
-            "C": [("D", 2.0 * 3600.0)],    # AD span = 2h > 1h window → reject
-        })
+        nav = self._nav_with_edges_by_from(
+            {
+                "A": [("B", 0.0)],
+                "B": [("C", 3600.0)],  # AB+1h, within any window
+                "C": [("D", 2.0 * 3600.0)],  # AD span = 2h > 1h window → reject
+            }
+        )
         res = nav._enumerate_chain_k("A", "p", time_window_hours=1, k=4)
         assert res == [], (
-            f"Expected 2h span rejected by 1h window but got {res} — "
-            "unit mismatch regression?"
+            f"Expected 2h span rejected by 1h window but got {res} — unit mismatch regression?"
         )
 
 
@@ -1572,6 +1720,7 @@ class TestChainKViaAdj:
 
     def _adj(self, edges):
         from hypertopos.engine.adjacency import AdjacencyIndex
+
         return AdjacencyIndex.from_edge_lists(
             from_keys=[e[0] for e in edges],
             to_keys=[e[1] for e in edges],
@@ -1581,44 +1730,52 @@ class TestChainKViaAdj:
         )
 
     def test_chain_k4_via_adj_linear(self):
-        adj = self._adj([
-            ("A", "B", 100.0, 1.0, "e1"),
-            ("B", "C", 200.0, 1.0, "e2"),
-            ("C", "D", 300.0, 1.0, "e3"),
-        ])
+        adj = self._adj(
+            [
+                ("A", "B", 100.0, 1.0, "e1"),
+                ("B", "C", 200.0, 1.0, "e2"),
+                ("C", "D", 300.0, 1.0, "e3"),
+            ]
+        )
         res = GDSNavigator._enum_chain_k_via_adj("A", adj, 168 * 3600.0, k=4)
         assert len(res) == 1
         assert res[0]["path"] == ["A", "B", "C", "D"]
         assert res[0]["edges"] == [("A", "B"), ("B", "C"), ("C", "D")]
 
     def test_chain_k_via_adj_rejects_cycle_closure(self):
-        adj = self._adj([
-            ("A", "B", 100.0, 1.0, "e1"),
-            ("B", "C", 200.0, 1.0, "e2"),
-            ("C", "A", 300.0, 1.0, "e3"),
-        ])
+        adj = self._adj(
+            [
+                ("A", "B", 100.0, 1.0, "e1"),
+                ("B", "C", 200.0, 1.0, "e2"),
+                ("C", "A", 300.0, 1.0, "e3"),
+            ]
+        )
         res = GDSNavigator._enum_chain_k_via_adj("A", adj, 168 * 3600.0, k=4)
         # cycle_3 territory, not chain_k — must be empty
         assert res == []
 
     def test_chain_k_via_adj_window_enforced(self):
-        adj = self._adj([
-            ("A", "B", 0.0, 1.0, "e1"),
-            ("B", "C", 3600.0, 1.0, "e2"),
-            ("C", "D", 200.0 * 3600.0, 1.0, "e3"),  # 200h > 168h window
-        ])
+        adj = self._adj(
+            [
+                ("A", "B", 0.0, 1.0, "e1"),
+                ("B", "C", 3600.0, 1.0, "e2"),
+                ("C", "D", 200.0 * 3600.0, 1.0, "e3"),  # 200h > 168h window
+            ]
+        )
         res = GDSNavigator._enum_chain_k_via_adj("A", adj, 168 * 3600.0, k=4)
         assert res == []
 
     def test_chain_k_via_adj_multiple_branches(self):
-        adj = self._adj([
-            ("A", "B", 100.0, 1.0, "e1"),
-            ("A", "B2", 100.0, 1.0, "e2"),
-            ("B", "C", 200.0, 1.0, "e3"),
-            ("B2", "C2", 200.0, 1.0, "e4"),
-            ("C", "D", 300.0, 1.0, "e5"),
-            ("C2", "D2", 300.0, 1.0, "e6"),
-        ])
+        adj = self._adj(
+            [
+                ("A", "B", 100.0, 1.0, "e1"),
+                ("A", "B2", 100.0, 1.0, "e2"),
+                ("B", "C", 200.0, 1.0, "e3"),
+                ("B2", "C2", 200.0, 1.0, "e4"),
+                ("C", "D", 300.0, 1.0, "e5"),
+                ("C2", "D2", 300.0, 1.0, "e6"),
+            ]
+        )
         res = GDSNavigator._enum_chain_k_via_adj("A", adj, 168 * 3600.0, k=4)
         paths = {tuple(r["path"]) for r in res}
         assert paths == {("A", "B", "C", "D"), ("A", "B2", "C2", "D2")}
@@ -1631,19 +1788,29 @@ class TestChainKViaAdj:
             edges.append((f"C{i}", f"D{i}", 300.0 + i, 1.0, f"e_cd{i}"))
         adj = self._adj(edges)
         res = GDSNavigator._enum_chain_k_via_adj(
-            "A", adj, 168 * 3600.0, k=4, max_frontier=5,
+            "A",
+            adj,
+            168 * 3600.0,
+            k=4,
+            max_frontier=5,
         )
         assert res, "expected at least one chain"
         assert all(r["frontier_truncated"] is True for r in res)
 
     def test_chain_k_via_adj_frontier_not_truncated(self):
-        adj = self._adj([
-            ("A", "B", 100.0, 1.0, "e1"),
-            ("B", "C", 200.0, 1.0, "e2"),
-            ("C", "D", 300.0, 1.0, "e3"),
-        ])
+        adj = self._adj(
+            [
+                ("A", "B", 100.0, 1.0, "e1"),
+                ("B", "C", 200.0, 1.0, "e2"),
+                ("C", "D", 300.0, 1.0, "e3"),
+            ]
+        )
         res = GDSNavigator._enum_chain_k_via_adj(
-            "A", adj, 168 * 3600.0, k=4, max_frontier=1000,
+            "A",
+            adj,
+            168 * 3600.0,
+            k=4,
+            max_frontier=1000,
         )
         assert len(res) == 1
         assert res[0]["frontier_truncated"] is False
@@ -1654,6 +1821,7 @@ class TestChainKActiveSeeds:
 
     def _adj(self, edges):
         from hypertopos.engine.adjacency import AdjacencyIndex
+
         return AdjacencyIndex.from_edge_lists(
             from_keys=[e[0] for e in edges],
             to_keys=[e[1] for e in edges],
@@ -1663,12 +1831,17 @@ class TestChainKActiveSeeds:
         )
 
     def test_active_seeds_chain_k_filters_isolated(self):
-        adj = self._adj([
-            ("A", "B", 0.0, 1.0, "e1"),
-        ])
+        adj = self._adj(
+            [
+                ("A", "B", 0.0, 1.0, "e1"),
+            ]
+        )
         # X is in all_seeds but has no outgoing edge
         seeds = GDSNavigator._active_seeds_for_motif(
-            adj, all_seeds=["A", "X"], motif_type="chain_k", effective_min_k=3,
+            adj,
+            all_seeds=["A", "X"],
+            motif_type="chain_k",
+            effective_min_k=3,
         )
         assert set(seeds) == {"A"}
 
@@ -1678,11 +1851,13 @@ class TestChainKPublicAPI:
 
     def test_score_motif_chain_k_default_k4(self, monkeypatch):
         # _enumerate_chain_k delegates to get_adjacency; build real AdjacencyIndex.
-        nav = _enum_nav([
-            ("A", "B", 100.0),
-            ("B", "C", 200.0),
-            ("C", "D", 300.0),
-        ])
+        nav = _enum_nav(
+            [
+                ("A", "B", 100.0),
+                ("B", "C", 200.0),
+                ("C", "D", 300.0),
+            ]
+        )
         # _score_motif_from_edges uses _batch_read_deltas + _lean_score_motif.
         # Chain A→B→C→D: 3 unidirectional edges × dist 2.0 = 8.0.
         nav._batch_read_deltas = MagicMock(side_effect=_uniform_delta_batch(2.0))  # type: ignore[assignment]
@@ -1695,10 +1870,12 @@ class TestChainKPublicAPI:
 
     def test_score_motif_chain_k_custom_k(self):
         # k=3 → 2 edges, score = 3.0 * 3.0 = 9
-        nav = _enum_nav([
-            ("A", "B", 100.0),
-            ("B", "C", 200.0),
-        ])
+        nav = _enum_nav(
+            [
+                ("A", "B", 100.0),
+                ("B", "C", 200.0),
+            ]
+        )
         # 2 unidirectional edges × dist 3.0 = 9.0.
         nav._batch_read_deltas = MagicMock(side_effect=_uniform_delta_batch(3.0))  # type: ignore[assignment]
         res = nav.score_motif("A", "chain_k", "tx", k=3, time_window_hours=168)
@@ -1716,6 +1893,7 @@ class TestChainKPublicAPI:
     def test_find_high_potential_motifs_chain_k_cache_key_includes_k(self):
         """Different k values must produce separate cache entries."""
         import pyarrow as pa
+
         nav = GDSNavigator(MagicMock(), MagicMock(), MagicMock(), MagicMock())
         nav._resolve_motif_graph_pid = MagicMock(return_value="p")
         nav._resolve_version = MagicMock(return_value=1)
@@ -1749,6 +1927,7 @@ class TestSplitRecombineEnumerator:
         exercise the same code as production ranking.
         """
         from hypertopos.engine.adjacency import AdjacencyIndex
+
         edges_by_from = edges_by_from or {}
         edges_by_to = edges_by_to or {}
         nav = GDSNavigator(MagicMock(), MagicMock(), MagicMock(), MagicMock())
@@ -1759,7 +1938,7 @@ class TestSplitRecombineEnumerator:
         to_keys: list[str] = []
         timestamps: list[float] = []
         for fk, items in edges_by_from.items():
-            for (tk, ts) in items:
+            for tk, ts in items:
                 key = (fk, tk, float(ts))
                 if key in seen:
                     continue
@@ -1768,7 +1947,7 @@ class TestSplitRecombineEnumerator:
                 to_keys.append(tk)
                 timestamps.append(float(ts))
         for tk, items in edges_by_to.items():
-            for (fk, ts) in items:
+            for fk, ts in items:
                 key = (fk, tk, float(ts))
                 if key in seen:
                     continue
@@ -1806,10 +1985,16 @@ class TestSplitRecombineEnumerator:
         assert m["sink"] == "D"
         assert m["k"] == 3
         assert sorted(m["intermediaries"]) == ["M1", "M2", "M3"]
-        assert sorted(m["edges"]) == sorted([
-            ("S", "M1"), ("S", "M2"), ("S", "M3"),
-            ("M1", "D"), ("M2", "D"), ("M3", "D"),
-        ])
+        assert sorted(m["edges"]) == sorted(
+            [
+                ("S", "M1"),
+                ("S", "M2"),
+                ("S", "M3"),
+                ("M1", "D"),
+                ("M2", "D"),
+                ("M3", "D"),
+            ]
+        )
 
     def test_forward_below_min_k_returns_empty(self):
         edges_by_from = {
@@ -1885,7 +2070,11 @@ class TestSplitRecombineEnumerator:
         }
         nav = self._nav_with_adj(edges_by_to=edges_by_to)
         result = nav._enumerate_split_recombine(
-            "D", "p", time_window_hours=168, min_k=3, direction="backward",
+            "D",
+            "p",
+            time_window_hours=168,
+            min_k=3,
+            direction="backward",
         )
         assert len(result) == 1
         m = result[0]
@@ -1900,7 +2089,11 @@ class TestSplitRecombineEnumerator:
         nav = self._nav_with_adj()
         with pytest.raises(GDSNavigationError, match="direction"):
             nav._enumerate_split_recombine(
-                "S", "p", time_window_hours=24, min_k=3, direction="sideways",
+                "S",
+                "p",
+                time_window_hours=24,
+                min_k=3,
+                direction="sideways",
             )
 
     def test_min_k_below_two_raises(self):
@@ -1914,6 +2107,7 @@ class TestSplitRecombineViaAdj:
 
     def _adj(self, edges: list[tuple[str, str, float, float, str]]):
         from hypertopos.engine.adjacency import AdjacencyIndex
+
         return AdjacencyIndex.from_edge_lists(
             from_keys=[e[0] for e in edges],
             to_keys=[e[1] for e in edges],
@@ -1924,16 +2118,22 @@ class TestSplitRecombineViaAdj:
 
     def test_via_adj_forward_diamond_returns_one_motif(self):
         """S → {M1,M2,M3} → D, all split before all recombine, within window."""
-        adj = self._adj([
-            ("S", "M1", 0.0, 1.0, "e1"),
-            ("S", "M2", 1.0, 1.0, "e2"),
-            ("S", "M3", 2.0, 1.0, "e3"),
-            ("M1", "D", 100.0, 1.0, "e4"),
-            ("M2", "D", 101.0, 1.0, "e5"),
-            ("M3", "D", 102.0, 1.0, "e6"),
-        ])
+        adj = self._adj(
+            [
+                ("S", "M1", 0.0, 1.0, "e1"),
+                ("S", "M2", 1.0, 1.0, "e2"),
+                ("S", "M3", 2.0, 1.0, "e3"),
+                ("M1", "D", 100.0, 1.0, "e4"),
+                ("M2", "D", 101.0, 1.0, "e5"),
+                ("M3", "D", 102.0, 1.0, "e6"),
+            ]
+        )
         result = GDSNavigator._enum_split_recombine_via_adj(
-            "S", adj, window_sec=168 * 3600.0, min_k=3, direction="forward",
+            "S",
+            adj,
+            window_sec=168 * 3600.0,
+            min_k=3,
+            direction="forward",
         )
         assert len(result) == 1
         m = result[0]
@@ -1944,36 +2144,54 @@ class TestSplitRecombineViaAdj:
         assert m["sink"] == "D"
         assert m["k"] == 3
         assert sorted(m["intermediaries"]) == ["M1", "M2", "M3"]
-        assert sorted(m["edges"]) == sorted([
-            ("S", "M1"), ("S", "M2"), ("S", "M3"),
-            ("M1", "D"), ("M2", "D"), ("M3", "D"),
-        ])
+        assert sorted(m["edges"]) == sorted(
+            [
+                ("S", "M1"),
+                ("S", "M2"),
+                ("S", "M3"),
+                ("M1", "D"),
+                ("M2", "D"),
+                ("M3", "D"),
+            ]
+        )
 
     def test_via_adj_below_min_k_returns_empty(self):
-        adj = self._adj([
-            ("S", "M1", 0.0, 1.0, "e1"),
-            ("S", "M2", 1.0, 1.0, "e2"),
-            ("M1", "D", 100.0, 1.0, "e3"),
-            ("M2", "D", 101.0, 1.0, "e4"),
-        ])
+        adj = self._adj(
+            [
+                ("S", "M1", 0.0, 1.0, "e1"),
+                ("S", "M2", 1.0, 1.0, "e2"),
+                ("M1", "D", 100.0, 1.0, "e3"),
+                ("M2", "D", 101.0, 1.0, "e4"),
+            ]
+        )
         result = GDSNavigator._enum_split_recombine_via_adj(
-            "S", adj, window_sec=168 * 3600.0, min_k=3, direction="forward",
+            "S",
+            adj,
+            window_sec=168 * 3600.0,
+            min_k=3,
+            direction="forward",
         )
         assert result == []
 
     def test_via_adj_temporal_order_violated_drops_intermediary(self):
         """One recombine-hop precedes its split-hop → drops that intermediary."""
-        adj = self._adj([
-            ("S", "M1", 50.0, 1.0, "e1"),
-            ("S", "M2", 51.0, 1.0, "e2"),
-            ("S", "M3", 52.0, 1.0, "e3"),
-            # M1's recombine is BEFORE the S→M1 split hop — temporal violation
-            ("M1", "D", 10.0, 1.0, "e4"),
-            ("M2", "D", 60.0, 1.0, "e5"),
-            ("M3", "D", 61.0, 1.0, "e6"),
-        ])
+        adj = self._adj(
+            [
+                ("S", "M1", 50.0, 1.0, "e1"),
+                ("S", "M2", 51.0, 1.0, "e2"),
+                ("S", "M3", 52.0, 1.0, "e3"),
+                # M1's recombine is BEFORE the S→M1 split hop — temporal violation
+                ("M1", "D", 10.0, 1.0, "e4"),
+                ("M2", "D", 60.0, 1.0, "e5"),
+                ("M3", "D", 61.0, 1.0, "e6"),
+            ]
+        )
         result = GDSNavigator._enum_split_recombine_via_adj(
-            "S", adj, window_sec=168 * 3600.0, min_k=3, direction="forward",
+            "S",
+            adj,
+            window_sec=168 * 3600.0,
+            min_k=3,
+            direction="forward",
         )
         # M1 dropped, M2+M3 valid → k=2 < min_k=3 → reject
         assert result == []
@@ -1981,32 +2199,44 @@ class TestSplitRecombineViaAdj:
     def test_via_adj_window_filter_drops_old_split(self):
         """Split-hop older than window relative to max split ts is filtered."""
         window_sec = 10 * 3600.0
-        adj = self._adj([
-            ("S", "M1", 0.0, 1.0, "e1"),
-            ("S", "M2", 0.0, 1.0, "e2"),
-            ("S", "M3", -window_sec * 2, 1.0, "e3"),  # ancient split-hop
-            ("M1", "D", 1.0, 1.0, "e4"),
-            ("M2", "D", 1.0, 1.0, "e5"),
-            ("M3", "D", 1.0, 1.0, "e6"),
-        ])
+        adj = self._adj(
+            [
+                ("S", "M1", 0.0, 1.0, "e1"),
+                ("S", "M2", 0.0, 1.0, "e2"),
+                ("S", "M3", -window_sec * 2, 1.0, "e3"),  # ancient split-hop
+                ("M1", "D", 1.0, 1.0, "e4"),
+                ("M2", "D", 1.0, 1.0, "e5"),
+                ("M3", "D", 1.0, 1.0, "e6"),
+            ]
+        )
         result = GDSNavigator._enum_split_recombine_via_adj(
-            "S", adj, window_sec=window_sec, min_k=3, direction="forward",
+            "S",
+            adj,
+            window_sec=window_sec,
+            min_k=3,
+            direction="forward",
         )
         # M3 dropped by window → k=2 < min_k=3 → reject
         assert result == []
 
     def test_via_adj_backward_diamond_from_sink_seed(self):
         """Seed = D; backward enumerator searches in-edges then sources."""
-        adj = self._adj([
-            ("S", "M1", 0.0, 1.0, "e1"),
-            ("S", "M2", 1.0, 1.0, "e2"),
-            ("S", "M3", 2.0, 1.0, "e3"),
-            ("M1", "D", 100.0, 1.0, "e4"),
-            ("M2", "D", 101.0, 1.0, "e5"),
-            ("M3", "D", 102.0, 1.0, "e6"),
-        ])
+        adj = self._adj(
+            [
+                ("S", "M1", 0.0, 1.0, "e1"),
+                ("S", "M2", 1.0, 1.0, "e2"),
+                ("S", "M3", 2.0, 1.0, "e3"),
+                ("M1", "D", 100.0, 1.0, "e4"),
+                ("M2", "D", 101.0, 1.0, "e5"),
+                ("M3", "D", 102.0, 1.0, "e6"),
+            ]
+        )
         result = GDSNavigator._enum_split_recombine_via_adj(
-            "D", adj, window_sec=168 * 3600.0, min_k=3, direction="backward",
+            "D",
+            adj,
+            window_sec=168 * 3600.0,
+            min_k=3,
+            direction="backward",
         )
         assert len(result) == 1
         m = result[0]
@@ -2019,17 +2249,23 @@ class TestSplitRecombineViaAdj:
 
     def test_via_adj_skips_self_loop(self):
         """Self-loops on seed and intermediary == seed are excluded."""
-        adj = self._adj([
-            ("S", "S", 0.0, 1.0, "e0"),  # seed self-loop must be skipped
-            ("S", "M1", 1.0, 1.0, "e1"),
-            ("S", "M2", 2.0, 1.0, "e2"),
-            ("S", "M3", 3.0, 1.0, "e3"),
-            ("M1", "D", 100.0, 1.0, "e4"),
-            ("M2", "D", 101.0, 1.0, "e5"),
-            ("M3", "D", 102.0, 1.0, "e6"),
-        ])
+        adj = self._adj(
+            [
+                ("S", "S", 0.0, 1.0, "e0"),  # seed self-loop must be skipped
+                ("S", "M1", 1.0, 1.0, "e1"),
+                ("S", "M2", 2.0, 1.0, "e2"),
+                ("S", "M3", 3.0, 1.0, "e3"),
+                ("M1", "D", 100.0, 1.0, "e4"),
+                ("M2", "D", 101.0, 1.0, "e5"),
+                ("M3", "D", 102.0, 1.0, "e6"),
+            ]
+        )
         result = GDSNavigator._enum_split_recombine_via_adj(
-            "S", adj, window_sec=168 * 3600.0, min_k=3, direction="forward",
+            "S",
+            adj,
+            window_sec=168 * 3600.0,
+            min_k=3,
+            direction="forward",
         )
         assert len(result) == 1
         assert "S" not in result[0]["intermediaries"]
@@ -2037,12 +2273,18 @@ class TestSplitRecombineViaAdj:
 
     def test_via_adj_invalid_direction_returns_empty(self):
         """Unlike single-seed which raises, adj path returns [] (rank-loop safety)."""
-        adj = self._adj([
-            ("S", "M1", 0.0, 1.0, "e1"),
-            ("M1", "D", 1.0, 1.0, "e2"),
-        ])
+        adj = self._adj(
+            [
+                ("S", "M1", 0.0, 1.0, "e1"),
+                ("M1", "D", 1.0, 1.0, "e2"),
+            ]
+        )
         result = GDSNavigator._enum_split_recombine_via_adj(
-            "S", adj, window_sec=168 * 3600.0, min_k=3, direction="sideways",
+            "S",
+            adj,
+            window_sec=168 * 3600.0,
+            min_k=3,
+            direction="sideways",
         )
         assert result == []
 
@@ -2063,12 +2305,20 @@ class TestSplitRecombineViaAdj:
         nav._resolve_motif_graph_pid = MagicMock(return_value="p")
         nav._storage.get_adjacency = MagicMock(return_value=adj)
         single_seed_res = nav._enumerate_split_recombine(
-            "S", "p", time_window_hours=168, min_k=3, direction="forward",
+            "S",
+            "p",
+            time_window_hours=168,
+            min_k=3,
+            direction="forward",
         )
 
         # Adjacency-path
         adj_res = GDSNavigator._enum_split_recombine_via_adj(
-            "S", adj, window_sec=168 * 3600.0, min_k=3, direction="forward",
+            "S",
+            adj,
+            window_sec=168 * 3600.0,
+            min_k=3,
+            direction="forward",
         )
 
         assert len(single_seed_res) == 1
@@ -2090,6 +2340,7 @@ class TestBipartiteBurstEnumerator:
         exercise the same code as production ranking.
         """
         from hypertopos.engine.adjacency import AdjacencyIndex
+
         edges_by_from = edges_by_from or {}
         edges_by_to = edges_by_to or {}
         nav = GDSNavigator(MagicMock(), MagicMock(), MagicMock(), MagicMock())
@@ -2100,7 +2351,7 @@ class TestBipartiteBurstEnumerator:
         to_keys: list[str] = []
         timestamps: list[float] = []
         for fk, items in edges_by_from.items():
-            for (tk, ts) in items:
+            for tk, ts in items:
                 key = (fk, tk, float(ts))
                 if key in seen:
                     continue
@@ -2109,7 +2360,7 @@ class TestBipartiteBurstEnumerator:
                 to_keys.append(tk)
                 timestamps.append(float(ts))
         for tk, items in edges_by_to.items():
-            for (fk, ts) in items:
+            for fk, ts in items:
                 key = (fk, tk, float(ts))
                 if key in seen:
                     continue
@@ -2147,7 +2398,11 @@ class TestBipartiteBurstEnumerator:
         by_from, by_to = self._complete_k33()
         nav = self._nav_with_adj(edges_by_from=by_from, edges_by_to=by_to)
         result = nav._enumerate_bipartite_burst(
-            "S1", "p", time_window_hours=24, min_k=3, min_m=3,
+            "S1",
+            "p",
+            time_window_hours=24,
+            min_k=3,
+            min_m=3,
         )
         assert len(result) == 1
         m = result[0]
@@ -2171,7 +2426,11 @@ class TestBipartiteBurstEnumerator:
         by_to = {"D1": [("S1", 0)], "D2": [("S1", 1)]}
         nav = self._nav_with_adj(edges_by_from=by_from, edges_by_to=by_to)
         result = nav._enumerate_bipartite_burst(
-            "S1", "p", time_window_hours=24, min_k=3, min_m=3,
+            "S1",
+            "p",
+            time_window_hours=24,
+            min_k=3,
+            min_m=3,
         )
         assert result == []
 
@@ -2183,7 +2442,11 @@ class TestBipartiteBurstEnumerator:
         nav = self._nav_with_adj(edges_by_from=by_from, edges_by_to=by_to)
         # Seed is D1 — _try_source returns None (no out-edges), falls back to _try_sink.
         result = nav._enumerate_bipartite_burst(
-            "D1", "p", time_window_hours=24, min_k=3, min_m=3,
+            "D1",
+            "p",
+            time_window_hours=24,
+            min_k=3,
+            min_m=3,
         )
         assert len(result) == 1
         m = result[0]
@@ -2202,7 +2465,11 @@ class TestBipartiteBurstEnumerator:
         by_to["D3"] = [(s, ts) for (s, ts) in by_to["D3"] if s != "S2"]
         nav = self._nav_with_adj(edges_by_from=by_from, edges_by_to=by_to)
         result = nav._enumerate_bipartite_burst(
-            "S1", "p", time_window_hours=24, min_k=3, min_m=3,
+            "S1",
+            "p",
+            time_window_hours=24,
+            min_k=3,
+            min_m=3,
         )
         # Common sources across {D1,D2,D3} = {S1, S3} (S2 drops because no S2→D3).
         # |common| = 2 < min_k=3 → reject.
@@ -2226,7 +2493,11 @@ class TestBipartiteBurstEnumerator:
             by_to.setdefault("D3", []).append((s, ancient))
         nav = self._nav_with_adj(edges_by_from=by_from, edges_by_to=by_to)
         result = nav._enumerate_bipartite_burst(
-            "S1", "p", time_window_hours=1, min_k=3, min_m=3,
+            "S1",
+            "p",
+            time_window_hours=1,
+            min_k=3,
+            min_m=3,
         )
         # D3 dropped by window → only D1,D2 → m=2 < min_m=3 → reject
         assert result == []
@@ -2239,7 +2510,11 @@ class TestBipartiteBurstEnumerator:
         by_to.setdefault("S1", []).append(("S1", 200.0))
         nav = self._nav_with_adj(edges_by_from=by_from, edges_by_to=by_to)
         result = nav._enumerate_bipartite_burst(
-            "S1", "p", time_window_hours=24, min_k=3, min_m=3,
+            "S1",
+            "p",
+            time_window_hours=24,
+            min_k=3,
+            min_m=3,
         )
         assert len(result) == 1
         m = result[0]
@@ -2250,14 +2525,22 @@ class TestBipartiteBurstEnumerator:
         nav = self._nav_with_adj()
         with pytest.raises(GDSNavigationError, match="min_k"):
             nav._enumerate_bipartite_burst(
-                "S1", "p", time_window_hours=24, min_k=1, min_m=3,
+                "S1",
+                "p",
+                time_window_hours=24,
+                min_k=1,
+                min_m=3,
             )
 
     def test_min_m_below_two_raises(self):
         nav = self._nav_with_adj()
         with pytest.raises(GDSNavigationError, match="min_m"):
             nav._enumerate_bipartite_burst(
-                "S1", "p", time_window_hours=24, min_k=3, min_m=1,
+                "S1",
+                "p",
+                time_window_hours=24,
+                min_k=3,
+                min_m=1,
             )
 
     def test_seed_must_reach_all_sinks(self):
@@ -2277,7 +2560,11 @@ class TestBipartiteBurstEnumerator:
         }
         nav = self._nav_with_adj(edges_by_from=by_from, edges_by_to=by_to)
         result = nav._enumerate_bipartite_burst(
-            "S1", "p", time_window_hours=24, min_k=3, min_m=3,
+            "S1",
+            "p",
+            time_window_hours=24,
+            min_k=3,
+            min_m=3,
         )
         # In source mode, seed S1 must reach every sink. S1 doesn't reach D3,
         # so |sinks_seed_reaches| = 2 < min_m=3 OR seed not in common-source-set.
@@ -2290,7 +2577,11 @@ class TestBipartiteBurstEnumerator:
         # X is unrelated — no edges.
         nav = self._nav_with_adj(edges_by_from=by_from, edges_by_to=by_to)
         result = nav._enumerate_bipartite_burst(
-            "X", "p", time_window_hours=24, min_k=3, min_m=3,
+            "X",
+            "p",
+            time_window_hours=24,
+            min_k=3,
+            min_m=3,
         )
         assert result == []
 
@@ -2306,7 +2597,11 @@ class TestBipartiteBurstEnumerator:
         }
         nav = self._nav_with_adj(edges_by_from=by_from, edges_by_to=by_to)
         result = nav._enumerate_bipartite_burst(
-            "S1", "p", time_window_hours=24, min_k=2, min_m=2,
+            "S1",
+            "p",
+            time_window_hours=24,
+            min_k=2,
+            min_m=2,
         )
         assert len(result) == 1
         m = result[0]
@@ -2321,6 +2616,7 @@ class TestBipartiteBurstViaAdj:
 
     def _adj(self, edges: list[tuple[str, str, float, float, str]]):
         from hypertopos.engine.adjacency import AdjacencyIndex
+
         return AdjacencyIndex.from_edge_lists(
             from_keys=[e[0] for e in edges],
             to_keys=[e[1] for e in edges],
@@ -2343,7 +2639,11 @@ class TestBipartiteBurstViaAdj:
         """Seed = S1, complete K_{3,3} matches and result fields are populated."""
         adj = self._adj(self._k33_edges())
         result = GDSNavigator._enum_bipartite_burst_via_adj(
-            "S1", adj, window_sec=24 * 3600.0, min_k=3, min_m=3,
+            "S1",
+            adj,
+            window_sec=24 * 3600.0,
+            min_k=3,
+            min_m=3,
         )
         assert len(result) == 1
         m = result[0]
@@ -2357,12 +2657,18 @@ class TestBipartiteBurstViaAdj:
 
     def test_via_adj_below_min_m_returns_empty(self):
         """S1 only has 2 distinct sinks → m=2 < min_m=3 → reject."""
-        adj = self._adj([
-            ("S1", "D1", 100.0, 100.0, "e1"),
-            ("S1", "D2", 101.0, 100.0, "e2"),
-        ])
+        adj = self._adj(
+            [
+                ("S1", "D1", 100.0, 100.0, "e1"),
+                ("S1", "D2", 101.0, 100.0, "e2"),
+            ]
+        )
         result = GDSNavigator._enum_bipartite_burst_via_adj(
-            "S1", adj, window_sec=24 * 3600.0, min_k=3, min_m=3,
+            "S1",
+            adj,
+            window_sec=24 * 3600.0,
+            min_k=3,
+            min_m=3,
         )
         assert result == []
 
@@ -2371,7 +2677,11 @@ class TestBipartiteBurstViaAdj:
         # D1 has no out-edges. D1 is a sink of the K_{3,3} S{1..3} -> D{1..3}.
         adj = self._adj(self._k33_edges())
         result = GDSNavigator._enum_bipartite_burst_via_adj(
-            "D1", adj, window_sec=24 * 3600.0, min_k=3, min_m=3,
+            "D1",
+            adj,
+            window_sec=24 * 3600.0,
+            min_k=3,
+            min_m=3,
         )
         assert len(result) == 1
         m = result[0]
@@ -2381,13 +2691,14 @@ class TestBipartiteBurstViaAdj:
 
     def test_via_adj_incomplete_bipartite_rejects(self):
         """K_{3,3} minus one edge S2->D3 → intersection drops to {S1,S3} → reject."""
-        edges = [
-            e for e in self._k33_edges()
-            if not (e[0] == "S2" and e[1] == "D3")
-        ]
+        edges = [e for e in self._k33_edges() if not (e[0] == "S2" and e[1] == "D3")]
         adj = self._adj(edges)
         result = GDSNavigator._enum_bipartite_burst_via_adj(
-            "S1", adj, window_sec=24 * 3600.0, min_k=3, min_m=3,
+            "S1",
+            adj,
+            window_sec=24 * 3600.0,
+            min_k=3,
+            min_m=3,
         )
         assert result == []
 
@@ -2406,7 +2717,11 @@ class TestBipartiteBurstViaAdj:
             edges.append((s, "D3", ancient, 100.0, f"e_{s}_D3"))
         adj = self._adj(edges)
         result = GDSNavigator._enum_bipartite_burst_via_adj(
-            "S1", adj, window_sec=window_sec, min_k=3, min_m=3,
+            "S1",
+            adj,
+            window_sec=window_sec,
+            min_k=3,
+            min_m=3,
         )
         assert result == []
 
@@ -2416,7 +2731,11 @@ class TestBipartiteBurstViaAdj:
         edges.append(("S1", "S1", 100.0, 100.0, "self"))
         adj = self._adj(edges)
         result = GDSNavigator._enum_bipartite_burst_via_adj(
-            "S1", adj, window_sec=24 * 3600.0, min_k=3, min_m=3,
+            "S1",
+            adj,
+            window_sec=24 * 3600.0,
+            min_k=3,
+            min_m=3,
         )
         assert len(result) == 1
         m = result[0]
@@ -2438,7 +2757,11 @@ class TestBipartiteBurstViaAdj:
                 ts += 1
         adj = self._adj(edges)
         result = GDSNavigator._enum_bipartite_burst_via_adj(
-            "S1", adj, window_sec=24 * 3600.0, min_k=3, min_m=3,
+            "S1",
+            adj,
+            window_sec=24 * 3600.0,
+            min_k=3,
+            min_m=3,
         )
         # In source mode, seed S1 must reach every selected sink. It misses D3,
         # so the seed_in_common guard rejects.
@@ -2453,12 +2776,20 @@ class TestBipartiteBurstViaAdj:
         nav._resolve_motif_graph_pid = MagicMock(return_value="p")
         nav._storage.get_adjacency = MagicMock(return_value=adj)
         single_seed = nav._enumerate_bipartite_burst(
-            "S1", "p", time_window_hours=24, min_k=3, min_m=3,
+            "S1",
+            "p",
+            time_window_hours=24,
+            min_k=3,
+            min_m=3,
         )
 
         # Adjacency path (direct call)
         via_adj = GDSNavigator._enum_bipartite_burst_via_adj(
-            "S1", adj, window_sec=24 * 3600.0, min_k=3, min_m=3,
+            "S1",
+            adj,
+            window_sec=24 * 3600.0,
+            min_k=3,
+            min_m=3,
         )
 
         assert len(single_seed) == 1
@@ -2482,6 +2813,7 @@ class TestBipartiteBurstViaAdj:
         ascending so common starts at 5.
         """
         from hypertopos.engine.adjacency import AdjacencyIndex
+
         common_sources = ["S1", "S2", "S3"]
         other_sources = [f"S_BIG_{i}" for i in range(47)]
 
@@ -2510,13 +2842,20 @@ class TestBipartiteBurstViaAdj:
             event_keys=[f"e{i}" for i in range(n)],
         )
         result = GDSNavigator._enum_bipartite_burst_via_adj(
-            seed="S1", adj=adj, window_sec=86400.0, min_k=3, min_m=3,
+            seed="S1",
+            adj=adj,
+            window_sec=86400.0,
+            min_k=3,
+            min_m=3,
         )
         assert len(result) == 1, f"expected 1 motif, got {len(result)}"
         motif = result[0]
         assert set(motif["sources"]) == set(common_sources)
         assert set(motif["sinks"]) == {
-            "BIG_SINK", "SMALL_SINK_A", "SMALL_SINK_B", "SMALL_SINK_C",
+            "BIG_SINK",
+            "SMALL_SINK_A",
+            "SMALL_SINK_B",
+            "SMALL_SINK_C",
         }
         assert motif["k"] == 3
         assert motif["m"] == 4
@@ -2532,6 +2871,7 @@ class TestSplitRecombineActiveSeeds:
 
     def _adj(self, edges):
         from hypertopos.engine.adjacency import AdjacencyIndex
+
         return AdjacencyIndex.from_edge_lists(
             from_keys=[e[0] for e in edges],
             to_keys=[e[1] for e in edges],
@@ -2542,31 +2882,41 @@ class TestSplitRecombineActiveSeeds:
 
     def test_active_seeds_split_recombine_forward_filters_low_out_degree(self):
         # S1 has 3 distinct out-neighbours; S2 has 2 → S2 dropped at min_k=3
-        adj = self._adj([
-            ("S1", "M1", 0.0, 1.0, "e1"),
-            ("S1", "M2", 0.0, 1.0, "e2"),
-            ("S1", "M3", 0.0, 1.0, "e3"),
-            ("S2", "M1", 0.0, 1.0, "e4"),
-            ("S2", "M2", 0.0, 1.0, "e5"),
-        ])
+        adj = self._adj(
+            [
+                ("S1", "M1", 0.0, 1.0, "e1"),
+                ("S1", "M2", 0.0, 1.0, "e2"),
+                ("S1", "M3", 0.0, 1.0, "e3"),
+                ("S2", "M1", 0.0, 1.0, "e4"),
+                ("S2", "M2", 0.0, 1.0, "e5"),
+            ]
+        )
         seeds = GDSNavigator._active_seeds_for_motif(
-            adj, all_seeds=["S1", "S2"], motif_type="split_recombine",
-            effective_min_k=3, direction="forward",
+            adj,
+            all_seeds=["S1", "S2"],
+            motif_type="split_recombine",
+            effective_min_k=3,
+            direction="forward",
         )
         assert set(seeds) == {"S1"}
 
     def test_active_seeds_split_recombine_backward_filters_low_in_degree(self):
         # D1 has 3 distinct in-neighbours; D2 has 2 → D2 dropped at min_k=3
-        adj = self._adj([
-            ("M1", "D1", 0.0, 1.0, "e1"),
-            ("M2", "D1", 0.0, 1.0, "e2"),
-            ("M3", "D1", 0.0, 1.0, "e3"),
-            ("M1", "D2", 0.0, 1.0, "e4"),
-            ("M2", "D2", 0.0, 1.0, "e5"),
-        ])
+        adj = self._adj(
+            [
+                ("M1", "D1", 0.0, 1.0, "e1"),
+                ("M2", "D1", 0.0, 1.0, "e2"),
+                ("M3", "D1", 0.0, 1.0, "e3"),
+                ("M1", "D2", 0.0, 1.0, "e4"),
+                ("M2", "D2", 0.0, 1.0, "e5"),
+            ]
+        )
         seeds = GDSNavigator._active_seeds_for_motif(
-            adj, all_seeds=["D1", "D2"], motif_type="split_recombine",
-            effective_min_k=3, direction="backward",
+            adj,
+            all_seeds=["D1", "D2"],
+            motif_type="split_recombine",
+            effective_min_k=3,
+            direction="backward",
         )
         assert set(seeds) == {"D1"}
 
@@ -2576,6 +2926,7 @@ class TestBipartiteBurstActiveSeeds:
 
     def _adj(self, edges):
         from hypertopos.engine.adjacency import AdjacencyIndex
+
         return AdjacencyIndex.from_edge_lists(
             from_keys=[e[0] for e in edges],
             to_keys=[e[1] for e in edges],
@@ -2586,41 +2937,56 @@ class TestBipartiteBurstActiveSeeds:
 
     def test_active_seeds_bipartite_burst_accepts_high_out(self):
         # S has 3 out-neighbours → keeps S as seed-as-source candidate
-        adj = self._adj([
-            ("S", "D1", 0.0, 1.0, "e1"),
-            ("S", "D2", 0.0, 1.0, "e2"),
-            ("S", "D3", 0.0, 1.0, "e3"),
-        ])
+        adj = self._adj(
+            [
+                ("S", "D1", 0.0, 1.0, "e1"),
+                ("S", "D2", 0.0, 1.0, "e2"),
+                ("S", "D3", 0.0, 1.0, "e3"),
+            ]
+        )
         seeds = GDSNavigator._active_seeds_for_motif(
-            adj, all_seeds=["S"], motif_type="bipartite_burst",
-            effective_min_k=3, min_m=3,
+            adj,
+            all_seeds=["S"],
+            motif_type="bipartite_burst",
+            effective_min_k=3,
+            min_m=3,
         )
         assert set(seeds) == {"S"}
 
     def test_active_seeds_bipartite_burst_accepts_high_in(self):
         # D has 3 in-neighbours → keeps D as seed-as-sink candidate
-        adj = self._adj([
-            ("S1", "D", 0.0, 1.0, "e1"),
-            ("S2", "D", 0.0, 1.0, "e2"),
-            ("S3", "D", 0.0, 1.0, "e3"),
-        ])
+        adj = self._adj(
+            [
+                ("S1", "D", 0.0, 1.0, "e1"),
+                ("S2", "D", 0.0, 1.0, "e2"),
+                ("S3", "D", 0.0, 1.0, "e3"),
+            ]
+        )
         seeds = GDSNavigator._active_seeds_for_motif(
-            adj, all_seeds=["D"], motif_type="bipartite_burst",
-            effective_min_k=3, min_m=3,
+            adj,
+            all_seeds=["D"],
+            motif_type="bipartite_burst",
+            effective_min_k=3,
+            min_m=3,
         )
         assert set(seeds) == {"D"}
 
     def test_active_seeds_bipartite_burst_rejects_isolated(self):
         # X has neither sufficient in nor out degree → dropped
-        adj = self._adj([
-            ("S", "D1", 0.0, 1.0, "e1"),
-            ("S", "D2", 0.0, 1.0, "e2"),
-            ("S", "D3", 0.0, 1.0, "e3"),
-            ("X", "D1", 0.0, 1.0, "e4"),  # X has out-degree 1 only
-        ])
+        adj = self._adj(
+            [
+                ("S", "D1", 0.0, 1.0, "e1"),
+                ("S", "D2", 0.0, 1.0, "e2"),
+                ("S", "D3", 0.0, 1.0, "e3"),
+                ("X", "D1", 0.0, 1.0, "e4"),  # X has out-degree 1 only
+            ]
+        )
         seeds = GDSNavigator._active_seeds_for_motif(
-            adj, all_seeds=["S", "X"], motif_type="bipartite_burst",
-            effective_min_k=3, min_m=3,
+            adj,
+            all_seeds=["S", "X"],
+            motif_type="bipartite_burst",
+            effective_min_k=3,
+            min_m=3,
         )
         assert set(seeds) == {"S"}
 
@@ -2636,6 +3002,7 @@ class TestSplitRecombinePublicAPI:
         exercise the same code as production ranking.
         """
         from hypertopos.engine.adjacency import AdjacencyIndex
+
         edges_by_from = edges_by_from or {}
         edges_by_to = edges_by_to or {}
         nav = GDSNavigator(MagicMock(), MagicMock(), MagicMock(), MagicMock())
@@ -2646,7 +3013,7 @@ class TestSplitRecombinePublicAPI:
         to_keys: list[str] = []
         timestamps: list[float] = []
         for fk, items in edges_by_from.items():
-            for (tk, ts) in items:
+            for tk, ts in items:
                 key = (fk, tk, float(ts))
                 if key in seen:
                     continue
@@ -2655,7 +3022,7 @@ class TestSplitRecombinePublicAPI:
                 to_keys.append(tk)
                 timestamps.append(float(ts))
         for tk, items in edges_by_to.items():
-            for (fk, ts) in items:
+            for fk, ts in items:
                 key = (fk, tk, float(ts))
                 if key in seen:
                     continue
@@ -2678,15 +3045,21 @@ class TestSplitRecombinePublicAPI:
         return nav
 
     def test_score_motif_split_recombine_forward_smoke(self):
-        nav = self._nav_with_adj(edges_by_from={
-            "S": [("M1", 0), ("M2", 1), ("M3", 2)],
-            "M1": [("D", 100)],
-            "M2": [("D", 101)],
-            "M3": [("D", 102)],
-        })
+        nav = self._nav_with_adj(
+            edges_by_from={
+                "S": [("M1", 0), ("M2", 1), ("M3", 2)],
+                "M1": [("D", 100)],
+                "M2": [("D", 101)],
+                "M3": [("D", 102)],
+            }
+        )
         res = nav.score_motif(
-            "S", "split_recombine", "p",
-            time_window_hours=168, direction="forward", min_k=3,
+            "S",
+            "split_recombine",
+            "p",
+            time_window_hours=168,
+            direction="forward",
+            min_k=3,
         )
         assert res["found"] is True
         assert res["motif_type"] == "split_recombine"
@@ -2699,15 +3072,21 @@ class TestSplitRecombinePublicAPI:
         assert len(res["breakdown"]) == 6
 
     def test_score_motif_split_recombine_backward_smoke(self):
-        nav = self._nav_with_adj(edges_by_to={
-            "D": [("M1", 100), ("M2", 101), ("M3", 102)],
-            "M1": [("S", 0)],
-            "M2": [("S", 1)],
-            "M3": [("S", 2)],
-        })
+        nav = self._nav_with_adj(
+            edges_by_to={
+                "D": [("M1", 100), ("M2", 101), ("M3", 102)],
+                "M1": [("S", 0)],
+                "M2": [("S", 1)],
+                "M3": [("S", 2)],
+            }
+        )
         res = nav.score_motif(
-            "D", "split_recombine", "p",
-            time_window_hours=168, direction="backward", min_k=3,
+            "D",
+            "split_recombine",
+            "p",
+            time_window_hours=168,
+            direction="backward",
+            min_k=3,
         )
         assert res["found"] is True
         assert res["motif_type"] == "split_recombine"
@@ -2720,13 +3099,18 @@ class TestSplitRecombinePublicAPI:
         nav = self._nav_with_adj()
         with pytest.raises(GDSNavigationError, match="direction"):
             nav.score_motif(
-                "S", "split_recombine", "p",
-                time_window_hours=168, direction="sideways", min_k=3,
+                "S",
+                "split_recombine",
+                "p",
+                time_window_hours=168,
+                direction="sideways",
+                min_k=3,
             )
 
     def test_find_high_potential_motifs_split_recombine_cache_key_separates_directions(self):
         """Same pattern, two different directions → two distinct cache entries."""
         import pyarrow as pa
+
         nav = GDSNavigator(MagicMock(), MagicMock(), MagicMock(), MagicMock())
         nav._resolve_motif_graph_pid = MagicMock(return_value="p")
         nav._resolve_version = MagicMock(return_value=1)
@@ -2738,10 +3122,16 @@ class TestSplitRecombinePublicAPI:
         nav._storage.read_geometry = MagicMock(return_value=pa.table({"primary_key": []}))
 
         nav.find_high_potential_motifs(
-            "p", "split_recombine", top_n=5, direction="forward",
+            "p",
+            "split_recombine",
+            top_n=5,
+            direction="forward",
         )
         nav.find_high_potential_motifs(
-            "p", "split_recombine", top_n=5, direction="backward",
+            "p",
+            "split_recombine",
+            top_n=5,
+            direction="backward",
         )
         keys = list(nav._motif_ranking_cache.keys())
         assert len(keys) == 2
@@ -2757,6 +3147,7 @@ class TestBipartiteBurstPublicAPI:
         """edges: list of (from, to, ts) — built into a real AdjacencyIndex
         and exposed via mocked ``_storage.get_adjacency``."""
         from hypertopos.engine.adjacency import AdjacencyIndex
+
         nav = GDSNavigator(MagicMock(), MagicMock(), MagicMock(), MagicMock())
         nav._resolve_motif_graph_pid = MagicMock(return_value="p")
         n = len(edges)
@@ -2775,14 +3166,15 @@ class TestBipartiteBurstPublicAPI:
 
     def test_score_motif_bipartite_burst_3x3_smoke(self):
         # K_{3,3}: S1/S2/S3 all send to D1/D2/D3 within window.
-        edges = [
-            (f"S{i}", f"D{j}", float(i * 10 + j))
-            for i in range(1, 4) for j in range(1, 4)
-        ]
+        edges = [(f"S{i}", f"D{j}", float(i * 10 + j)) for i in range(1, 4) for j in range(1, 4)]
         nav = self._nav_with_edges(edges)
         res = nav.score_motif(
-            "S1", "bipartite_burst", "p",
-            time_window_hours=24, min_k=3, min_m=3,
+            "S1",
+            "bipartite_burst",
+            "p",
+            time_window_hours=24,
+            min_k=3,
+            min_m=3,
         )
         assert res["found"] is True
         assert res["motif_type"] == "bipartite_burst"
@@ -2797,21 +3189,30 @@ class TestBipartiteBurstPublicAPI:
         nav = self._nav_with_edges([])
         with pytest.raises(GDSNavigationError, match="min_k"):
             nav.score_motif(
-                "S", "bipartite_burst", "p",
-                time_window_hours=24, min_k=1, min_m=3,
+                "S",
+                "bipartite_burst",
+                "p",
+                time_window_hours=24,
+                min_k=1,
+                min_m=3,
             )
 
     def test_score_motif_bipartite_burst_invalid_min_m_raises(self):
         nav = self._nav_with_edges([])
         with pytest.raises(GDSNavigationError, match="min_m"):
             nav.score_motif(
-                "S", "bipartite_burst", "p",
-                time_window_hours=24, min_k=3, min_m=1,
+                "S",
+                "bipartite_burst",
+                "p",
+                time_window_hours=24,
+                min_k=3,
+                min_m=1,
             )
 
     def test_find_high_potential_motifs_bipartite_burst_cache_key_separates_min_m(self):
         """Same pattern, two different min_m → two distinct cache entries."""
         import pyarrow as pa
+
         nav = GDSNavigator(MagicMock(), MagicMock(), MagicMock(), MagicMock())
         nav._resolve_motif_graph_pid = MagicMock(return_value="p")
         nav._resolve_version = MagicMock(return_value=1)
@@ -2823,10 +3224,18 @@ class TestBipartiteBurstPublicAPI:
         nav._storage.read_geometry = MagicMock(return_value=pa.table({"primary_key": []}))
 
         nav.find_high_potential_motifs(
-            "p", "bipartite_burst", top_n=5, min_k=3, min_m=3,
+            "p",
+            "bipartite_burst",
+            top_n=5,
+            min_k=3,
+            min_m=3,
         )
         nav.find_high_potential_motifs(
-            "p", "bipartite_burst", top_n=5, min_k=3, min_m=4,
+            "p",
+            "bipartite_burst",
+            top_n=5,
+            min_k=3,
+            min_m=4,
         )
         keys = list(nav._motif_ranking_cache.keys())
         assert len(keys) == 2
@@ -2838,6 +3247,7 @@ class TestBipartiteBurstPublicAPI:
 class TestChainKAdaptiveFrontierCap:
     def test_per_k_frontier_cap_lookup(self):
         from unittest.mock import MagicMock
+
         nav = GDSNavigator(MagicMock(), MagicMock(), MagicMock(), MagicMock())
         assert nav._CHAIN_K_MAX_FRONTIER_PER_K[3] == 1000
         assert nav._CHAIN_K_MAX_FRONTIER_PER_K[4] == 1000
@@ -2848,6 +3258,7 @@ class TestChainKAdaptiveFrontierCap:
 
     def test_unknown_k_falls_back_to_legacy_cap(self):
         from unittest.mock import MagicMock
+
         nav = GDSNavigator(MagicMock(), MagicMock(), MagicMock(), MagicMock())
         assert nav._CHAIN_K_MAX_FRONTIER_PER_K.get(99, nav._CHAIN_K_MAX_FRONTIER) == 1000
 
@@ -2861,6 +3272,7 @@ class TestChainKAdaptiveFrontierCap:
         test catches it locally.
         """
         from unittest.mock import MagicMock
+
         nav = GDSNavigator(MagicMock(), MagicMock(), MagicMock(), MagicMock())
         adj = MagicMock()
         adj.edge_count.return_value = 1

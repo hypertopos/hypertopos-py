@@ -2,7 +2,7 @@
 # Licensed under the Business Source License 1.1 (the "License");
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
-"""Tests for the core aggregation engine (packages/hypertopos-py/hypertopos/engine/aggregation.py)."""
+"""Tests for the core aggregation engine (hypertopos/engine/aggregation.py)."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 import numpy as np
 import pyarrow as pa
 import pytest
+
 from hypertopos.engine.aggregation import aggregate
 from hypertopos.model.manifest import Manifest
 from hypertopos.model.sphere import (
@@ -458,7 +459,10 @@ class TestEventPatternEntityKeys:
             points={"customers": pa.table({"primary_key": ["CUST-A", "CUST-B", "CUST-C"]})},
         )
         result = aggregate(
-            reader, _MockEngine(), _make_sphere(), _MANIFEST,
+            reader,
+            _MockEngine(),
+            _make_sphere(),
+            _MANIFEST,
             event_pattern_id="tx_pattern",
             group_by_line="customers",
         )
@@ -477,14 +481,19 @@ class TestEventPatternEntityKeys:
             geometry=geo,
             points={
                 "customers": pa.table({"primary_key": ["CUST-A", "CUST-B"]}),
-                "transactions": pa.table({
-                    "primary_key": ["TX-0000", "TX-0001", "TX-0002", "TX-0003"],
-                    "amount": [100.0, 200.0, 50.0, 75.0],
-                }),
+                "transactions": pa.table(
+                    {
+                        "primary_key": ["TX-0000", "TX-0001", "TX-0002", "TX-0003"],
+                        "amount": [100.0, 200.0, 50.0, 75.0],
+                    }
+                ),
             },
         )
         result = aggregate(
-            reader, _MockEngine(), _make_sphere(), _MANIFEST,
+            reader,
+            _MockEngine(),
+            _make_sphere(),
+            _MANIFEST,
             event_pattern_id="tx_pattern",
             group_by_line="customers",
             metric="sum:amount",
@@ -497,10 +506,15 @@ class TestEventPatternEntityKeys:
         geo = _make_entity_keys_geometry(n=100)
         reader = _MockReader(
             geometry=geo,
-            points={"customers": pa.table({"primary_key": [f"CUST-{i % 3:03d}" for i in range(3)]})},
+            points={
+                "customers": pa.table({"primary_key": [f"CUST-{i % 3:03d}" for i in range(3)]})
+            },
         )
         result = aggregate(
-            reader, _MockEngine(), _make_sphere(), _MANIFEST,
+            reader,
+            _MockEngine(),
+            _make_sphere(),
+            _MANIFEST,
             event_pattern_id="tx_pattern",
             group_by_line="customers",
             sample_size=10,
@@ -512,16 +526,21 @@ class TestEventPatternEntityKeys:
     def test_dead_edges_excluded_in_entity_keys(self):
         """Empty string in entity_keys = dead edge, should be excluded."""
         entity_keys_rows = [["CUST-A", "PROD-1"], ["", "PROD-2"], ["CUST-A", ""]]
-        geo = pa.table({
-            "primary_key": ["TX-0", "TX-1", "TX-2"],
-            "entity_keys": pa.array(entity_keys_rows, type=pa.list_(pa.string())),
-        })
+        geo = pa.table(
+            {
+                "primary_key": ["TX-0", "TX-1", "TX-2"],
+                "entity_keys": pa.array(entity_keys_rows, type=pa.list_(pa.string())),
+            }
+        )
         reader = _MockReader(
             geometry=geo,
             points={"customers": pa.table({"primary_key": ["CUST-A"]})},
         )
         result = aggregate(
-            reader, _MockEngine(), _make_sphere(), _MANIFEST,
+            reader,
+            _MockEngine(),
+            _make_sphere(),
+            _MANIFEST,
             event_pattern_id="tx_pattern",
             group_by_line="customers",
         )
@@ -669,8 +688,11 @@ class TestAggregateHaving:
         geo = _make_geometry_table(
             n=6,
             customer_keys=[
-                "CUST-A", "CUST-A", "CUST-A",
-                "CUST-B", "CUST-B",
+                "CUST-A",
+                "CUST-A",
+                "CUST-A",
+                "CUST-B",
+                "CUST-B",
                 "CUST-C",
             ],
         )
@@ -682,7 +704,10 @@ class TestAggregateHaving:
         )
         sphere = _make_sphere()
         result = aggregate(
-            reader, _MockEngine(), sphere, _MANIFEST,
+            reader,
+            _MockEngine(),
+            sphere,
+            _MANIFEST,
             event_pattern_id="tx_pattern",
             group_by_line="customers",
             having={"gt": 1},
@@ -699,8 +724,11 @@ class TestAggregateHaving:
         geo = _make_geometry_table(
             n=6,
             customer_keys=[
-                "CUST-A", "CUST-A", "CUST-A",
-                "CUST-B", "CUST-B",
+                "CUST-A",
+                "CUST-A",
+                "CUST-A",
+                "CUST-B",
+                "CUST-B",
                 "CUST-C",
             ],
         )
@@ -712,7 +740,10 @@ class TestAggregateHaving:
         )
         sphere = _make_sphere()
         result = aggregate(
-            reader, _MockEngine(), sphere, _MANIFEST,
+            reader,
+            _MockEngine(),
+            sphere,
+            _MANIFEST,
             event_pattern_id="tx_pattern",
             group_by_line="customers",
         )
@@ -1373,10 +1404,12 @@ class TestAggregateTimeWindow:
             customer_keys=["CUST-A", "CUST-A", "CUST-B", "CUST-B"],
         )
         pks = geo["primary_key"].to_pylist()
-        tx_table = pa.table({
-            "primary_key": pks,
-            "orderdate": ["1994-06-01", "1995-03-15", "1994-11-20", "1995-07-10"],
-        })
+        tx_table = pa.table(
+            {
+                "primary_key": pks,
+                "orderdate": ["1994-06-01", "1995-03-15", "1994-11-20", "1995-07-10"],
+            }
+        )
         reader = _MockReader(
             geometry=geo,
             points={
@@ -1386,7 +1419,10 @@ class TestAggregateTimeWindow:
         )
         sphere = _make_sphere(pattern=self._make_pattern_with_ts())
         result = aggregate(
-            reader, _MockEngine(), sphere, _MANIFEST,
+            reader,
+            _MockEngine(),
+            sphere,
+            _MANIFEST,
             event_pattern_id="tx_pattern",
             group_by_line="customers",
             metric="count",
@@ -1404,10 +1440,12 @@ class TestAggregateTimeWindow:
             customer_keys=["CUST-A", "CUST-A", "CUST-B", "CUST-B"],
         )
         pks = geo["primary_key"].to_pylist()
-        tx_table = pa.table({
-            "primary_key": pks,
-            "orderdate": ["1994-06-01", "1995-03-15", "1995-07-10", "1996-01-05"],
-        })
+        tx_table = pa.table(
+            {
+                "primary_key": pks,
+                "orderdate": ["1994-06-01", "1995-03-15", "1995-07-10", "1996-01-05"],
+            }
+        )
         reader = _MockReader(
             geometry=geo,
             points={
@@ -1417,7 +1455,10 @@ class TestAggregateTimeWindow:
         )
         sphere = _make_sphere(pattern=self._make_pattern_with_ts())
         result = aggregate(
-            reader, _MockEngine(), sphere, _MANIFEST,
+            reader,
+            _MockEngine(),
+            sphere,
+            _MANIFEST,
             event_pattern_id="tx_pattern",
             group_by_line="customers",
             metric="count",
@@ -1442,7 +1483,10 @@ class TestAggregateTimeWindow:
         sphere = _make_sphere()  # default pattern has no timestamp_col
         with pytest.raises(ValueError, match="timestamp_col"):
             aggregate(
-                reader, _MockEngine(), sphere, _MANIFEST,
+                reader,
+                _MockEngine(),
+                sphere,
+                _MANIFEST,
                 event_pattern_id="tx_pattern",
                 group_by_line="customers",
                 metric="count",
@@ -1462,7 +1506,10 @@ class TestAggregateTimeWindow:
         sphere = _make_sphere(pattern=self._make_pattern_with_ts())
         with pytest.raises(ValueError, match="Cannot use time_from"):
             aggregate(
-                reader, _MockEngine(), sphere, _MANIFEST,
+                reader,
+                _MockEngine(),
+                sphere,
+                _MANIFEST,
                 event_pattern_id="tx_pattern",
                 group_by_line="customers",
                 metric="count",
@@ -1477,11 +1524,13 @@ class TestAggregateTimeWindow:
             customer_keys=["CUST-A", "CUST-A", "CUST-B", "CUST-B"],
         )
         pks = geo["primary_key"].to_pylist()
-        tx_table = pa.table({
-            "primary_key": pks,
-            "orderdate": ["1995-03-15", "1995-07-10", "1994-06-01", "1995-08-20"],
-            "amount": [100.0, 200.0, 50.0, 300.0],
-        })
+        tx_table = pa.table(
+            {
+                "primary_key": pks,
+                "orderdate": ["1995-03-15", "1995-07-10", "1994-06-01", "1995-08-20"],
+                "amount": [100.0, 200.0, 50.0, 300.0],
+            }
+        )
         reader = _MockReader(
             geometry=geo,
             points={
@@ -1491,7 +1540,10 @@ class TestAggregateTimeWindow:
         )
         sphere = _make_sphere(pattern=self._make_pattern_with_ts())
         result = aggregate(
-            reader, _MockEngine(), sphere, _MANIFEST,
+            reader,
+            _MockEngine(),
+            sphere,
+            _MANIFEST,
             event_pattern_id="tx_pattern",
             group_by_line="customers",
             metric="count",
@@ -1516,7 +1568,10 @@ class TestAggregateTimeWindow:
         sphere = _make_sphere(pattern=self._make_pattern_with_ts())
         with pytest.raises(ValueError, match="not a valid ISO-8601"):
             aggregate(
-                reader, _MockEngine(), sphere, _MANIFEST,
+                reader,
+                _MockEngine(),
+                sphere,
+                _MANIFEST,
                 event_pattern_id="tx_pattern",
                 group_by_line="customers",
                 metric="count",
@@ -1677,10 +1732,12 @@ class TestAggregateMedianBlockEPct:
             customer_keys=["CUST-A", "CUST-A", "CUST-A", "CUST-B", "CUST-B"],
         )
         pks = geo["primary_key"].to_pylist()
-        tx_table = pa.table({
-            "primary_key": pks,
-            "amount": [100.0, 200.0, 300.0, 50.0, 150.0],
-        })
+        tx_table = pa.table(
+            {
+                "primary_key": pks,
+                "amount": [100.0, 200.0, 300.0, 50.0, 150.0],
+            }
+        )
         reader = _MockReader(
             geometry=geo,
             points={
@@ -1689,7 +1746,10 @@ class TestAggregateMedianBlockEPct:
             },
         )
         result = aggregate(
-            reader, _MockEngine(), _make_sphere(), _MANIFEST,
+            reader,
+            _MockEngine(),
+            _make_sphere(),
+            _MANIFEST,
             event_pattern_id="tx_pattern",
             group_by_line="customers",
             metric="median:amount",
@@ -1708,10 +1768,12 @@ class TestAggregateMedianBlockEPct:
             customer_keys=["CUST-A", "CUST-A", "CUST-A", "CUST-B", "CUST-B"],
         )
         pks = geo["primary_key"].to_pylist()
-        tx_table = pa.table({
-            "primary_key": pks,
-            "amount": [100.0, 200.0, 300.0, 50.0, 150.0],
-        })
+        tx_table = pa.table(
+            {
+                "primary_key": pks,
+                "amount": [100.0, 200.0, 300.0, 50.0, 150.0],
+            }
+        )
         reader = _MockReader(
             geometry=geo,
             points={
@@ -1720,7 +1782,10 @@ class TestAggregateMedianBlockEPct:
             },
         )
         result = aggregate(
-            reader, _MockEngine(), _make_sphere(), _MANIFEST,
+            reader,
+            _MockEngine(),
+            _make_sphere(),
+            _MANIFEST,
             event_pattern_id="tx_pattern",
             group_by_line="customers",
             metric="pct75:amount",
@@ -1739,10 +1804,12 @@ class TestAggregateMedianBlockEPct:
             customer_keys=["CUST-A", "CUST-A", "CUST-A", "CUST-B", "CUST-B"],
         )
         pks = geo["primary_key"].to_pylist()
-        tx_table = pa.table({
-            "primary_key": pks,
-            "amount": [10.0, 20.0, 30.0, 5.0, 25.0],
-        })
+        tx_table = pa.table(
+            {
+                "primary_key": pks,
+                "amount": [10.0, 20.0, 30.0, 5.0, 25.0],
+            }
+        )
         reader = _MockReader(
             geometry=geo,
             points={
@@ -1751,7 +1818,10 @@ class TestAggregateMedianBlockEPct:
             },
         )
         result = aggregate(
-            reader, _MockEngine(), _make_sphere(), _MANIFEST,
+            reader,
+            _MockEngine(),
+            _make_sphere(),
+            _MANIFEST,
             event_pattern_id="tx_pattern",
             group_by_line="customers",
             metric="median:amount",
@@ -1768,10 +1838,12 @@ class TestAggregateMedianBlockEPct:
             customer_keys=["CUST-A", "CUST-A", "CUST-B", "CUST-B"],
         )
         pks = geo["primary_key"].to_pylist()
-        tx_table = pa.table({
-            "primary_key": pks,
-            "amount": [100.0, 200.0, 50.0, 150.0],
-        })
+        tx_table = pa.table(
+            {
+                "primary_key": pks,
+                "amount": [100.0, 200.0, 50.0, 150.0],
+            }
+        )
         reader = _MockReader(
             geometry=geo,
             points={
@@ -1780,7 +1852,10 @@ class TestAggregateMedianBlockEPct:
             },
         )
         result = aggregate(
-            reader, _MockEngine(), _make_sphere(), _MANIFEST,
+            reader,
+            _MockEngine(),
+            _make_sphere(),
+            _MANIFEST,
             event_pattern_id="tx_pattern",
             group_by_line="customers",
             metric="pct0:amount",
@@ -1796,10 +1871,12 @@ class TestAggregateMedianBlockEPct:
             customer_keys=["CUST-A", "CUST-A", "CUST-B", "CUST-B"],
         )
         pks = geo["primary_key"].to_pylist()
-        tx_table = pa.table({
-            "primary_key": pks,
-            "amount": [100.0, 200.0, 50.0, 150.0],
-        })
+        tx_table = pa.table(
+            {
+                "primary_key": pks,
+                "amount": [100.0, 200.0, 50.0, 150.0],
+            }
+        )
         reader = _MockReader(
             geometry=geo,
             points={
@@ -1808,7 +1885,10 @@ class TestAggregateMedianBlockEPct:
             },
         )
         result = aggregate(
-            reader, _MockEngine(), _make_sphere(), _MANIFEST,
+            reader,
+            _MockEngine(),
+            _make_sphere(),
+            _MANIFEST,
             event_pattern_id="tx_pattern",
             group_by_line="customers",
             metric="pct100:amount",
@@ -1816,3 +1896,63 @@ class TestAggregateMedianBlockEPct:
         vals = {r["key"]: r["value"] for r in result["results"]}
         assert vals["CUST-A"] == pytest.approx(200.0)
         assert vals["CUST-B"] == pytest.approx(150.0)
+
+
+class TestFilterInOperator:
+    """{"col": {"in": [...]}} keeps rows whose value is in the list."""
+
+    @staticmethod
+    def _table() -> pa.Table:
+        return pa.table(
+            {
+                "primary_key": ["L1", "L2", "L3", "L4"],
+                "loan_status": ["A", "B", "C", "D"],
+                "loan_amount": [100, 200, 300, 400],
+            }
+        )
+
+    def test_in_keeps_listed_values(self):
+        from hypertopos.engine.aggregation import _apply_event_filters
+
+        out = _apply_event_filters(self._table(), {"loan_status": {"in": ["B", "D"]}})
+
+        assert out["primary_key"].to_pylist() == ["L2", "L4"]
+
+    def test_in_combines_with_other_ops_as_and(self):
+        from hypertopos.engine.aggregation import _apply_event_filters
+
+        out = _apply_event_filters(
+            self._table(), {"loan_status": {"in": ["B", "D"]}, "loan_amount": {"gt": 250}}
+        )
+
+        assert out["primary_key"].to_pylist() == ["L4"]
+
+    def test_in_matches_numeric_columns(self):
+        from hypertopos.engine.aggregation import _apply_event_filters
+
+        out = _apply_event_filters(self._table(), {"loan_amount": {"in": [100, 300]}})
+
+        assert out["primary_key"].to_pylist() == ["L1", "L3"]
+
+    @pytest.mark.parametrize("bad", ["B", [], None])
+    def test_in_requires_a_non_empty_list(self, bad):
+        from hypertopos.engine.aggregation import _apply_event_filters
+
+        with pytest.raises(RuntimeError, match="'in' expects a non-empty list"):
+            _apply_event_filters(self._table(), {"loan_status": {"in": bad}})
+
+    def test_op_value_syntax_supports_in(self):
+        from hypertopos.engine.aggregation import _build_property_filter_mask
+
+        table = self._table()
+        mask = _build_property_filter_mask(
+            table, {"loan_status": {"op": "in", "value": ["B", "D"]}}
+        )
+
+        assert table.filter(mask)["primary_key"].to_pylist() == ["L2", "L4"]
+
+    def test_op_value_syntax_in_requires_a_non_empty_list(self):
+        from hypertopos.engine.aggregation import _build_property_filter_mask
+
+        with pytest.raises(RuntimeError, match="'in' expects a non-empty list"):
+            _build_property_filter_mask(self._table(), {"loan_status": {"op": "in", "value": []}})

@@ -15,10 +15,8 @@ import pytest
 
 from hypertopos.navigation.navigator import (
     GDSNavigator,
-    GDSNavigationError,
     _classify_trajectory,
 )
-
 
 # -----------------------------------------------------------------------
 # Pure function tests — _classify_trajectory
@@ -126,24 +124,26 @@ class TestDetectCrossPatternDiscrepancy:
         fake_scanner.scan.return_value = _FakeScanResult(hits=[hit_single, hit_multi])
 
         # cross_pattern_profile for A001: anomalous in pat_a, normal in pat_b
-        nav.cross_pattern_profile = MagicMock(return_value={
-            "primary_key": "A001",
-            "line_id": "accounts",
-            "source_count": 1,
-            "total_patterns": 2,
-            "signals": {
-                "pat_a": {
-                    "is_anomaly": True,
-                    "delta_norm": 3.5,
-                    "delta_rank_pct": 95.0,
+        nav.cross_pattern_profile = MagicMock(
+            return_value={
+                "primary_key": "A001",
+                "line_id": "accounts",
+                "source_count": 1,
+                "total_patterns": 2,
+                "signals": {
+                    "pat_a": {
+                        "is_anomaly": True,
+                        "delta_norm": 3.5,
+                        "delta_rank_pct": 95.0,
+                    },
+                    "pat_b": {
+                        "is_anomaly": False,
+                        "delta_norm": 0.8,
+                        "delta_rank_pct": 40.0,
+                    },
                 },
-                "pat_b": {
-                    "is_anomaly": False,
-                    "delta_norm": 0.8,
-                    "delta_rank_pct": 40.0,
-                },
-            },
-        })
+            }
+        )
 
         with patch(
             "hypertopos.navigation.scanner.PassiveScanner",
@@ -178,7 +178,8 @@ class TestDetectCrossPatternDiscrepancy:
             nav.detect_cross_pattern_discrepancy("accounts")
 
         fake_scanner.auto_discover.assert_called_once_with(
-            "accounts", include_graph=False,
+            "accounts",
+            include_graph=False,
         )
 
 
@@ -190,11 +191,13 @@ class TestDetectNeighborContamination:
         nav = _make_navigator()
         nav._manifest.pattern_version.return_value = 1
 
-        geo = pa.table({
-            "primary_key": ["A001", "A002", "A003"],
-            "is_anomaly": [False, False, False],
-            "delta_rank_pct": [30.0, 50.0, 60.0],
-        })
+        geo = pa.table(
+            {
+                "primary_key": ["A001", "A002", "A003"],
+                "is_anomaly": [False, False, False],
+                "delta_rank_pct": [30.0, 50.0, 60.0],
+            }
+        )
         nav._storage.read_geometry.return_value = geo
 
         result = nav.detect_neighbor_contamination("pat_a")
@@ -205,19 +208,23 @@ class TestDetectNeighborContamination:
         nav = _make_navigator()
         nav._manifest.pattern_version.return_value = 1
 
-        geo = pa.table({
-            "primary_key": ["A001", "A002", "A003", "A004"],
-            "is_anomaly": [True, True, False, False],
-            "delta_rank_pct": [99.0, 98.0, 40.0, 50.0],
-        })
+        geo = pa.table(
+            {
+                "primary_key": ["A001", "A002", "A003", "A004"],
+                "is_anomaly": [True, True, False, False],
+                "delta_rank_pct": [99.0, 98.0, 40.0, 50.0],
+            }
+        )
         # First call: full geometry read, second call: neighbour batch read
         nav._storage.read_geometry.side_effect = [
             geo,
             # Batch read for neighbour anomaly status
-            pa.table({
-                "primary_key": ["A001", "A002", "A003"],
-                "is_anomaly": [True, True, False],
-            }),
+            pa.table(
+                {
+                    "primary_key": ["A001", "A002", "A003"],
+                    "is_anomaly": [True, True, False],
+                }
+            ),
         ]
 
         # find_similar_entities returns neighbours
@@ -228,7 +235,9 @@ class TestDetectNeighborContamination:
 
         with patch("random.sample", side_effect=lambda lst, n: lst[:n]):
             result = nav.detect_neighbor_contamination(
-                "pat_a", k=3, sample_size=5,
+                "pat_a",
+                k=3,
+                sample_size=5,
                 contamination_threshold=0.5,
             )
 
@@ -237,17 +246,18 @@ class TestDetectNeighborContamination:
         for r in result:
             assert r["is_anomaly_target"] is False
 
-
     def test_inverted_search_finds_contaminated_normals(self):
         """Inverted search: start from anomalies, find their normal neighbors."""
         nav = _make_navigator()
         nav._manifest.pattern_version.return_value = 1
 
         # A001, A002 are anomalous; A003 is normal but neighbors are all anomalous
-        geo = pa.table({
-            "primary_key": ["A001", "A002", "A003"],
-            "is_anomaly": [True, True, False],
-        })
+        geo = pa.table(
+            {
+                "primary_key": ["A001", "A002", "A003"],
+                "is_anomaly": [True, True, False],
+            }
+        )
         nav._storage.read_geometry.return_value = geo
 
         # Phase 1: anomaly A001's neighbors include normal A003
@@ -263,7 +273,9 @@ class TestDetectNeighborContamination:
 
         with patch("random.sample", side_effect=lambda lst, n: lst[:n]):
             result = nav.detect_neighbor_contamination(
-                "pat_a", k=2, sample_size=5,
+                "pat_a",
+                k=2,
+                sample_size=5,
                 contamination_threshold=0.5,
             )
 
@@ -299,6 +311,8 @@ class TestDetectTrajectoryAnomaly:
         fake_pattern.relations = [MagicMock(line_id="dim_a")]
         fake_pattern.sigma_diag = np.array([1.0], dtype=np.float32)
         fake_pattern.mu = np.array([0.0], dtype=np.float32)
+        fake_pattern.cholesky_inv = None
+        fake_pattern.dimension_weights = None
 
         fake_sphere = MagicMock()
         fake_sphere.patterns = {"pat_a": fake_pattern}
@@ -307,14 +321,16 @@ class TestDetectTrajectoryAnomaly:
         # Temporal data: monotonically increasing → linear_drift
         shapes = [[float(i) * 0.1] for i in range(10)]
         ts_base = 1704067200000000  # 2024-01-01 in μs
-        temporal = pa.table({
-            "primary_key": ["E001"] * 10,
-            "shape_snapshot": shapes,
-            "timestamp": pa.array(
-                [ts_base + i * 86400_000_000 * 30 for i in range(10)],
-                type=pa.timestamp("us", tz="UTC"),
-            ),
-        })
+        temporal = pa.table(
+            {
+                "primary_key": ["E001"] * 10,
+                "shape_snapshot": shapes,
+                "timestamp": pa.array(
+                    [ts_base + i * 86400_000_000 * 30 for i in range(10)],
+                    type=pa.timestamp("us", tz="UTC"),
+                ),
+            }
+        )
 
         def fake_temporal_batched(pattern_id, **kwargs):
             yield temporal.to_batches()[0]
@@ -355,10 +371,12 @@ class TestDetectSegmentShift:
         # Geometry: 100 entities, 10 anomalous (10% population rate)
         pk_list = [f"A{i:04d}" for i in range(100)]
         is_anom = [i < 10 for i in range(100)]  # first 10 are anomalous
-        geo = pa.table({
-            "primary_key": pk_list,
-            "is_anomaly": is_anom,
-        })
+        geo = pa.table(
+            {
+                "primary_key": pk_list,
+                "is_anomaly": is_anom,
+            }
+        )
         nav._storage.read_geometry.return_value = geo
 
         # Regime change: no data
@@ -366,14 +384,17 @@ class TestDetectSegmentShift:
 
         # Points: first 20 entities are "region=EAST", rest are "region=WEST"
         regions = ["EAST" if i < 20 else "WEST" for i in range(100)]
-        pts = pa.table({
-            "primary_key": pk_list,
-            "region": regions,
-        })
+        pts = pa.table(
+            {
+                "primary_key": pk_list,
+                "region": regions,
+            }
+        )
         nav._storage.read_points.return_value = pts
 
         result = nav.detect_segment_shift(
-            "pat_a", min_shift_ratio=2.0,
+            "pat_a",
+            min_shift_ratio=2.0,
         )
 
         # EAST: 10/20 anomalous = 50%, shift_ratio = 50%/10% = 5.0 (included)
@@ -408,23 +429,28 @@ class TestDetectSegmentShift:
         # Geometry: 100 entities, 10 anomalous
         pk_list = [f"A{i:04d}" for i in range(100)]
         is_anom = [i < 10 for i in range(100)]
-        geo = pa.table({
-            "primary_key": pk_list,
-            "is_anomaly": is_anom,
-        })
+        geo = pa.table(
+            {
+                "primary_key": pk_list,
+                "is_anomaly": is_anom,
+            }
+        )
         nav._storage.read_geometry.return_value = geo
 
         nav.π12_attract_regime_change = MagicMock(return_value=[])
 
         # 100 distinct names → exceeds max_cardinality=50
-        pts = pa.table({
-            "primary_key": pk_list,
-            "account_name": [f"Name_{i}" for i in range(100)],
-        })
+        pts = pa.table(
+            {
+                "primary_key": pk_list,
+                "account_name": [f"Name_{i}" for i in range(100)],
+            }
+        )
         nav._storage.read_points.return_value = pts
 
         result = nav.detect_segment_shift(
-            "pat_a", max_cardinality=50,
+            "pat_a",
+            max_cardinality=50,
         )
 
         # High cardinality column is skipped entirely

@@ -13,6 +13,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
+
 from hypertopos.builder.builder import GDSBuilder, RelationSpec
 
 

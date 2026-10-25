@@ -10,61 +10,41 @@ The orchestrator :func:`compute_all_edge_dims` runs all dims listed in
 a config dict and returns a single Arrow table keyed by ``event_key``
 for sidecar persistence.
 """
+
 from __future__ import annotations
 
-from collections import defaultdict
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
 EDGE_DIM_KINDS: dict[str, str] = {
-    "pair_edge_count":           "poisson",
-    "position_in_chain":         "poisson",
+    "pair_edge_count": "poisson",
+    "position_in_chain": "poisson",
     "time_since_pair_last_edge": "gaussian",
-    "pair_amount_zscore":        "gaussian",
-    "find_motif_structuring":    "bernoulli",
-    "edge_curvature_frc":        "gaussian",
+    "pair_amount_zscore": "gaussian",
+    "find_motif_structuring": "bernoulli",
+    "edge_curvature_frc": "gaussian",
 }
 
 
-def compute_pair_edge_count(edges: pa.Table) -> pa.Array:
-    """Per-edge count of how many times the (from, to) pair appears.
+def _pair_codes(edges: pa.Table) -> np.ndarray:
+    """One int64 id per ``(from_key, to_key)`` pair, equal ids for equal pairs."""
+    from_codes = pc.dictionary_encode(edges["from_key"].combine_chunks())
+    to_codes = pc.dictionary_encode(edges["to_key"].combine_chunks())
+    n_to = max(len(to_codes.dictionary), 1)
+    from_ids = np.asarray(from_codes.indices.to_numpy(), dtype=np.int64)
+    to_ids = np.asarray(to_codes.indices.to_numpy(), dtype=np.int64)
+    return from_ids * n_to + to_ids
 
-    Vectorised: pyarrow native group_by then numpy-side broadcast back to
-    edge order via a sort + searchsorted on a packed `(from\\x00to)` key.
-    Replaces a per-row dict lookup loop that scaled O(n_edges).
-    """
+
+def compute_pair_edge_count(edges: pa.Table) -> pa.Array:
+    """Per-edge count of how many times the (from, to) pair appears."""
     if edges.num_rows == 0:
         return pa.array([], type=pa.float32())
-    pair_counts = (
-        edges.group_by(["from_key", "to_key"])
-             .aggregate([("event_key", "count")])
-    )
-    # Pack (from, to) into a single string key for both the group table and
-    # the edges table, then map via searchsorted on the sorted group keys.
-    sep = "\x00"  # NUL separator — guaranteed not present in event keys
-    g_fk = pair_counts["from_key"].combine_chunks()
-    g_tk = pair_counts["to_key"].combine_chunks()
-    e_fk = edges["from_key"].combine_chunks()
-    e_tk = edges["to_key"].combine_chunks()
-    g_key = pc.binary_join_element_wise(
-        pc.cast(g_fk, pa.string()), pc.cast(g_tk, pa.string()), sep,
-    ).to_numpy(zero_copy_only=False)
-    e_key = pc.binary_join_element_wise(
-        pc.cast(e_fk, pa.string()), pc.cast(e_tk, pa.string()), sep,
-    ).to_numpy(zero_copy_only=False)
-    g_count = pair_counts["event_key_count"].combine_chunks().to_numpy(
-        zero_copy_only=False,
-    )
-    sort_g = np.argsort(g_key, kind="stable")
-    sorted_g_key = g_key[sort_g]
-    sorted_g_count = g_count[sort_g]
-    insert_idx = np.searchsorted(sorted_g_key, e_key)
-    # Every edge MUST have a matching group (group_by sourced from edges).
-    counts = sorted_g_count[insert_idx].astype(np.float32)
-    return pa.array(counts, type=pa.float32())
+    _, inverse, counts = np.unique(_pair_codes(edges), return_inverse=True, return_counts=True)
+    return pa.array(counts[inverse].astype(np.float32), type=pa.float32())
 
 
 def compute_position_in_chain(
@@ -92,7 +72,9 @@ def compute_position_in_chain(
             chain_at_node[tk] = my_pos
 
     out = np.where(
-        pos >= min_position, pos.astype(np.float32), np.float32(0.0),
+        pos >= min_position,
+        pos.astype(np.float32),
+        np.float32(0.0),
     )
     return pa.array(out, type=pa.float32())
 
@@ -114,31 +96,26 @@ def compute_time_since_pair_last_edge(
     n = edges.num_rows
     if n == 0:
         return pa.array([], type=pa.float32())
-    sort_idx = pc.sort_indices(
-        edges,
-        sort_keys=[
-            ("from_key", "ascending"),
-            ("to_key", "ascending"),
-            ("timestamp", "ascending"),
-        ],
-    ).to_numpy(zero_copy_only=False)
-    sorted_t = edges.take(sort_idx)
-    fks = sorted_t["from_key"].combine_chunks().to_numpy(zero_copy_only=False)
-    tks = sorted_t["to_key"].combine_chunks().to_numpy(zero_copy_only=False)
-    ts = sorted_t["timestamp"].combine_chunks().to_numpy(
-        zero_copy_only=False,
-    ).astype(np.float64)
+    # Order rows by (pair, timestamp); stable sorts keep ties in row order.
+    ts_all = edges["timestamp"].combine_chunks().to_numpy(zero_copy_only=False).astype(np.float64)
+    pair = _pair_codes(edges)
+    sort_idx = np.argsort(ts_all, kind="stable")
+    sort_idx = sort_idx[np.argsort(pair[sort_idx], kind="stable")]
+    pairs_sorted = pair[sort_idx]
+    ts = ts_all[sort_idx]
     # `same_pair_as_prev[i]` = True iff row i belongs to the same (from,to)
     # group as row i-1 (so we should diff with row i-1's timestamp).
     same_prev = np.zeros(n, dtype=bool)
     if n > 1:
-        same_prev[1:] = (fks[1:] == fks[:-1]) & (tks[1:] == tks[:-1])
+        same_prev[1:] = pairs_sorted[1:] == pairs_sorted[:-1]
     diffs = np.empty(n, dtype=np.float32)
     diffs[0] = np.float32(dormant_seconds)
     if n > 1:
         delta = (ts[1:] - ts[:-1]).astype(np.float32)
         diffs[1:] = np.where(
-            same_prev[1:], delta, np.float32(dormant_seconds),
+            same_prev[1:],
+            delta,
+            np.float32(dormant_seconds),
         )
     out = np.empty(n, dtype=np.float32)
     out[sort_idx] = diffs
@@ -164,34 +141,37 @@ def compute_pair_amount_zscore(
     n = edges.num_rows
     if n == 0:
         return pa.array([], type=pa.float32())
-    sort_idx = pc.sort_indices(
-        edges,
-        sort_keys=[
-            ("from_key", "ascending"),
-            ("to_key", "ascending"),
-        ],
-    ).to_numpy(zero_copy_only=False)
-    sorted_t = edges.take(sort_idx)
-    fks = sorted_t["from_key"].combine_chunks().to_numpy(zero_copy_only=False)
-    tks = sorted_t["to_key"].combine_chunks().to_numpy(zero_copy_only=False)
-    amts = pc.fill_null(sorted_t["amount"], 0.0).combine_chunks().to_numpy(
-        zero_copy_only=False,
-    ).astype(np.float64)
+    pair = _pair_codes(edges)
+    sort_idx = np.argsort(pair, kind="stable")
+    pairs_sorted = pair[sort_idx]
+    amts = (
+        pc.fill_null(edges["amount"], 0.0)
+        .combine_chunks()
+        .to_numpy(zero_copy_only=False)
+        .astype(np.float64)[sort_idx]
+    )
 
     # Assign each row a contiguous group id per (from, to) pair.
     same_prev = np.zeros(n, dtype=bool)
     if n > 1:
-        same_prev[1:] = (fks[1:] == fks[:-1]) & (tks[1:] == tks[:-1])
+        same_prev[1:] = pairs_sorted[1:] == pairs_sorted[:-1]
     # `new_group[i] = True` exactly at first row of each group.
     new_group = ~same_prev
     group_id = (np.cumsum(new_group) - 1).astype(np.int64)
     n_groups = int(group_id[-1]) + 1
 
+    # A missing amount is stored as 0.0; only positive amounts enter the pair
+    # statistics, and missing rows get z = 0.0 below.
+    present = amts > 0
+    weights = present.astype(np.float64)
+
     # Per-group running statistics via bincount.
-    counts = np.bincount(group_id, minlength=n_groups).astype(np.float64)
-    sums = np.bincount(group_id, weights=amts, minlength=n_groups)
+    counts = np.bincount(group_id, weights=weights, minlength=n_groups)
+    sums = np.bincount(group_id, weights=amts * weights, minlength=n_groups)
     sq_sums = np.bincount(
-        group_id, weights=(amts * amts), minlength=n_groups,
+        group_id,
+        weights=(amts * amts * weights),
+        minlength=n_groups,
     )
     safe_counts = np.where(counts > 0, counts, 1.0)
     means = sums / safe_counts
@@ -203,15 +183,10 @@ def compute_pair_amount_zscore(
     abs_means = np.abs(means)
     safe_abs_means = np.where(abs_means > 0, abs_means, 1.0)
     cvs = stds / safe_abs_means
-    valid_group = (
-        (counts >= min_count)
-        & (means != 0.0)
-        & (stds != 0.0)
-        & (cvs < cv_threshold)
-    )
+    valid_group = (counts >= min_count) & (means != 0.0) & (stds != 0.0) & (cvs < cv_threshold)
 
     # Per-row z-score for valid groups, 0.0 otherwise.
-    valid_per_row = valid_group[group_id]
+    valid_per_row = valid_group[group_id] & present
     safe_stds_per_row = np.where(stds[group_id] != 0, stds[group_id], 1.0)
     z = np.where(
         valid_per_row,
@@ -239,16 +214,17 @@ def compute_find_motif_structuring(
         amt1_min=amt1_min,
         amt2_max=amt2_max,
     )
-    eks = edges["event_key"].to_pylist()
-    out = np.array(
-        [1.0 if ek in motif_keys else 0.0 for ek in eks],
-        dtype=np.float32,
-    )
-    return pa.array(out, type=pa.float32())
+    event_keys = edges["event_key"]
+    flagged = pc.is_in(event_keys, value_set=pa.array(sorted(motif_keys), type=event_keys.type))
+    return pa.array(flagged.to_numpy(zero_copy_only=False).astype(np.float32), type=pa.float32())
 
 
 AGGREGATE_NAMES: tuple[str, ...] = (
-    "mean", "max", "std", "p95", "count_above_threshold",
+    "mean",
+    "max",
+    "std",
+    "p95",
+    "count_above_threshold",
 )
 
 # Map our aggregate name -> (pyarrow group_by aggregate spec, options, output column suffix).
@@ -256,9 +232,9 @@ AGGREGATE_NAMES: tuple[str, ...] = (
 # we rename to canonical "<col>_<our-name>" in _fill_aggregate_columns.
 # When the pyarrow agg name is None, the aggregate is computed manually.
 _AGG_TO_PYARROW: dict[str, tuple[str | None, Any | None, str]] = {
-    "mean": ("mean",    None,                                "mean"),
-    "max":  ("max",     None,                                "max"),
-    "std":  ("stddev",  pc.VarianceOptions(ddof=0),          "stddev"),
+    "mean": ("mean", None, "mean"),
+    "max": ("max", None, "max"),
+    "std": ("stddev", pc.VarianceOptions(ddof=0), "stddev"),
     # p95 was previously delegated to pyarrow's `tdigest` group_by aggregate
     # (the only quantile aggregation in the hash-aggregate suite). Empirical
     # benchmark on 10M-row × 515k-group input showed tdigest = ~88% of the
@@ -266,11 +242,11 @@ _AGG_TO_PYARROW: dict[str, tuple[str | None, Any | None, str]] = {
     # a vectorized exact-quantile path post-group_by — see
     # `_fill_aggregate_columns`. The (None, None, …) marker keeps p95 out of
     # the pyarrow aggregate spec list.
-    "p95":  (None,      None,                                "p95"),
+    "p95": (None, None, "p95"),
     # count_above_threshold is computed manually post-group_by from the
     # underlying values + a per-dim threshold (passed via the `thresholds`
     # kwarg, default = population p95 from the sidecar).
-    "count_above_threshold": (None,        None,             "count_above_threshold"),
+    "count_above_threshold": (None, None, "count_above_threshold"),
 }
 
 
@@ -314,10 +290,7 @@ def _resolve_count_above_thresholds(
             continue
         # pc.quantile returns an Array of length len(q); we passed scalar 0.95.
         raw_arr = pc.quantile(col, q=0.95)
-        if hasattr(raw_arr, "as_py"):
-            raw = raw_arr.as_py()
-        else:
-            raw = raw_arr.to_pylist()
+        raw = raw_arr.as_py() if hasattr(raw_arr, "as_py") else raw_arr.to_pylist()
         q = raw[0] if isinstance(raw, list) else raw
         if q is None:
             out[d] = 0.0
@@ -327,12 +300,17 @@ def _resolve_count_above_thresholds(
     return out
 
 
+def _anchor_positions(keys: pa.Array | pa.ChunkedArray, anchors: pa.Array) -> np.ndarray:
+    """Row of each key in ``anchors`` (-1 when the key is not an anchor)."""
+    found = pc.index_in(keys, value_set=anchors)
+    return np.asarray(pc.fill_null(found, -1).to_numpy(zero_copy_only=False), dtype=np.int64)
+
+
 def _fill_aggregate_columns(
     *,
     out_cols: dict[str, pa.Array],
     grouped: pa.Table,
     anchor_keys: list[str],
-    pk_to_idx: dict[str, int],
     aggregates_per_dim: dict[str, tuple[str, ...]],
     n_anchors: int,
     base: pa.Table | None = None,
@@ -341,156 +319,81 @@ def _fill_aggregate_columns(
     """Read each per-aggregate column from the grouped table and write it
     into out_cols under canonical naming `<dim>_<our_agg_name>`.
 
-    Three aggregate dispatch paths:
+    Every key is mapped once to its anchor row with ``pc.index_in``; all
+    later work is on integer rows (no string sorting). Anchors without a
+    value get 0, NaN results become 0.
 
-    1. **pyarrow group_by aggregates** (mean / max / std) — read the column
-       from the post-group_by table and gather per-anchor values via a
-       single vectorised `np.searchsorted` instead of a per-anchor
-       `dict.get` loop.
-
-    2. **p95** — pyarrow's `tdigest` group_by aggregate empirically dominates
-       the entire `_group_by` cost on real-data scale (~88% on a 10M-row ×
-       515k-group input). Replaced by a vectorised exact-quantile path:
-       `lexsort((vals, pks))` once per dim, then index the 95-th percentile
-       element of each contiguous group. Returns the exact value rather
-       than the t-digest sketch — strictly more accurate, materially
-       faster.
-
-    3. **count_above_threshold** — replaces the prior 10M-iteration
-       Python dict-update loop with a pyarrow `filter` + `group_by("count")`
-       pipeline that runs end-to-end in C++ (Acero count aggregate is
-       1-2 s on the same scale).
+    1. **pyarrow group_by aggregates** (mean / max / std) — scattered from the
+       post-group_by table.
+    2. **p95** — exact quantile: rows ordered by (anchor, value) with two
+       stable sorts, then the ``int((size - 1) * 0.95)``-th value of each
+       anchor's run.
+    3. **count_above_threshold** — ``bincount`` of the anchor rows whose
+       value exceeds the dim's threshold.
     """
-    # Vectorised lookup: anchor_keys → row index in `grouped` (one index per
-    # anchor; -1 marks "no row for this anchor"). Built once and reused for
-    # every (dim, agg) pair in section (1). `grouped` is the post-group_by
-    # table whose row order is dictated by Acero — sort once for searchsorted.
-    grouped_pks_arr = grouped["primary_key"]
-    if isinstance(grouped_pks_arr, pa.ChunkedArray):
-        grouped_pks_arr = grouped_pks_arr.combine_chunks()
-    grouped_pks_np = grouped_pks_arr.to_numpy(zero_copy_only=False)
-    sort_g = np.argsort(grouped_pks_np, kind="stable")
-    sorted_gpks = grouped_pks_np[sort_g]
-    ak_np = np.asarray(anchor_keys, dtype=object)
-    insert_idx = np.searchsorted(sorted_gpks, ak_np)
-    in_range = insert_idx < len(sorted_gpks)
-    match_mask = np.zeros(n_anchors, dtype=bool)
-    safe_idx = np.minimum(insert_idx, len(sorted_gpks) - 1)
-    match_mask[in_range] = (
-        sorted_gpks[safe_idx[in_range]] == ak_np[in_range]
-    )
-    gi_per_anchor = np.where(match_mask, sort_g[safe_idx], -1)
+    anchors = pa.array(anchor_keys, type=pa.string())
 
-    # 1. pyarrow group_by aggregates (mean / max / std) — vectorised gather.
+    # 1. pyarrow group_by aggregates (mean / max / std).
+    grouped_rows = _anchor_positions(grouped["primary_key"], anchors)
+    hit = grouped_rows >= 0
     for d, agg_list in aggregates_per_dim.items():
         for agg_name in agg_list:
             pyarrow_agg, _options, suffix = _AGG_TO_PYARROW[agg_name]
             if pyarrow_agg is None:
                 continue  # manual: handled in sections (2) and (3) below
-            grouped_col_arr = grouped[f"{d}_{suffix}"]
-            if isinstance(grouped_col_arr, pa.ChunkedArray):
-                grouped_col_arr = grouped_col_arr.combine_chunks()
-            col_np = grouped_col_arr.to_numpy(zero_copy_only=False)
+            col_arr = grouped[f"{d}_{suffix}"]
+            if isinstance(col_arr, pa.ChunkedArray):
+                col_arr = col_arr.combine_chunks()
+            col_np = col_arr.to_numpy(zero_copy_only=False)
             buf = np.zeros(n_anchors, dtype=np.float32)
-            if match_mask.any():
-                vals = col_np[gi_per_anchor[match_mask]]
-                vals = np.where(np.isnan(vals), 0.0, vals).astype(np.float32)
-                buf[match_mask] = vals
+            vals = col_np[hit]
+            buf[grouped_rows[hit]] = np.where(np.isnan(vals), 0.0, vals).astype(np.float32)
             out_cols[f"{d}_{agg_name}"] = pa.array(buf)
 
-    # 2. Manual p95 — vectorised exact quantile per anchor PK group.
-    if base is not None and any(
-        "p95" in agg_list for agg_list in aggregates_per_dim.values()
-    ):
-        base_pks_arr = base["primary_key"]
-        if isinstance(base_pks_arr, pa.ChunkedArray):
-            base_pks_arr = base_pks_arr.combine_chunks()
-        base_pks_np = base_pks_arr.to_numpy(zero_copy_only=False)
+    if base is None:
+        return
+    need_p95 = any("p95" in agg_list for agg_list in aggregates_per_dim.values())
+    need_count = any(
+        "count_above_threshold" in agg_list for agg_list in aggregates_per_dim.values()
+    )
+    if not (need_p95 or need_count):
+        return
+    base_rows = _anchor_positions(base["primary_key"], anchors)
+    on_anchor = base_rows >= 0
+    rows = base_rows[on_anchor]
+
+    # 2. Manual p95 — exact quantile per anchor.
+    if need_p95:
         for d, agg_list in aggregates_per_dim.items():
             if "p95" not in agg_list:
                 continue
             vals_arr = base[d]
             if isinstance(vals_arr, pa.ChunkedArray):
                 vals_arr = vals_arr.combine_chunks()
-            vals_np = vals_arr.to_numpy(zero_copy_only=False)
-            # Sort by (primary_key ASC, value ASC within group) so each
-            # contiguous run of pks holds its values in ascending order.
-            sort_idx = np.lexsort((vals_np, base_pks_np))
-            sorted_pks = base_pks_np[sort_idx]
-            sorted_vals = vals_np[sort_idx]
-            unique_pks, group_starts = np.unique(
-                sorted_pks, return_index=True,
-            )
-            group_sizes = np.diff(
-                np.append(group_starts, len(sorted_pks)),
-            )
-            p95_offsets = ((group_sizes - 1) * 0.95).astype(np.int64)
-            p95_idxs = group_starts + p95_offsets
-            p95_per_group = sorted_vals[p95_idxs].astype(np.float32)
-            # Map back to anchor_keys order via searchsorted (unique_pks
-            # is already sorted ascending by `np.unique`).
-            ins_idx = np.searchsorted(unique_pks, ak_np)
-            in_range_p = ins_idx < len(unique_pks)
-            mask_p = np.zeros(n_anchors, dtype=bool)
-            safe_p = np.minimum(ins_idx, len(unique_pks) - 1)
-            mask_p[in_range_p] = (
-                unique_pks[safe_p[in_range_p]] == ak_np[in_range_p]
-            )
+            vals = vals_arr.to_numpy(zero_copy_only=False)[on_anchor]
             buf = np.zeros(n_anchors, dtype=np.float32)
-            if mask_p.any():
-                vals = p95_per_group[safe_p[mask_p]]
-                vals = np.where(np.isnan(vals), 0.0, vals).astype(np.float32)
-                buf[mask_p] = vals
+            if len(rows):
+                order = np.argsort(vals, kind="stable")
+                order = order[np.argsort(rows[order], kind="stable")]
+                sorted_rows, sorted_vals = rows[order], vals[order]
+                starts = np.flatnonzero(np.r_[True, sorted_rows[1:] != sorted_rows[:-1]])
+                sizes = np.diff(np.r_[starts, len(sorted_rows)])
+                p95 = sorted_vals[starts + ((sizes - 1) * 0.95).astype(np.int64)]
+                buf[sorted_rows[starts]] = np.where(np.isnan(p95), 0.0, p95).astype(np.float32)
             out_cols[f"{d}_p95"] = pa.array(buf)
 
-    # 3. count_above_threshold — pyarrow filter + group_by("count") pipeline.
-    if base is not None and any(
-        "count_above_threshold" in agg_list
-        for agg_list in aggregates_per_dim.values()
-    ):
+    # 3. count_above_threshold — rows above the dim's threshold per anchor.
+    if need_count:
         thresholds = thresholds or {}
         for d, agg_list in aggregates_per_dim.items():
             if "count_above_threshold" not in agg_list:
                 continue
             thr = float(thresholds.get(d, 0.0))
-            # Filter to rows where dim value > threshold (NaN rejected by `>`).
-            mask = pc.greater(base[d], pa.scalar(thr, type=pa.float32()))
-            mask = pc.fill_null(mask, False)
-            # Project to (primary_key) only, then group_by_count.
-            filtered = base.filter(mask).select(["primary_key"])
-            if filtered.num_rows == 0:
-                out_cols[f"{d}_count_above_threshold"] = pa.array(
-                    np.zeros(n_anchors, dtype=np.float32),
-                )
-                continue
-            counts_tbl = (
-                filtered.group_by("primary_key")
-                .aggregate([("primary_key", "count")])
-            )
-            cpks_arr = counts_tbl["primary_key"]
-            if isinstance(cpks_arr, pa.ChunkedArray):
-                cpks_arr = cpks_arr.combine_chunks()
-            cpks_np = cpks_arr.to_numpy(zero_copy_only=False)
-            ccnt_arr = counts_tbl["primary_key_count"]
-            if isinstance(ccnt_arr, pa.ChunkedArray):
-                ccnt_arr = ccnt_arr.combine_chunks()
-            ccnt_np = ccnt_arr.to_numpy(zero_copy_only=False)
-            # Sort and searchsorted-map back to anchor_keys order.
-            sort_c = np.argsort(cpks_np, kind="stable")
-            sorted_cpks = cpks_np[sort_c]
-            ins_idx = np.searchsorted(sorted_cpks, ak_np)
-            in_range_c = ins_idx < len(sorted_cpks)
-            mask_c = np.zeros(n_anchors, dtype=bool)
-            safe_c = np.minimum(ins_idx, len(sorted_cpks) - 1)
-            mask_c[in_range_c] = (
-                sorted_cpks[safe_c[in_range_c]] == ak_np[in_range_c]
-            )
-            buf = np.zeros(n_anchors, dtype=np.float32)
-            if mask_c.any():
-                buf[mask_c] = ccnt_np[sort_c[safe_c[mask_c]]].astype(
-                    np.float32,
-                )
-            out_cols[f"{d}_count_above_threshold"] = pa.array(buf)
+            # NaN and null values are not above any threshold.
+            above = pc.fill_null(pc.greater(base[d], pa.scalar(thr, type=pa.float32())), False)
+            mask = np.asarray(above.to_numpy(zero_copy_only=False), dtype=bool)[on_anchor]
+            counts = np.bincount(rows[mask], minlength=n_anchors).astype(np.float32)
+            out_cols[f"{d}_count_above_threshold"] = pa.array(counts)
 
 
 def aggregate_kind(source_kind: str, agg: str) -> str:
@@ -523,8 +426,7 @@ def aggregate_edge_dims_for_anchor(
 ) -> pa.Table:
     if anchor_kind not in ("single", "pair", "chain"):
         raise ValueError(
-            f"anchor_kind must be one of 'single' / 'pair' / 'chain'; "
-            f"got {anchor_kind!r}",
+            f"anchor_kind must be one of 'single' / 'pair' / 'chain'; got {anchor_kind!r}",
         )
     if anchor_kind == "chain":
         if chain_events is None:
@@ -540,8 +442,7 @@ def aggregate_edge_dims_for_anchor(
     for d in dims:
         if d not in EDGE_DIM_KINDS:
             raise ValueError(
-                f"unknown edge dimension: {d!r}; "
-                f"valid: {sorted(EDGE_DIM_KINDS)}",
+                f"unknown edge dimension: {d!r}; valid: {sorted(EDGE_DIM_KINDS)}",
             )
         if d not in sidecar.column_names:
             raise ValueError(
@@ -563,14 +464,12 @@ def aggregate_edge_dims_for_anchor(
         for d, agg_list in aggregates_per_dim.items():
             if not agg_list:
                 raise ValueError(
-                    f"aggregates_per_dim[{d!r}] must be a non-empty "
-                    f"tuple of aggregate names",
+                    f"aggregates_per_dim[{d!r}] must be a non-empty tuple of aggregate names",
                 )
             for agg in agg_list:
                 if agg not in AGGREGATE_NAMES:
                     raise ValueError(
-                        f"unknown aggregate {agg!r} for dim {d!r}; "
-                        f"valid: {list(AGGREGATE_NAMES)}",
+                        f"unknown aggregate {agg!r} for dim {d!r}; valid: {list(AGGREGATE_NAMES)}",
                     )
 
     n_anchors = len(anchor_keys)
@@ -591,13 +490,17 @@ def aggregate_edge_dims_for_anchor(
     # before per-anchor group_by, so threshold is a population property,
     # not a per-anchor property.
     resolved_thresholds = _resolve_count_above_thresholds(
-        sidecar, dims, thresholds,
+        sidecar,
+        dims,
+        thresholds,
     )
 
     if anchor_kind == "chain":
         chain_id_flat: list[str] = []
         event_key_flat: list[str] = []
-        for cid, evs_str in zip(anchor_keys, chain_events, strict=True):
+        # chain_events is validated non-None for the chain regime above.
+        chain_events_list = cast("list[str]", chain_events)
+        for cid, evs_str in zip(anchor_keys, chain_events_list, strict=True):
             if not evs_str:
                 continue
             evs = evs_str.split(",")
@@ -612,21 +515,19 @@ def aggregate_edge_dims_for_anchor(
                     )
             return pa.table(out_cols)
 
-        exploded = pa.table({
-            "primary_key": pa.array(chain_id_flat, type=pa.string()),
-            "event_key":   pa.array(event_key_flat, type=pa.string()),
-        })
+        exploded = pa.table(
+            {
+                "primary_key": pa.array(chain_id_flat, type=pa.string()),
+                "event_key": pa.array(event_key_flat, type=pa.string()),
+            }
+        )
         joined = exploded.join(sidecar, keys="event_key")
         aggs = _build_pyarrow_aggs(aggregates_per_dim)
         grouped = joined.group_by("primary_key").aggregate(aggs)
-        pk_to_idx = {
-            pk: i for i, pk in enumerate(grouped["primary_key"].to_pylist())
-        }
         _fill_aggregate_columns(
             out_cols=out_cols,
             grouped=grouped,
             anchor_keys=anchor_keys,
-            pk_to_idx=pk_to_idx,
             aggregates_per_dim=aggregates_per_dim,
             n_anchors=n_anchors,
             base=joined,
@@ -638,7 +539,7 @@ def aggregate_edge_dims_for_anchor(
 
     if anchor_kind == "single":
         from_pk_arr = joined["from_key"].combine_chunks()
-        to_pk_arr   = joined["to_key"].combine_chunks()
+        to_pk_arr = joined["to_key"].combine_chunks()
         anchor_pk_arr = pa.concat_arrays([from_pk_arr, to_pk_arr])
         dim_arrays: dict[str, pa.Array] = {}
         for d in dims:
@@ -659,9 +560,7 @@ def aggregate_edge_dims_for_anchor(
             cols = ["from_key", "to_key"]
         else:
             property_cols = list(key_cols[2:])
-            missing_in_joined = [
-                c for c in property_cols if c not in joined.column_names
-            ]
+            missing_in_joined = [c for c in property_cols if c not in joined.column_names]
             if missing_in_joined:
                 if event_table is None:
                     raise ValueError(
@@ -671,8 +570,7 @@ def aggregate_edge_dims_for_anchor(
                         f"missing columns {missing_in_joined!r} can be joined",
                     )
                 missing_in_event = [
-                    c for c in missing_in_joined
-                    if c not in event_table.column_names
+                    c for c in missing_in_joined if c not in event_table.column_names
                 ]
                 if missing_in_event:
                     raise ValueError(
@@ -682,7 +580,8 @@ def aggregate_edge_dims_for_anchor(
                         f"{sorted(event_table.column_names)!r}",
                     )
                 event_key_col = (
-                    "event_key" if "event_key" in event_table.column_names
+                    "event_key"
+                    if "event_key" in event_table.column_names
                     else "primary_key"  # event line uses primary_key
                 )
                 prop_subset = event_table.select(
@@ -697,25 +596,17 @@ def aggregate_edge_dims_for_anchor(
         # Cast each key column to string and join positionally with pair_separator.
         # Mirrors build_composite_table convention so anchor PKs match what
         # was registered at composite_line resolution time.
-        str_cols = [
-            pc.cast(joined_for_pk[c].combine_chunks(), pa.string()) for c in cols
-        ]
+        str_cols = [pc.cast(joined_for_pk[c].combine_chunks(), pa.string()) for c in cols]
         anchor_pk_arr = pc.binary_join_element_wise(*str_cols, pair_separator)
-        dim_arrays = {
-            d: joined_for_pk[d].combine_chunks() for d in dims
-        }
+        dim_arrays = {d: joined_for_pk[d].combine_chunks() for d in dims}
 
     base = pa.table({"primary_key": anchor_pk_arr, **dim_arrays})
     aggs = _build_pyarrow_aggs(aggregates_per_dim)
     grouped = base.group_by("primary_key").aggregate(aggs)
-    pk_to_idx = {
-        pk: i for i, pk in enumerate(grouped["primary_key"].to_pylist())
-    }
     _fill_aggregate_columns(
         out_cols=out_cols,
         grouped=grouped,
         anchor_keys=anchor_keys,
-        pk_to_idx=pk_to_idx,
         aggregates_per_dim=aggregates_per_dim,
         n_anchors=n_anchors,
         base=base,
@@ -768,8 +659,7 @@ def compute_edge_curvature_frc(edges: pa.Table) -> pa.Array:
     lo = np.where(fks <= tks, fks, tks)
     hi = np.where(fks <= tks, tks, fks)
     sep = "\x00"
-    e_key = np.array([f"{a}{sep}{b}" for a, b in zip(lo, hi, strict=False)],
-                     dtype=object)
+    e_key = np.array([f"{a}{sep}{b}" for a, b in zip(lo, hi, strict=False)], dtype=object)
 
     # ── 2. Unique undirected pairs ──────────────────────────────────────
     unique_keys, e_to_pair = np.unique(e_key, return_inverse=True)
@@ -794,9 +684,13 @@ def compute_edge_curvature_frc(edges: pa.Table) -> pa.Array:
     # ── 4. Symmetric sparse adjacency (presence, not multiplicity) ──────
     # Multigraph collapse: data is np.ones(...) — same pair appearing many
     # times in events still contributes a single 1 to A (see docstring).
-    rows = np.concatenate([u_idx, v_idx])
-    cols = np.concatenate([v_idx, u_idx])
-    data = np.ones(2 * n_pairs, dtype=np.float64)
+    # Self-transfers (u == v) are not graph edges: they would enter A twice on
+    # the diagonal and inflate deg(u). They are left out and get FRC 0.0.
+    is_self = u_idx == v_idx
+    nu, nv = u_idx[~is_self], v_idx[~is_self]
+    rows = np.concatenate([nu, nv])
+    cols = np.concatenate([nv, nu])
+    data = np.ones(rows.size, dtype=np.float64)
     A = sparse.coo_matrix((data, (rows, cols)), shape=(V, V)).tocsr()
 
     # ── 5. Triangle counts: (A @ A).multiply(A), restricted to edges ───
@@ -809,6 +703,7 @@ def compute_edge_curvature_frc(edges: pa.Table) -> pa.Array:
 
     # ── 7. Per-pair FRC: 4 − deg(u) − deg(v) + #triangles ───────────────
     pair_frc = (4.0 - deg[u_idx] - deg[v_idx] + tri_counts).astype(np.float32)
+    pair_frc[is_self] = 0.0
 
     # ── 8. Broadcast per-pair → per-event order ─────────────────────────
     out = pair_frc[e_to_pair]
@@ -816,7 +711,8 @@ def compute_edge_curvature_frc(edges: pa.Table) -> pa.Array:
 
 
 def compute_all_edge_dims(
-    edges: pa.Table, config: dict[str, dict[str, Any]],
+    edges: pa.Table,
+    config: dict[str, dict[str, Any]],
 ) -> pa.Table:
     """Run each declared dim, return Arrow table keyed by event_key."""
     columns: dict[str, pa.Array] = {"event_key": edges["event_key"]}
@@ -825,7 +721,8 @@ def compute_all_edge_dims(
             columns[dim_name] = compute_pair_edge_count(edges)
         elif dim_name == "position_in_chain":
             columns[dim_name] = compute_position_in_chain(
-                edges, min_position=int(params["min_position"]),
+                edges,
+                min_position=int(params["min_position"]),
             )
         elif dim_name == "time_since_pair_last_edge":
             columns[dim_name] = compute_time_since_pair_last_edge(
@@ -850,7 +747,6 @@ def compute_all_edge_dims(
             columns[dim_name] = compute_edge_curvature_frc(edges)
         else:
             raise ValueError(
-                f"unknown edge dimension: {dim_name!r}; "
-                f"valid: {sorted(EDGE_DIM_KINDS)}",
+                f"unknown edge dimension: {dim_name!r}; valid: {sorted(EDGE_DIM_KINDS)}",
             )
     return pa.table(columns)

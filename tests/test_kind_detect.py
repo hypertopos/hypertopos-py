@@ -3,8 +3,8 @@
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
 """Tests for kind auto-detection functions in _bregman.py."""
+
 import numpy as np
-import pytest
 
 from hypertopos.builder._bregman import (
     detect_kind_for_column,
@@ -238,17 +238,17 @@ class TestDetectKindsForPattern:
             event_column_values=[binary_col, count_col],
         )
         expected = [
-            "bernoulli",   # relation None
-            "poisson",     # relation 5
-            "bernoulli",   # event binary_col
-            "poisson",     # event count_col
-            "poisson",     # derived count
-            "gaussian",    # derived sum:amount
-            "bernoulli",   # precomputed edge_max=1
-            "gaussian",    # precomputed edge_max=3
-            "bernoulli",   # prop_fill
-            "bernoulli",   # prop_fill
-            "gaussian",    # dim_block
+            "bernoulli",  # relation None
+            "poisson",  # relation 5
+            "bernoulli",  # event binary_col
+            "poisson",  # event count_col
+            "poisson",  # derived count
+            "gaussian",  # derived sum:amount
+            "bernoulli",  # precomputed edge_max=1
+            "gaussian",  # precomputed edge_max=3
+            "bernoulli",  # prop_fill
+            "bernoulli",  # prop_fill
+            "gaussian",  # dim_block
         ]
         assert result == expected
 

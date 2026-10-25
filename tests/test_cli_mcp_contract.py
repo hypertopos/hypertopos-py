@@ -26,6 +26,7 @@ Design notes:
   asserting CLI-JSON == navigator-result pins the identical contract without
   reaching across packages.
 """
+
 from __future__ import annotations
 
 import json
@@ -35,6 +36,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+
 from hypertopos.sphere import HyperSphere
 
 
@@ -87,12 +89,39 @@ def small_fixture_sphere(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return sphere_out
 
 
+@pytest.fixture(scope="module")
+def health_payload(small_fixture_sphere: Path) -> dict:
+    """Run ``hypertopos sphere health <sphere> --json`` once, return parsed JSON.
+
+    Every test below compares against the same deterministic invocation on
+    the same read-only sphere, so one subprocess serves the whole module.
+    """
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hypertopos.cli.main",
+            "sphere",
+            "health",
+            str(small_fixture_sphere),
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
 def _navigator_for(sphere_path: Path):
     """Open the sphere via the public API and return a fresh navigator."""
     return HyperSphere.open(str(sphere_path)).session("contract-test").navigator()
 
 
-def test_health_overview_matches_navigator(small_fixture_sphere: Path) -> None:
+def test_health_overview_matches_navigator(
+    small_fixture_sphere: Path, health_payload: dict
+) -> None:
     """CLI ``sphere health`` ``overview`` block == ``navigator.sphere_overview()``.
 
     The CLI embeds the navigator's ``sphere_overview()`` result verbatim
@@ -102,22 +131,7 @@ def test_health_overview_matches_navigator(small_fixture_sphere: Path) -> None:
     method, adding its own ``profiling_alerts`` / ``continuous_mode_note``
     enrichments on top — so this pins CLI == navigator, not CLI == MCP).
     """
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "hypertopos.cli.main",
-            "sphere",
-            "health",
-            str(small_fixture_sphere),
-            "--json",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    assert result.returncode == 0, result.stderr
-    cli_payload = json.loads(result.stdout)
+    cli_payload = health_payload
 
     nav = _navigator_for(small_fixture_sphere)
     expected_overview = nav.sphere_overview()
@@ -125,34 +139,17 @@ def test_health_overview_matches_navigator(small_fixture_sphere: Path) -> None:
     # Round-trip the navigator result through JSON so both sides compare as
     # plain JSON values (the CLI serializes with default=str). On the
     # zero-pattern fixture both are the empty list.
-    expected_overview_json = json.loads(
-        json.dumps(expected_overview, default=str)
-    )
+    expected_overview_json = json.loads(json.dumps(expected_overview, default=str))
     assert cli_payload["overview"] == expected_overview_json
 
 
-def test_health_alerts_matches_navigator(small_fixture_sphere: Path) -> None:
+def test_health_alerts_matches_navigator(small_fixture_sphere: Path, health_payload: dict) -> None:
     """CLI ``sphere health`` ``alerts`` block == ``navigator.check_alerts()``.
 
     The CLI embeds the navigator's ``check_alerts()`` result verbatim under
     the ``alerts`` key (same shape the MCP ``check_alerts`` tool returns).
     """
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "hypertopos.cli.main",
-            "sphere",
-            "health",
-            str(small_fixture_sphere),
-            "--json",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    assert result.returncode == 0, result.stderr
-    cli_payload = json.loads(result.stdout)
+    cli_payload = health_payload
 
     nav = _navigator_for(small_fixture_sphere)
     expected_alerts = nav.check_alerts()
@@ -161,31 +158,14 @@ def test_health_alerts_matches_navigator(small_fixture_sphere: Path) -> None:
     assert cli_payload["alerts"] == expected_alerts_json
 
 
-def test_health_status_consistent_with_alerts(
-    small_fixture_sphere: Path,
-) -> None:
+def test_health_status_consistent_with_alerts(health_payload: dict) -> None:
     """The derived ``status`` is consistent with the embedded alert severities.
 
     ``status`` is "critical" iff a HIGH alert is present, "warning" iff a
     MEDIUM alert is present (and no HIGH), else "ok". This pins the
     derivation rule the ``--exit-code-on-critical`` CI gate relies on.
     """
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "hypertopos.cli.main",
-            "sphere",
-            "health",
-            str(small_fixture_sphere),
-            "--json",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    assert result.returncode == 0, result.stderr
-    payload = json.loads(result.stdout)
+    payload = health_payload
 
     severities = {a.get("severity") for a in payload["alerts"]["alerts"]}
     if "HIGH" in severities:

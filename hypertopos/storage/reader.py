@@ -4,15 +4,17 @@
 # See LICENSE.md in the repository root for full terms.
 from __future__ import annotations
 
+import itertools
 import json
 import warnings
+import weakref
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
-import lance as _lance  # type: ignore[import-untyped]  # noqa: E402
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -35,6 +37,9 @@ from hypertopos.model.sphere import (  # noqa: E402
     Sphere,
     StorageConfig,
 )
+from hypertopos.storage import _lance_branches
+from hypertopos.storage._lance_branches import Pin
+from hypertopos.storage._lance_session import open_dataset
 from hypertopos.storage.calibration_history import (
     CalibrationNotFoundError,
     _compute_schema_hash_from_pattern_node,
@@ -42,9 +47,17 @@ from hypertopos.storage.calibration_history import (
     _parse_dt,
     deserialize_fit,
     history_dir,
+)
+from hypertopos.storage.calibration_history import (
     list_calibration_versions as _list_versions_on_disk,
 )
-from hypertopos.storage.exceptions import GDSVersionError
+from hypertopos.storage.exceptions import GDSStorageError, GDSVersionError
+
+if TYPE_CHECKING:
+    from lance import LanceDataset
+
+    from hypertopos.engine.calibration import CalibrationTracker
+    from hypertopos.model.sphere import CalibrationFit
 
 _RECOVERABLE_READ_ERRORS = (
     OSError,
@@ -76,17 +89,35 @@ BATCH_SCAN_THRESHOLD = 10_000_000  # rows; use batched path above this
 # converge to a stable ~16 MB working set per batch.
 _BATCH_SIZE_BYTES = 16 * 1024 * 1024
 
+# Process-wide source of GDSReader.snapshot_id values (unique per snapshot).
+_SNAPSHOT_IDS = itertools.count(1)
+
+
+def _iso_to_epoch_us(value: str) -> int:
+    """Microseconds since the epoch for an ISO timestamp; no offset means UTC."""
+    dt = datetime.fromisoformat(value)
+    dt = dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+    return int(dt.timestamp() * 1_000_000)
+
 
 class GDSReader:
-    def __init__(self, base_path: str) -> None:
-        self._base = Path(base_path)
+    def __init__(self, base_path: str, branch: str | None = None) -> None:
+        # A branch reader resolves the path: Lance ref lookups fail on a
+        # Windows 8.3 short spelling.
+        self._base = Path(base_path).resolve() if branch else Path(base_path)
+        self.branch = branch
+        # Root of the metadata this reader reads: the sphere, or the branch
+        # directory, which holds the branch's own ``_gds_meta`` copy.
+        self.meta_root = _lance_branches.overlay_dir(self._base, branch) if branch else self._base
         self._storage_config: StorageConfig | None = None
         self._points_cache: dict[tuple[str, int], pa.Table] = {}
         self._lance_dataset_cache: dict[str, Any] = {}
         # Lance version pinned at session open time for MVCC isolation.
-        # Key: pattern_id (geometry) or "temporal:<pattern_id>" (temporal).
-        # Value: Lance dataset version integer captured when the session opened.
-        self._pinned_lance_versions: dict[str, int] = {}
+        # Key: pattern_id (geometry), "temporal:<pattern_id>", "edges:<pattern_id>"
+        # and, on a branch, the other dataset keys of the branch inventory.
+        # Value: the version captured when the session opened; on a branch the
+        # branched datasets carry (branch, version).
+        self._pinned_lance_versions: dict[str, Pin] = {}
         # LRU row-ID cache — maps (pattern_id, version, primary_key) to
         # the Lance row ID, enabling O(1) ds.take() on repeated reads of the
         # same entity.  Bypassed when MVCC pinning is active (pinned version row
@@ -106,19 +137,210 @@ class GDSReader:
         self._points_cache_hits = 0
         self._points_cache_misses = 0
         self._adjacency_cache: dict[str, Any] = {}
+        # Metadata files captured with the pinned Lance versions by
+        # take_snapshot() ({relative path: text}); None means "no snapshot,
+        # read the files live".
+        self._meta_files: dict[str, str] | None = None
+        self._snapshot_at: datetime | None = None
+        # Changes on every snapshot; caches built from one snapshot key on it.
+        self.snapshot_id = 0
+        self._repin_listeners: list[weakref.WeakMethod[Callable[[], None]]] = []
 
     def get_adjacency(self, pattern_id: str) -> Any:
         if not hasattr(self, "_adjacency_cache"):
-            self._adjacency_cache: dict[str, Any] = {}
+            self._adjacency_cache = {}
         if pattern_id not in self._adjacency_cache:
             from hypertopos.engine.adjacency import AdjacencyIndex
+
             self._adjacency_cache[pattern_id] = AdjacencyIndex.from_lance(
-                self, pattern_id,
+                self,
+                pattern_id,
             )
         return self._adjacency_cache[pattern_id]
 
+    def sphere_json_text(self) -> str:
+        """sphere.json as captured by the session snapshot, or read live without one."""
+        if self._meta_files is not None:
+            return self._meta_files["sphere.json"]
+        return (self.meta_root / "_gds_meta" / "sphere.json").read_text(encoding="utf-8")
+
+    def meta_file_text(self, rel: str) -> str | None:
+        """A ``_gds_meta`` file as of the snapshot (None when it did not exist).
+
+        Without a snapshot the file is read live.
+        """
+        if self._meta_files is not None:
+            return self._meta_files.get(rel)
+        path = self.meta_root / "_gds_meta" / rel
+        return path.read_text(encoding="utf-8") if path.exists() else None
+
+    def read_meta_files(self) -> dict[str, str]:
+        """Current text of every metadata file a session pins.
+
+        sphere.json, semantics.json, and the per-pattern geometry-stats and
+        calibration-tracker files.
+        """
+        meta = self.meta_root / "_gds_meta"
+        files = {"sphere.json": (meta / "sphere.json").read_text(encoding="utf-8")}
+        candidates = [meta / "semantics.json"]
+        for sub in ("geometry_stats", "calibration"):
+            if (meta / sub).is_dir():
+                candidates.extend(sorted((meta / sub).glob("*.json")))
+        for path in candidates:
+            with suppress(FileNotFoundError):
+                files[path.relative_to(meta).as_posix()] = path.read_text(encoding="utf-8")
+        return files
+
+    def _open(
+        self, key: str | None, path: Path | str, *, version: Pin | None = None
+    ) -> LanceDataset:
+        """Open a Lance dataset at the version this reader reads.
+
+        ``version`` when given, else the session pin for ``key`` (``pid``,
+        ``temporal:<pid>``, ``edges:<pid>``); ``key=None`` derives the key from
+        the path, and a dataset without a pin reads the latest version. The
+        single place where GDSReader opens Lance datasets.
+        """
+        ds = open_dataset(str(path))
+        if key is None and (self.branch or self._pinned_lance_versions):
+            key = self._branch_key(path)
+        pin = version if version is not None else self._pinned_lance_versions.get(key or "")
+        if pin is not None and pin != ds.latest_version:
+            ds = ds.checkout_version(pin)
+        return ds
+
+    def dataset(self, path: Path | str, key: str | None = None) -> LanceDataset:
+        """A Lance dataset as this reader reads it, for callers outside the reader.
+
+        ``key`` selects the session pin (see ``_open``); with ``None`` the pin
+        is looked up by the dataset's path.
+        """
+        return self._open(key, path)
+
+    def add_repin_listener(self, callback: Callable[[], None]) -> None:
+        """Call the bound method ``callback`` after every re-pin (held weakly)."""
+        self._repin_listeners.append(weakref.WeakMethod(callback))
+
+    def _branch_key(self, path: Path | str) -> str | None:
+        try:
+            rel = Path(path).relative_to(self._base).as_posix()
+        except ValueError:
+            try:
+                rel = Path(path).resolve().relative_to(self._base.resolve()).as_posix()
+            except ValueError:
+                return None
+        return _lance_branches._key_for(rel)
+
+    def _branch_versions(self) -> dict[str, Pin]:
+        """Pins of a branch reader: (branch, latest on the branch) for the
+        datasets with a Lance branch, the recorded parent version for the rest.
+        """
+        assert self.branch is not None
+        info = _lance_branches.read_branch_json(self._base, self.branch)
+        parent = info["parent"]["lance_versions"]
+        inventory = _lance_branches.dataset_inventory(self._base)
+        versions: dict[str, Pin] = {}
+        for key, mechanism in info["datasets"].items():
+            if mechanism != _lance_branches.LANCE_BRANCH:
+                versions[key] = int(parent[key])
+                continue
+            path = inventory.get(key)
+            try:
+                if path is None:
+                    raise FileNotFoundError(key)
+                ds = open_dataset(str(path)).checkout_version((self.branch, None))
+            except Exception as exc:
+                raise GDSStorageError(
+                    f"branch {self.branch!r} is incomplete: dataset {key!r} has no Lance "
+                    f"branch {self.branch!r}; delete it with delete_branch({self.branch!r})"
+                ) from exc
+            versions[key] = (self.branch, ds.version)
+        return versions
+
+    def latest_lance_versions(self, pattern_ids: Iterable[str]) -> dict[str, Pin]:
+        """Latest Lance version of each existing dataset a session pins per pattern.
+
+        Geometry, temporal and edge datasets (keys ``pattern_id``,
+        ``temporal:<pattern_id>``, ``edges:<pattern_id>``) and the derived
+        ones: population forecast, edge features, trajectory index, temporal
+        centroids and contagion statistics (keys as ``dataset_inventory``).
+        A branch reader returns its branch pins instead (see ``_branch_versions``).
+        """
+        if self.branch:
+            return self._branch_versions()
+        versions: dict[str, Pin] = {}
+        for pattern_id in pattern_ids:
+            for rel in (
+                f"geometry/{pattern_id}/data.lance",
+                f"temporal/{pattern_id}/data.lance",
+                f"edges/{pattern_id}/data.lance",
+                f"forecast/population/{pattern_id}/data.lance",
+                f"_gds_meta/edge_features/{pattern_id}/data.lance",
+                f"_gds_meta/trajectory/{pattern_id}.lance",
+                f"_gds_meta/temporal_centroids/{pattern_id}.lance",
+                f"_gds_meta/contagion_stats/{pattern_id}.lance",
+            ):
+                path = self._base / rel
+                key = _lance_branches._key_for(rel)
+                if key is not None and path.exists():
+                    with suppress(Exception):
+                        versions[key] = open_dataset(str(path)).latest_version
+        return versions
+
+    def take_snapshot(self, max_attempts: int = 3) -> None:
+        """Pin sphere.json together with the latest Lance versions.
+
+        Reads the versions, the sphere.json text and the versions again; a
+        writer that commits in between makes the two reads differ and the
+        snapshot is retaken. Writers commit Lance data before replacing
+        sphere.json, so a matching pair is consistent except for the few
+        milliseconds between a writer's Lance commit and its sphere.json write.
+        """
+        files_before = self.read_meta_files()
+        for _ in range(max_attempts):
+            pattern_ids = list(json.loads(files_before["sphere.json"]).get("patterns", {}))
+            before = self.latest_lance_versions(pattern_ids)
+            files = self.read_meta_files()
+            after = self.latest_lance_versions(pattern_ids)
+            if before == after and files == files_before:
+                self._pinned_lance_versions = after
+                self._meta_files = files
+                self._snapshot_at = datetime.now(UTC)
+                self.snapshot_id = next(_SNAPSHOT_IDS)
+                return
+            files_before = files
+        raise GDSStorageError(
+            "sphere is being written by another process; retry opening the session"
+        )
+
+    def _repin(self) -> None:
+        """Drop everything read under the old snapshot and take a new one.
+
+        The only way a reader's pins change after construction.
+        """
+        self._lance_dataset_cache.clear()
+        self._points_dataset_cache.clear()
+        self._points_cache.clear()
+        self._row_id_cache.clear()
+        self._adjacency_cache.clear()
+        self._points_btree_built.clear()
+        self.take_snapshot()
+        for ref in list(self._repin_listeners):
+            callback = ref()
+            if callback is None:
+                self._repin_listeners.remove(ref)
+            else:
+                callback()
+
+    def edge_table_config(self, pattern_id: str) -> dict[str, Any] | None:
+        """The ``edge_table`` block of an event pattern (``from_col``,
+        ``to_col``, ``timestamp_col``, ``amount_col``), or None."""
+        node = json.loads(self.sphere_json_text()).get("patterns", {}).get(pattern_id, {})
+        config = node.get("edge_table")
+        return config if isinstance(config, dict) else None
+
     def read_sphere(self) -> Sphere:
-        raw = json.loads((self._base / "_gds_meta" / "sphere.json").read_text())
+        raw = json.loads(self.sphere_json_text())
         fmt = raw.get("format_version")
         # Major-only comparison: format 3.x is accepted, anything else is
         # rejected. New optional top-level fields ride the minor bump
@@ -244,29 +466,20 @@ class GDSReader:
             FDRTemporalLevel,
             _rule_from_dict,
         )
+
         fdr_hierarchy = [
-            FDRHierarchyLevel.from_dict(lvl)
-            for lvl in (raw.get("fdr_hierarchy") or [])
+            FDRHierarchyLevel.from_dict(lvl) for lvl in (raw.get("fdr_hierarchy") or [])
         ]
         fdr_temporal_hierarchy = [
-            FDRTemporalLevel.from_dict(lvl)
-            for lvl in (raw.get("fdr_temporal_hierarchy") or [])
+            FDRTemporalLevel.from_dict(lvl) for lvl in (raw.get("fdr_temporal_hierarchy") or [])
         ]
-        conformance_rules = [
-            _rule_from_dict(r)
-            for r in (raw.get("conformance_rules") or [])
-        ]
+        conformance_rules = [_rule_from_dict(r) for r in (raw.get("conformance_rules") or [])]
         eda_raw = raw.get("edge_dim_aggregations")
         if eda_raw:
-            eda_dims = (
-                tuple(eda_raw["dims"])
-                if eda_raw.get("dims") is not None
-                else None
-            )
+            eda_dims = tuple(eda_raw["dims"]) if eda_raw.get("dims") is not None else None
             apd_raw = eda_raw.get("aggregates_per_dim")
             apd_parsed = (
-                {d: tuple(aggs) for d, aggs in apd_raw.items()}
-                if apd_raw is not None else None
+                {d: tuple(aggs) for d, aggs in apd_raw.items()} if apd_raw is not None else None
             )
             # `EdgeDimAggregationsRef.__post_init__` materialises the
             # all-five canonical default when `apd_parsed` is None (older
@@ -288,6 +501,7 @@ class GDSReader:
         label_aware_calibration: dict[str, Any] | None = None
         if isinstance(lac_raw, dict) and lac_raw:
             from types import SimpleNamespace
+
             label_aware_calibration = {
                 label: SimpleNamespace(
                     mu_pos=float(entry.get("mu_pos", 0.0)),
@@ -309,6 +523,8 @@ class GDSReader:
                     line_id=r["line_id"],
                     direction=r["direction"],
                     required=r["required"],
+                    interpretation=r.get("interpretation"),
+                    role=r.get("display_name"),
                 )
                 for r in raw["relations"]
             ],
@@ -326,7 +542,8 @@ class GDSReader:
             ),
             last_calibrated_at=(
                 datetime.fromisoformat(raw["last_calibrated_at"])
-                if raw.get("last_calibrated_at") else None
+                if raw.get("last_calibrated_at")
+                else None
             ),
             prop_columns=raw.get("prop_columns", []),
             excluded_properties=raw.get("excluded_properties", []),
@@ -382,9 +599,7 @@ class GDSReader:
         f = raw["filter"]
         cp_raw = f.get("cutting_plane")
         cutting_plane = (
-            CuttingPlane(normal=cp_raw["normal"], bias=float(cp_raw["bias"]))
-            if cp_raw
-            else None
+            CuttingPlane(normal=cp_raw["normal"], bias=float(cp_raw["bias"])) if cp_raw else None
         )
         return Alias(
             alias_id=raw["alias_id"],
@@ -405,10 +620,10 @@ class GDSReader:
         )
 
     def _overlay_semantics(self, sphere: Sphere) -> None:
-        sem_path = self._base / "_gds_meta" / "semantics.json"
-        if not sem_path.exists():
+        sem_text = self.meta_file_text("semantics.json")
+        if sem_text is None:
             return
-        sem = json.loads(sem_path.read_text())
+        sem = json.loads(sem_text)
 
         if sphere_sem := sem.get("sphere"):
             desc = sphere_sem.get("description")
@@ -444,7 +659,8 @@ class GDSReader:
                 if dn is not None:
                     self._check_semantic_limit(
                         f"patterns.{pat_id}.relations.{rel.line_id}.display_name",
-                        dn, "display_name"
+                        dn,
+                        "display_name",
                     )
                     rel.display_name = dn
 
@@ -452,33 +668,27 @@ class GDSReader:
                 if interp is not None:
                     self._check_semantic_limit(
                         f"patterns.{pat_id}.relations.{rel.line_id}.interpretation",
-                        interp, "interpretation"
+                        interp,
+                        "interpretation",
                     )
                     rel.interpretation = interp
 
     def _check_semantic_limit(self, path: str, value: str, field: str) -> None:
         limit = _SEMANTICS_LIMITS[field]
         if len(value) > limit:
-            raise ValueError(
-                f"semantics.json: {path} exceeds {limit} chars "
-                f"(got {len(value)})"
-            )
+            raise ValueError(f"semantics.json: {path} exceeds {limit} chars (got {len(value)})")
 
-    def read_geometry_stats(self, pattern_id: str, version: int) -> dict | None:
+    def read_geometry_stats(self, pattern_id: str, version: int) -> dict[str, Any] | None:
         """Read persisted geometry stats cache for a pattern version.
 
         Returns None if the cache file does not exist (caller should fall back
         to a full geometry scan).
         """
-        path = (
-            self._base
-            / "_gds_meta"
-            / "geometry_stats"
-            / f"{pattern_id}_v{version}.json"
-        )
-        if not path.exists():
+        text = self.meta_file_text(f"geometry_stats/{pattern_id}_v{version}.json")
+        if text is None:
             return None
-        return json.loads(path.read_text())
+        stats: dict[str, Any] = json.loads(text)
+        return stats
 
     def read_population_forecast(self, pattern_id: str) -> pa.Table | None:
         """Read population forecast data for a pattern.
@@ -488,17 +698,19 @@ class GDSReader:
         lance_path = self._base / "forecast" / "population" / pattern_id / "data.lance"
         if not lance_path.exists():
             return None
-        ds = _lance.dataset(str(lance_path))
+        ds = self._open(None, str(lance_path))
         return ds.to_table()
 
     def geometry_column_names(
-        self, pattern_id: str, version: int,
+        self,
+        pattern_id: str,
+        version: int,
     ) -> set[str]:
         """Return the set of column names in a geometry Lance dataset."""
         lance_path = self._base / "geometry" / pattern_id / "data.lance"
         if not lance_path.exists():
             return set()
-        ds = _lance.dataset(str(lance_path))
+        ds = self._open(pattern_id, lance_path)
         return {f.name for f in ds.schema}
 
     def read_geometry(
@@ -522,17 +734,21 @@ class GDSReader:
             and filters is None
             and point_keys is None
         ):
-            ds = _lance.dataset(lance_path)
-            if pinned is not None and pinned != ds.latest_version:
-                ds = ds.checkout_version(pinned)
-            if sample_size >= ds.count_rows():
+            ds = self._open(pattern_id, lance_path)
+            n_rows = ds.count_rows()
+            if sample_size >= n_rows:
                 return ds.to_table(columns=columns)
-            table = ds.sample(sample_size, columns=columns, randomize_order=False)
+            # A fixed seed makes every sampled read of the same size return the
+            # same rows (Lance's own sample draws from the global random state).
+            rows = np.sort(np.random.default_rng(0).choice(n_rows, size=sample_size, replace=False))
             # Schema validation not applied to sampled reads (partial data)
-            return table
+            return ds.take(rows, columns=columns)
         if point_keys is not None:
             table = self._read_lance_geometry_filtered(
-                lance_path, point_keys, columns=columns, lance_version=pinned,
+                lance_path,
+                point_keys,
+                columns=columns,
+                lance_version=pinned,
                 pattern_id=pattern_id,
             )
         else:
@@ -541,8 +757,7 @@ class GDSReader:
                 escaped_pk = primary_key.replace("'", "''")
                 pk_filter = f"primary_key = '{escaped_pk}'"
             combined = (
-                f"({pk_filter}) AND ({filter})" if pk_filter and filter
-                else pk_filter or filter
+                f"({pk_filter}) AND ({filter})" if pk_filter and filter else pk_filter or filter
             )
             # Pass cache_key only for pure single-key reads with no extra
             # filter and no MVCC pinning (pinned row IDs may differ across versions).
@@ -568,6 +783,7 @@ class GDSReader:
         # Schema validation: full reads must contain all canonical columns
         if columns is None and table.num_rows > 0:
             from hypertopos.storage._schemas import GEOMETRY_REQUIRED_COLUMNS
+
             missing = GEOMETRY_REQUIRED_COLUMNS - set(table.schema.names)
             if missing:
                 raise RuntimeError(
@@ -576,9 +792,11 @@ class GDSReader:
                 )
         return table
 
-    def count_geometry_rows(
-        self, pattern_id: str, filter: str | None = None
-    ) -> int:
+    def pinned_geometry_version(self, pattern_id: str) -> Pin | None:
+        """Lance version of the pattern's geometry pinned when the session opened, if any."""
+        return self._pinned_lance_versions.get(pattern_id)
+
+    def count_geometry_rows(self, pattern_id: str, filter: str | None = None) -> int:
         lance_path = self._base / "geometry" / pattern_id / "data.lance"
         # Mirror geometry_column_names / read_edge_features: a declared pattern
         # whose geometry/<pid>/data.lance is absent (corrupt or partially built
@@ -587,12 +805,10 @@ class GDSReader:
         if not lance_path.exists():
             return 0
         if pattern_id not in self._lance_dataset_cache:
-            self._lance_dataset_cache[pattern_id] = _lance.dataset(str(lance_path))
+            self._lance_dataset_cache[pattern_id] = self._open(pattern_id, lance_path)
         ds = self._lance_dataset_cache[pattern_id]
-        pinned = self._pinned_lance_versions.get(pattern_id)
-        if pinned is not None and pinned != ds.latest_version:
-            ds = ds.checkout_version(pinned)
-        return ds.count_rows(filter=filter)
+        n_rows: int = ds.count_rows(filter=filter)
+        return n_rows
 
     def read_edge_features(self, pattern_id: str) -> pa.Table:
         """Read the per-edge derived dimension sidecar for an event pattern.
@@ -607,12 +823,10 @@ class GDSReader:
         """
         from hypertopos.storage._schemas import EDGE_FEATURES_SCHEMA
 
-        lance_path = (
-            self._base / "_gds_meta" / "edge_features" / pattern_id / "data.lance"
-        )
+        lance_path = self._base / "_gds_meta" / "edge_features" / pattern_id / "data.lance"
         if not lance_path.exists():
             return EDGE_FEATURES_SCHEMA.empty_table()
-        return _lance.dataset(str(lance_path)).to_table()
+        return self._open(None, str(lance_path)).to_table()
 
     def read_geometry_batched(
         self,
@@ -628,10 +842,7 @@ class GDSReader:
         Use for bulk scans on large spheres (>BATCH_SCAN_THRESHOLD rows).
         """
         lance_path = self._base / "geometry" / pattern_id / "data.lance"
-        pinned = self._pinned_lance_versions.get(pattern_id)
-        ds = _lance.dataset(str(lance_path))
-        if pinned is not None and pinned != ds.latest_version:
-            ds = ds.checkout_version(pinned)
+        ds = self._open(pattern_id, lance_path)
         scanner = ds.scanner(
             filter=filter_expr,
             columns=columns,
@@ -644,7 +855,7 @@ class GDSReader:
         lance_path: str,
         point_keys: list[str],
         columns: list[str] | None = None,
-        lance_version: int | None = None,
+        lance_version: Pin | None = None,
         pattern_id: str | None = None,
     ) -> pa.Table:
         """Read geometry from Lance with entity_keys pushdown filter.
@@ -655,10 +866,11 @@ class GDSReader:
         if pattern_id is not None and pattern_id in self._lance_dataset_cache:
             ds = self._lance_dataset_cache[pattern_id]
         else:
-            ds = _lance.dataset(lance_path)
+            ds = self._open(pattern_id, lance_path)
             if pattern_id is not None:
                 self._lance_dataset_cache[pattern_id] = ds
-        if lance_version is not None and lance_version != ds.latest_version:
+        current: Pin = (self.branch, ds.version) if self.branch else ds.version
+        if lance_version is not None and lance_version != current:
             ds = ds.checkout_version(lance_version)
         # Check if entity_keys column exists in schema
         field_names = [f.name for f in ds.schema]
@@ -694,9 +906,7 @@ class GDSReader:
             table = table.drop("entity_keys")
         return table
 
-    def _filter_by_point_keys(
-        self, table: pa.Table, point_keys: list[str]
-    ) -> pa.Table:
+    def _filter_by_point_keys(self, table: pa.Table, point_keys: list[str]) -> pa.Table:
         """Filter geometry rows to those with at least one edge.point_key in point_keys.
 
         Uses vectorized pc.is_in on flattened struct array — O(n) Arrow C++.
@@ -711,7 +921,7 @@ class GDSReader:
         offsets_np = edges_col.offsets.to_numpy()
         matched_flat = np.where(flat_match.to_numpy(zero_copy_only=False))[0]
         row_indices = np.searchsorted(offsets_np[1:], matched_flat, side="right")
-        keep = sorted(set(row_indices.tolist()))
+        keep = [int(i) for i in np.unique(row_indices)]
         if not keep:
             return table.slice(0, 0)
         return table.take(keep)
@@ -726,16 +936,17 @@ class GDSReader:
         filters: dict[str, str | list[str]] | None = None,
     ) -> pa.Table:
         lance_tables: list[pa.Table] = []
-        lance_paths: list[Path] = [self._base / "temporal" / pattern_id / "data.lance"]
+        # The shared temporal dataset is pinned; an agent's scratch is not.
+        lance_paths: list[tuple[Path, str | None]] = [
+            (self._base / "temporal" / pattern_id / "data.lance", f"temporal:{pattern_id}")
+        ]
         if agent_id is not None:
             lance_paths.append(
-                self._base / "temporal" / "_agents" / agent_id / pattern_id / "data.lance"
+                (self._base / "temporal" / "_agents" / agent_id / pattern_id / "data.lance", None)
             )
-        for lp in lance_paths:
+        for lp, key in lance_paths:
             if lp.exists():
-                lance_tables.append(
-                    self._read_lance_temporal(lp, primary_key, filters)
-                )
+                lance_tables.append(self._read_lance_temporal(lp, primary_key, filters, key=key))
         if not lance_tables:
             return pa.table({})
         table = pa.concat_tables(lance_tables) if len(lance_tables) > 1 else lance_tables[0]
@@ -757,12 +968,7 @@ class GDSReader:
         lance_path = self._base / "temporal" / pattern_id / "data.lance"
         if not lance_path.exists():
             return pa.table({})
-        # Use session-pinned Lance version for MVCC isolation.
-        # Optimization: skip version= when pinned equals latest.
-        pinned = self._pinned_lance_versions.get(f"temporal:{pattern_id}")
-        ds = _lance.dataset(str(lance_path))
-        if pinned is not None and pinned != ds.latest_version:
-            ds = ds.checkout_version(pinned)
+        ds = self._open(f"temporal:{pattern_id}", lance_path)
         table = ds.to_table()
         if filters and table.num_rows > 0:
             table = self._apply_temporal_filters(table, filters)
@@ -798,35 +1004,28 @@ class GDSReader:
         lance_path = self._base / "temporal" / pattern_id / "data.lance"
         if not lance_path.exists():
             return
-        pinned = self._pinned_lance_versions.get(f"temporal:{pattern_id}")
-        ds = _lance.dataset(str(lance_path))
-        if pinned is not None and pinned != ds.latest_version:
-            ds = ds.checkout_version(pinned)
+        ds = self._open(f"temporal:{pattern_id}", lance_path)
         # Build int64 microsecond SQL filter to avoid Lance's TimestampTz Substrait crash
         # (TimestampTz literals are unsupported in Lance's Substrait layer; CAST to BIGINT works).
         filter_parts: list[str] = []
         if keys is not None:
             if not keys:
-                # Empty key list → no rows can match; return empty iterator
-                return iter([])
+                # Empty key list → no rows can match; yield nothing
+                return
             escaped = [k.replace("'", "''") for k in keys]
             pk_in = "primary_key IN (" + ", ".join(f"'{k}'" for k in escaped) + ")"
             filter_parts.append(pk_in)
         if timestamp_from:
-            from_us = int(
-                datetime.fromisoformat(timestamp_from).replace(tzinfo=UTC).timestamp()
-                * 1_000_000
-            )
+            from_us = _iso_to_epoch_us(timestamp_from)
             filter_parts.append(f"CAST(timestamp AS BIGINT) >= {from_us}")
         if timestamp_to:
-            to_us = int(
-                datetime.fromisoformat(timestamp_to).replace(tzinfo=UTC).timestamp()
-                * 1_000_000
-            )
+            to_us = _iso_to_epoch_us(timestamp_to)
             filter_parts.append(f"CAST(timestamp AS BIGINT) < {to_us}")
         sql_filter: str | None = " AND ".join(filter_parts) if filter_parts else None
         yield from ds.scanner(
-            columns=columns, filter=sql_filter, batch_size_bytes=batch_size_bytes,
+            columns=columns,
+            filter=sql_filter,
+            batch_size_bytes=batch_size_bytes,
         ).to_batches()
 
     def _apply_temporal_filters(
@@ -848,10 +1047,12 @@ class GDSReader:
                 for yr in year_ints:
                     start_us = int(datetime(yr, 1, 1, tzinfo=UTC).timestamp() * 1_000_000)
                     end_us = int(datetime(yr + 1, 1, 1, tzinfo=UTC).timestamp() * 1_000_000)
-                    masks.append(pc.and_(
-                        pc.greater_equal(ts_int, start_us),
-                        pc.less(ts_int, end_us),
-                    ))
+                    masks.append(
+                        pc.and_(
+                            pc.greater_equal(ts_int, start_us),
+                            pc.less(ts_int, end_us),
+                        )
+                    )
                 year_mask = masks[0]
                 for m in masks[1:]:
                     year_mask = pc.or_(year_mask, m)
@@ -860,21 +1061,12 @@ class GDSReader:
 
         # Generic timestamp bounds — any granularity (month, quarter, day, etc.)
         if "timestamp_from" in filters and table.num_rows > 0:
-            from_us = int(
-                datetime.fromisoformat(filters["timestamp_from"])
-                .replace(tzinfo=UTC)
-                .timestamp()
-                * 1_000_000
-            )
+            # Timestamp bounds are scalar ISO strings; only "year" takes a list.
+            from_us = _iso_to_epoch_us(cast(str, filters["timestamp_from"]))
             table = table.filter(pc.greater_equal(ts_int, from_us))
             ts_int = pc.cast(table["timestamp"], pa.int64())
         if "timestamp_to" in filters and table.num_rows > 0:
-            to_us = int(
-                datetime.fromisoformat(filters["timestamp_to"])
-                .replace(tzinfo=UTC)
-                .timestamp()
-                * 1_000_000
-            )
+            to_us = _iso_to_epoch_us(cast(str, filters["timestamp_to"]))
             table = table.filter(pc.less(ts_int, to_us))
         return table
 
@@ -883,10 +1075,12 @@ class GDSReader:
         lance_path: Path,
         primary_key: str,
         filters: dict[str, str | list[str]] | None,
+        key: str | None = None,
     ) -> pa.Table:
         """Read temporal slices from a Lance dataset, filtering by primary_key."""
-        ds = _lance.dataset(str(lance_path))
-        table = ds.scanner(filter=f"primary_key = '{primary_key}'").to_table()
+        ds = self._open(key, lance_path)
+        escaped = primary_key.replace("'", "''")
+        table = ds.scanner(filter=f"primary_key = '{escaped}'").to_table()
         if not filters or table.num_rows == 0:
             return table
         return self._apply_temporal_filters(table, filters)
@@ -901,7 +1095,7 @@ class GDSReader:
         if cached is not None:
             return cached.schema
         lance_path = self._base / "points" / line_id / f"v={version}" / "data.lance"
-        ds = _lance.dataset(str(lance_path))
+        ds = self._open(None, str(lance_path))
         return ds.schema
 
     def read_points(
@@ -919,9 +1113,7 @@ class GDSReader:
             cached = self._points_cache.get(cache_key)
             if cached is not None:
                 if primary_key is not None:
-                    return cached.filter(
-                        pc.equal(cached["primary_key"], primary_key)
-                    )
+                    return cached.filter(pc.equal(cached["primary_key"], primary_key))
                 return cached
 
         # Column projection — project from cache if warm, else targeted read
@@ -931,7 +1123,7 @@ class GDSReader:
                 return cached.select(columns)
             base = self._base / "points" / line_id / f"v={version}"
             lance_path = base / "data.lance"
-            ds = _lance.dataset(str(lance_path))
+            ds = self._open(None, str(lance_path))
             return ds.scanner(columns=columns).to_table()
 
         base = self._base / "points" / line_id / f"v={version}"
@@ -958,7 +1150,7 @@ class GDSReader:
         lance_path = self._base / "points" / line_id / f"v={version}" / "data.lance"
         if not lance_path.exists():
             return 0
-        ds = _lance.dataset(str(lance_path))
+        ds = self._open(None, str(lance_path))
         return ds.count_rows()
 
     def search_points_fts(
@@ -982,7 +1174,7 @@ class GDSReader:
                 f"FTS requires Lance points for line '{line_id}' v={version}. "
                 f"Dataset not found at {lance_path}"
             )
-        ds = _lance.dataset(str(lance_path))
+        ds = self._open(None, str(lance_path))
         return ds.scanner(full_text_query=query, limit=limit).to_table()
 
     def read_points_batch(
@@ -1008,6 +1200,7 @@ class GDSReader:
         absent. Every caller keys results by primary_key, so order is not part
         of the contract.
         """
+
         def _project(table: pa.Table) -> pa.Table:
             if columns is None:
                 return table
@@ -1019,9 +1212,7 @@ class GDSReader:
             ds = self._points_dataset(line_id, version)
             if ds is None:
                 return pa.table({})
-            return pa.table(
-                {f.name: pa.array([], type=f.type) for f in ds.schema}
-            )
+            return pa.table({f.name: pa.array([], type=f.type) for f in ds.schema})
 
         cached = self._points_cache.get((line_id, version))
         if cached is not None:
@@ -1057,9 +1248,7 @@ class GDSReader:
                 if res.num_rows > 0:
                     tables.append(res)
             if not tables:
-                return pa.table(
-                    {f.name: pa.array([], type=f.type) for f in ds.schema}
-                )
+                return pa.table({f.name: pa.array([], type=f.type) for f in ds.schema})
             return _project(pa.concat_tables(tables))
 
     def _points_dataset(self, line_id: str, version: int) -> Any | None:
@@ -1076,7 +1265,7 @@ class GDSReader:
         lance_path = self._base / "points" / line_id / f"v={version}" / "data.lance"
         if not lance_path.exists():
             return None
-        ds = _lance.dataset(str(lance_path))
+        ds = self._open(None, str(lance_path))
         self._points_dataset_cache[key] = ds
         self._points_cache_misses += 1
         return ds
@@ -1087,10 +1276,15 @@ class GDSReader:
         btree_key = f"{line_id}:{version}"
         if btree_key in self._points_btree_built:
             return
+        # A branch reader reads main's points datasets at their parent
+        # version; an index build there would commit to main.
+        if self.branch:
+            self._points_btree_built.add(btree_key)
+            return
         try:
             has_btree = any(
-                getattr(idx, "index_type", "").lower() in ("btree",)
-                and "primary_key" in getattr(idx, "columns", [])
+                str(getattr(idx, "index_type", "")).lower() == "btree"
+                and "primary_key" in getattr(idx, "field_names", [])
                 for idx in ds.describe_indices()
             )
             if not has_btree:
@@ -1116,10 +1310,9 @@ class GDSReader:
         if not lance_path.exists():
             return False
         try:
-            ds = _lance.dataset(str(lance_path))
+            ds = self._open(None, str(lance_path))
             return any(
-                getattr(idx, "index_type", "") == "Inverted"
-                for idx in ds.describe_indices()
+                getattr(idx, "index_type", "") == "Inverted" for idx in ds.describe_indices()
             )
         except _RECOVERABLE_READ_ERRORS:
             return False
@@ -1131,14 +1324,16 @@ class GDSReader:
         filters: dict[str, Any] | None,
     ) -> pa.Table:
         """Read points from Lance dataset. Uses scanner for predicate pushdown."""
-        ds = _lance.dataset(str(lance_path))
+        ds = self._open(None, str(lance_path))
         filter_parts: list[str] = []
         if primary_key is not None:
-            filter_parts.append(f"primary_key = '{primary_key}'")
+            escaped_pk = primary_key.replace("'", "''")
+            filter_parts.append(f"primary_key = '{escaped_pk}'")
         if filters:
             for col, val in filters.items():
                 if isinstance(val, str):
-                    filter_parts.append(f"{col} = '{val}'")
+                    escaped_val = val.replace("'", "''")
+                    filter_parts.append(f"{col} = '{escaped_val}'")
                 else:
                     filter_parts.append(f"{col} = {val}")
         if filter_parts:
@@ -1149,9 +1344,7 @@ class GDSReader:
     # Calibration history reader API
     # ------------------------------------------------------------------
 
-    def read_calibration_fit(
-        self, pattern_id: str, version: int | None = None
-    ) -> CalibrationFit:  # noqa: F821
+    def read_calibration_fit(self, pattern_id: str, version: int | None = None) -> CalibrationFit:
         """Load one calibration epoch as a CalibrationFit.
 
         version=None resolves to the pattern's current calibration_epoch from
@@ -1166,7 +1359,7 @@ class GDSReader:
         if version is None:
             version = current_epoch
 
-        epoch_path = history_dir(self._base, pattern_id) / f"v={version}.json"
+        epoch_path = history_dir(self.meta_root, pattern_id) / f"v={version}.json"
         if epoch_path.exists():
             blob = json.loads(epoch_path.read_text(encoding="utf-8"))
             return deserialize_fit(blob)
@@ -1175,7 +1368,7 @@ class GDSReader:
         # (i.e. legacy sphere that never wrote epoch files) and version==1.
         # On a 2.4 sphere that has the history dir, a missing v=N.json means
         # the epoch was GC'd or never written — raise CalibrationNotFoundError.
-        hdir = history_dir(self._base, pattern_id)
+        hdir = history_dir(self.meta_root, pattern_id)
         if version == 1 and not hdir.exists():
             return self._reconstruct_fit_from_pattern_node(pattern_id, pattern_node)
 
@@ -1188,7 +1381,7 @@ class GDSReader:
         On a 2.4 sphere returns the integers N present in
         _gds_meta/calibration_history/{pattern_id}/v={N}.json.
         """
-        on_disk = _list_versions_on_disk(self._base, pattern_id)
+        on_disk = _list_versions_on_disk(self.meta_root, pattern_id)
         if on_disk:
             return on_disk
         sphere_meta = self._load_sphere_json()
@@ -1196,16 +1389,19 @@ class GDSReader:
             return [1]
         return []
 
-    def _load_sphere_json(self) -> dict:
-        return json.loads((self._base / "_gds_meta" / "sphere.json").read_text(encoding="utf-8"))
+    def _load_sphere_json(self) -> dict[str, Any]:
+        meta: dict[str, Any] = json.loads(self.sphere_json_text())
+        return meta
 
     def _reconstruct_fit_from_pattern_node(
-        self, pattern_id: str, pattern_node: dict
-    ) -> CalibrationFit:  # noqa: F821
+        self, pattern_id: str, pattern_node: dict[str, Any]
+    ) -> CalibrationFit:
         """Build a CalibrationFit from the inline sphere.json pattern node (2.3 fallback)."""
         from hypertopos.model.sphere import CalibrationFit
 
-        schema_hash = pattern_node.get("schema_hash") or _compute_schema_hash_from_pattern_node(pattern_node)
+        schema_hash = pattern_node.get("schema_hash") or _compute_schema_hash_from_pattern_node(
+            pattern_node
+        )
         return CalibrationFit(
             pattern_id=pattern_id,
             calibration_epoch=1,
@@ -1253,15 +1449,13 @@ class GDSReader:
         lance_path: str,
         columns: list[str] | None = None,
         filter: str | None = None,
-        lance_version: int | None = None,
+        lance_version: Pin | None = None,
         cache_key: tuple[str, int, str] | None = None,
     ) -> pa.Table:
         # Open the exact pinned version when supplied (MVCC isolation).
         # Optimization: skip version= when pinned equals latest (common case,
         # avoids Lance version reconstruction overhead — up to 12x faster).
-        ds = _lance.dataset(lance_path)
-        if lance_version is not None and lance_version != ds.latest_version:
-            ds = ds.checkout_version(lance_version)
+        ds = self._open(None, lance_path, version=lance_version)
         if columns is not None:
             schema_names = {f.name for f in ds.schema}
             columns = [c for c in columns if c in schema_names] or None
@@ -1288,9 +1482,7 @@ class GDSReader:
         if filter is not None:
             if cache_key is not None:
                 # Request _rowid alongside regular columns to populate cache.
-                result = ds.scanner(
-                    filter=filter, columns=columns, with_row_id=True
-                ).to_table()
+                result = ds.scanner(filter=filter, columns=columns, with_row_id=True).to_table()
                 if result.num_rows == 1:
                     rowid = int(result["_rowid"][0].as_py())
                     self._row_id_cache[cache_key] = rowid
@@ -1321,7 +1513,7 @@ class GDSReader:
             return None
         exclude = exclude_keys or set()
         k_fetch = (k + len(exclude) + 5) * 2
-        ds = _lance.dataset(str(lance_path))
+        ds = self._open(pattern_id, lance_path)
         scanner_kwargs: dict[str, Any] = {
             "nearest": {"column": "delta", "q": query_vector.tolist(), "k": k_fetch},
             "columns": ["primary_key", "delta"],
@@ -1347,7 +1539,7 @@ class GDSReader:
         query_vector: np.ndarray,
         k: int,
         exclude_keys: set[str] | None = None,
-    ) -> list[dict] | None:
+    ) -> list[dict[str, Any]] | None:
         """ANN search over trajectory summary vectors.
 
         Returns None if the trajectory index does not exist for this pattern.
@@ -1359,7 +1551,7 @@ class GDSReader:
             return None
         exclude = exclude_keys or set()
         k_fetch = (k + len(exclude) + 5) * 2
-        ds = _lance.dataset(str(traj_path))
+        ds = self._open(None, str(traj_path))
         result = ds.scanner(
             nearest={
                 "column": "trajectory_vector",
@@ -1367,26 +1559,32 @@ class GDSReader:
                 "k": k_fetch,
             },
             columns=[
-                "primary_key", "trajectory_vector", "displacement",
-                "num_slices", "first_timestamp", "last_timestamp",
+                "primary_key",
+                "trajectory_vector",
+                "displacement",
+                "num_slices",
+                "first_timestamp",
+                "last_timestamp",
             ],
         ).to_table()
         q = query_vector.astype(np.float32)
-        out: list[dict] = []
+        out: list[dict[str, Any]] = []
         for i in range(result.num_rows):
             pk = result["primary_key"][i].as_py()
             if pk in exclude:
                 continue
             tv = np.array(result["trajectory_vector"][i].as_py(), dtype=np.float32)
             dist = float(np.linalg.norm(tv - q))
-            out.append({
-                "primary_key": pk,
-                "distance": dist,
-                "displacement": result["displacement"][i].as_py(),
-                "num_slices": result["num_slices"][i].as_py(),
-                "first_timestamp": result["first_timestamp"][i].as_py(),
-                "last_timestamp": result["last_timestamp"][i].as_py(),
-            })
+            out.append(
+                {
+                    "primary_key": pk,
+                    "distance": dist,
+                    "displacement": result["displacement"][i].as_py(),
+                    "num_slices": result["num_slices"][i].as_py(),
+                    "first_timestamp": result["first_timestamp"][i].as_py(),
+                    "last_timestamp": result["last_timestamp"][i].as_py(),
+                }
+            )
             if len(out) >= k:
                 break
         out.sort(key=lambda x: x["distance"])
@@ -1414,7 +1612,7 @@ class GDSReader:
         lance_path = str(lance_dir)
         if not lance_dir.exists():
             return None
-        ds = _lance.dataset(lance_path)
+        ds = self._open(pattern_id, lance_path)
         field_names = {f.name for f in ds.schema}
         if "entity_keys" not in field_names:
             return None  # No entity_keys column — caller should fall back
@@ -1423,21 +1621,22 @@ class GDSReader:
         filter_expr = f"array_contains(entity_keys, '{pk_escaped}')"
         if line_id is None:
             tbl = ds.scanner(
-                filter=filter_expr, columns=["primary_key"],
+                filter=filter_expr,
+                columns=["primary_key"],
             ).to_table()
-            return tbl.column("primary_key").to_pylist()
+            all_pks: list[str] = tbl.column("primary_key").to_pylist()
+            return all_pks
         # Filter by specific line_id position in entity_keys
         sphere = self.read_sphere()
         pattern = sphere.patterns.get(pattern_id)
         if pattern is None:
             tbl = ds.scanner(
-                filter=filter_expr, columns=["primary_key"],
+                filter=filter_expr,
+                columns=["primary_key"],
             ).to_table()
-            return tbl.column("primary_key").to_pylist()
-        rel_indices = [
-            i for i, rel in enumerate(pattern.relations)
-            if rel.line_id == line_id
-        ]
+            pattern_pks: list[str] = tbl.column("primary_key").to_pylist()
+            return pattern_pks
+        rel_indices = [i for i, rel in enumerate(pattern.relations) if rel.line_id == line_id]
         if not rel_indices:
             return []
         # Read matching rows and post-filter: keep rows where point_key sits in
@@ -1447,37 +1646,42 @@ class GDSReader:
         # occupies a non-first slot — the array_contains pre-filter already
         # matched it in any slot, and the full-scan fallback is any-slot too.
         tbl = ds.scanner(
-            filter=filter_expr, columns=["primary_key", "entity_keys"],
+            filter=filter_expr,
+            columns=["primary_key", "entity_keys"],
         ).to_table()
         results = []
         for i in range(tbl.num_rows):
             ek = tbl["entity_keys"][i].as_py()
-            if ek and any(
-                idx < len(ek) and ek[idx] == point_key for idx in rel_indices
-            ):
+            if ek and any(idx < len(ek) and ek[idx] == point_key for idx in rel_indices):
                 results.append(tbl["primary_key"][i].as_py())
         return results
 
     def read_temporal_centroids(
-        self, pattern_id: str,
-    ) -> list[dict] | None:
-        """Read pre-computed temporal centroids. Returns None if cache doesn't exist."""
-        cache_path = (
-            self._base / "_gds_meta" / "temporal_centroids" / f"{pattern_id}.lance"
-        )
+        self,
+        pattern_id: str,
+    ) -> list[dict[str, Any]] | None:
+        """Read pre-computed temporal centroids.
+
+        Returns None if the cache doesn't exist or was invalidated (no rows).
+        """
+        cache_path = self._base / "_gds_meta" / "temporal_centroids" / f"{pattern_id}.lance"
         if not cache_path.exists():
             return None
-        ds = _lance.dataset(str(cache_path))
+        ds = self._open(None, str(cache_path))
         table = ds.to_table()
+        if table.num_rows == 0:
+            return None
         result = []
         for i in range(table.num_rows):
-            result.append({
-                "window_start": table["window_start"][i].as_py(),
-                "window_end": table["window_end"][i].as_py(),
-                "centroid": table["centroid"][i].as_py(),
-                "entity_count": table["entity_count"][i].as_py(),
-                "anomaly_rate": table["anomaly_rate"][i].as_py(),
-            })
+            result.append(
+                {
+                    "window_start": table["window_start"][i].as_py(),
+                    "window_end": table["window_end"][i].as_py(),
+                    "centroid": table["centroid"][i].as_py(),
+                    "entity_count": table["entity_count"][i].as_py(),
+                    "anomaly_rate": table["anomaly_rate"][i].as_py(),
+                }
+            )
         return result
 
     # ── Edge table ──────────────────────────────────────────────
@@ -1501,21 +1705,19 @@ class GDSReader:
         lance_path = self._base / "edges" / pattern_id / "data.lance"
         if not lance_path.exists():
             from hypertopos.storage._schemas import EDGE_TABLE_SCHEMA
+
             return pa.table(
                 {f.name: pa.array([], type=f.type) for f in EDGE_TABLE_SCHEMA},
             )
-        pinned = self._pinned_lance_versions.get(f"edges:{pattern_id}")
-        ds = _lance.dataset(str(lance_path))
-        if pinned is not None and pinned != ds.latest_version:
-            ds = ds.checkout_version(pinned)
+        ds = self._open(f"edges:{pattern_id}", lance_path)
 
         # Build filter expression
         parts: list[str] = []
         if from_keys is not None:
-            escaped = ", ".join(f"'{k.replace(chr(39), chr(39)*2)}'" for k in from_keys)
+            escaped = ", ".join(f"'{k.replace(chr(39), chr(39) * 2)}'" for k in from_keys)
             parts.append(f"from_key IN ({escaped})")
         if to_keys is not None:
-            escaped = ", ".join(f"'{k.replace(chr(39), chr(39)*2)}'" for k in to_keys)
+            escaped = ", ".join(f"'{k.replace(chr(39), chr(39) * 2)}'" for k in to_keys)
             parts.append(f"to_key IN ({escaped})")
         if timestamp_from is not None:
             parts.append(f"timestamp >= {timestamp_from}")
@@ -1547,24 +1749,21 @@ class GDSReader:
         lance_path = self._base / "_gds_meta" / "contagion_stats" / f"{pattern_id}.lance"
         if not lance_path.exists():
             return None
-        ds = _lance.dataset(str(lance_path))
+        ds = self._open(None, str(lance_path))
         if primary_keys is None:
             return ds.to_table()
         if not primary_keys:
             return ds.to_table().slice(0, 0)
         from hypertopos.engine.lance_sql_agg import _escape_sql_string
-        escaped = ", ".join(
-            f"'{_escape_sql_string(k)}'" for k in primary_keys
-        )
+
+        escaped = ", ".join(f"'{_escape_sql_string(k)}'" for k in primary_keys)
         return ds.scanner(filter=f"primary_key IN ({escaped})").to_table()
 
     def has_contagion_stats(self, pattern_id: str) -> bool:
         """Check whether a precomputed contagion stats table exists."""
-        return (
-            self._base / "_gds_meta" / "contagion_stats" / f"{pattern_id}.lance"
-        ).exists()
+        return (self._base / "_gds_meta" / "contagion_stats" / f"{pattern_id}.lance").exists()
 
-    def edge_stats_cached(self, pattern_id: str) -> dict | None:
+    def edge_stats_cached(self, pattern_id: str) -> dict[str, Any] | None:
         """Return precomputed edge_stats JSON only — never falls back to a live scan.
 
         Build-time produces this cache; primitives that need a CHEAP guard
@@ -1572,12 +1771,13 @@ class GDSReader:
         edge_table_stats, which can trigger an O(N) Lance scan when the cache
         is missing — defeating the purpose of a fast bail.
         """
-        cache_path = self._base / "_gds_meta" / "edge_stats" / f"{pattern_id}.json"
+        cache_path = self.meta_root / "_gds_meta" / "edge_stats" / f"{pattern_id}.json"
         if cache_path.exists():
-            return json.loads(cache_path.read_text())
+            cached: dict[str, Any] = json.loads(cache_path.read_text())
+            return cached
         return None
 
-    def edge_table_stats(self, pattern_id: str) -> dict | None:
+    def edge_table_stats(self, pattern_id: str) -> dict[str, Any] | None:
         """Quick statistics about the edge table. Returns None if not present."""
         # Try cached stats first (written at build time)
         cached = self.edge_stats_cached(pattern_id)
@@ -1587,7 +1787,7 @@ class GDSReader:
         lance_path = self._base / "edges" / pattern_id / "data.lance"
         if not lance_path.exists():
             return None
-        ds = _lance.dataset(str(lance_path))
+        ds = self._open(f"edges:{pattern_id}", lance_path)
         row_count = ds.count_rows()
         if row_count == 0:
             return {"row_count": 0}
@@ -1606,15 +1806,16 @@ class GDSReader:
         }
 
     def read_calibration_tracker(
-        self, pattern_id: str,
-    ) -> CalibrationTracker | None:  # noqa: F821
+        self,
+        pattern_id: str,
+    ) -> CalibrationTracker | None:
         """Read calibration tracker from _gds_meta/calibration/{pattern_id}.json."""
         from hypertopos.engine.calibration import RESERVOIR_K, CalibrationTracker
 
-        path = self._base / "_gds_meta" / "calibration" / f"{pattern_id}.json"
-        if not path.exists():
+        text = self.meta_file_text(f"calibration/{pattern_id}.json")
+        if text is None:
             return None
-        data = json.loads(path.read_text())
+        data = json.loads(text)
 
         # Backward compat: older trackers lack norm_reservoir fields
         raw_reservoir = data.get("norm_reservoir", [])

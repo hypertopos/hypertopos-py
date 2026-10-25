@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import pyarrow as pa
 import pytest
+
 from hypertopos.builder.builder import GDSBuilder, RelationSpec
 from hypertopos.storage.reader import GDSReader
 
@@ -200,6 +201,7 @@ def test_write_points_creates_inverted_index(tmp_path):
     """write_points builds INVERTED indices on string columns."""
     import lance
     import pyarrow as pa  # noqa: F811
+
     from hypertopos.builder._writer import write_points
 
     table = pa.table(
@@ -228,6 +230,7 @@ def test_write_points_fts_search_after_build(tmp_path):
     """After write_points with INVERTED index, FTS search returns correct results."""
     import lance
     import pyarrow as pa  # noqa: F811
+
     from hypertopos.builder._writer import write_points
 
     table = pa.table(
@@ -269,6 +272,7 @@ def _get_inverted_columns(lance_path) -> set[str]:
 def test_write_points_fts_columns_all(tmp_path):
     """fts_columns='all' creates INVERTED on all string columns (except primary_key)."""
     import lance
+
     from hypertopos.builder._writer import write_points
 
     table = pa.table(
@@ -292,6 +296,7 @@ def test_write_points_fts_columns_all(tmp_path):
 def test_write_points_fts_columns_empty_list(tmp_path):
     """fts_columns=[] creates NO INVERTED indices — FTS search raises."""
     import lance
+
     from hypertopos.builder._writer import write_points
 
     table = pa.table(
@@ -314,6 +319,7 @@ def test_write_points_fts_columns_empty_list(tmp_path):
 def test_write_points_fts_columns_selective(tmp_path):
     """fts_columns=['name'] creates INVERTED only on 'name', not on other string cols."""
     import lance
+
     from hypertopos.builder._writer import write_points
 
     table = pa.table(

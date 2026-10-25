@@ -3,10 +3,12 @@
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
 """Tests for engine.fdr multi-resolution helpers."""
+
 from __future__ import annotations
 
 import pyarrow as pa
 import pytest
+
 from hypertopos.engine.fdr import (
     cell_p_values_from_anomaly_indicator,
     fdr_multi_resolution,
@@ -18,13 +20,17 @@ class TestCellPValuesSingleHierarchy:
 
     def test_single_cell_no_contrast_returns_one(self):
         # All entities in same cell, same anomaly rate as 'rest' (vacuously) -> p=1
-        geometry = pa.table({
-            "primary_key": ["e1", "e2", "e3", "e4"],
-            "bank_id": ["B1", "B1", "B1", "B1"],
-            "is_anomaly": [True, False, True, False],
-        })
+        geometry = pa.table(
+            {
+                "primary_key": ["e1", "e2", "e3", "e4"],
+                "bank_id": ["B1", "B1", "B1", "B1"],
+                "is_anomaly": [True, False, True, False],
+            }
+        )
         result = cell_p_values_from_anomaly_indicator(
-            geometry, hierarchy_dims=["bank_id"], temporal_dim=None,
+            geometry,
+            hierarchy_dims=["bank_id"],
+            temporal_dim=None,
         )
         assert set(result.keys()) == {("B1",)}
         # Single-cell case: no contrast vs complement (complement is empty); p=1.0
@@ -32,13 +38,17 @@ class TestCellPValuesSingleHierarchy:
 
     def test_two_cells_one_enriched(self):
         # B1: 4/4 anomalous (extreme); B2: 0/4 anomalous; B1 enriched, B2 depleted
-        geometry = pa.table({
-            "primary_key": ["e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8"],
-            "bank_id": ["B1", "B1", "B1", "B1", "B2", "B2", "B2", "B2"],
-            "is_anomaly": [True, True, True, True, False, False, False, False],
-        })
+        geometry = pa.table(
+            {
+                "primary_key": ["e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8"],
+                "bank_id": ["B1", "B1", "B1", "B1", "B2", "B2", "B2", "B2"],
+                "is_anomaly": [True, True, True, True, False, False, False, False],
+            }
+        )
         result = cell_p_values_from_anomaly_indicator(
-            geometry, hierarchy_dims=["bank_id"], temporal_dim=None,
+            geometry,
+            hierarchy_dims=["bank_id"],
+            temporal_dim=None,
         )
         assert set(result.keys()) == {("B1",), ("B2",)}
         # B1 enriched: p << 0.05; B2 depleted (upper-tail p ≈ 1.0)
@@ -56,14 +66,16 @@ class TestCellPValuesIntersection:
             for q in ("Q1", "Q2", "Q3", "Q4"):
                 for i in range(10):
                     pk = f"{bank}-{q}-{i}"
-                    is_anom = (bank == "B1" and q == "Q1" and i < 8)
+                    is_anom = bank == "B1" and q == "Q1" and i < 8
                     rows.append((pk, bank, q, is_anom))
-        geometry = pa.table({
-            "primary_key": [r[0] for r in rows],
-            "bank_id": [r[1] for r in rows],
-            "temporal_bucket": [r[2] for r in rows],
-            "is_anomaly": [r[3] for r in rows],
-        })
+        geometry = pa.table(
+            {
+                "primary_key": [r[0] for r in rows],
+                "bank_id": [r[1] for r in rows],
+                "temporal_bucket": [r[2] for r in rows],
+                "is_anomaly": [r[3] for r in rows],
+            }
+        )
         result = cell_p_values_from_anomaly_indicator(
             geometry,
             hierarchy_dims=["bank_id"],
@@ -82,27 +94,38 @@ class TestCellPValuesIntersection:
 
 class TestCellPValuesErrors:
     def test_missing_anomaly_col(self):
-        geometry = pa.table({
-            "primary_key": ["e1"], "bank_id": ["B1"],
-        })
+        geometry = pa.table(
+            {
+                "primary_key": ["e1"],
+                "bank_id": ["B1"],
+            }
+        )
         with pytest.raises(ValueError, match="anomaly_col"):
             cell_p_values_from_anomaly_indicator(
-                geometry, hierarchy_dims=["bank_id"],
+                geometry,
+                hierarchy_dims=["bank_id"],
             )
 
     def test_missing_cell_dim(self):
-        geometry = pa.table({
-            "primary_key": ["e1"], "is_anomaly": [True],
-        })
+        geometry = pa.table(
+            {
+                "primary_key": ["e1"],
+                "is_anomaly": [True],
+            }
+        )
         with pytest.raises(ValueError, match="cell-defining columns missing"):
             cell_p_values_from_anomaly_indicator(
-                geometry, hierarchy_dims=["bank_id"],
+                geometry,
+                hierarchy_dims=["bank_id"],
             )
 
     def test_no_axis(self):
-        geometry = pa.table({
-            "primary_key": ["e1"], "is_anomaly": [True],
-        })
+        geometry = pa.table(
+            {
+                "primary_key": ["e1"],
+                "is_anomaly": [True],
+            }
+        )
         with pytest.raises(ValueError, match="at least one of"):
             cell_p_values_from_anomaly_indicator(geometry)
 
@@ -212,13 +235,17 @@ class TestFDRMultiResolutionErrors:
     def test_alpha_out_of_range(self):
         with pytest.raises(ValueError, match="alpha"):
             fdr_multi_resolution(
-                {("A",): 0.1}, hierarchy=["x"], alpha=1.5,
+                {("A",): 0.1},
+                hierarchy=["x"],
+                alpha=1.5,
             )
 
     def test_unknown_method(self):
         with pytest.raises(ValueError, match="method"):
             fdr_multi_resolution(
-                {("A",): 0.1}, hierarchy=["x"], method="banana",
+                {("A",): 0.1},
+                hierarchy=["x"],
+                method="banana",
             )
 
     def test_no_axis(self):
@@ -229,12 +256,14 @@ class TestFDRMultiResolutionErrors:
         with pytest.raises(ValueError, match="cell-tuple length mismatch"):
             fdr_multi_resolution(
                 {("A", "B"): 0.1},
-                hierarchy=["x"],   # expects len 1
+                hierarchy=["x"],  # expects len 1
             )
 
     def test_empty_input(self):
         q_vals, surviving = fdr_multi_resolution(
-            {}, hierarchy=["x"], alpha=0.05,
+            {},
+            hierarchy=["x"],
+            alpha=0.05,
         )
         assert q_vals == {}
         assert surviving == set()

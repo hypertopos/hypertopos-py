@@ -36,5 +36,5 @@ tests/fixtures/gds/
 # Built spheres (output of hypertopos build)
 **/sphere/gds_*/
 
-# Build CLI cache (source parquet + chain pickle)
+# Build CLI cache (source parquet)
 .cache/

@@ -4,6 +4,7 @@
 # See LICENSE.md in the repository root for full terms.
 from hypertopos.builder import GDSBuilder, RelationSpec
 from hypertopos.model.sphere import (
+    BranchDiffReport,
     CalibrationDriftReport,
     CalibrationFit,
     DimensionContribution,
@@ -17,13 +18,22 @@ from hypertopos.model.sphere import (
     IntrinsicExtrinsicReport,
     LeadLagReport,
 )
-from hypertopos.navigation.navigator import GDSError, GDSNavigationError, GDSNavigator, SimilarityResult
+from hypertopos.navigation.navigator import (
+    GDSError,
+    GDSNavigationError,
+    GDSNavigator,
+    SimilarityResult,
+)
 from hypertopos.sphere import HyperSession, HyperSphere
+from hypertopos.storage._lance_branches import BranchInfo, PromoteReport
 from hypertopos.storage.calibration_history import CalibrationNotFoundError
 
 __all__ = [
     "HyperSphere",
     "HyperSession",
+    "BranchInfo",
+    "BranchDiffReport",
+    "PromoteReport",
     "GDSNavigator",
     "GDSError",
     "GDSNavigationError",
@@ -44,4 +54,4 @@ __all__ = [
     "IntrinsicExtrinsicReport",
     "LeadLagReport",
 ]
-__version__ = "0.8.1"
+__version__ = "0.9.0"

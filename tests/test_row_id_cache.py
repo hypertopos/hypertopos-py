@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 
 import lance as _lance
+
 from hypertopos.storage.reader import _ROW_ID_CACHE_MAXSIZE, GDSReader
 
 # ---------------------------------------------------------------------------

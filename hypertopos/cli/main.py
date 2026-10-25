@@ -20,39 +20,49 @@ def main() -> None:
     build_p = sub.add_parser("build", help="Build a sphere from YAML config")
     build_config = build_p.add_mutually_exclusive_group(required=True)
     build_config.add_argument(
-        "--config", metavar="FILE",
+        "--config",
+        metavar="FILE",
         help="Path to sphere.yaml (new format)",
     )
     build_config.add_argument(
-        "--mapping", metavar="FILE",
+        "--mapping",
+        metavar="FILE",
         help="Path to gds_mapping.yaml (legacy format)",
     )
     build_p.add_argument(
-        "--output", default=None, metavar="DIR",
+        "--output",
+        default=None,
+        metavar="DIR",
         help="Output directory (overrides YAML setting)",
     )
     build_p.add_argument(
-        "--force", action="store_true",
+        "--force",
+        action="store_true",
         help="Overwrite existing output directory",
     )
     build_p.add_argument(
-        "--verbose", action="store_true",
+        "--verbose",
+        action="store_true",
         help="Print progress messages",
     )
     build_p.add_argument(
-        "--no-temporal", action="store_true",
+        "--no-temporal",
+        action="store_true",
         help="Skip temporal snapshot build",
     )
     build_p.add_argument(
-        "--no-chains", action="store_true",
+        "--no-chains",
+        action="store_true",
         help="Skip chain extraction",
     )
     build_p.add_argument(
-        "--no-edges", action="store_true",
+        "--no-edges",
+        action="store_true",
         help="Skip edge table emission",
     )
     build_p.add_argument(
-        "--label-aware-calibration", action="store_true",
+        "--label-aware-calibration",
+        action="store_true",
         help=(
             "Enable label-aware per-dim calibration. No-op unless the "
             "sphere config declares a label_audit block selecting "
@@ -62,10 +72,13 @@ def main() -> None:
 
     # --- validate ---
     validate_p = sub.add_parser(
-        "validate", help="Validate sphere.yaml without building",
+        "validate",
+        help="Validate sphere.yaml without building",
     )
     validate_p.add_argument(
-        "--config", required=True, metavar="FILE",
+        "--config",
+        required=True,
+        metavar="FILE",
         help="Path to sphere.yaml",
     )
 
@@ -75,43 +88,55 @@ def main() -> None:
 
     # --- sphere (cloud-ops verbs over a built sphere) ---
     sphere_p = sub.add_parser(
-        "sphere", help="Cloud-ops verbs over a built sphere (health/validate/diff)",
+        "sphere",
+        help="Cloud-ops verbs over a built sphere (health/validate/diff)",
     )
     sphere_sub = sphere_p.add_subparsers(dest="sphere_command", metavar="subcommand")
 
     health_p = sphere_sub.add_parser(
-        "health", help="Health-check a built sphere (CI gate)",
+        "health",
+        help="Health-check a built sphere (CI gate)",
     )
     health_p.add_argument("path", help="Path to a built sphere directory")
     health_p.add_argument(
-        "--json", action="store_true", dest="as_json",
+        "--json",
+        action="store_true",
+        dest="as_json",
         help="Emit machine-readable JSON on stdout",
     )
     health_p.add_argument(
-        "--exit-code-on-critical", action="store_true",
+        "--exit-code-on-critical",
+        action="store_true",
         help="Exit 2 when status is critical (HIGH-severity alerts present)",
     )
 
     svalidate_p = sphere_sub.add_parser(
-        "validate", help="Structural integrity check over a built sphere",
+        "validate",
+        help="Structural integrity check over a built sphere",
     )
     svalidate_p.add_argument("path", help="Path to a built sphere directory")
     svalidate_p.add_argument(
-        "--strict", action="store_true",
+        "--strict",
+        action="store_true",
         help="Promote calibration / dimension-quality warnings to errors",
     )
     svalidate_p.add_argument(
-        "--json", action="store_true", dest="as_json",
+        "--json",
+        action="store_true",
+        dest="as_json",
         help="Emit machine-readable JSON on stdout",
     )
 
     sdiff_p = sphere_sub.add_parser(
-        "diff", help="Diff two built spheres (pattern inventory + calibration drift)",
+        "diff",
+        help="Diff two built spheres (pattern inventory + calibration drift)",
     )
     sdiff_p.add_argument("old", help="Path to the old built sphere directory")
     sdiff_p.add_argument("new", help="Path to the new built sphere directory")
     sdiff_p.add_argument(
-        "--json", action="store_true", dest="as_json",
+        "--json",
+        action="store_true",
+        dest="as_json",
         help="Emit machine-readable JSON on stdout",
     )
 
@@ -121,36 +146,67 @@ def main() -> None:
     )
     singest_p.add_argument("path", help="Path to a built sphere directory")
     singest_p.add_argument(
-        "--points", required=True, metavar="FILE",
+        "--points",
+        required=True,
+        metavar="FILE",
         help=(
             "New-/changed-entities table (.arrow/.arrows, .parquet/.pq, "
             ".csv/.csv.gz) with a primary_key column"
         ),
     )
     singest_p.add_argument(
-        "--pattern", default=None, metavar="ID",
+        "--pattern",
+        default=None,
+        metavar="ID",
         help=(
             "Pattern to ingest into. Optional when the sphere has exactly one "
             "pattern; required otherwise"
         ),
     )
     singest_p.add_argument(
-        "--recalibrate", default="auto", choices=("auto", "force", "never"),
+        "--recalibrate",
+        default="auto",
+        choices=("auto", "force", "never"),
         help="Recalibration policy passed to incremental_update (default: auto)",
     )
     singest_p.add_argument(
-        "--reindex", action="store_true",
+        "--reindex",
+        action="store_true",
         help="Force an ANN index rebuild so appended rows are immediately indexed",
     )
     singest_p.add_argument(
-        "--finalize", action="store_true",
+        "--finalize",
+        action="store_true",
         help=(
             "Recompute the global delta_rank_pct and rebuild the ANN index once "
             "after the append (use at the end of a batched ingest session)"
         ),
     )
     singest_p.add_argument(
-        "--json", action="store_true", dest="as_json",
+        "--branch",
+        default=None,
+        metavar="NAME",
+        help="Ingest into this sphere branch only; main is not touched",
+    )
+    singest_p.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit machine-readable JSON on stdout",
+    )
+
+    sbranch_p = sphere_sub.add_parser(
+        "branch",
+        help="List, create, delete or promote sphere branches",
+    )
+    sbranch_p.add_argument("action", choices=("list", "create", "delete", "promote"))
+    sbranch_p.add_argument("path", help="Path to a built sphere directory")
+    sbranch_p.add_argument("name", nargs="?", default=None, help="Branch name")
+    sbranch_p.add_argument("--purpose", default="", help="Free-text purpose (create)")
+    sbranch_p.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
         help="Emit machine-readable JSON on stdout",
     )
 
@@ -162,36 +218,59 @@ def main() -> None:
             _cmd_build_legacy(args.mapping, args.output)
         else:
             from hypertopos.cli.build import run_build
+
             run_build(
-                args.config, args.output, args.force, args.verbose,
-                no_temporal=args.no_temporal, no_chains=args.no_chains,
+                args.config,
+                args.output,
+                args.force,
+                args.verbose,
+                no_temporal=args.no_temporal,
+                no_chains=args.no_chains,
                 no_edges=args.no_edges,
                 label_aware_calibration=args.label_aware_calibration,
             )
     elif args.command == "validate":
         from hypertopos.cli.build import run_validate
+
         run_validate(args.config)
     elif args.command == "info":
         from hypertopos.cli.info import run_info
+
         run_info(args.path)
     elif args.command == "sphere":
         if args.sphere_command == "health":
             from hypertopos.cli.sphere_ops import run_sphere_health
+
             run_sphere_health(
-                args.path, args.as_json, args.exit_code_on_critical,
+                args.path,
+                args.as_json,
+                args.exit_code_on_critical,
             )
         elif args.sphere_command == "validate":
             from hypertopos.cli.sphere_ops import run_sphere_validate
+
             run_sphere_validate(args.path, args.strict, args.as_json)
         elif args.sphere_command == "diff":
             from hypertopos.cli.sphere_ops import run_sphere_diff
+
             run_sphere_diff(args.old, args.new, args.as_json)
         elif args.sphere_command == "ingest":
             from hypertopos.cli.sphere_ops import run_sphere_ingest
+
             run_sphere_ingest(
-                args.path, args.points, args.pattern, args.recalibrate,
-                args.reindex, args.finalize, args.as_json,
+                args.path,
+                args.points,
+                args.pattern,
+                args.recalibrate,
+                args.reindex,
+                args.finalize,
+                args.as_json,
+                args.branch,
             )
+        elif args.sphere_command == "branch":
+            from hypertopos.cli.sphere_ops import run_sphere_branch
+
+            run_sphere_branch(args.path, args.action, args.name, args.purpose, args.as_json)
         else:
             sphere_p.print_help()
             sys.exit(1)

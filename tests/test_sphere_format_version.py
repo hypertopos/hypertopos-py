@@ -3,12 +3,14 @@
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
 """Sphere format_version gate — major-only comparator (3.x accepted)."""
+
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
 import pytest
+
 from hypertopos.builder import GDSBuilder, RelationSpec
 from hypertopos.navigation.navigator import GDSVersionError
 from hypertopos.sphere import HyperSphere

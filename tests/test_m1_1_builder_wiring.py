@@ -21,6 +21,7 @@ end-to-end wiring:
 - Sphere written → reader hydrates the field with attribute-access
   semantics expected by ``audit_pattern_dims``.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -28,6 +29,7 @@ from pathlib import Path
 import lance
 import numpy as np
 import pyarrow as pa
+
 from hypertopos.builder import GDSBuilder, RelationSpec
 from hypertopos.cli.schema import LabelAuditConfig
 from hypertopos.storage.reader import GDSReader
@@ -59,22 +61,31 @@ def _build_two_class_sphere(
     noise_score = rng.normal(0.0, 1.0, n).astype(np.float32)
 
     pks = [f"T-{i:04d}" for i in range(n)]
-    tx = pa.table({
-        "tx_id": pks,
-        "account_id": ["A-shared"] * n,
-        "sep_score": sep_score,
-        "noise_score": noise_score,
-        "label": labels_pyarr,
-    })
+    tx = pa.table(
+        {
+            "tx_id": pks,
+            "account_id": ["A-shared"] * n,
+            "sep_score": sep_score,
+            "noise_score": noise_score,
+            "label": labels_pyarr,
+        }
+    )
     accounts = pa.table({"account_id": ["A-shared"]})
 
     out_path = tmp_path / out_dir_name
     b = GDSBuilder("two_class_wired", str(out_path))
     b.add_line(
-        "accounts", accounts, key_col="account_id", source_id="test",
+        "accounts",
+        accounts,
+        key_col="account_id",
+        source_id="test",
     )
     b.add_line(
-        "tx", tx, key_col="tx_id", source_id="test", role="event",
+        "tx",
+        tx,
+        key_col="tx_id",
+        source_id="test",
+        role="event",
     )
     b.add_pattern(
         "tx_pattern",
@@ -82,17 +93,23 @@ def _build_two_class_sphere(
         entity_line="tx",
         relations=[
             RelationSpec(
-                line_id="accounts", fk_col="account_id",
-                direction="in", required=True,
+                line_id="accounts",
+                fk_col="account_id",
+                direction="in",
+                required=True,
             ),
         ],
         anomaly_percentile=95.0,
     )
     b.add_event_dimension(
-        "tx_pattern", column="sep_score", edge_max="auto",
+        "tx_pattern",
+        column="sep_score",
+        edge_max="auto",
     )
     b.add_event_dimension(
-        "tx_pattern", column="noise_score", edge_max="auto",
+        "tx_pattern",
+        column="noise_score",
+        edge_max="auto",
     )
 
     if enable_label_aware:
@@ -106,7 +123,8 @@ def _build_two_class_sphere(
 
     out = b.build()
     labels_arr = np.array(
-        [1] * n_per_class + [0] * n_per_class, dtype=np.int32,
+        [1] * n_per_class + [0] * n_per_class,
+        dtype=np.int32,
     )
     return out, pks, labels_arr
 
@@ -137,7 +155,9 @@ def test_label_aware_wired_populates_pattern_and_geometry(tmp_path):
     pat = sphere.patterns["tx_pattern"]
     assert pat.label_aware_calibration is not None
     assert set(pat.label_aware_calibration.keys()) == {
-        "accounts", "sep_score", "noise_score",
+        "accounts",
+        "sep_score",
+        "noise_score",
     }
     sep_cal = pat.label_aware_calibration["sep_score"]
     noise_cal = pat.label_aware_calibration["noise_score"]
@@ -149,12 +169,10 @@ def test_label_aware_wired_populates_pattern_and_geometry(tmp_path):
     # Separating dim carries the bulk of the unit Fisher axis; noise
     # dim's component stays small.
     assert abs(sep_cal.direction) > 0.5, (
-        f"separating dim |direction|={abs(sep_cal.direction):.3f} "
-        f"should exceed 0.5"
+        f"separating dim |direction|={abs(sep_cal.direction):.3f} should exceed 0.5"
     )
     assert abs(noise_cal.direction) < 0.1, (
-        f"noise dim |direction|={abs(noise_cal.direction):.3f} "
-        f"should be below 0.1"
+        f"noise dim |direction|={abs(noise_cal.direction):.3f} should be below 0.1"
     )
 
     # 2. delta_norm_signed populated (no nulls when label-aware fires).
@@ -167,7 +185,8 @@ def test_label_aware_wired_populates_pattern_and_geometry(tmp_path):
     pk_to_label = dict(zip(pks, labels, strict=True))
     geo_pks = tbl["primary_key"].to_pylist()
     row_labels = np.array(
-        [pk_to_label[pk] for pk in geo_pks], dtype=np.int32,
+        [pk_to_label[pk] for pk in geo_pks],
+        dtype=np.int32,
     )
     signed = tbl["delta_norm_signed"].to_numpy(zero_copy_only=False)
     assert signed[row_labels == 1].mean() > signed[row_labels == 0].mean()
@@ -246,9 +265,7 @@ def test_round_trip_preserves_label_aware_calibration(tmp_path):
         d1, d2 = cal1[label], cal2[label]
         for attr in ("mu_pos", "sigma_pos", "mu_neg", "sigma_neg", "direction"):
             v1, v2 = getattr(d1, attr), getattr(d2, attr)
-            assert v1 == v2, (
-                f"{label}.{attr} round-trip mismatch: {v1} != {v2}"
-            )
+            assert v1 == v2, f"{label}.{attr} round-trip mismatch: {v1} != {v2}"
 
 
 def test_audit_pattern_dims_returns_full_field_path_end_to_end(tmp_path):
@@ -320,7 +337,10 @@ def test_audit_pattern_dims_returns_full_field_path_end_to_end(tmp_path):
             assert row["cohens_d_pos_neg"] is not None, row
             assert row["direction_component"] is not None, row
             assert {
-                "mu_pos", "sigma_pos", "mu_neg", "sigma_neg",
+                "mu_pos",
+                "sigma_pos",
+                "mu_neg",
+                "sigma_neg",
             }.issubset(row.keys())
         # The dim with the separating signal must out-rank the noise dim
         # by absolute Cohen's d.
@@ -345,20 +365,29 @@ def test_label_aware_skipped_when_label_column_missing(tmp_path, caplog):
     # but the entity_line has no such column.
     n = 40
     pks = [f"T-{i:04d}" for i in range(n)]
-    tx = pa.table({
-        "tx_id": pks,
-        "account_id": ["A-shared"] * n,
-        "sep_score": np.arange(n, dtype=np.float32),
-    })
+    tx = pa.table(
+        {
+            "tx_id": pks,
+            "account_id": ["A-shared"] * n,
+            "sep_score": np.arange(n, dtype=np.float32),
+        }
+    )
     accounts = pa.table({"account_id": ["A-shared"]})
 
     out_path = tmp_path / "gds_missing_label_col"
     b = GDSBuilder("missing_label_col", str(out_path))
     b.add_line(
-        "accounts", accounts, key_col="account_id", source_id="test",
+        "accounts",
+        accounts,
+        key_col="account_id",
+        source_id="test",
     )
     b.add_line(
-        "tx", tx, key_col="tx_id", source_id="test", role="event",
+        "tx",
+        tx,
+        key_col="tx_id",
+        source_id="test",
+        role="event",
     )
     b.add_pattern(
         "tx_pattern",
@@ -366,8 +395,10 @@ def test_label_aware_skipped_when_label_column_missing(tmp_path, caplog):
         entity_line="tx",
         relations=[
             RelationSpec(
-                line_id="accounts", fk_col="account_id",
-                direction="in", required=True,
+                line_id="accounts",
+                fk_col="account_id",
+                direction="in",
+                required=True,
             ),
         ],
     )

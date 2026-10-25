@@ -10,6 +10,7 @@ Acceptance signal (plan §M1.3):
 - 2-class synthetic: signed delta separation between classes >
   unsigned delta separation by ≥ 20%.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -17,6 +18,7 @@ from pathlib import Path
 import lance
 import numpy as np
 import pyarrow as pa
+
 from hypertopos.builder import GDSBuilder, RelationSpec
 from hypertopos.engine.calibration_label_aware import calibrate_label_aware
 
@@ -55,12 +57,14 @@ def _make_two_class_sphere_inputs(
     noise_score = rng.normal(0.0, 1.0, n).astype(np.float32)
 
     pks = [f"T-{i:04d}" for i in range(n)]
-    tx = pa.table({
-        "tx_id": pks,
-        "account_id": ["A-shared"] * n,
-        "sep_score": sep_score,
-        "noise_score": noise_score,
-    })
+    tx = pa.table(
+        {
+            "tx_id": pks,
+            "account_id": ["A-shared"] * n,
+            "sep_score": sep_score,
+            "noise_score": noise_score,
+        }
+    )
     accounts = pa.table({"account_id": ["A-shared"]})
     return accounts, tx, pks, labels
 
@@ -79,14 +83,22 @@ def _build_two_class_sphere(
     the label vector aligned with that primary-key order.
     """
     accounts, tx, pks, labels = _make_two_class_sphere_inputs(
-        n_per_class=n_per_class, seed=seed,
+        n_per_class=n_per_class,
+        seed=seed,
     )
     b = GDSBuilder("two_class_sphere", str(tmp_path / out_dir_name))
     b.add_line(
-        "accounts", accounts, key_col="account_id", source_id="test",
+        "accounts",
+        accounts,
+        key_col="account_id",
+        source_id="test",
     )
     b.add_line(
-        "tx", tx, key_col="tx_id", source_id="test", role="event",
+        "tx",
+        tx,
+        key_col="tx_id",
+        source_id="test",
+        role="event",
     )
     b.add_pattern(
         "tx_pattern",
@@ -94,17 +106,23 @@ def _build_two_class_sphere(
         entity_line="tx",
         relations=[
             RelationSpec(
-                line_id="accounts", fk_col="account_id",
-                direction="in", required=True,
+                line_id="accounts",
+                fk_col="account_id",
+                direction="in",
+                required=True,
             ),
         ],
         anomaly_percentile=95.0,
     )
     b.add_event_dimension(
-        "tx_pattern", column="sep_score", edge_max="auto",
+        "tx_pattern",
+        column="sep_score",
+        edge_max="auto",
     )
     b.add_event_dimension(
-        "tx_pattern", column="noise_score", edge_max="auto",
+        "tx_pattern",
+        column="noise_score",
+        edge_max="auto",
     )
     if direction is not None:
         b._label_aware_directions["tx_pattern"] = direction
@@ -113,7 +131,10 @@ def _build_two_class_sphere(
 
 
 def _fit_direction_for_pattern(
-    out_path: str, pattern_id: str, pks: list[str], labels: np.ndarray,
+    out_path: str,
+    pattern_id: str,
+    pks: list[str],
+    labels: np.ndarray,
 ) -> np.ndarray:
     """Read the freshly built geometry, fit a Fisher LDA direction.
 
@@ -130,10 +151,12 @@ def _fit_direction_for_pattern(
     deltas = np.zeros((len(geo_pks), n_dims), dtype=np.float32)
     for row_idx, pk in enumerate(geo_pks):
         deltas[pk_to_idx[pk]] = np.asarray(
-            delta_col[row_idx].as_py(), dtype=np.float32,
+            delta_col[row_idx].as_py(),
+            dtype=np.float32,
         )
     result = calibrate_label_aware(
-        deltas=deltas, labels=labels,
+        deltas=deltas,
+        labels=labels,
     )
     return np.asarray(result.signed_direction_vector, dtype=np.float32)
 
@@ -175,7 +198,9 @@ def test_delta_norm_signed_separates_classes_better_than_unsigned(tmp_path):
     # Rebuild with the direction registered so the geometry pass
     # projects each polygon's delta vector onto the unit-norm axis.
     rebuild_out, _pks2, _labels2 = _build_two_class_sphere(
-        tmp_path, direction=direction, out_dir_name="gds_two_class_signed",
+        tmp_path,
+        direction=direction,
+        out_dir_name="gds_two_class_signed",
     )
     geo_path = Path(rebuild_out) / "geometry" / "tx_pattern" / "data.lance"
     tbl = lance.dataset(str(geo_path)).to_table()
@@ -191,7 +216,8 @@ def test_delta_norm_signed_separates_classes_better_than_unsigned(tmp_path):
     pk_to_label = dict(zip(pks, labels, strict=True))
     geo_pks = tbl["primary_key"].to_pylist()
     row_labels = np.array(
-        [pk_to_label[pk] for pk in geo_pks], dtype=np.int32,
+        [pk_to_label[pk] for pk in geo_pks],
+        dtype=np.int32,
     )
 
     signed = tbl["delta_norm_signed"].to_numpy(zero_copy_only=False)
@@ -206,9 +232,7 @@ def test_delta_norm_signed_separates_classes_better_than_unsigned(tmp_path):
     # Diagnostic: both terms must be meaningfully positive — guards
     # against the trivial pass where unsigned_sep ≈ 0 makes the ratio
     # explode without proving anything about signed_sep itself.
-    assert signed_sep > 0.5, (
-        f"signed separation too small to be meaningful: {signed_sep:.4f}"
-    )
+    assert signed_sep > 0.5, f"signed separation too small to be meaningful: {signed_sep:.4f}"
     assert unsigned_sep > 0.05, (
         f"unsigned separation must be non-trivially positive to make "
         f"the 1.2× comparison meaningful, got {unsigned_sep:.4f}"
@@ -238,7 +262,8 @@ def test_delta_norm_signed_dim_mismatch_falls_back_to_null(tmp_path):
     bogus_direction = np.zeros(99, dtype=np.float32)
     bogus_direction[0] = 1.0
     out, _pks, _labels = _build_two_class_sphere(
-        tmp_path, direction=bogus_direction,
+        tmp_path,
+        direction=bogus_direction,
         out_dir_name="gds_two_class_mismatch",
     )
     geo_path = Path(out) / "geometry" / "tx_pattern" / "data.lance"
@@ -255,25 +280,38 @@ def test_delta_norm_signed_skipped_for_unrelated_pattern(tmp_path):
     full-nulls regardless of what's in the registry under another key.
     """
     accounts, tx, _pks, _labels = _make_two_class_sphere_inputs(
-        n_per_class=20, seed=23,
+        n_per_class=20,
+        seed=23,
     )
     other_event_pks = [f"O-{i:04d}" for i in range(10)]
-    other_events = pa.table({
-        "other_id": other_event_pks,
-        "account_id": ["A-shared"] * 10,
-        "value": np.arange(10, dtype=np.float32),
-    })
+    other_events = pa.table(
+        {
+            "other_id": other_event_pks,
+            "account_id": ["A-shared"] * 10,
+            "value": np.arange(10, dtype=np.float32),
+        }
+    )
 
     b = GDSBuilder("two_class_partial", str(tmp_path / "gds_partial"))
     b.add_line(
-        "accounts", accounts, key_col="account_id", source_id="test",
+        "accounts",
+        accounts,
+        key_col="account_id",
+        source_id="test",
     )
     b.add_line(
-        "tx", tx, key_col="tx_id", source_id="test", role="event",
+        "tx",
+        tx,
+        key_col="tx_id",
+        source_id="test",
+        role="event",
     )
     b.add_line(
-        "other_events", other_events, key_col="other_id",
-        source_id="test", role="event",
+        "other_events",
+        other_events,
+        key_col="other_id",
+        source_id="test",
+        role="event",
     )
     b.add_pattern(
         "tx_pattern",
@@ -281,8 +319,10 @@ def test_delta_norm_signed_skipped_for_unrelated_pattern(tmp_path):
         entity_line="tx",
         relations=[
             RelationSpec(
-                line_id="accounts", fk_col="account_id",
-                direction="in", required=True,
+                line_id="accounts",
+                fk_col="account_id",
+                direction="in",
+                required=True,
             ),
         ],
         anomaly_percentile=95.0,
@@ -296,8 +336,10 @@ def test_delta_norm_signed_skipped_for_unrelated_pattern(tmp_path):
         entity_line="other_events",
         relations=[
             RelationSpec(
-                line_id="accounts", fk_col="account_id",
-                direction="in", required=True,
+                line_id="accounts",
+                fk_col="account_id",
+                direction="in",
+                required=True,
             ),
         ],
         anomaly_percentile=95.0,
@@ -311,7 +353,8 @@ def test_delta_norm_signed_skipped_for_unrelated_pattern(tmp_path):
     # tx_pattern's column falls back to null too — the test only
     # asserts the per-pattern boundary, not what tx_pattern emits.
     b._label_aware_directions["tx_pattern"] = np.array(
-        [1.0, 0.0], dtype=np.float32,
+        [1.0, 0.0],
+        dtype=np.float32,
     )
     b.build()
 
@@ -342,7 +385,9 @@ def test_delta_norm_signed_preserves_sign(tmp_path):
     direction = _fit_direction_for_pattern(out, "tx_pattern", pks, labels)
 
     rebuild_out, _pks2, _labels2 = _build_two_class_sphere(
-        tmp_path, n_per_class=60, direction=direction,
+        tmp_path,
+        n_per_class=60,
+        direction=direction,
         out_dir_name="gds_two_class_sign",
     )
     geo_path = Path(rebuild_out) / "geometry" / "tx_pattern" / "data.lance"
@@ -350,7 +395,8 @@ def test_delta_norm_signed_preserves_sign(tmp_path):
     pk_to_label = dict(zip(pks, labels, strict=True))
     geo_pks = tbl["primary_key"].to_pylist()
     row_labels = np.array(
-        [pk_to_label[pk] for pk in geo_pks], dtype=np.int32,
+        [pk_to_label[pk] for pk in geo_pks],
+        dtype=np.int32,
     )
     signed = tbl["delta_norm_signed"].to_numpy(zero_copy_only=False)
     pos_mean = signed[row_labels == 1].mean()

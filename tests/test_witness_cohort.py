@@ -3,6 +3,7 @@
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
 """Tests for witness cohort discovery."""
+
 from __future__ import annotations
 
 import dataclasses
@@ -15,7 +16,6 @@ from hypertopos.navigation.navigator import (
     CohortMember,
     WitnessCohortResult,
 )
-
 
 # ---------------------------------------------------------------------------
 # Result types
@@ -34,8 +34,10 @@ class TestCohortMemberDataclass:
             delta_rank_pct=97.2,
             explanation="Similar profile, shared witness {a, b}, converging.",
             component_scores={
-                "delta": 0.368, "witness": 0.201,
-                "trajectory": 0.142, "anomaly": 0.10,
+                "delta": 0.368,
+                "witness": 0.201,
+                "trajectory": 0.142,
+                "anomaly": 0.10,
             },
         )
         assert member.primary_key == "ACC-001"
@@ -45,20 +47,30 @@ class TestCohortMemberDataclass:
 
     def test_member_is_frozen(self):
         member = CohortMember(
-            primary_key="X", score=0.5, delta_similarity=0.5,
-            witness_overlap=0.5, trajectory_alignment=None,
-            is_anomaly=False, delta_rank_pct=50.0,
-            explanation="", component_scores={},
+            primary_key="X",
+            score=0.5,
+            delta_similarity=0.5,
+            witness_overlap=0.5,
+            trajectory_alignment=None,
+            is_anomaly=False,
+            delta_rank_pct=50.0,
+            explanation="",
+            component_scores={},
         )
         with pytest.raises(dataclasses.FrozenInstanceError):
             member.primary_key = "Y"  # type: ignore[misc]
 
     def test_member_serializable(self):
         member = CohortMember(
-            primary_key="X", score=0.5, delta_similarity=0.5,
-            witness_overlap=0.5, trajectory_alignment=None,
-            is_anomaly=False, delta_rank_pct=50.0,
-            explanation="", component_scores={"delta": 0.5},
+            primary_key="X",
+            score=0.5,
+            delta_similarity=0.5,
+            witness_overlap=0.5,
+            trajectory_alignment=None,
+            is_anomaly=False,
+            delta_rank_pct=50.0,
+            explanation="",
+            component_scores={"delta": 0.5},
         )
         d = dataclasses.asdict(member)
         assert d["primary_key"] == "X"
@@ -109,7 +121,9 @@ class TestWitnessJaccard:
 
     def test_half_overlap(self):
         # 2 / 4
-        assert GDSEngine.witness_jaccard({"a", "b", "c"}, {"a", "b", "d", "e"}) == pytest.approx(0.4)
+        assert GDSEngine.witness_jaccard({"a", "b", "c"}, {"a", "b", "d", "e"}) == pytest.approx(
+            0.4
+        )
 
 
 class TestTrajectoryCosine:
@@ -211,13 +225,17 @@ class TestCompositeLinkScore:
     def test_monotonic_in_each_component(self):
         # Increasing one component while keeping others fixed must not decrease score
         baseline, _ = GDSEngine.composite_link_score(
-            delta_similarity=0.5, witness_overlap=0.5,
-            trajectory_alignment=0.5, anomaly_bonus=0.0,
+            delta_similarity=0.5,
+            witness_overlap=0.5,
+            trajectory_alignment=0.5,
+            anomaly_bonus=0.0,
             weights={"delta": 0.4, "witness": 0.3, "trajectory": 0.2, "anomaly": 0.1},
         )
         higher_delta, _ = GDSEngine.composite_link_score(
-            delta_similarity=0.9, witness_overlap=0.5,
-            trajectory_alignment=0.5, anomaly_bonus=0.0,
+            delta_similarity=0.9,
+            witness_overlap=0.5,
+            trajectory_alignment=0.5,
+            anomaly_bonus=0.0,
             weights={"delta": 0.4, "witness": 0.3, "trajectory": 0.2, "anomaly": 0.1},
         )
         assert higher_delta > baseline

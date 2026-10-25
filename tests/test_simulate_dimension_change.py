@@ -9,6 +9,7 @@ single entity, then recompute ``delta`` / ``delta_norm`` / anomaly flag and
 report the per-dim audit. Math is hand-verified against the engine's
 ``compute_delta`` (cholesky vs diagonal path, optional ``dimension_weights``).
 """
+
 from __future__ import annotations
 
 import math
@@ -22,15 +23,11 @@ import pytest
 from hypertopos.model.sphere import EdgeDimAggregationsRef, Pattern, RelationDef
 from hypertopos.navigation.navigator import GDSNavigationError, GDSNavigator
 
-
 # ── Synthetic pattern helpers ──────────────────────────────────────────────
 
 
 def _make_relations(line_ids: list[str]) -> list[RelationDef]:
-    return [
-        RelationDef(line_id=lid, direction="out", required=False)
-        for lid in line_ids
-    ]
+    return [RelationDef(line_id=lid, direction="out", required=False) for lid in line_ids]
 
 
 def _make_pattern(
@@ -75,12 +72,14 @@ def _make_nav(pattern: Pattern, *, delta: list[float], is_anomaly: bool) -> GDSN
     nav._storage.read_sphere.return_value = MagicMock(
         patterns={"test_pattern": pattern},
     )
-    nav._storage.read_geometry.return_value = pa.table({
-        "primary_key": ["E1"],
-        "delta": pa.array([delta_np.tolist()], type=pa.list_(pa.float64())),
-        "delta_norm": [delta_norm],
-        "is_anomaly": [is_anomaly],
-    })
+    nav._storage.read_geometry.return_value = pa.table(
+        {
+            "primary_key": ["E1"],
+            "delta": pa.array([delta_np.tolist()], type=pa.list_(pa.float64())),
+            "delta_norm": [delta_norm],
+            "is_anomaly": [is_anomaly],
+        }
+    )
     nav._resolve_version = MagicMock(return_value=1)
     return nav
 
@@ -176,7 +175,10 @@ def test_zero_anomalous_dim_clears_anomaly():
 
 def test_unknown_pattern_id_raises():
     pattern = _make_pattern(
-        line_ids=["A"], mu=[0.0], sigma_diag=[1.0], theta=[3.0],
+        line_ids=["A"],
+        mu=[0.0],
+        sigma_diag=[1.0],
+        theta=[3.0],
     )
     nav = _make_nav(pattern, delta=[0.0], is_anomaly=False)
 
@@ -191,16 +193,21 @@ def test_unknown_pattern_id_raises():
 
 def test_unknown_primary_key_raises():
     pattern = _make_pattern(
-        line_ids=["A"], mu=[0.0], sigma_diag=[1.0], theta=[3.0],
+        line_ids=["A"],
+        mu=[0.0],
+        sigma_diag=[1.0],
+        theta=[3.0],
     )
     nav = _make_nav(pattern, delta=[0.0], is_anomaly=False)
     # Force empty geometry table.
-    nav._storage.read_geometry.return_value = pa.table({
-        "primary_key": pa.array([], type=pa.string()),
-        "delta": pa.array([], type=pa.list_(pa.float64())),
-        "delta_norm": pa.array([], type=pa.float64()),
-        "is_anomaly": pa.array([], type=pa.bool_()),
-    })
+    nav._storage.read_geometry.return_value = pa.table(
+        {
+            "primary_key": pa.array([], type=pa.string()),
+            "delta": pa.array([], type=pa.list_(pa.float64())),
+            "delta_norm": pa.array([], type=pa.float64()),
+            "is_anomaly": pa.array([], type=pa.bool_()),
+        }
+    )
 
     with pytest.raises(GDSNavigationError, match="not found in"):
         nav.simulate_dimension_change(
@@ -277,12 +284,14 @@ def test_aggregation_label_resolves_via_dim_index():
     nav._storage.read_sphere.return_value = MagicMock(
         patterns={"test_pattern": pattern},
     )
-    nav._storage.read_geometry.return_value = pa.table({
-        "primary_key": ["E1"],
-        "delta": pa.array([delta_np.tolist()], type=pa.list_(pa.float64())),
-        "delta_norm": [float(np.linalg.norm(delta_np))],
-        "is_anomaly": [False],
-    })
+    nav._storage.read_geometry.return_value = pa.table(
+        {
+            "primary_key": ["E1"],
+            "delta": pa.array([delta_np.tolist()], type=pa.list_(pa.float64())),
+            "delta_norm": [float(np.linalg.norm(delta_np))],
+            "is_anomaly": [False],
+        }
+    )
     nav._resolve_version = MagicMock(return_value=1)
 
     result = nav.simulate_dimension_change(
@@ -337,7 +346,10 @@ def test_inf_value_raises():
 
 def test_empty_set_dimension_raises():
     pattern = _make_pattern(
-        line_ids=["A"], mu=[0.0], sigma_diag=[1.0], theta=[3.0],
+        line_ids=["A"],
+        mu=[0.0],
+        sigma_diag=[1.0],
+        theta=[3.0],
     )
     nav = _make_nav(pattern, delta=[0.0], is_anomaly=False)
 
@@ -430,8 +442,7 @@ def test_cholesky_pattern_recomputes_correctly():
     # Choose L_inv with explicit cross-term so dim 0 of shape touches BOTH
     # delta dims.
     cholesky_inv = np.array(
-        [[2.0, 0.0],
-         [1.0, 0.5]],
+        [[2.0, 0.0], [1.0, 0.5]],
         dtype=np.float64,
     )
     pattern = _make_pattern(
@@ -462,9 +473,7 @@ def test_cholesky_pattern_recomputes_correctly():
         top_n=2,
     )
 
-    expected_delta_after = (
-        cholesky_inv @ np.array([4.0, 2.0], dtype=np.float64)
-    ).tolist()
+    expected_delta_after = (cholesky_inv @ np.array([4.0, 2.0], dtype=np.float64)).tolist()
     assert expected_delta_after == [8.0, 5.0]
     assert result["delta_norm_after"] == pytest.approx(math.sqrt(64.0 + 25.0), abs=1e-9)
     # Both delta entries moved despite overriding only one shape dim.
@@ -472,9 +481,7 @@ def test_cholesky_pattern_recomputes_correctly():
     assert row_a["old_delta"] == pytest.approx(4.0, abs=1e-9)
     assert row_a["new_delta"] == pytest.approx(8.0, abs=1e-9)
     # Witness dim B (index 1) reflects the cross-coupled new delta (5.0).
-    witness_by_label = {
-        row["dim_label"]: row for row in result["top_witness_dims_after"]
-    }
+    witness_by_label = {row["dim_label"]: row for row in result["top_witness_dims_after"]}
     assert witness_by_label["B"]["delta"] == pytest.approx(5.0, abs=1e-9)
     assert witness_by_label["A"]["delta"] == pytest.approx(8.0, abs=1e-9)
 
@@ -501,7 +508,8 @@ def test_determinism():
 
     assert r1["delta_norm_after"] == pytest.approx(r2["delta_norm_after"], abs=1e-15)
     assert r1["delta_norm_pct_change"] == pytest.approx(
-        r2["delta_norm_pct_change"], abs=1e-15,
+        r2["delta_norm_pct_change"],
+        abs=1e-15,
     )
     assert r1["top_witness_dims_after"] == r2["top_witness_dims_after"]
     assert r1["dimensions_overridden"] == r2["dimensions_overridden"]

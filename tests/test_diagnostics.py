@@ -3,6 +3,7 @@
 equal-variance, 10x-variance, and low-N-skip fixtures exercise the
 three branches the builder calibration pass relies on.
 """
+
 from __future__ import annotations
 
 import numpy as np
@@ -19,16 +20,20 @@ def test_equal_variance_no_rejection():
     the 0.01 warning threshold)."""
     rng = np.random.default_rng(0)
     n = 200
-    values = np.concatenate([
-        rng.normal(0.0, 1.0, n),
-        rng.normal(0.0, 1.0, n),
-        rng.normal(0.0, 1.0, n),
-    ])
-    group_ids = np.concatenate([
-        np.full(n, "A"),
-        np.full(n, "B"),
-        np.full(n, "C"),
-    ])
+    values = np.concatenate(
+        [
+            rng.normal(0.0, 1.0, n),
+            rng.normal(0.0, 1.0, n),
+            rng.normal(0.0, 1.0, n),
+        ]
+    )
+    group_ids = np.concatenate(
+        [
+            np.full(n, "A"),
+            np.full(n, "B"),
+            np.full(n, "C"),
+        ]
+    )
     result = levene_test_per_group(values, group_ids)
     assert result["k_groups"] == 3
     assert result["skipped_groups_low_n"] == 0
@@ -41,16 +46,20 @@ def test_one_group_with_10x_variance_strong_rejection():
     p < 0.001 (orders of magnitude below the warning threshold)."""
     rng = np.random.default_rng(1)
     n = 200
-    values = np.concatenate([
-        rng.normal(0.0, 1.0, n),
-        rng.normal(0.0, 1.0, n),
-        rng.normal(0.0, 10.0, n),
-    ])
-    group_ids = np.concatenate([
-        np.full(n, "low_1"),
-        np.full(n, "low_2"),
-        np.full(n, "high_var"),
-    ])
+    values = np.concatenate(
+        [
+            rng.normal(0.0, 1.0, n),
+            rng.normal(0.0, 1.0, n),
+            rng.normal(0.0, 10.0, n),
+        ]
+    )
+    group_ids = np.concatenate(
+        [
+            np.full(n, "low_1"),
+            np.full(n, "low_2"),
+            np.full(n, "high_var"),
+        ]
+    )
     result = levene_test_per_group(values, group_ids)
     assert result["k_groups"] == 3
     assert result["W_statistic"] > 10.0
@@ -67,18 +76,22 @@ def test_low_n_groups_silently_skipped():
     rng = np.random.default_rng(2)
     big_n = 100
     small_n = MIN_GROUP_SIZE - 1  # below the threshold
-    values = np.concatenate([
-        rng.normal(0.0, 1.0, big_n),
-        rng.normal(0.0, 1.0, big_n),
-        rng.normal(0.0, 1.0, small_n),
-        rng.normal(0.0, 1.0, small_n),
-    ])
-    group_ids = np.concatenate([
-        np.full(big_n, "big_A"),
-        np.full(big_n, "big_B"),
-        np.full(small_n, "small_X"),
-        np.full(small_n, "small_Y"),
-    ])
+    values = np.concatenate(
+        [
+            rng.normal(0.0, 1.0, big_n),
+            rng.normal(0.0, 1.0, big_n),
+            rng.normal(0.0, 1.0, small_n),
+            rng.normal(0.0, 1.0, small_n),
+        ]
+    )
+    group_ids = np.concatenate(
+        [
+            np.full(big_n, "big_A"),
+            np.full(big_n, "big_B"),
+            np.full(small_n, "small_X"),
+            np.full(small_n, "small_Y"),
+        ]
+    )
     result = levene_test_per_group(values, group_ids)
     assert result["k_groups"] == 2
     assert result["skipped_groups_low_n"] == 2
@@ -90,14 +103,18 @@ def test_fewer_than_two_qualifying_groups_returns_none():
     """Only one group survives the low-N filter — Levene's test cannot
     be computed; W and p are None but no error raised."""
     rng = np.random.default_rng(3)
-    values = np.concatenate([
-        rng.normal(0.0, 1.0, 100),
-        rng.normal(0.0, 1.0, 5),  # below MIN_GROUP_SIZE
-    ])
-    group_ids = np.concatenate([
-        np.full(100, "big"),
-        np.full(5, "tiny"),
-    ])
+    values = np.concatenate(
+        [
+            rng.normal(0.0, 1.0, 100),
+            rng.normal(0.0, 1.0, 5),  # below MIN_GROUP_SIZE
+        ]
+    )
+    group_ids = np.concatenate(
+        [
+            np.full(100, "big"),
+            np.full(5, "tiny"),
+        ]
+    )
     result = levene_test_per_group(values, group_ids)
     assert result["k_groups"] == 1
     assert result["W_statistic"] is None

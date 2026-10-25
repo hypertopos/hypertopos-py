@@ -8,6 +8,7 @@ Engineered-input tests prove the classifier discriminates between the four
 categories (arch / V / linear / flat) and degenerate inputs (<3 samples,
 all-zero).
 """
+
 from __future__ import annotations
 
 from hypertopos.engine.topology import local_trajectory_shape

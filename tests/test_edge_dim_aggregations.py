@@ -14,14 +14,16 @@ def test_parse_edge_dim_aggregations_omitted_dims_rejected():
     runtime model lost track) — explicit declaration is now required."""
     with pytest.raises(ValueError, match="dims must be a non-empty list"):
         parse_edge_dim_aggregations(
-            {"from": "tx_pattern"}, pattern_type="anchor",
+            {"from": "tx_pattern"},
+            pattern_type="anchor",
         )
 
 
 def test_parse_edge_dim_aggregations_empty_dims_rejected():
     with pytest.raises(ValueError, match="non-empty list"):
         parse_edge_dim_aggregations(
-            {"from": "tx_pattern", "dims": []}, pattern_type="anchor",
+            {"from": "tx_pattern", "dims": []},
+            pattern_type="anchor",
         )
 
 
@@ -39,7 +41,8 @@ def test_parse_edge_dim_aggregations_explicit_dims():
 def test_parse_edge_dim_aggregations_rejects_event():
     with pytest.raises(ValueError, match="only supported on anchor patterns"):
         parse_edge_dim_aggregations(
-            {"from": "tx_pattern"}, pattern_type="event",
+            {"from": "tx_pattern"},
+            pattern_type="event",
         )
 
 
@@ -59,7 +62,8 @@ def test_parse_edge_dim_aggregations_unknown_dim():
 def test_parse_edge_dim_aggregations_rejects_non_dict():
     with pytest.raises(ValueError, match="must be a YAML mapping"):
         parse_edge_dim_aggregations(
-            ["tx_pattern"], pattern_type="anchor",  # type: ignore[arg-type]
+            ["tx_pattern"],
+            pattern_type="anchor",  # type: ignore[arg-type]
         )
 
 
@@ -78,10 +82,15 @@ def test_pattern_dim_labels_extends_with_aggregated_dim_names():
     follow-up and the broadcast bug in anomaly_summary on patterns with
     edge_dim_aggregations declared."""
     from datetime import datetime
+
     import numpy as np
+
     from hypertopos.model.sphere import (
-        EdgeDimAggregationsRef, Pattern, RelationDef,
+        EdgeDimAggregationsRef,
+        Pattern,
+        RelationDef,
     )
+
     pat = Pattern(
         pattern_id="account_pattern",
         entity_type="accounts",
@@ -126,8 +135,11 @@ def test_pattern_dim_labels_no_aggregations_unchanged():
     """Pattern without edge_dim_aggregations keeps the original
     dim_labels / delta_dim shape — backward compat."""
     from datetime import datetime
+
     import numpy as np
+
     from hypertopos.model.sphere import Pattern, RelationDef
+
     pat = Pattern(
         pattern_id="account_pattern",
         entity_type="accounts",
@@ -155,10 +167,15 @@ def test_pattern_dim_labels_aggregations_with_empty_dims():
     enforces the user-facing contract; this guards against in-memory
     construction during tests / loaded-from-older-sphere paths."""
     from datetime import datetime
+
     import numpy as np
+
     from hypertopos.model.sphere import (
-        EdgeDimAggregationsRef, Pattern, RelationDef,
+        EdgeDimAggregationsRef,
+        Pattern,
+        RelationDef,
     )
+
     pat = Pattern(
         pattern_id="account_pattern",
         entity_type="accounts",
@@ -212,7 +229,7 @@ def test_parse_aggregations_mapping_form_per_dim_subset():
             "from": "tx_pattern",
             "dims": {
                 "pair_edge_count": ["count_above_threshold"],
-                "find_motif_structuring": ["max", "mean"],   # reversed user input
+                "find_motif_structuring": ["max", "mean"],  # reversed user input
             },
         },
         pattern_type="anchor",

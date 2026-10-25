@@ -10,6 +10,7 @@ from pathlib import Path
 
 import lance as _lance
 import pyarrow as pa
+
 from hypertopos.builder import GDSBuilder, RelationSpec
 from hypertopos.sphere import HyperSphere
 
@@ -152,6 +153,53 @@ class TestMvccSessionIsolation:
         )
         assert after_keys == before_keys
 
+        session.close()
+
+    def test_sql_pushdown_aggregate_ignores_write_after_open(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The Lance SQL count pushdown must read the session's pinned snapshot too."""
+        import hypertopos.engine.aggregation as aggregation
+        import hypertopos.engine.lance_sql_agg as lance_sql_agg
+
+        out = _build_minimal_sphere(tmp_path)
+        sphere = HyperSphere.open(out)
+        pattern_id = "order_pattern"
+        session = sphere.session("agent-mvcc-sql")
+        nav = session.navigator()
+
+        sql_calls = []
+        real_count = lance_sql_agg.aggregate_count
+
+        def spy(*args, **kwargs):
+            sql_calls.append(kwargs.get("lance_version"))
+            return real_count(*args, **kwargs)
+
+        # Force the SQL count pushdown: skip the per-group reversed scan (which
+        # already counts through the pinned reader) and the row-count gate.
+        monkeypatch.setattr(aggregation, "_REVERSED_SCAN_MAX_GROUPS", 0)
+        monkeypatch.setattr(aggregation, "_SUBPROCESS_THRESHOLD", 0)
+        monkeypatch.setattr(lance_sql_agg, "aggregate_count", spy)
+        before = nav.aggregate(pattern_id, "customers", metric="count")
+
+        # Another writer duplicates O-1 (customer C-1) after the session opened.
+        geo_path = str(Path(out) / "geometry" / pattern_id / "data.lance")
+        ds = _lance.dataset(geo_path)
+        row = ds.to_table(filter="primary_key = 'O-1'")
+        row = row.set_column(0, "primary_key", pa.array(["O-99"], type=row.schema.field(0).type))
+        _lance.write_dataset(row, geo_path, mode="append")
+
+        after = nav.aggregate(pattern_id, "customers", metric="count")
+        assert len(sql_calls) == 2, "the SQL count pushdown must be the path under test"
+
+        # Tied groups come back in any order; compare the counts per key.
+        def counts(result):
+            return {r["key"]: r["value"] for r in result["results"]}
+
+        assert counts(after) == counts(before), (
+            "a write after session open leaked into the SQL pushdown"
+        )
+        assert sql_calls[0] is not None
         session.close()
 
     def test_new_session_sees_write_after_it(self, tmp_path: Path) -> None:

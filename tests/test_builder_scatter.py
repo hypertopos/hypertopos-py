@@ -3,6 +3,7 @@
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
 """Tests for hypertopos.builder._scatter — vectorized Arrow→tensor scatter."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -21,7 +22,9 @@ class TestVectorizedScatter:
         tensor = np.zeros((3, 4, 1), dtype=np.float32)
 
         vectorized_scatter(
-            tensor, dim_idx=0, edge_max=100.0,
+            tensor,
+            dim_idx=0,
+            edge_max=100.0,
             anchor_keys_arr=anchor_keys,
             grouped_fk_col=grouped_fk,
             grouped_bucket_col=grouped_bucket,
@@ -41,7 +44,9 @@ class TestVectorizedScatter:
         tensor = np.zeros((2, 1, 1), dtype=np.float32)
 
         vectorized_scatter(
-            tensor, dim_idx=0, edge_max=10.0,
+            tensor,
+            dim_idx=0,
+            edge_max=10.0,
             anchor_keys_arr=anchor_keys,
             grouped_fk_col=grouped_fk,
             grouped_bucket_col=grouped_bucket,
@@ -59,7 +64,9 @@ class TestVectorizedScatter:
         tensor = np.zeros((1, 2, 1), dtype=np.float32)
 
         vectorized_scatter(
-            tensor, dim_idx=0, edge_max=10.0,
+            tensor,
+            dim_idx=0,
+            edge_max=10.0,
             anchor_keys_arr=anchor_keys,
             grouped_fk_col=grouped_fk,
             grouped_bucket_col=grouped_bucket,
@@ -77,7 +84,9 @@ class TestVectorizedScatter:
         tensor = np.zeros((1, 2, 1), dtype=np.float32)
 
         vectorized_scatter(
-            tensor, dim_idx=0, edge_max=100.0,
+            tensor,
+            dim_idx=0,
+            edge_max=100.0,
             anchor_keys_arr=anchor_keys,
             grouped_fk_col=grouped_fk,
             grouped_bucket_col=grouped_bucket,
@@ -95,7 +104,9 @@ class TestVectorizedScatter:
         tensor = np.zeros((2, 3, 1), dtype=np.float32)
 
         vectorized_scatter(
-            tensor, dim_idx=0, edge_max=10.0,
+            tensor,
+            dim_idx=0,
+            edge_max=10.0,
             anchor_keys_arr=anchor_keys,
             grouped_fk_col=grouped_fk,
             grouped_bucket_col=grouped_bucket,
@@ -113,7 +124,9 @@ class TestVectorizedScatter:
         for dim in range(3):
             vals = pa.array([float(dim + 1) * 10, float(dim + 1) * 20])
             vectorized_scatter(
-                tensor, dim_idx=dim, edge_max=100.0,
+                tensor,
+                dim_idx=dim,
+                edge_max=100.0,
                 anchor_keys_arr=anchor_keys,
                 grouped_fk_col=grouped_fk,
                 grouped_bucket_col=grouped_bucket,

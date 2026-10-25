@@ -8,6 +8,7 @@ Replaces Python-level row iteration with Arrow pc.index_in + numpy
 fancy indexing. Used by both static (compute_derived_batch) and
 temporal (_precompute_shape_tensor) build paths.
 """
+
 from __future__ import annotations
 
 import numpy as np
@@ -24,22 +25,39 @@ def vectorized_scatter(
     grouped_fk_col: pa.Array,
     grouped_bucket_col: pa.Array,
     grouped_values_col: pa.Array,
+    entity_idx: pa.Array | None = None,
 ) -> None:
+    """``entity_idx`` = ``pc.index_in(grouped_fk_col, anchor_keys_arr)``, when the
+    caller scatters several value columns of one grouped table."""
     if len(grouped_fk_col) == 0:
         return
 
-    entity_idx_arr = pc.index_in(grouped_fk_col, anchor_keys_arr)
+    entity_idx_arr = (
+        entity_idx if entity_idx is not None else pc.index_in(grouped_fk_col, anchor_keys_arr)
+    )
     valid = pc.and_(pc.is_valid(entity_idx_arr), pc.is_valid(grouped_values_col))
 
-    entity_indices = entity_idx_arr.filter(valid).to_numpy(
-        zero_copy_only=False,
-    ).astype(np.intp)
-    bucket_indices = grouped_bucket_col.filter(valid).to_numpy(
-        zero_copy_only=False,
-    ).astype(np.intp)
-    values = grouped_values_col.filter(valid).to_numpy(
-        zero_copy_only=False,
-    ).astype(np.float64)
+    entity_indices = (
+        entity_idx_arr.filter(valid)
+        .to_numpy(
+            zero_copy_only=False,
+        )
+        .astype(np.intp)
+    )
+    bucket_indices = (
+        grouped_bucket_col.filter(valid)
+        .to_numpy(
+            zero_copy_only=False,
+        )
+        .astype(np.intp)
+    )
+    values = (
+        grouped_values_col.filter(valid)
+        .to_numpy(
+            zero_copy_only=False,
+        )
+        .astype(np.float64)
+    )
 
     nan_ok = ~np.isnan(values)
     entity_indices = entity_indices[nan_ok]
@@ -54,19 +72,51 @@ def vectorized_scatter_1d(
     anchor_keys_arr: pa.Array,
     grouped_fk_col: pa.Array,
     grouped_values_col: pa.Array,
+    entity_idx: pa.Array | None = None,
 ) -> None:
+    """``entity_idx`` as in :func:`vectorized_scatter`."""
     if len(grouped_fk_col) == 0:
         return
 
-    entity_idx_arr = pc.index_in(grouped_fk_col, anchor_keys_arr)
+    entity_idx_arr = (
+        entity_idx if entity_idx is not None else pc.index_in(grouped_fk_col, anchor_keys_arr)
+    )
     valid = pc.and_(pc.is_valid(entity_idx_arr), pc.is_valid(grouped_values_col))
 
-    entity_indices = entity_idx_arr.filter(valid).to_numpy(
-        zero_copy_only=False,
-    ).astype(np.intp)
-    values = grouped_values_col.filter(valid).to_numpy(
-        zero_copy_only=False,
-    ).astype(np.float64)
+    entity_indices = (
+        entity_idx_arr.filter(valid)
+        .to_numpy(
+            zero_copy_only=False,
+        )
+        .astype(np.intp)
+    )
+    values = (
+        grouped_values_col.filter(valid)
+        .to_numpy(
+            zero_copy_only=False,
+        )
+        .astype(np.float64)
+    )
 
     nan_ok = ~np.isnan(values)
     result[entity_indices[nan_ok]] = values[nan_ok]
+
+
+def scatter_columns(
+    matrix: NDArray[np.float32],
+    anchor_keys_arr: pa.Array,
+    keys_col: pa.Array | pa.ChunkedArray,
+    value_cols: list[pa.Array | pa.ChunkedArray],
+) -> None:
+    """``matrix[row of key, j] = value_cols[j]`` for every key found in ``anchor_keys_arr``.
+
+    Values are written as they are (nulls become NaN); keys missing from
+    ``anchor_keys_arr`` are skipped.
+    """
+    if len(keys_col) == 0:
+        return
+    position = pc.index_in(keys_col, anchor_keys_arr)
+    found = pc.is_valid(position)
+    rows = pc.filter(position, found).to_numpy().astype(np.intp)
+    for j, values in enumerate(value_cols):
+        matrix[rows, j] = pc.filter(values, found).to_numpy()

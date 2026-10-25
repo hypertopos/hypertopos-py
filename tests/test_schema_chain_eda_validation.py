@@ -1,4 +1,5 @@
 """Cross-block parse-time validation for chain_lines.edge_dim_aggregations."""
+
 from pathlib import Path
 
 import pytest
@@ -27,10 +28,13 @@ def _base_yaml() -> dict:
                 "entity_line": "events",
                 "relations": [],
                 "edge_dimensions": [
-                    {"find_motif_structuring": {
-                        "amt1_min": 10000.0, "amt2_max": 5000.0,
-                        "time_window_hours": 24.0,
-                    }},
+                    {
+                        "find_motif_structuring": {
+                            "amt1_min": 10000.0,
+                            "amt2_max": 5000.0,
+                            "time_window_hours": 24.0,
+                        }
+                    },
                 ],
             },
         },
@@ -64,17 +68,22 @@ def test_chain_eda_event_line_mismatch_raises(tmp_path):
     """Mismatched event_line raises ValueError at parse time."""
     spec = _base_yaml()
     spec["lines"]["other_events"] = {
-        "source": "events", "key": "primary_key", "role": "event",
+        "source": "events",
+        "key": "primary_key",
+        "role": "event",
     }
     spec["patterns"]["other_pattern"] = {
         "type": "event",
         "entity_line": "other_events",
         "relations": [],
         "edge_dimensions": [
-            {"find_motif_structuring": {
-                "amt1_min": 10000.0, "amt2_max": 5000.0,
-                "time_window_hours": 24.0,
-            }},
+            {
+                "find_motif_structuring": {
+                    "amt1_min": 10000.0,
+                    "amt2_max": 5000.0,
+                    "time_window_hours": 24.0,
+                }
+            },
         ],
     }
     spec["chain_lines"]["tx_chains"]["edge_dim_aggregations"] = {
@@ -102,7 +111,9 @@ def test_chain_eda_anchor_pattern_in_from_raises(tmp_path):
     """from: must reference an event pattern, not anchor."""
     spec = _base_yaml()
     spec["lines"]["accounts"] = {
-        "source": "events", "key": "primary_key", "role": "anchor",
+        "source": "events",
+        "key": "primary_key",
+        "role": "anchor",
     }
     spec["patterns"]["acct_pattern"] = {
         "type": "anchor",

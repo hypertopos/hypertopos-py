@@ -4,16 +4,17 @@
 # See LICENSE.md in the repository root for full terms.
 """Tests for ``GDSNavigator.find_diverse_explanations``.
 
-Greedy max-K strictly disjoint cover over per-dim Bregman
-contributions. Each hypothesis is a disjoint set of dim labels whose
-joint contribution clears ``min_contribution_pct``; once a dim is
-claimed by a hypothesis it is removed from the pool, so the Jaccard
-between any two hypotheses is structurally 0 and the post-hoc
-``diversity_score`` (mean pairwise ``1 - jaccard``) is always 1.0
-when at least two hypotheses are returned. Tests use ``MagicMock``-
-backed storage so the navigator sees engineered deltas without
-opening a real sphere.
+Greedy max-K strictly disjoint cover over per-dim contributions to
+``delta_norm²`` (``delta**2``, the metric behind ``is_anomaly``). Each
+hypothesis is a disjoint set of dim labels whose joint contribution
+clears ``min_contribution_pct``; once a dim is claimed by a hypothesis
+it is removed from the pool, so the Jaccard between any two hypotheses
+is structurally 0 and the post-hoc ``diversity_score`` (mean pairwise
+``1 - jaccard``) is always 1.0 when at least two hypotheses are
+returned. Tests use ``MagicMock``-backed storage so the navigator sees
+engineered deltas without opening a real sphere.
 """
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -26,15 +27,11 @@ import pytest
 from hypertopos.model.sphere import Pattern, RelationDef
 from hypertopos.navigation.navigator import GDSNavigationError, GDSNavigator
 
-
 # ── Synthetic pattern helpers ──────────────────────────────────────────────
 
 
 def _make_relations(line_ids: list[str]) -> list[RelationDef]:
-    return [
-        RelationDef(line_id=lid, direction="out", required=False)
-        for lid in line_ids
-    ]
+    return [RelationDef(line_id=lid, direction="out", required=False) for lid in line_ids]
 
 
 def _make_pattern(
@@ -45,10 +42,9 @@ def _make_pattern(
     theta: list[float],
     dimension_kinds: list[str] | None = None,
 ) -> Pattern:
-    """Build a synthetic Pattern. ``dimension_kinds=None`` skips the
-    Bregman branch in ``_per_dim_anomaly_contributions`` and falls
-    back to ``delta**2`` — convenient for tests that want to fully
-    control the contribution vector."""
+    """Build a synthetic Pattern. Contributions are ``delta**2`` whatever
+    ``dimension_kinds`` says, so tests control the contribution vector
+    through ``delta`` directly."""
     return Pattern(
         pattern_id="test_pattern",
         entity_type="account",
@@ -77,11 +73,14 @@ def _make_nav(pattern: Pattern, *, delta: list[float]) -> GDSNavigator:
     nav._storage.read_sphere.return_value = MagicMock(
         patterns={"test_pattern": pattern},
     )
-    nav._storage.read_geometry.return_value = pa.table({
-        "primary_key": ["E1"],
-        "delta": pa.array([delta_np.tolist()], type=pa.list_(pa.float64())),
-        "delta_norm": [delta_norm],
-    })
+    nav._storage.read_geometry.return_value = pa.table(
+        {
+            "primary_key": ["E1"],
+            "delta": pa.array([delta_np.tolist()], type=pa.list_(pa.float64())),
+            "delta_norm": [delta_norm],
+            "is_anomaly": [True],
+        }
+    )
     nav._resolve_version = MagicMock(return_value=1)
     return nav
 
@@ -259,19 +258,25 @@ def test_diverse_explanation_degrades_to_top2_when_floor_unmet():
     # Narrative must name the dim and explain it's below the floor.
     assert "B" in secondary["narrative"]
     assert "below" in secondary["narrative"]
-    # Two emitted hypotheses ⇒ diversity_score is the pair distance.
-    assert result["diversity_score"] == 1.0
+    # Only one primary hypothesis: the below-floor secondary is not a
+    # diverse explanation, so there is no diversity to score.
+    assert result["diversity_score"] is None
 
 
 def test_n_hypotheses_zero_raises():
     pattern = _make_pattern(
-        line_ids=["A"], mu=[0.0], sigma_diag=[1.0], theta=[3.0],
+        line_ids=["A"],
+        mu=[0.0],
+        sigma_diag=[1.0],
+        theta=[3.0],
     )
     nav = _make_nav(pattern, delta=[1.0])
 
     with pytest.raises(GDSNavigationError, match="must be >= 1"):
         nav.find_diverse_explanations(
-            "E1", pattern_id="test_pattern", n_hypotheses=0,
+            "E1",
+            pattern_id="test_pattern",
+            n_hypotheses=0,
         )
 
 
@@ -308,31 +313,43 @@ def test_n_hypotheses_exceeds_dim_count_caps_silently():
 
 def test_unknown_pattern_id_raises():
     pattern = _make_pattern(
-        line_ids=["A"], mu=[0.0], sigma_diag=[1.0], theta=[3.0],
+        line_ids=["A"],
+        mu=[0.0],
+        sigma_diag=[1.0],
+        theta=[3.0],
     )
     nav = _make_nav(pattern, delta=[1.0])
 
     with pytest.raises(GDSNavigationError, match="pattern not found"):
         nav.find_diverse_explanations(
-            "E1", pattern_id="does_not_exist", n_hypotheses=2,
+            "E1",
+            pattern_id="does_not_exist",
+            n_hypotheses=2,
         )
 
 
 def test_unknown_primary_key_raises():
     pattern = _make_pattern(
-        line_ids=["A"], mu=[0.0], sigma_diag=[1.0], theta=[3.0],
+        line_ids=["A"],
+        mu=[0.0],
+        sigma_diag=[1.0],
+        theta=[3.0],
     )
     nav = _make_nav(pattern, delta=[1.0])
     # Override read_geometry to return an empty table.
-    nav._storage.read_geometry.return_value = pa.table({
-        "primary_key": pa.array([], type=pa.string()),
-        "delta": pa.array([], type=pa.list_(pa.float64())),
-        "delta_norm": pa.array([], type=pa.float64()),
-    })
+    nav._storage.read_geometry.return_value = pa.table(
+        {
+            "primary_key": pa.array([], type=pa.string()),
+            "delta": pa.array([], type=pa.list_(pa.float64())),
+            "delta_norm": pa.array([], type=pa.float64()),
+        }
+    )
 
     with pytest.raises(GDSNavigationError, match="not found in"):
         nav.find_diverse_explanations(
-            "missing_entity", pattern_id="test_pattern", n_hypotheses=2,
+            "missing_entity",
+            pattern_id="test_pattern",
+            n_hypotheses=2,
         )
 
 
@@ -393,10 +410,12 @@ def test_validate_true_calls_simulate_dimension_change_per_hypothesis():
         theta=[3.0] * 6,
     )
     nav = _make_nav(pattern, delta=delta)
-    nav.simulate_dimension_change = MagicMock(return_value={
-        "delta_norm_after": 0.5,
-        "is_anomaly_after": False,
-    })
+    nav.simulate_dimension_change = MagicMock(
+        return_value={
+            "delta_norm_after": 0.5,
+            "is_anomaly_after": False,
+        }
+    )
 
     result = nav.find_diverse_explanations(
         "E1",
@@ -434,3 +453,86 @@ def test_diversity_score_none_when_single_hypothesis():
 
     assert result["n_hypotheses_returned"] == 1
     assert result["diversity_score"] is None
+
+
+# Mixed-family fixture: a rare poisson count with a tiny sigma (huge
+# z-score, small family-level divergence) next to a wide poisson count.
+_POISSON_MU = [0.009, 0.951]
+_POISSON_SIGMA = [0.204, 7.07]
+_POISSON_DELTA = [299.6, 197.1]
+
+
+def _poisson_pattern(theta: list[float]) -> Pattern:
+    return _make_pattern(
+        line_ids=["rare_count", "pair_count"],
+        mu=_POISSON_MU,
+        sigma_diag=_POISSON_SIGMA,
+        theta=theta,
+        dimension_kinds=["poisson", "poisson"],
+    )
+
+
+@pytest.mark.parametrize("theta", [[7.03, 7.03], [180.0, 180.0]])
+def test_validation_consistent_with_share(theta):
+    """On a diagonal pattern, neutralising a hypothesis with joint share
+    ``s`` of ``delta_norm²`` leaves ``delta_norm_after² = (1 - s) ·
+    delta_norm²`` — so ``neutralizes_anomaly`` follows from the share.
+    Runs the real ``simulate_dimension_change`` (no mock)."""
+    pattern = _poisson_pattern(theta)
+    assert pattern.cholesky_inv is None
+    assert pattern.dimension_weights is None
+    nav = _make_nav(pattern, delta=_POISSON_DELTA)
+
+    result = nav.find_diverse_explanations(
+        "E1",
+        pattern_id="test_pattern",
+        n_hypotheses=2,
+        min_contribution_pct=0.10,
+        validate=True,
+    )
+
+    delta_norm_sq = result["delta_norm"] ** 2
+    theta_norm = float(np.linalg.norm(theta))
+    assert result["n_hypotheses_returned"] == 2
+    assert result["hypotheses"][0]["dim_labels"] == ["rare_count"]
+    for h in result["hypotheses"]:
+        share = h["joint_contribution_pct"] / 100.0
+        after = h["validation"]["delta_norm_after_override"]
+        assert after**2 == pytest.approx((1.0 - share) * delta_norm_sq, rel=1e-5)
+        assert h["validation"]["neutralizes_anomaly"] == (after < theta_norm)
+    # The larger theta separates the two hypotheses: dropping the
+    # dominant dim clears the anomaly, dropping the minor one does not.
+    if theta[0] == 180.0:
+        flags = [h["validation"]["neutralizes_anomaly"] for h in result["hypotheses"]]
+        assert flags == [True, False]
+
+
+def test_explain_top_dimension_agrees_with_simulate_dimension_change():
+    """Setting ``top_dimensions[0]`` to its population mu drops
+    ``delta_norm²`` by exactly its ``pct_of_total`` (diagonal pattern)."""
+    from hypertopos.engine.investigation import build_explanation
+
+    pattern = _poisson_pattern([7.03, 7.03])
+    nav = _make_nav(pattern, delta=_POISSON_DELTA)
+    delta = np.asarray(_POISSON_DELTA, dtype=np.float64)
+    delta_norm = float(np.linalg.norm(delta))
+    expl = build_explanation(
+        delta=delta,
+        dim_labels=pattern.dim_labels,
+        theta_norm=float(np.linalg.norm(pattern.theta)),
+        delta_norm=delta_norm,
+        dimension_kinds=pattern.dimension_kinds,
+    )
+    top = expl["top_dimensions"][0]
+    idx = pattern.dim_labels.index(top["dim"])
+
+    sim = nav.simulate_dimension_change(
+        "E1",
+        pattern_id="test_pattern",
+        line_id="E1",
+        set_dimension={top["dim"]: float(pattern.mu[idx])},
+    )
+
+    drop = 1.0 - sim["delta_norm_after"] ** 2 / sim["delta_norm_before"] ** 2
+    assert top["dim"] == "rare_count"
+    assert drop == pytest.approx(top["pct_of_total"], abs=1e-4)

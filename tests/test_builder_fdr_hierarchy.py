@@ -3,12 +3,14 @@
 # you may not use this file except in compliance with the License.
 """Integration tests for builder's fdr_hierarchy column validation +
 temporal_bucket auto-materialisation hook."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
 
 import pyarrow as pa
 import pytest
+
 from hypertopos.model.sphere import (
     FDRHierarchyLevel,
     FDRTemporalLevel,
@@ -89,15 +91,17 @@ class TestTemporalBucketMaterialisationHook:
             ],
         )
         geometry = pa.table({"primary_key": ["A1", "A2"]})
-        events = pa.table({
-            "primary_key": ["tx1", "tx2"],
-            "from_account": ["A1", "A2"],
-            "to_account": ["A2", "A1"],
-            "timestamp": [
-                datetime(2024, 1, 15, tzinfo=UTC),
-                datetime(2024, 1, 16, tzinfo=UTC),
-            ],
-        })
+        events = pa.table(
+            {
+                "primary_key": ["tx1", "tx2"],
+                "from_account": ["A1", "A2"],
+                "to_account": ["A2", "A1"],
+                "timestamp": [
+                    datetime(2024, 1, 15, tzinfo=UTC),
+                    datetime(2024, 1, 16, tzinfo=UTC),
+                ],
+            }
+        )
         out = _maybe_materialise_temporal_buckets(
             pat,
             geometry_table=geometry,
@@ -121,16 +125,20 @@ class TestTemporalBucketMaterialisationHook:
                 ),
             ],
         )
-        geometry = pa.table({
-            "primary_key": ["A1", "A2"],
-            "temporal_bucket": ["existing_value_1", "existing_value_2"],
-        })
-        events = pa.table({
-            "primary_key": pa.array([], type=pa.string()),
-            "from_account": pa.array([], type=pa.string()),
-            "to_account": pa.array([], type=pa.string()),
-            "timestamp": pa.array([], type=pa.timestamp("us", tz="UTC")),
-        })
+        geometry = pa.table(
+            {
+                "primary_key": ["A1", "A2"],
+                "temporal_bucket": ["existing_value_1", "existing_value_2"],
+            }
+        )
+        events = pa.table(
+            {
+                "primary_key": pa.array([], type=pa.string()),
+                "from_account": pa.array([], type=pa.string()),
+                "to_account": pa.array([], type=pa.string()),
+                "timestamp": pa.array([], type=pa.timestamp("us", tz="UTC")),
+            }
+        )
         out = _maybe_materialise_temporal_buckets(
             pat,
             geometry_table=geometry,
@@ -139,7 +147,8 @@ class TestTemporalBucketMaterialisationHook:
             timestamp_col="timestamp",
         )
         assert out["temporal_bucket"].to_pylist() == [
-            "existing_value_1", "existing_value_2",
+            "existing_value_1",
+            "existing_value_2",
         ]
 
     def test_no_fdr_temporal_hierarchy_is_noop(self):
@@ -191,12 +200,14 @@ class TestTemporalBucketMaterialisationHook:
             ],
         )
         geometry = pa.table({"primary_key": ["A1"]})
-        events = pa.table({
-            "primary_key": ["tx1"],
-            "from_account": ["A1"],
-            "to_account": ["A1"],
-            "timestamp": [datetime(2024, 1, 15, tzinfo=UTC)],
-        })
+        events = pa.table(
+            {
+                "primary_key": ["tx1"],
+                "from_account": ["A1"],
+                "to_account": ["A1"],
+                "timestamp": [datetime(2024, 1, 15, tzinfo=UTC)],
+            }
+        )
         out = _maybe_materialise_temporal_buckets(
             pat,
             geometry_table=geometry,

@@ -12,6 +12,7 @@ Covers:
 - Vendored ``_auroc_rank_sum`` rank-based AUROC matches the textbook
   definition on a tied / untied toy input.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -19,6 +20,7 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 import pytest
+
 from hypertopos.builder import GDSBuilder, RelationSpec
 from hypertopos.cli.schema import LabelAuditConfig
 from hypertopos.navigation.navigator import _auroc_rank_sum
@@ -68,10 +70,17 @@ def _build_two_class_sphere(
     out_path = tmp_path / out_dir_name
     b = GDSBuilder("two_class_align", str(out_path))
     b.add_line(
-        "accounts", accounts, key_col="account_id", source_id="test",
+        "accounts",
+        accounts,
+        key_col="account_id",
+        source_id="test",
     )
     b.add_line(
-        "tx", tx, key_col="tx_id", source_id="test", role="event",
+        "tx",
+        tx,
+        key_col="tx_id",
+        source_id="test",
+        role="event",
     )
     b.add_pattern(
         "tx_pattern",
@@ -79,21 +88,29 @@ def _build_two_class_sphere(
         entity_line="tx",
         relations=[
             RelationSpec(
-                line_id="accounts", fk_col="account_id",
-                direction="in", required=True,
+                line_id="accounts",
+                fk_col="account_id",
+                direction="in",
+                required=True,
             ),
         ],
         anomaly_percentile=95.0,
     )
     b.add_event_dimension(
-        "tx_pattern", column="sep_score", edge_max="auto",
+        "tx_pattern",
+        column="sep_score",
+        edge_max="auto",
     )
     b.add_event_dimension(
-        "tx_pattern", column="noise_score", edge_max="auto",
+        "tx_pattern",
+        column="noise_score",
+        edge_max="auto",
     )
     for k in range(n_extra_dims):
         b.add_event_dimension(
-            "tx_pattern", column=f"extra_{k}", edge_max="auto",
+            "tx_pattern",
+            column=f"extra_{k}",
+            edge_max="auto",
         )
 
     if enable_label_aware:
@@ -107,7 +124,8 @@ def _build_two_class_sphere(
 
     out = b.build()
     labels_arr = np.array(
-        [1] * n_per_class + [0] * n_per_class, dtype=np.int32,
+        [1] * n_per_class + [0] * n_per_class,
+        dtype=np.int32,
     )
     return out, pks, labels_arr
 
@@ -131,6 +149,13 @@ def test_auroc_rank_sum_matches_textbook_formula():
     scores_tied = np.array([0.5, 0.5, 0.5, 0.5])
     labels_split = np.array([1, 1, 0, 0])
     assert _auroc_rank_sum(scores_tied, labels_split) == pytest.approx(0.5)
+
+
+def test_auroc_rank_sum_ignores_non_finite_scores():
+    labels = np.array([0, 0, 1, 0, 0])
+    scores = np.array([np.nan, 0.1, 0.9, 0.2, np.inf])
+    assert _auroc_rank_sum(scores, labels) == pytest.approx(1.0)
+    assert np.isnan(_auroc_rank_sum(np.array([np.nan, 0.3]), np.array([1, 0])))
 
 
 def test_full_field_path_auroc_high(tmp_path):
@@ -166,7 +191,9 @@ def test_full_field_path_auroc_high(tmp_path):
     # Each row carries the full field set.
     for row in result["top_dims"]:
         assert set(row.keys()) == {
-            "dim_label", "direction_component", "abs_direction",
+            "dim_label",
+            "direction_component",
+            "abs_direction",
             "cohens_d_pos_neg",
         }
 

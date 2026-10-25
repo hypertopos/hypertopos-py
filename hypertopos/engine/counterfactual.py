@@ -12,8 +12,10 @@ v0 covers the relations-dim class only (count-based, closed-form). The
 event_dim and edge_dim_aggregation classes need deeper builder integration
 and ship in a follow-up patch.
 """
+
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -33,6 +35,39 @@ __all__ = [
 _SIGMA_ZERO_FLOOR = 1e-10
 _AGGS_INTRINSIC = ("mean", "max", "std", "p95")  # no extra inputs needed
 _AGG_COUNT_ABOVE = "count_above_threshold"  # requires per-source-dim threshold
+
+
+def _delta_fn(
+    mu: np.ndarray,
+    sigma_diag: np.ndarray,
+    cholesky_inv: np.ndarray | None,
+    dimension_weights: np.ndarray | None,
+) -> Callable[[np.ndarray], np.ndarray]:
+    """Shape → delta in the pattern's stored metric.
+
+    Patterns with Mahalanobis whitening or ``dimension_weights`` use the same
+    calibration as the stored delta, so a removal that leaves the shape
+    unchanged reproduces the stored ``delta_norm``. Plain diagonal patterns
+    keep the z-score with sigma-dead dims (``sigma < 1e-10``) held at 0.
+    """
+    if cholesky_inv is None and dimension_weights is None:
+        dead = sigma_diag < _SIGMA_ZERO_FLOOR
+        safe = np.where(dead, 1.0, sigma_diag)
+        return lambda s: np.where(dead, 0.0, (s - mu) / safe)
+
+    from hypertopos.engine.geometry import calibrated_deltas
+
+    def _calibrated(s: np.ndarray) -> np.ndarray:
+        out: np.ndarray = calibrated_deltas(
+            s,
+            mu=mu,
+            sigma_diag=sigma_diag,
+            cholesky_inv=cholesky_inv,
+            dimension_weights=dimension_weights,
+        )[0]
+        return out
+
+    return _calibrated
 
 
 def _aggregate(
@@ -154,37 +189,39 @@ def simulate_edge_removal_naive(
 
         new_shape = shape - contribution
         new_delta = np.where(
-            sigma_dead_mask, 0.0, (new_shape - mu) / sigma_safe,
+            sigma_dead_mask,
+            0.0,
+            (new_shape - mu) / sigma_safe,
         )
         new_delta_norm = float(np.linalg.norm(new_delta))
         if not np.isfinite(new_delta_norm):
             new_delta_norm = float(delta_norm)
-        drop_pct = (
-            (delta_norm - new_delta_norm) / delta_norm * 100.0
-            if delta_norm > 0
-            else 0.0
-        )
+        drop_pct = (delta_norm - new_delta_norm) / delta_norm * 100.0 if delta_norm > 0 else 0.0
 
         # Dominant dim: argmax of |new_delta - old_delta|. If contribution is
         # all zero, the dominant_dim_idx is undefined; default to 0.
         old_delta = np.where(
-            sigma_dead_mask, 0.0, (shape - mu) / sigma_safe,
+            sigma_dead_mask,
+            0.0,
+            (shape - mu) / sigma_safe,
         )
         delta_diff = np.abs(new_delta - old_delta)
         dominant_dim_idx = int(np.argmax(delta_diff))
 
-        rows.append({
-            "edge_id": edge["edge_id"],
-            "edge_partner_key": edge.get("partner_key"),
-            "edge_direction": edge.get("direction"),
-            "edge_line_id": edge.get("line_id"),
-            "delta_norm_before": float(delta_norm),
-            "delta_norm_after": new_delta_norm,
-            "drop_pct": float(drop_pct),
-            "dominant_dim_idx": dominant_dim_idx,
-            "dimensions_simulated": dims_simulated,
-            "dimensions_skipped": dims_skipped,
-        })
+        rows.append(
+            {
+                "edge_id": edge["edge_id"],
+                "edge_partner_key": edge.get("partner_key"),
+                "edge_direction": edge.get("direction"),
+                "edge_line_id": edge.get("line_id"),
+                "delta_norm_before": float(delta_norm),
+                "delta_norm_after": new_delta_norm,
+                "drop_pct": float(drop_pct),
+                "dominant_dim_idx": dominant_dim_idx,
+                "dimensions_simulated": dims_simulated,
+                "dimensions_skipped": dims_skipped,
+            }
+        )
 
     # If the pattern has NO relations matching ANY edge's line_id (regardless
     # of direction), the counterfactual surface is structurally empty —
@@ -216,6 +253,8 @@ def simulate_edge_removal_with_aggregations(
     candidate_edge_ids: list[str] | None,
     top_n: int,
     thresholds: dict[str, float] | None = None,
+    cholesky_inv: np.ndarray | None = None,
+    dimension_weights: np.ndarray | None = None,
 ) -> list[dict[str, Any]]:
     """Per-edge counterfactual covering relations + edge_dim_aggregations.
 
@@ -232,8 +271,9 @@ def simulate_edge_removal_with_aggregations(
            recompute the aggregate on the entity's event source-values
            EXCLUDING the candidate ``e`` and write the new value into
            ``new_shape[edge_agg_dim_offset + i]``.
-        3. Re-normalise via ``(new_shape - mu) / sigma_diag`` and report
-           the delta_norm drop.
+        3. Re-normalise in the pattern's metric (``(new_shape - mu) /
+           sigma_diag``, or the ``cholesky_inv`` whitening, then
+           ``dimension_weights`` when given) and report the delta_norm drop.
 
     ``count_above_threshold`` requires population-level threshold lookup
     that the builder resolves from sidecar p95; if a caller cannot supply
@@ -257,6 +297,9 @@ def simulate_edge_removal_with_aggregations(
             the builder's group_by + aggregate would consume.
         candidate_edge_ids: filter.
         top_n: cap on returned entries.
+        cholesky_inv, dimension_weights: the pattern's saved calibration;
+            pass them so the after-removal delta uses the same metric as the
+            stored ``delta_norm``.
 
     Returns:
         Per-edge dict list — same shape as ``simulate_edge_removal_naive``
@@ -274,8 +317,9 @@ def simulate_edge_removal_with_aggregations(
     sigma_diag = sigma_diag.astype(np.float64, copy=False)
 
     sigma_dead_mask = sigma_diag < _SIGMA_ZERO_FLOOR
-    sigma_safe = np.where(sigma_dead_mask, 1.0, sigma_diag)
     dims_skipped = [int(i) for i, dead in enumerate(sigma_dead_mask) if dead]
+    to_delta = _delta_fn(mu, sigma_diag, cholesky_inv, dimension_weights)
+    old_delta = to_delta(shape)
 
     # Relations lookup (same as naive path).
     rel_by_key: dict[tuple[str, str], list[int]] = {}
@@ -291,8 +335,7 @@ def simulate_edge_removal_with_aggregations(
     source_value_arrays: dict[str, np.ndarray] = {}
     for source_dim in {s[0] for s in edge_agg_specs}:
         vals = np.array(
-            [event_source_values.get(ek, {}).get(source_dim, 0.0)
-             for ek in event_keys],
+            [event_source_values.get(ek, {}).get(source_dim, 0.0) for ek in event_keys],
             dtype=np.float64,
         )
         source_value_arrays[source_dim] = vals
@@ -312,9 +355,7 @@ def simulate_edge_removal_with_aggregations(
             unsupported_agg_indices.append(edge_agg_dim_offset + i)
     dims_skipped.extend(unsupported_agg_indices)
     dims_skipped = sorted(set(dims_skipped))
-    dims_simulated = [
-        i for i in range(len(shape)) if i not in dims_skipped
-    ]
+    dims_simulated = [i for i in range(len(shape)) if i not in dims_skipped]
 
     # Filter candidates.
     if candidate_edge_ids is None:
@@ -326,18 +367,11 @@ def simulate_edge_removal_with_aggregations(
     # If the pattern has NO relations matching ANY edge's line_id AND there
     # are no edge_dim_aggregations to simulate either, the surface is empty.
     pattern_line_ids = {rel["line_id"] for rel in relations}
-    any_relation_line_match = any(
-        edge["line_id"] in pattern_line_ids for edge in edges
-    )
+    any_relation_line_match = any(edge["line_id"] in pattern_line_ids for edge in edges)
     has_supported_aggs = any(
-        _agg_is_supported(source_dim, agg)
-        for source_dim, agg in edge_agg_specs
+        _agg_is_supported(source_dim, agg) for source_dim, agg in edge_agg_specs
     )
-    if (
-        candidate_edge_ids is None
-        and not any_relation_line_match
-        and not has_supported_aggs
-    ):
+    if candidate_edge_ids is None and not any_relation_line_match and not has_supported_aggs:
         return []
 
     rows: list[dict[str, Any]] = []
@@ -368,41 +402,35 @@ def simulate_edge_removal_with_aggregations(
                 else:
                     remaining = np.delete(vals, edge_idx_in_events)
                     new_agg = _aggregate(
-                        remaining, agg,
+                        remaining,
+                        agg,
                         threshold=thresholds_map.get(source_dim),
                     )
                 new_shape[dim_idx] = new_agg
 
-        new_delta = np.where(
-            sigma_dead_mask, 0.0, (new_shape - mu) / sigma_safe,
-        )
+        new_delta = to_delta(new_shape)
         new_delta_norm = float(np.linalg.norm(new_delta))
         if not np.isfinite(new_delta_norm):
             new_delta_norm = float(delta_norm)
-        drop_pct = (
-            (delta_norm - new_delta_norm) / delta_norm * 100.0
-            if delta_norm > 0
-            else 0.0
-        )
+        drop_pct = (delta_norm - new_delta_norm) / delta_norm * 100.0 if delta_norm > 0 else 0.0
 
-        old_delta = np.where(
-            sigma_dead_mask, 0.0, (shape - mu) / sigma_safe,
-        )
         delta_diff = np.abs(new_delta - old_delta)
         dominant_dim_idx = int(np.argmax(delta_diff))
 
-        rows.append({
-            "edge_id": edge["edge_id"],
-            "edge_partner_key": edge.get("partner_key"),
-            "edge_direction": edge.get("direction"),
-            "edge_line_id": edge.get("line_id"),
-            "delta_norm_before": float(delta_norm),
-            "delta_norm_after": new_delta_norm,
-            "drop_pct": float(drop_pct),
-            "dominant_dim_idx": dominant_dim_idx,
-            "dimensions_simulated": dims_simulated,
-            "dimensions_skipped": dims_skipped,
-        })
+        rows.append(
+            {
+                "edge_id": edge["edge_id"],
+                "edge_partner_key": edge.get("partner_key"),
+                "edge_direction": edge.get("direction"),
+                "edge_line_id": edge.get("line_id"),
+                "delta_norm_before": float(delta_norm),
+                "delta_norm_after": new_delta_norm,
+                "drop_pct": float(drop_pct),
+                "dominant_dim_idx": dominant_dim_idx,
+                "dimensions_simulated": dims_simulated,
+                "dimensions_skipped": dims_skipped,
+            }
+        )
 
     rows.sort(key=lambda r: abs(r["drop_pct"]), reverse=True)
     return rows[:top_n]
@@ -455,15 +483,18 @@ def aggregate_edge_removals_by_counterparty(
         seen_edges.add(dedup_key)
 
         drop = float(row.get("drop_pct", 0.0))
-        bucket = by_partner.setdefault(partner, {
-            "partner_key": partner,
-            "n_edges": 0,
-            "sum_drop_pct": 0.0,
-            "sum_abs_drop_pct": 0.0,
-            "max_abs_drop_pct": 0.0,
-            "dominant_dim_label": None,
-            "edge_ids": [],
-        })
+        bucket = by_partner.setdefault(
+            partner,
+            {
+                "partner_key": partner,
+                "n_edges": 0,
+                "sum_drop_pct": 0.0,
+                "sum_abs_drop_pct": 0.0,
+                "max_abs_drop_pct": 0.0,
+                "dominant_dim_label": None,
+                "edge_ids": [],
+            },
+        )
         bucket["n_edges"] += 1
         bucket["sum_drop_pct"] += drop
         bucket["sum_abs_drop_pct"] += abs(drop)
@@ -491,7 +522,7 @@ def ecdf_pvalue_upper_tail(
 
     Phipson-Smyth-style floor applied: when ``value`` exceeds every
     population sample (would otherwise return 0), returns ``1 / (N + 1)``
-    so HMP / log combiners downstream stay finite.
+    so HMP / log combiners downstream stay finite. A NaN ``value`` returns 1.0.
 
     Args:
         value: edge's source-dim observation.
@@ -499,7 +530,9 @@ def ecdf_pvalue_upper_tail(
             for the same source dim. Caller is responsible for the sort.
     """
     n = population_sorted.size
-    if n == 0:
+    # A missing (NaN) observation carries no evidence; searchsorted would
+    # place it past every sample and return the most extreme p.
+    if n == 0 or np.isnan(value):
         return 1.0
     # searchsorted with side='left' returns the index where `value` would be
     # inserted to keep order, i.e. number of pop entries strictly < value.
@@ -597,33 +630,36 @@ def _joint_new_shape(
     rel_by_key: dict[tuple[str, str], list[int]] = {}
     for dim_idx, rel in enumerate(relations):
         rel_by_key.setdefault(
-            (rel["line_id"], rel["direction"]), [],
+            (rel["line_id"], rel["direction"]),
+            [],
         ).append(dim_idx)
     for edge in edges_to_remove:
         for dim_idx in rel_by_key.get(
-            (edge["line_id"], edge["direction"]), [],
+            (edge["line_id"], edge["direction"]),
+            [],
         ):
             if not sigma_dead_mask[dim_idx]:
                 new_shape[dim_idx] -= 1.0
 
     # Aggregation dims: rescan over surviving events.
     if edge_agg_specs:
-        surviving_events = [
-            e for e in all_edges if e["edge_id"] not in remove_ids
-        ]
+        surviving_events = [e for e in all_edges if e["edge_id"] not in remove_ids]
         if surviving_events:
             for i, (source_dim, agg) in enumerate(edge_agg_specs):
                 dim_idx = edge_agg_dim_offset + i
                 if sigma_dead_mask[dim_idx] or not supported_aggs_mask[i]:
                     continue
                 vals = np.array(
-                    [event_source_values.get(e["edge_id"], {})
-                     .get(source_dim, 0.0)
-                     for e in surviving_events],
+                    [
+                        event_source_values.get(e["edge_id"], {}).get(source_dim, 0.0)
+                        for e in surviving_events
+                    ],
                     dtype=np.float64,
                 )
                 new_shape[dim_idx] = _aggregate(
-                    vals, agg, threshold=thresholds_map.get(source_dim),
+                    vals,
+                    agg,
+                    threshold=thresholds_map.get(source_dim),
                 )
     return new_shape
 
@@ -641,6 +677,8 @@ def simulate_joint_edge_removal(
     edge_agg_specs: list[tuple[str, str]],
     event_source_values: dict[str, dict[str, float]],
     thresholds: dict[str, float] | None = None,
+    cholesky_inv: np.ndarray | None = None,
+    dimension_weights: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Joint counterfactual: remove a SET of edges simultaneously and
     report the resulting ``delta_norm``.
@@ -657,8 +695,8 @@ def simulate_joint_edge_removal(
         all_edges: full edge inventory (needed to rescan aggregations
             over the surviving events).
         relations, edge_agg_dim_offset, edge_agg_specs,
-            event_source_values, thresholds: identical to the per-edge
-            primitive.
+            event_source_values, thresholds, cholesky_inv,
+            dimension_weights: identical to the per-edge primitive.
 
     Returns:
         ``{removed_edge_ids, delta_norm_before, delta_norm_after,
@@ -676,7 +714,7 @@ def simulate_joint_edge_removal(
     sigma_diag = sigma_diag.astype(np.float64, copy=False)
 
     sigma_dead_mask = sigma_diag < _SIGMA_ZERO_FLOOR
-    sigma_safe = np.where(sigma_dead_mask, 1.0, sigma_diag)
+    to_delta = _delta_fn(mu, sigma_diag, cholesky_inv, dimension_weights)
     thresholds_map = thresholds or {}
 
     def _agg_is_supported(source_dim: str, agg: str) -> bool:
@@ -685,31 +723,27 @@ def simulate_joint_edge_removal(
         if agg == _AGG_COUNT_ABOVE:
             return source_dim in thresholds_map
         return False
-    supported_aggs_mask = [
-        _agg_is_supported(s, a) for s, a in edge_agg_specs
-    ]
+
+    supported_aggs_mask = [_agg_is_supported(s, a) for s, a in edge_agg_specs]
 
     new_shape = _joint_new_shape(
-        shape=shape, edges_to_remove=edges_to_remove, all_edges=all_edges,
-        relations=relations, edge_agg_dim_offset=edge_agg_dim_offset,
+        shape=shape,
+        edges_to_remove=edges_to_remove,
+        all_edges=all_edges,
+        relations=relations,
+        edge_agg_dim_offset=edge_agg_dim_offset,
         edge_agg_specs=edge_agg_specs,
         event_source_values=event_source_values,
-        sigma_dead_mask=sigma_dead_mask, thresholds_map=thresholds_map,
+        sigma_dead_mask=sigma_dead_mask,
+        thresholds_map=thresholds_map,
         supported_aggs_mask=supported_aggs_mask,
     )
-    new_delta = np.where(
-        sigma_dead_mask, 0.0, (new_shape - mu) / sigma_safe,
-    )
+    new_delta = to_delta(new_shape)
     new_delta_norm = float(np.linalg.norm(new_delta))
     if not np.isfinite(new_delta_norm):
         new_delta_norm = float(delta_norm)
-    drop_pct = (
-        (delta_norm - new_delta_norm) / delta_norm * 100.0
-        if delta_norm > 0 else 0.0
-    )
-    old_delta = np.where(
-        sigma_dead_mask, 0.0, (shape - mu) / sigma_safe,
-    )
+    drop_pct = (delta_norm - new_delta_norm) / delta_norm * 100.0 if delta_norm > 0 else 0.0
+    old_delta = to_delta(shape)
     dominant_dim_idx = int(np.argmax(np.abs(new_delta - old_delta)))
     return {
         "removed_edge_ids": [e["edge_id"] for e in edges_to_remove],
@@ -734,6 +768,8 @@ def select_minimal_joint_removal(
     target_drop_pct: float = 50.0,
     k_max: int = 10,
     thresholds: dict[str, float] | None = None,
+    cholesky_inv: np.ndarray | None = None,
+    dimension_weights: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Greedy submodular selection of the smallest edge set whose joint
     removal achieves at least ``target_drop_pct`` reduction in
@@ -752,6 +788,8 @@ def select_minimal_joint_removal(
     set.
 
     Args:
+        cholesky_inv, dimension_weights: the pattern's saved calibration,
+            forwarded to :func:`simulate_joint_edge_removal`.
         target_drop_pct: stop when joint reduction reaches this percent.
         k_max: hard cap on selected set size (greedy compute cost is
             ``O(k_max × n_candidates)`` evaluations).
@@ -781,13 +819,19 @@ def select_minimal_joint_removal(
         for cand in remaining:
             trial = [*selected, cand]
             r = simulate_joint_edge_removal(
-                shape=shape, mu=mu, sigma_diag=sigma_diag,
+                shape=shape,
+                mu=mu,
+                sigma_diag=sigma_diag,
                 delta_norm=delta_norm,
-                edges_to_remove=trial, all_edges=candidate_edges,
-                relations=relations, edge_agg_dim_offset=edge_agg_dim_offset,
+                edges_to_remove=trial,
+                all_edges=candidate_edges,
+                relations=relations,
+                edge_agg_dim_offset=edge_agg_dim_offset,
                 edge_agg_specs=edge_agg_specs,
                 event_source_values=event_source_values,
                 thresholds=thresholds,
+                cholesky_inv=cholesky_inv,
+                dimension_weights=dimension_weights,
             )
             cand_signed = r["joint_drop_pct"]
             if abs(cand_signed) > best_abs:
@@ -797,19 +841,19 @@ def select_minimal_joint_removal(
         if best_edge is None:
             break  # plateau — no candidate improves |joint_drop_pct|
         selected.append(best_edge)
-        remaining = [
-            e for e in remaining if e["edge_id"] != best_edge["edge_id"]
-        ]
+        remaining = [e for e in remaining if e["edge_id"] != best_edge["edge_id"]]
         achieved = best_abs
         achieved_signed = best_signed
-        sequence.append({
-            "step": step + 1,
-            "picked_edge_id": best_edge["edge_id"],
-            "picked_partner_key": best_edge.get("partner_key"),
-            "picked_direction": best_edge.get("direction"),
-            "joint_drop_pct": achieved_signed,
-            "abs_joint_drop_pct": achieved,
-        })
+        sequence.append(
+            {
+                "step": step + 1,
+                "picked_edge_id": best_edge["edge_id"],
+                "picked_partner_key": best_edge.get("partner_key"),
+                "picked_direction": best_edge.get("direction"),
+                "joint_drop_pct": achieved_signed,
+                "abs_joint_drop_pct": achieved,
+            }
+        )
         if achieved >= target_drop_pct:
             break
 

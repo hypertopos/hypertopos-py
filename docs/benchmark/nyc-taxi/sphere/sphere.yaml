@@ -94,7 +94,6 @@ patterns:
       - column: passenger_count
     anomaly_percentile: 95
     dimension_weights: kurtosis
-    timestamp_col: pickup_date
 
   zone_activity_pattern:
     type: anchor
@@ -150,10 +149,8 @@ temporal:
   - pattern: zone_activity_pattern
     event_line: trips
     timestamp_col: pickup_date
-    anchor_fk: pu_zone
     window: 7d
   - pattern: zone_destination_pattern
     event_line: trips
     timestamp_col: pickup_date
-    anchor_fk: do_zone
     window: 7d

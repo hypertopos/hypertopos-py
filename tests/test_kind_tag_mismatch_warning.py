@@ -14,6 +14,7 @@ Suppressed by index when ``negative_space`` already fires on the same
 dim — the negative_space remediation supersedes the kind_mismatch
 complaint (same pattern as ``non_normal_dim``).
 """
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -21,6 +22,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest  # noqa: F401 — keeps parity with the sibling test module
+
 from hypertopos.model.sphere import Pattern, RelationDef
 from hypertopos.navigation.navigator import GDSNavigator
 
@@ -133,8 +135,7 @@ def test_kind_mismatch_suppressed_when_negative_space_fires():
         dimension_kinds=["gaussian"],
         # p50=0 with positive p99 → negative_space fires on this dim.
         dim_percentiles={
-            "line_0": {"p25": 0.0, "p50": 0.0, "p75": 0.0,
-                       "p99": 5.0, "max": 100.0},
+            "line_0": {"p25": 0.0, "p50": 0.0, "p75": 0.0, "p99": 5.0, "max": 100.0},
         },
         label_aware_calibration={
             "line_0": _dim_cal(direction=0.02, **_HIGH_D_CAL),
@@ -200,8 +201,7 @@ def test_kind_mismatch_multiple_dims_independent():
         # negative_space — dims A / B / C have no percentile coverage at
         # all, so the negative_space auditor returns nothing for them.
         dim_percentiles={
-            "line_3": {"p25": 0.0, "p50": 0.0, "p75": 0.0,
-                       "p99": 5.0, "max": 100.0},
+            "line_3": {"p25": 0.0, "p50": 0.0, "p75": 0.0, "p99": 5.0, "max": 100.0},
         },
         label_aware_calibration={
             # A: HIGH cohens_d, low direction, gaussian → FIRES
@@ -215,9 +215,7 @@ def test_kind_mismatch_multiple_dims_independent():
         },
     )
     warnings = GDSNavigator._compute_dim_quality_warnings(pat)
-    mismatch_labels = [
-        w["dim_label"] for w in warnings if w["type"] == "kind_mismatch"
-    ]
+    mismatch_labels = [w["dim_label"] for w in warnings if w["type"] == "kind_mismatch"]
     assert mismatch_labels == ["line_0"]
 
 
@@ -255,6 +253,7 @@ def test_kind_mismatch_suppression_by_index_when_naming_schemes_differ():
     kind_mismatch is silenced.
     """
     from hypertopos.model.sphere import RelationDef as _RD
+
     pat = _make_pattern(
         sigma_diag=[1.0],
         relations=[_RD(line_id="_d_foo", direction="in", required=True)],
@@ -262,8 +261,7 @@ def test_kind_mismatch_suppression_by_index_when_naming_schemes_differ():
         # negative_space keys off raw name "foo" (after stripping the
         # "_d_" prefix on the line_id).
         dim_percentiles={
-            "foo": {"p25": 0.0, "p50": 0.0, "p75": 0.0,
-                    "p99": 5.0, "max": 100.0},
+            "foo": {"p25": 0.0, "p50": 0.0, "p75": 0.0, "p99": 5.0, "max": 100.0},
         },
         # label-aware calibration keys off the full dim_label "_d_foo"
         # (this is what the builder emits via _dim_labels_for_pattern).

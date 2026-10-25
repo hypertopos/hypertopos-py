@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 540" font-family="'Segoe UI', system-ui, -apple-system, sans-serif" role="img" aria-labelledby="sesb-title sesb-desc">
+<title id="sesb-title">Sessions and branches</title>
+<desc id="sesb-desc">Top: a session reads one pinned snapshot of the sphere. Ingests and recalibrations from other processes land on main underneath without changing its results; is_stale() reports that a newer state exists and refresh() moves the session to it. Bottom: a copy-free branch is created from main, recalibrated with exclude_keys, compared with main by compare_branches, then promoted (its recipes replayed on main) or deleted. Writes on the branch never touch main.</desc>
+<defs>
+<linearGradient id="sesb-bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#0a0e27"/><stop offset="100%" stop-color="#1a1a3e"/></linearGradient>
+<radialGradient id="sesb-glow"><stop offset="0%" stop-color="#4808FC" stop-opacity="0.55"/><stop offset="100%" stop-color="#4808FC" stop-opacity="0"/></radialGradient>
+</defs>
+<rect width="900" height="540" rx="14" fill="url(#sesb-bg)" stroke="#230C7C" stroke-width="1.5"/>
+<text x="450" y="26" font-size="11" fill="#FFFFFF" fill-opacity="0.55" font-weight="600" text-anchor="middle" letter-spacing="2">SESSIONS AND BRANCHES</text>
+<rect x="16" y="40" width="868" height="214" rx="12" fill="#0f2040" stroke="#230C7C" stroke-width="1" fill-opacity="0.6"/>
+<text x="32" y="64" font-size="12.5" fill="#FFFFFF" font-weight="700">A session reads one pinned snapshot</text>
+<text x="36" y="126" font-size="10" fill="#A484FE" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">main</text>
+<line x1="78" y1="122" x2="846.4" y2="122" stroke="#FFFFFF" stroke-width="2" stroke-opacity="0.4"/>
+<polygon points="852,122 845,118.15 845,125.85" fill="#FFFFFF" fill-opacity="0.4"/>
+<circle cx="130" cy="122" r="4.5" fill="#FFFFFF" fill-opacity="0.85"/>
+<text x="130" y="144" font-size="9" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">state at open</text>
+<circle cx="330" cy="122" r="4.5" fill="#FFFFFF" fill-opacity="0.85"/>
+<text x="330" y="144" font-size="9" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">ingest lands</text>
+<text x="330" y="156" font-size="8.5" fill="#FFFFFF" fill-opacity="0.55" text-anchor="middle">(another process)</text>
+<circle cx="520" cy="122" r="4.5" fill="#FFFFFF" fill-opacity="0.85"/>
+<text x="520" y="144" font-size="9" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">recalibrate lands</text>
+<text x="520" y="156" font-size="8.5" fill="#FFFFFF" fill-opacity="0.55" text-anchor="middle">(another process)</text>
+<path d="M136 108 C 230 78, 420 78, 512 106" fill="none" stroke="#885EFD" stroke-width="1.5" stroke-dasharray="5,3"/>
+<polygon points="514,108 509.28,101.55 506.03,108.53" fill="#885EFD"/>
+<text x="325" y="80" font-size="9.5" fill="#DACEFE" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">refresh() — move the session to the latest state</text>
+<circle cx="130" cy="122" r="20" fill="url(#sesb-glow)"/>
+<polygon points="130,112 138.66,117 138.66,127 130,132 121.34,127 121.34,117" fill="#4808FC" stroke="#DACEFE" stroke-width="1.2"/>
+<path d="M130 116.5L131.4 120.6L135.5 122L131.4 123.4L130 127.5L128.6 123.4L124.5 122L128.6 120.6Z" fill="#FFFFFF"/>
+<line x1="130" y1="162" x2="130" y2="186" stroke="#885EFD" stroke-width="1.2" stroke-dasharray="3,3"/>
+<rect x="118" y="186" width="414" height="26" rx="13" fill="#130D47" stroke="#6D39FD" stroke-width="1.2"/>
+<text x="325" y="203" font-size="9.5" fill="#FFFFFF" fill-opacity="0.85" text-anchor="middle">HyperSession — every read uses the pinned snapshot</text>
+<text x="325" y="236" font-size="9" fill="#FFFFFF" fill-opacity="0.55" text-anchor="middle">only refresh() moves a session; its own recalibrate is visible at once</text>
+<rect x="574" y="150" width="296" height="92" rx="8" fill="#130D47" stroke="#230C7C" stroke-width="1"/>
+<text x="588" y="170" font-size="9.5" fill="#DACEFE" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">is_stale() → SnapshotStatus</text>
+<text x="588" y="186" font-size="8.5" fill="#A484FE" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">pinned_at · stale · metadata_changed</text>
+<text x="588" y="200" font-size="8.5" fill="#A484FE" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">pinned_versions · latest_versions</text>
+<text x="588" y="218" font-size="9" fill="#FFFFFF" fill-opacity="0.7">MCP: get_session_stats → snapshot block;</text>
+<text x="588" y="232" font-size="9" fill="#FFFFFF" fill-opacity="0.7">open_sphere(path) reopens on the latest state</text>
+<rect x="16" y="268" width="868" height="256" rx="12" fill="#0f2040" stroke="#230C7C" stroke-width="1" fill-opacity="0.6"/>
+<text x="32" y="292" font-size="12.5" fill="#FFFFFF" font-weight="700">A branch: a copy-free what-if workspace</text>
+<text x="36" y="326" font-size="10" fill="#A484FE" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">main</text>
+<line x1="78" y1="322" x2="846.4" y2="322" stroke="#FFFFFF" stroke-width="2" stroke-opacity="0.4"/>
+<polygon points="852,322 845,318.15 845,325.85" fill="#FFFFFF" fill-opacity="0.4"/>
+<text x="420" y="314" font-size="9" fill="#FFFFFF" fill-opacity="0.55" text-anchor="middle">untouched while the branch works</text>
+<circle cx="110" cy="322" r="4.5" fill="#FFFFFF" fill-opacity="0.85"/>
+<path d="M110 322 C 110 374, 120 404, 150 404" fill="none" stroke="#6D39FD" stroke-width="2"/>
+<line x1="150" y1="404" x2="700" y2="404" stroke="#6D39FD" stroke-width="2"/>
+<rect x="150" y="384" width="176" height="40" rx="8" fill="#130D47" stroke="#6D39FD" stroke-width="1.2"/>
+<text x="238" y="400" font-size="9.5" fill="#DACEFE" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">create_branch(name)</text>
+<text x="238" y="415" font-size="8" fill="#A484FE" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">manage_branch(action="create")</text>
+<text x="238" y="438" font-size="8.5" fill="#FFFFFF" fill-opacity="0.6" text-anchor="middle">no data copied;</text>
+<text x="238" y="450" font-size="8.5" fill="#FFFFFF" fill-opacity="0.6" text-anchor="middle">recalibrate(…, branch=) creates it too</text>
+<rect x="346" y="384" width="196" height="40" rx="8" fill="#130D47" stroke="#6D39FD" stroke-width="1.2"/>
+<text x="444" y="400" font-size="9.5" fill="#DACEFE" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">recalibrate(pattern_id,</text>
+<text x="444" y="415" font-size="8" fill="#A484FE" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">branch=, exclude_keys=[…])</text>
+<text x="444" y="438" font-size="8.5" fill="#FFFFFF" fill-opacity="0.6" text-anchor="middle">fit without those keys,</text>
+<text x="444" y="450" font-size="8.5" fill="#FFFFFF" fill-opacity="0.6" text-anchor="middle">every entity still scored</text>
+<rect x="562" y="384" width="140" height="40" rx="8" fill="#130D47" stroke="#6D39FD" stroke-width="1.2"/>
+<text x="632" y="400" font-size="9.5" fill="#DACEFE" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">compare_branches(</text>
+<text x="632" y="415" font-size="8" fill="#A484FE" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">pattern_id, branch)</text>
+<text x="632" y="438" font-size="8.5" fill="#FFFFFF" fill-opacity="0.6" text-anchor="middle">flipped_in · flipped_out</text>
+<text x="632" y="450" font-size="8.5" fill="#FFFFFF" fill-opacity="0.6" text-anchor="middle">jaccard · top_movers</text>
+<path d="M702 404 C 740 404, 760 362, 790 328" fill="none" stroke="#6D39FD" stroke-width="2"/>
+<polygon points="794,324 785.49,327.3 792.23,332.96" fill="#6D39FD"/>
+<path d="M702 404 C 740 404, 760 450, 792 456" fill="none" stroke="#6D39FD" stroke-width="1.6" stroke-dasharray="5,3"/>
+<line x1="797" y1="451" x2="807" y2="461" stroke="#A484FE" stroke-width="1.6"/>
+<line x1="807" y1="451" x2="797" y2="461" stroke="#A484FE" stroke-width="1.6"/>
+<text x="730" y="346" font-size="9" fill="#DACEFE" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">promote_branch(name)</text>
+<text x="730" y="358" font-size="8" fill="#A484FE" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">manage_branch(action="promote")</text>
+<text x="730" y="371" font-size="8.5" fill="#FFFFFF" fill-opacity="0.6" text-anchor="end">recipes replayed on main,</text>
+<text x="730" y="382" font-size="8.5" fill="#FFFFFF" fill-opacity="0.6" text-anchor="end">then the branch is deleted</text>
+<text x="736" y="480" font-size="9" fill="#DACEFE" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">delete_branch(name)</text>
+<text x="736" y="492" font-size="8" fill="#A484FE" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">manage_branch(action="delete")</text>
+<text x="450" y="496" font-size="9" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">Writes on a branch never touch main. Geometry and temporal centroids get a native Lance branch; other datasets stay pinned.</text>
+<text x="450" y="511" font-size="9" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">Promote is refused unless main is still at the branch's base state; read a branch with open_sphere(path, branch=name).</text>
+</svg>

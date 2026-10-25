@@ -4,6 +4,8 @@
 # See LICENSE.md in the repository root for full terms.
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -52,18 +54,14 @@ def flatten_edges_for_sql(table: pa.Table) -> pa.Table:
     lid_list = pa.ListArray.from_arrays(offsets_arr, alive_lids)
     pkey_list = pa.ListArray.from_arrays(offsets_arr, alive_pkeys)
 
-    table = table.append_column(
-        "edge_line_ids", lid_list.cast(pa.list_(pa.string()))
-    )
-    table = table.append_column(
-        "edge_point_keys", pkey_list.cast(pa.list_(pa.string()))
-    )
+    table = table.append_column("edge_line_ids", lid_list.cast(pa.list_(pa.string())))
+    table = table.append_column("edge_point_keys", pkey_list.cast(pa.list_(pa.string())))
     return table
 
 
 def reconstruct_edges_from_entity_keys(
     entity_keys_col: pa.ChunkedArray,
-    relations: list,
+    relations: list[Any],
 ) -> pa.Array:
     """Reconstruct edges struct list from entity_keys + pattern relations.
 
@@ -79,12 +77,14 @@ def reconstruct_edges_from_entity_keys(
         if keys:
             for i, rel in enumerate(relations):
                 key = keys[i] if i < len(keys) else ""
-                edges.append({
-                    "line_id": rel.line_id,
-                    "point_key": key,
-                    "status": "alive" if key else "dead",
-                    "direction": rel.direction,
-                })
+                edges.append(
+                    {
+                        "line_id": rel.line_id,
+                        "point_key": key,
+                        "status": "alive" if key else "dead",
+                        "direction": rel.direction,
+                    }
+                )
         edge_lists.append(edges)
     return pa.array(edge_lists, type=pa.list_(EDGE_STRUCT_TYPE))
 
@@ -108,4 +108,5 @@ def delta_matrix_from_arrow(table: pa.Table) -> np.ndarray:
             f"delta column has ragged rows: {len(flat)} values / {n} rows is not integer"
         )
     d = len(flat) // n
-    return flat.reshape(n, d).astype(np.float32, copy=False)
+    matrix: np.ndarray = flat.reshape(n, d).astype(np.float32, copy=False)
+    return matrix

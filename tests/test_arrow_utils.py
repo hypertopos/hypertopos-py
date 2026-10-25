@@ -7,6 +7,7 @@ from __future__ import annotations
 import numpy as np
 import pyarrow as pa
 import pytest
+
 from hypertopos.storage._schemas import EDGE_STRUCT_TYPE
 from hypertopos.utils.arrow import delta_matrix_from_arrow, flatten_edges_for_sql
 
@@ -83,21 +84,35 @@ class TestDeltaMatrixFromArrow:
 
 
 def _make_geo_table(edges_rows: list[list[dict]]) -> pa.Table:
-    return pa.table({
-        "primary_key": pa.array([f"PK-{i}" for i in range(len(edges_rows))]),
-        "edges": pa.array(edges_rows, type=pa.list_(EDGE_STRUCT_TYPE)),
-    })
+    return pa.table(
+        {
+            "primary_key": pa.array([f"PK-{i}" for i in range(len(edges_rows))]),
+            "edges": pa.array(edges_rows, type=pa.list_(EDGE_STRUCT_TYPE)),
+        }
+    )
 
 
 class TestFlattenEdgesForSql:
     def test_basic_alive_only(self):
-        table = _make_geo_table([
+        table = _make_geo_table(
             [
-                {"line_id": "customers", "point_key": "C1", "status": "alive", "direction": "in"},
-                {"line_id": "products", "point_key": "P1", "status": "dead", "direction": "out"},
-                {"line_id": "regions", "point_key": "R1", "status": "alive", "direction": "in"},
-            ],
-        ])
+                [
+                    {
+                        "line_id": "customers",
+                        "point_key": "C1",
+                        "status": "alive",
+                        "direction": "in",
+                    },
+                    {
+                        "line_id": "products",
+                        "point_key": "P1",
+                        "status": "dead",
+                        "direction": "out",
+                    },
+                    {"line_id": "regions", "point_key": "R1", "status": "alive", "direction": "in"},
+                ],
+            ]
+        )
         result = flatten_edges_for_sql(table)
         assert "edge_line_ids" in result.schema.names
         assert "edge_point_keys" in result.schema.names
@@ -107,15 +122,32 @@ class TestFlattenEdgesForSql:
         assert pkeys == ["C1", "R1"]
 
     def test_multiple_rows(self):
-        table = _make_geo_table([
+        table = _make_geo_table(
             [
-                {"line_id": "customers", "point_key": "C1", "status": "alive", "direction": "in"},
-            ],
-            [
-                {"line_id": "customers", "point_key": "C2", "status": "alive", "direction": "in"},
-                {"line_id": "products", "point_key": "P2", "status": "alive", "direction": "out"},
-            ],
-        ])
+                [
+                    {
+                        "line_id": "customers",
+                        "point_key": "C1",
+                        "status": "alive",
+                        "direction": "in",
+                    },
+                ],
+                [
+                    {
+                        "line_id": "customers",
+                        "point_key": "C2",
+                        "status": "alive",
+                        "direction": "in",
+                    },
+                    {
+                        "line_id": "products",
+                        "point_key": "P2",
+                        "status": "alive",
+                        "direction": "out",
+                    },
+                ],
+            ]
+        )
         result = flatten_edges_for_sql(table)
         assert result["edge_line_ids"][0].as_py() == ["customers"]
         assert result["edge_line_ids"][1].as_py() == ["customers", "products"]
@@ -123,11 +155,18 @@ class TestFlattenEdgesForSql:
         assert result["edge_point_keys"][1].as_py() == ["C2", "P2"]
 
     def test_all_dead_edges(self):
-        table = _make_geo_table([
+        table = _make_geo_table(
             [
-                {"line_id": "customers", "point_key": "C1", "status": "dead", "direction": "in"},
-            ],
-        ])
+                [
+                    {
+                        "line_id": "customers",
+                        "point_key": "C1",
+                        "status": "dead",
+                        "direction": "in",
+                    },
+                ],
+            ]
+        )
         result = flatten_edges_for_sql(table)
         assert result["edge_line_ids"][0].as_py() == []
         assert result["edge_point_keys"][0].as_py() == []
@@ -139,11 +178,18 @@ class TestFlattenEdgesForSql:
         assert result["edge_point_keys"][0].as_py() == []
 
     def test_preserves_original_columns(self):
-        table = _make_geo_table([
+        table = _make_geo_table(
             [
-                {"line_id": "customers", "point_key": "C1", "status": "alive", "direction": "in"},
-            ],
-        ])
+                [
+                    {
+                        "line_id": "customers",
+                        "point_key": "C1",
+                        "status": "alive",
+                        "direction": "in",
+                    },
+                ],
+            ]
+        )
         result = flatten_edges_for_sql(table)
         assert "primary_key" in result.schema.names
         assert "edges" in result.schema.names

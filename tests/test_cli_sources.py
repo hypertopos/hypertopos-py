@@ -9,6 +9,7 @@ from __future__ import annotations
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+
 from hypertopos.cli.schema import JoinSpec, SourceConfig, TransformSpec
 from hypertopos.cli.sources import load_source
 

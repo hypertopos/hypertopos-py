@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 
 import lance
 import pyarrow as pa
+
 from hypertopos.engine.geometry import GDSEngine
 from hypertopos.model.manifest import Contract, Manifest
 from hypertopos.navigation.navigator import GDSNavigator
@@ -88,7 +89,9 @@ def test_vector_index_health_stale_when_rows_appended_without_reindex(tmp_path):
     head = ds.to_table().slice(0, 40)
     new_keys = pa.array([f"NEW{i}" for i in range(40)], type=pa.string())
     head = head.set_column(
-        head.schema.get_field_index("primary_key"), "primary_key", new_keys,
+        head.schema.get_field_index("primary_key"),
+        "primary_key",
+        new_keys,
     )
     ds.insert(head)
 
@@ -162,15 +165,15 @@ def test_check_alerts_emits_stale_index_alert_end_to_end(tmp_path):
     head = ds.to_table().slice(0, 40)
     new_keys = pa.array([f"NEW{i}" for i in range(40)], type=pa.string())
     head = head.set_column(
-        head.schema.get_field_index("primary_key"), "primary_key", new_keys,
+        head.schema.get_field_index("primary_key"),
+        "primary_key",
+        new_keys,
     )
     ds.insert(head)
 
     nav = _navigator(sphere)
     result = nav.check_alerts("cust_pattern")
-    stale = [
-        a for a in result["alerts"] if a["check_type"] == "stale_vector_index"
-    ]
+    stale = [a for a in result["alerts"] if a["check_type"] == "stale_vector_index"]
     assert len(stale) == 1
     assert stale[0]["severity"] == "MEDIUM"
     assert stale[0]["details"]["num_unindexed_rows"] == 40
@@ -182,20 +185,20 @@ class TestStaleVectorIndexAlert:
     def _nav(self, health: dict):
         nav = MagicMock(spec=GDSNavigator)
         nav.vector_index_health.return_value = health
-        nav._check_stale_vector_index = (
-            GDSNavigator._check_stale_vector_index.__get__(nav)
-        )
+        nav._check_stale_vector_index = GDSNavigator._check_stale_vector_index.__get__(nav)
         return nav
 
     def test_stale_index_emits_medium_alert(self):
-        nav = self._nav({
-            "index_present": True,
-            "is_stale": True,
-            "num_unindexed_rows": 40,
-            "total_rows": 340,
-            "indexed_fraction": 300 / 340,
-            "stale_threshold": 0.1,
-        })
+        nav = self._nav(
+            {
+                "index_present": True,
+                "is_stale": True,
+                "num_unindexed_rows": 40,
+                "total_rows": 340,
+                "indexed_fraction": 300 / 340,
+                "stale_threshold": 0.1,
+            }
+        )
         alerts = nav._check_stale_vector_index("cust_pattern")
         assert len(alerts) == 1
         assert alerts[0]["severity"] == "MEDIUM"
@@ -205,23 +208,27 @@ class TestStaleVectorIndexAlert:
         assert alerts[0]["details"]["num_unindexed_rows"] == 40
 
     def test_fresh_index_emits_no_alert(self):
-        nav = self._nav({
-            "index_present": True,
-            "is_stale": False,
-            "num_unindexed_rows": 0,
-            "total_rows": 300,
-            "indexed_fraction": 1.0,
-            "stale_threshold": 0.1,
-        })
+        nav = self._nav(
+            {
+                "index_present": True,
+                "is_stale": False,
+                "num_unindexed_rows": 0,
+                "total_rows": 300,
+                "indexed_fraction": 1.0,
+                "stale_threshold": 0.1,
+            }
+        )
         assert nav._check_stale_vector_index("cust_pattern") == []
 
     def test_no_index_emits_no_alert(self):
-        nav = self._nav({
-            "index_present": False,
-            "is_stale": False,
-            "num_unindexed_rows": 0,
-            "total_rows": 100,
-            "indexed_fraction": 0.0,
-            "stale_threshold": 0.1,
-        })
+        nav = self._nav(
+            {
+                "index_present": False,
+                "is_stale": False,
+                "num_unindexed_rows": 0,
+                "total_rows": 100,
+                "indexed_fraction": 0.0,
+                "stale_threshold": 0.1,
+            }
+        )
         assert nav._check_stale_vector_index("cust_pattern") == []

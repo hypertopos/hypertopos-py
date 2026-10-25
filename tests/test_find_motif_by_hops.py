@@ -4,6 +4,7 @@ Uses the bundled AML HI-small sphere (event tx_pattern with edge_table +
 edge_dimensions sidecar) since Berka's tx_pattern lacks an explicit
 edge_table block.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -12,12 +13,8 @@ import pytest
 
 from hypertopos import HopPredicate, HyperSphere
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-AML_PATH = (
-    PROJECT_ROOT / "benchmark" / "ibm-aml" / "hi_small_sphere"
-    / "gds_aml_hi_small"
-)
+AML_PATH = PROJECT_ROOT / "benchmark" / "ibm-aml" / "hi_small_sphere" / "gds_aml_hi_small"
 
 
 def _aml_sphere_unavailable() -> bool:
@@ -25,12 +22,13 @@ def _aml_sphere_unavailable() -> bool:
     if not sphere_json.exists():
         return True
     import json
-    return json.loads(sphere_json.read_text()).get("format_version") != "3.0"
+
+    return json.loads(sphere_json.read_text()).get("format_version", "").split(".")[0] != "3"
 
 
 pytestmark = pytest.mark.skipif(
     _aml_sphere_unavailable(),
-    reason="AML HI-small sphere not built at format 3.0",
+    reason="AML HI-small sphere not built (format 3.x)",
 )
 
 
@@ -146,13 +144,17 @@ def test_large_seed_list_does_not_trigger_full_edge_read(aml_nav):
     # First call may pay cold adjacency cost (~28s on this sphere); not
     # asserted. Second call must be warm and fast.
     aml_nav.find_motif_by_hops(
-        "tx_pattern", hops=[HopPredicate()],
-        seed_keys=seeds, max_results=10,
+        "tx_pattern",
+        hops=[HopPredicate()],
+        seed_keys=seeds,
+        max_results=10,
     )
     t0 = time.perf_counter()
     out = aml_nav.find_motif_by_hops(
-        "tx_pattern", hops=[HopPredicate()],
-        seed_keys=seeds, max_results=10,
+        "tx_pattern",
+        hops=[HopPredicate()],
+        seed_keys=seeds,
+        max_results=10,
     )
     elapsed = time.perf_counter() - t0
     assert isinstance(out, dict)
@@ -166,14 +168,16 @@ def test_large_seed_list_does_not_trigger_full_edge_read(aml_nav):
 def test_anchor_pattern_raises(aml_nav):
     with pytest.raises(Exception, match="event pattern"):
         aml_nav.find_motif_by_hops(
-            "account_pattern", hops=[HopPredicate()],
+            "account_pattern",
+            hops=[HopPredicate()],
         )
 
 
 def test_unknown_pattern_raises(aml_nav):
     with pytest.raises(Exception, match="pattern not found"):
         aml_nav.find_motif_by_hops(
-            "nonexistent", hops=[HopPredicate()],
+            "nonexistent",
+            hops=[HopPredicate()],
         )
 
 
@@ -185,24 +189,29 @@ def test_empty_hops_raises(aml_nav):
 def test_too_many_hops_raises(aml_nav):
     with pytest.raises(Exception, match="hop count"):
         aml_nav.find_motif_by_hops(
-            "tx_pattern", hops=[HopPredicate()] * 9,
+            "tx_pattern",
+            hops=[HopPredicate()] * 9,
         )
 
 
 def test_invalid_max_results_raises(aml_nav):
     with pytest.raises(Exception, match="max_results"):
         aml_nav.find_motif_by_hops(
-            "tx_pattern", hops=[HopPredicate()], max_results=0,
+            "tx_pattern",
+            hops=[HopPredicate()],
+            max_results=0,
         )
 
 
 def test_edge_dim_predicate_filter_runs(aml_nav):
     out = aml_nav.find_motif_by_hops(
         "tx_pattern",
-        hops=[HopPredicate(
-            amount_min=10000.0,
-            edge_dim_predicates={"pair_edge_count": (">=", 5.0)},
-        )],
+        hops=[
+            HopPredicate(
+                amount_min=10000.0,
+                edge_dim_predicates={"pair_edge_count": (">=", 5.0)},
+            )
+        ],
         max_results=3,
         score=False,
     )
@@ -346,12 +355,10 @@ def test_score_breakdown_carries_event_factor(aml_nav):
             continue
         for entry in m["score_breakdown"]:
             assert "event_factor" in entry, (
-                f"event-aware breakdown must carry event_factor field; "
-                f"got {entry}"
+                f"event-aware breakdown must carry event_factor field; got {entry}"
             )
             assert entry["event_factor"] >= 1.0, (
-                f"event_factor must be >= 1.0 (centroid event = 1.0); "
-                f"got {entry['event_factor']}"
+                f"event_factor must be >= 1.0 (centroid event = 1.0); got {entry['event_factor']}"
             )
 
 
@@ -380,8 +387,7 @@ def test_score_event_aware_missing_event_polygon_fallback(aml_nav, monkeypatch):
             continue
         for entry in m["score_breakdown"]:
             assert entry["event_factor"] == 1.0, (
-                f"missing event polygon must yield neutral factor 1.0; "
-                f"got {entry['event_factor']}"
+                f"missing event polygon must yield neutral factor 1.0; got {entry['event_factor']}"
             )
 
 
@@ -443,16 +449,17 @@ def test_require_anomalous_default_no_filter(aml_nav):
     )
     explicit = aml_nav.find_motif_by_hops(
         "tx_pattern",
-        hops=[HopPredicate(
-            amount_min=10000.0, require_anomalous_entity=False,
-        )],
+        hops=[
+            HopPredicate(
+                amount_min=10000.0,
+                require_anomalous_entity=False,
+            )
+        ],
         max_results=5,
         score=False,
     )
     assert base["n_results"] == explicit["n_results"]
-    assert [m["nodes"] for m in base["motifs"]] == [
-        m["nodes"] for m in explicit["motifs"]
-    ]
+    assert [m["nodes"] for m in base["motifs"]] == [m["nodes"] for m in explicit["motifs"]]
 
 
 def test_require_anomalous_filters_destination(aml_nav):
@@ -460,9 +467,12 @@ def test_require_anomalous_filters_destination(aml_nav):
     motif's nodes[1] must be is_anomaly=True in the anchor companion."""
     out = aml_nav.find_motif_by_hops(
         "tx_pattern",
-        hops=[HopPredicate(
-            amount_min=10000.0, require_anomalous_entity=True,
-        )],
+        hops=[
+            HopPredicate(
+                amount_min=10000.0,
+                require_anomalous_entity=True,
+            )
+        ],
         max_results=20,
         score=False,
     )
@@ -472,7 +482,9 @@ def test_require_anomalous_filters_destination(aml_nav):
     version = aml_nav._resolve_version(anchor_pid)
     keys = list({m["nodes"][1] for m in out["motifs"]})
     geo = aml_nav._storage.read_geometry(
-        anchor_pid, version, point_keys=keys,
+        anchor_pid,
+        version,
+        point_keys=keys,
         columns=["primary_key", "is_anomaly"],
     )
     is_anomaly = {
@@ -502,7 +514,9 @@ def test_require_anomalous_per_hop_independence(aml_nav):
     version = aml_nav._resolve_version(anchor_pid)
     dest_keys = list({m["nodes"][1] for m in out["motifs"]})
     geo = aml_nav._storage.read_geometry(
-        anchor_pid, version, point_keys=dest_keys,
+        anchor_pid,
+        version,
+        point_keys=dest_keys,
         columns=["primary_key", "is_anomaly"],
     )
     is_anomaly = {
@@ -510,28 +524,32 @@ def test_require_anomalous_per_hop_independence(aml_nav):
         for i in range(geo.num_rows)
     }
     for m in out["motifs"]:
-        assert is_anomaly.get(m["nodes"][1], False), (
-            f"hop[0] flag must enforce nodes[1] anomalous"
-        )
+        assert is_anomaly.get(m["nodes"][1], False), "hop[0] flag must enforce nodes[1] anomalous"
 
 
 def test_require_anomalous_no_anchor_companion_raises(aml_nav, monkeypatch):
     monkeypatch.setattr(
-        aml_nav, "_resolve_anchor_pattern_for_scoring", lambda pid: None,
+        aml_nav,
+        "_resolve_anchor_pattern_for_scoring",
+        lambda pid: None,
     )
     with pytest.raises(Exception, match="anchor pattern"):
         aml_nav.find_motif_by_hops(
             "tx_pattern",
-            hops=[HopPredicate(
-                amount_min=10000.0, require_anomalous_entity=True,
-            )],
+            hops=[
+                HopPredicate(
+                    amount_min=10000.0,
+                    require_anomalous_entity=True,
+                )
+            ],
             max_results=3,
             score=False,
         )
 
 
 def test_require_anomalous_anchor_missing_is_anomaly_column_raises(
-    aml_nav, monkeypatch,
+    aml_nav,
+    monkeypatch,
 ):
     """Anchor pattern without is_anomaly column → raise GDSNavigationError."""
     real_read = aml_nav._storage.read_geometry
@@ -539,6 +557,7 @@ def test_require_anomalous_anchor_missing_is_anomaly_column_raises(
     def stripped_read(pattern_id, version, *args, **kwargs):
         if "is_anomaly" in (kwargs.get("columns") or ()):
             from pyarrow import Table
+
             return Table.from_pydict({"primary_key": []})
         return real_read(pattern_id, version, *args, **kwargs)
 
@@ -546,16 +565,20 @@ def test_require_anomalous_anchor_missing_is_anomaly_column_raises(
     with pytest.raises(Exception, match="is_anomaly"):
         aml_nav.find_motif_by_hops(
             "tx_pattern",
-            hops=[HopPredicate(
-                amount_min=10000.0, require_anomalous_entity=True,
-            )],
+            hops=[
+                HopPredicate(
+                    amount_min=10000.0,
+                    require_anomalous_entity=True,
+                )
+            ],
             max_results=3,
             score=False,
         )
 
 
 def test_require_anomalous_dest_missing_in_geometry_dropped(
-    aml_nav, monkeypatch,
+    aml_nav,
+    monkeypatch,
 ):
     """If anchor geometry returns no row for a destination key, treat as
     not anomalous and drop the motif."""
@@ -564,15 +587,19 @@ def test_require_anomalous_dest_missing_in_geometry_dropped(
     def empty_geo_read(pattern_id, version, *args, **kwargs):
         if "is_anomaly" in (kwargs.get("columns") or ()):
             from pyarrow import Table
+
             return Table.from_pydict({"primary_key": [], "is_anomaly": []})
         return real_read(pattern_id, version, *args, **kwargs)
 
     monkeypatch.setattr(aml_nav._storage, "read_geometry", empty_geo_read)
     out = aml_nav.find_motif_by_hops(
         "tx_pattern",
-        hops=[HopPredicate(
-            amount_min=10000.0, require_anomalous_entity=True,
-        )],
+        hops=[
+            HopPredicate(
+                amount_min=10000.0,
+                require_anomalous_entity=True,
+            )
+        ],
         max_results=5,
         score=False,
     )
@@ -583,7 +610,9 @@ def test_unknown_dim_raises(aml_nav):
     with pytest.raises(Exception, match="unknown dims"):
         aml_nav.find_motif_by_hops(
             "tx_pattern",
-            hops=[HopPredicate(
-                edge_dim_predicates={"nonexistent_dim": (">=", 1.0)},
-            )],
+            hops=[
+                HopPredicate(
+                    edge_dim_predicates={"nonexistent_dim": (">=", 1.0)},
+                )
+            ],
         )

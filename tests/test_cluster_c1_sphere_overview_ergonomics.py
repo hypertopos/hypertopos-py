@@ -15,6 +15,7 @@ returns pairwise Jaccard overlap of anomalous primary_keys across patterns
 sharing an ``entity_line``. ``None`` on spheres with fewer than two
 cover-overlapping patterns.
 """
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -22,6 +23,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pyarrow as pa
+
 from hypertopos.engine.aggregation import aggregate
 from hypertopos.model.manifest import Manifest
 from hypertopos.model.sphere import (
@@ -207,14 +209,26 @@ class TestC1aAnomalyRatePerEntity:
         # CUST-C: 3 events, 0 anomalous → 0.0
         pks = [f"TX-{i:04d}" for i in range(9)]
         cust = [
-            "CUST-A", "CUST-A", "CUST-A", "CUST-A",
-            "CUST-B", "CUST-B",
-            "CUST-C", "CUST-C", "CUST-C",
+            "CUST-A",
+            "CUST-A",
+            "CUST-A",
+            "CUST-A",
+            "CUST-B",
+            "CUST-B",
+            "CUST-C",
+            "CUST-C",
+            "CUST-C",
         ]
         anom = [
-            True, False, False, False,
-            True, True,
-            False, False, False,
+            True,
+            False,
+            False,
+            False,
+            True,
+            True,
+            False,
+            False,
+            False,
         ]
         geo = _build_geo_with_anomaly(pks, cust, anom)
         reader = _MockReader(

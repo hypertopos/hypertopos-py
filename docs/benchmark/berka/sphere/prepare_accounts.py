@@ -1,6 +1,7 @@
 # Copyright (C) 2026 Karol Kędzia
 # SPDX-License-Identifier: Apache-2.0
 """Tier 3 prepare script — builds enriched accounts table from 7 Berka CSVs."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -37,19 +38,23 @@ def prepare() -> pa.Table:
             "district_id": account_df["district_id"][i].as_py(),
         }
 
-    dist_region = {district_df["A1"][i].as_py(): district_df["A3"][i].as_py()
-                   for i in range(district_df.num_rows)}
+    dist_region = {
+        district_df["A1"][i].as_py(): district_df["A3"][i].as_py()
+        for i in range(district_df.num_rows)
+    }
     for info in acct_map.values():
         info["region"] = dist_region.get(info["district_id"], "unknown")
 
     disp_by_account: dict[int, list[dict]] = {}
     for i in range(disp_df.num_rows):
         aid = disp_df["account_id"][i].as_py()
-        disp_by_account.setdefault(aid, []).append({
-            "disp_id": disp_df["disp_id"][i].as_py(),
-            "client_id": disp_df["client_id"][i].as_py(),
-            "type": disp_df["type"][i].as_py(),
-        })
+        disp_by_account.setdefault(aid, []).append(
+            {
+                "disp_id": disp_df["disp_id"][i].as_py(),
+                "client_id": disp_df["client_id"][i].as_py(),
+                "type": disp_df["type"][i].as_py(),
+            }
+        )
 
     client_info = {}
     for i in range(client_df.num_rows):
@@ -90,8 +95,9 @@ def prepare() -> pa.Table:
             info["loan_amount"] = 0
             info["loan_duration"] = 0
 
-    card_by_disp = {card_df["disp_id"][i].as_py(): card_df["type"][i].as_py()
-                    for i in range(card_df.num_rows)}
+    card_by_disp = {
+        card_df["disp_id"][i].as_py(): card_df["type"][i].as_py() for i in range(card_df.num_rows)
+    }
     for aid, info in acct_map.items():
         disps = disp_by_account.get(aid, [])
         card_type = None
@@ -153,15 +159,17 @@ def prepare() -> pa.Table:
         # income_coverage: monthly_income / monthly_payment (0 if no loan)
         if loan_amt > 0 and info["loan_duration"] > 0:
             monthly_payment = loan_amt / info["loan_duration"]
-            info["income_coverage"] = monthly_income / monthly_payment if monthly_payment > 0 else 0.0
+            info["income_coverage"] = (
+                monthly_income / monthly_payment if monthly_payment > 0 else 0.0
+            )
         else:
             info["income_coverage"] = 0.0
 
         # balance_trend: sign of (last 10% of balances mean - first 10% mean)
         n = len(balances)
         if n >= 10:
-            first_chunk = balances[:max(n // 10, 1)]
-            last_chunk = balances[-max(n // 10, 1):]
+            first_chunk = balances[: max(n // 10, 1)]
+            last_chunk = balances[-max(n // 10, 1) :]
             info["balance_trend"] = float(np.mean(last_chunk) - np.mean(first_chunk))
         else:
             info["balance_trend"] = 0.0
@@ -170,26 +178,58 @@ def prepare() -> pa.Table:
         info["penalty_interest_count"] = acct_penalties.get(aid, 0)
 
     sorted_aids = sorted(acct_map.keys())
-    return pa.table({
-        "primary_key": pa.array([str(a) for a in sorted_aids], type=pa.string()),
-        "account_id": pa.array([str(a) for a in sorted_aids], type=pa.string()),
-        "frequency": pa.array([acct_map[a]["frequency"] for a in sorted_aids], type=pa.string()),
-        "district_id": pa.array([str(acct_map[a]["district_id"]) for a in sorted_aids], type=pa.string()),
-        "region": pa.array([acct_map[a]["region"] for a in sorted_aids], type=pa.string()),
-        "has_loan": pa.array([acct_map[a]["has_loan"] for a in sorted_aids], type=pa.string()),
-        "loan_status": pa.array([acct_map[a]["loan_status"] for a in sorted_aids], type=pa.string()),
-        "has_card": pa.array([acct_map[a]["has_card"] for a in sorted_aids], type=pa.string()),
-        "card_type": pa.array([acct_map[a]["card_type"] for a in sorted_aids], type=pa.string()),
-        "owner_gender": pa.array([acct_map[a]["owner_gender"] for a in sorted_aids], type=pa.string()),
-        "owner_birth_year": pa.array([acct_map[a]["owner_birth_year"] for a in sorted_aids], type=pa.int64()),
-        "n_clients": pa.array([acct_map[a]["n_clients"] for a in sorted_aids], type=pa.int64()),
-        "n_standing_orders": pa.array([acct_map[a]["n_standing_orders"] for a in sorted_aids], type=pa.int64()),
-        "loan_amount": pa.array([acct_map[a]["loan_amount"] for a in sorted_aids], type=pa.int64()),
-        "loan_duration": pa.array([acct_map[a]["loan_duration"] for a in sorted_aids], type=pa.int64()),
-        "balance_to_loan": pa.array([acct_map[a]["balance_to_loan"] for a in sorted_aids], type=pa.float64()),
-        "min_balance": pa.array([acct_map[a]["min_balance"] for a in sorted_aids], type=pa.float64()),
-        "balance_volatility": pa.array([acct_map[a]["balance_volatility"] for a in sorted_aids], type=pa.float64()),
-        "income_coverage": pa.array([acct_map[a]["income_coverage"] for a in sorted_aids], type=pa.float64()),
-        "balance_trend": pa.array([acct_map[a]["balance_trend"] for a in sorted_aids], type=pa.float64()),
-        "penalty_interest_count": pa.array([acct_map[a]["penalty_interest_count"] for a in sorted_aids], type=pa.int64()),
-    })
+    return pa.table(
+        {
+            "primary_key": pa.array([str(a) for a in sorted_aids], type=pa.string()),
+            "account_id": pa.array([str(a) for a in sorted_aids], type=pa.string()),
+            "frequency": pa.array(
+                [acct_map[a]["frequency"] for a in sorted_aids], type=pa.string()
+            ),
+            "district_id": pa.array(
+                [str(acct_map[a]["district_id"]) for a in sorted_aids], type=pa.string()
+            ),
+            "region": pa.array([acct_map[a]["region"] for a in sorted_aids], type=pa.string()),
+            "has_loan": pa.array([acct_map[a]["has_loan"] for a in sorted_aids], type=pa.string()),
+            "loan_status": pa.array(
+                [acct_map[a]["loan_status"] for a in sorted_aids], type=pa.string()
+            ),
+            "has_card": pa.array([acct_map[a]["has_card"] for a in sorted_aids], type=pa.string()),
+            "card_type": pa.array(
+                [acct_map[a]["card_type"] for a in sorted_aids], type=pa.string()
+            ),
+            "owner_gender": pa.array(
+                [acct_map[a]["owner_gender"] for a in sorted_aids], type=pa.string()
+            ),
+            "owner_birth_year": pa.array(
+                [acct_map[a]["owner_birth_year"] for a in sorted_aids], type=pa.int64()
+            ),
+            "n_clients": pa.array([acct_map[a]["n_clients"] for a in sorted_aids], type=pa.int64()),
+            "n_standing_orders": pa.array(
+                [acct_map[a]["n_standing_orders"] for a in sorted_aids], type=pa.int64()
+            ),
+            "loan_amount": pa.array(
+                [acct_map[a]["loan_amount"] for a in sorted_aids], type=pa.int64()
+            ),
+            "loan_duration": pa.array(
+                [acct_map[a]["loan_duration"] for a in sorted_aids], type=pa.int64()
+            ),
+            "balance_to_loan": pa.array(
+                [acct_map[a]["balance_to_loan"] for a in sorted_aids], type=pa.float64()
+            ),
+            "min_balance": pa.array(
+                [acct_map[a]["min_balance"] for a in sorted_aids], type=pa.float64()
+            ),
+            "balance_volatility": pa.array(
+                [acct_map[a]["balance_volatility"] for a in sorted_aids], type=pa.float64()
+            ),
+            "income_coverage": pa.array(
+                [acct_map[a]["income_coverage"] for a in sorted_aids], type=pa.float64()
+            ),
+            "balance_trend": pa.array(
+                [acct_map[a]["balance_trend"] for a in sorted_aids], type=pa.float64()
+            ),
+            "penalty_interest_count": pa.array(
+                [acct_map[a]["penalty_interest_count"] for a in sorted_aids], type=pa.int64()
+            ),
+        }
+    )

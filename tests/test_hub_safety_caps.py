@@ -11,6 +11,7 @@ edges pushes per-call wall clock past several minutes; the cap clips the
 candidate list to a bounded prefix BEFORE the Lance sidecar IN-clause and
 the engine call so the work is constant-bounded regardless of degree.
 """
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -26,8 +27,7 @@ from hypertopos.navigation.navigator import GDSNavigator
 def _make_plain_anchor(n_relations: int = 2) -> Pattern:
     """Minimal anchor pattern — no aggregation dim tail, no edge features."""
     relations = [
-        RelationDef(line_id=f"L{i}", direction="out", required=False)
-        for i in range(n_relations)
+        RelationDef(line_id=f"L{i}", direction="out", required=False) for i in range(n_relations)
     ]
     return Pattern(
         pattern_id="P",
@@ -69,25 +69,27 @@ def test_select_minimal_joint_truncates_candidates_to_max_candidates():
     """
     pat = _make_plain_anchor(n_relations=2)
     nav = _make_navigator(pat)
-    delta_dim = len(pat.mu)
 
     # Geometry table — one row for the seed entity with a small finite delta
     delta_vec = np.array([1.0, 2.0], dtype=np.float32)
-    geo_table = pa.table({
-        "primary_key": ["SEED"],
-        "delta": pa.array(
-            [delta_vec.tolist()], type=pa.list_(pa.float32()),
-        ),
-        "delta_norm": pa.array([float(np.linalg.norm(delta_vec))], type=pa.float32()),
-    })
+    geo_table = pa.table(
+        {
+            "primary_key": ["SEED"],
+            "delta": pa.array(
+                [delta_vec.tolist()],
+                type=pa.list_(pa.float32()),
+            ),
+            "delta_norm": pa.array([float(np.linalg.norm(delta_vec))], type=pa.float32()),
+        }
+    )
     nav._storage.read_geometry = MagicMock(return_value=geo_table)
 
     # Adjacency for the line — 1500 outbound edges from the seed
     n_total_edges = 1500
     adj = MagicMock()
-    adj.neighbors_out = MagicMock(return_value=[
-        (f"P{i}", "out", 0, f"EID-{i}") for i in range(n_total_edges)
-    ])
+    adj.neighbors_out = MagicMock(
+        return_value=[(f"P{i}", "out", 0, f"EID-{i}") for i in range(n_total_edges)]
+    )
     adj.neighbors_in = MagicMock(return_value=[])
     nav._storage.get_adjacency = MagicMock(return_value=adj)
 
@@ -99,11 +101,14 @@ def test_select_minimal_joint_truncates_candidates_to_max_candidates():
     # Stub the engine call to record what it received and return a
     # deterministic minimal joint result.
     from hypertopos.engine import counterfactual as cf_module
+
     captured: dict[str, object] = {}
     original_engine = cf_module.select_minimal_joint_removal
 
     def _spy(*args, **kwargs):
-        captured["candidate_edges"] = kwargs.get("candidate_edges", args[4] if len(args) > 4 else None)
+        captured["candidate_edges"] = kwargs.get(
+            "candidate_edges", args[4] if len(args) > 4 else None
+        )
         return {
             "selected_edge_ids": [],
             "selected_partner_keys": [],
@@ -117,8 +122,12 @@ def test_select_minimal_joint_truncates_candidates_to_max_candidates():
     cf_module.select_minimal_joint_removal = _spy
     try:
         result = nav.select_minimal_joint_edge_removal(
-            "SEED", pattern_id="P", line_id="L0",
-            target_drop_pct=50.0, k_max=3, max_candidates=300,
+            "SEED",
+            pattern_id="P",
+            line_id="L0",
+            target_drop_pct=50.0,
+            k_max=3,
+            max_candidates=300,
         )
     finally:
         cf_module.select_minimal_joint_removal = original_engine
@@ -140,31 +149,37 @@ def test_select_minimal_joint_no_truncation_when_below_cap():
     nav = _make_navigator(pat)
 
     delta_vec = np.array([1.0, 2.0], dtype=np.float32)
-    geo_table = pa.table({
-        "primary_key": ["SEED"],
-        "delta": pa.array(
-            [delta_vec.tolist()], type=pa.list_(pa.float32()),
-        ),
-        "delta_norm": pa.array([float(np.linalg.norm(delta_vec))], type=pa.float32()),
-    })
+    geo_table = pa.table(
+        {
+            "primary_key": ["SEED"],
+            "delta": pa.array(
+                [delta_vec.tolist()],
+                type=pa.list_(pa.float32()),
+            ),
+            "delta_norm": pa.array([float(np.linalg.norm(delta_vec))], type=pa.float32()),
+        }
+    )
     nav._storage.read_geometry = MagicMock(return_value=geo_table)
 
     n_total_edges = 20
     adj = MagicMock()
-    adj.neighbors_out = MagicMock(return_value=[
-        (f"P{i}", "out", 0, f"EID-{i}") for i in range(n_total_edges)
-    ])
+    adj.neighbors_out = MagicMock(
+        return_value=[(f"P{i}", "out", 0, f"EID-{i}") for i in range(n_total_edges)]
+    )
     adj.neighbors_in = MagicMock(return_value=[])
     nav._storage.get_adjacency = MagicMock(return_value=adj)
 
     nav.simulate_edge_removal = MagicMock(return_value=[])  # type: ignore[method-assign]
 
     from hypertopos.engine import counterfactual as cf_module
+
     captured: dict[str, object] = {}
     original = cf_module.select_minimal_joint_removal
 
     def _spy(*args, **kwargs):
-        captured["candidate_edges"] = kwargs.get("candidate_edges", args[4] if len(args) > 4 else None)
+        captured["candidate_edges"] = kwargs.get(
+            "candidate_edges", args[4] if len(args) > 4 else None
+        )
         return {
             "selected_edge_ids": [],
             "selected_partner_keys": [],
@@ -178,8 +193,12 @@ def test_select_minimal_joint_no_truncation_when_below_cap():
     cf_module.select_minimal_joint_removal = _spy
     try:
         result = nav.select_minimal_joint_edge_removal(
-            "SEED", pattern_id="P", line_id="L0",
-            target_drop_pct=50.0, k_max=3, max_candidates=500,
+            "SEED",
+            pattern_id="P",
+            line_id="L0",
+            target_drop_pct=50.0,
+            k_max=3,
+            max_candidates=500,
         )
     finally:
         cf_module.select_minimal_joint_removal = original
@@ -200,25 +219,29 @@ def test_simulate_edge_removal_max_edges_loaded_truncates_to_prefix():
     nav = _make_navigator(pat)
 
     delta_vec = np.array([1.0, 2.0], dtype=np.float32)
-    geo_table = pa.table({
-        "primary_key": ["SEED"],
-        "delta": pa.array(
-            [delta_vec.tolist()], type=pa.list_(pa.float32()),
-        ),
-        "delta_norm": pa.array([float(np.linalg.norm(delta_vec))], type=pa.float32()),
-    })
+    geo_table = pa.table(
+        {
+            "primary_key": ["SEED"],
+            "delta": pa.array(
+                [delta_vec.tolist()],
+                type=pa.list_(pa.float32()),
+            ),
+            "delta_norm": pa.array([float(np.linalg.norm(delta_vec))], type=pa.float32()),
+        }
+    )
     nav._storage.read_geometry = MagicMock(return_value=geo_table)
 
     n_total_edges = 3000
     adj = MagicMock()
-    adj.neighbors_out = MagicMock(return_value=[
-        (f"P{i}", "out", 0, f"EID-{i}") for i in range(n_total_edges)
-    ])
+    adj.neighbors_out = MagicMock(
+        return_value=[(f"P{i}", "out", 0, f"EID-{i}") for i in range(n_total_edges)]
+    )
     adj.neighbors_in = MagicMock(return_value=[])
     nav._storage.get_adjacency = MagicMock(return_value=adj)
 
     # Spy on the engine evaluator — record the edges it received.
     from hypertopos.engine import counterfactual as cf_module
+
     captured: dict[str, object] = {}
     original = cf_module.simulate_edge_removal_with_aggregations
 
@@ -229,17 +252,18 @@ def test_simulate_edge_removal_max_edges_loaded_truncates_to_prefix():
     cf_module.simulate_edge_removal_with_aggregations = _spy
     try:
         envelope = nav.simulate_edge_removal(
-            "SEED", pattern_id="P", line_id="L0",
-            top_n=5, max_edges_loaded=250,
+            "SEED",
+            pattern_id="P",
+            line_id="L0",
+            top_n=5,
+            max_edges_loaded=250,
         )
     finally:
         cf_module.simulate_edge_removal_with_aggregations = original
 
     received = captured["edges"]
     assert received is not None
-    assert len(received) == 250, (
-        f"engine must see the truncated prefix (250), got {len(received)}"
-    )
+    assert len(received) == 250, f"engine must see the truncated prefix (250), got {len(received)}"
 
     # The return envelope must surface the truncation so the agent never
     # mistakes a partial ranking for a complete one.

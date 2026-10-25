@@ -7,6 +7,7 @@
 Tracks population drift after appends using Welford's online algorithm.
 No I/O — pure numpy computation. Storage handled by reader/writer.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -37,7 +38,7 @@ class CalibrationTracker:
     )
     norm_reservoir_count: int = 0
     _rng: np.random.Generator = field(
-        default_factory=lambda: np.random.default_rng(),
+        default_factory=lambda: np.random.default_rng(0),  # reproducible reservoir
         repr=False,
     )
 

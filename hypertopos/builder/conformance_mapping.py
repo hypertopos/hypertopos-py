@@ -30,6 +30,7 @@ Note: ``prop`` references columns on the **points table**, not pattern
 ``pyarrow.compute.field(prop)`` against the entity-line table — so
 ``prop`` is a raw source column name, not a dimension name.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -73,8 +74,7 @@ def _parse_predicate(
     op = raw.get("op")
     if not isinstance(op, str):
         raise ValueError(
-            f"Pattern '{pattern_id}' rule '{rule_id}' {path}: predicate "
-            f"missing string 'op'",
+            f"Pattern '{pattern_id}' rule '{rule_id}' {path}: predicate missing string 'op'",
         )
 
     if op in _LOGICAL_OPS:
@@ -199,8 +199,7 @@ def parse_conformance_rules(
             )
         if rule_id in seen_ids:
             raise ValueError(
-                f"Pattern '{pattern_id}' conformance_rules: duplicate "
-                f"rule_id {rule_id!r}",
+                f"Pattern '{pattern_id}' conformance_rules: duplicate rule_id {rule_id!r}",
             )
         seen_ids.add(rule_id)
 
@@ -215,8 +214,7 @@ def parse_conformance_rules(
         violates_when_raw = entry.get("violates_when")
         if violates_when_raw is None:
             raise ValueError(
-                f"Pattern '{pattern_id}' rule '{rule_id}' missing "
-                f"'violates_when' predicate",
+                f"Pattern '{pattern_id}' rule '{rule_id}' missing 'violates_when' predicate",
             )
 
         predicate = _parse_predicate(

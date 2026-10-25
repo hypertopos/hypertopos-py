@@ -55,33 +55,39 @@ def _write_ctx(path: Path, table: pa.Table) -> str:
 
 
 def _accounts_pattern() -> _Pat:
-    return _Pat(relations=[
-        _Rel("accounts"),  # entity_keys[1] = sender
-        _Rel("accounts"),  # entity_keys[2] = receiver
-        _Rel("currencies"),
-    ])
+    return _Pat(
+        relations=[
+            _Rel("accounts"),  # entity_keys[1] = sender
+            _Rel("accounts"),  # entity_keys[2] = receiver
+            _Rel("currencies"),
+        ]
+    )
 
 
 def _basic_geo_table() -> pa.Table:
-    return pa.table({
-        "primary_key": ["t1", "t2", "t3", "t4"],
-        "entity_keys": pa.array(
-            [
-                ["A", "B", "USD"],
-                ["B", "C", "EUR"],
-                ["A", "C", "USD"],
-                ["A", "A", "USD"],
-            ],
-            type=pa.list_(pa.string()),
-        ),
-    })
+    return pa.table(
+        {
+            "primary_key": ["t1", "t2", "t3", "t4"],
+            "entity_keys": pa.array(
+                [
+                    ["A", "B", "USD"],
+                    ["B", "C", "EUR"],
+                    ["A", "C", "USD"],
+                    ["A", "A", "USD"],
+                ],
+                type=pa.list_(pa.string()),
+            ),
+        }
+    )
 
 
 def _basic_ctx_table() -> pa.Table:
-    return pa.table({
-        "primary_key": ["t1", "t2", "t3", "t4"],
-        "amount": [10.0, 20.0, 30.0, 40.0],
-    })
+    return pa.table(
+        {
+            "primary_key": ["t1", "t2", "t3", "t4"],
+            "amount": [10.0, 20.0, 30.0, 40.0],
+        }
+    )
 
 
 # ── _escape_sql_string ────────────────────────────────────────────────
@@ -91,6 +97,7 @@ class TestLinePositions:
     def test_empty_pattern_returns_empty(self):
         pat = _Pat(relations=[])
         from hypertopos.engine.lance_sql_agg import _line_positions
+
         assert _line_positions(pat, "anything") == []
 
     def test_unicode_key_escaping(self):
@@ -192,8 +199,12 @@ class TestAggregateMetric:
         geo_path = _write_geo(tmp_path, _basic_geo_table())
         ctx_path = _write_ctx(tmp_path, _basic_ctx_table())
         metrics, counts = aggregate_metric(
-            geo_path, ctx_path, _accounts_pattern(),
-            "accounts", "amount", "sum",
+            geo_path,
+            ctx_path,
+            _accounts_pattern(),
+            "accounts",
+            "amount",
+            "sum",
         )
         # A: 10 + 30 + 40 + 40 = 120 (t4 contributes twice for A,A)
         # B: 10 + 20 = 30
@@ -205,8 +216,12 @@ class TestAggregateMetric:
         geo_path = _write_geo(tmp_path, _basic_geo_table())
         ctx_path = _write_ctx(tmp_path, _basic_ctx_table())
         metrics, _ = aggregate_metric(
-            geo_path, ctx_path, _accounts_pattern(),
-            "accounts", "amount", "avg",
+            geo_path,
+            ctx_path,
+            _accounts_pattern(),
+            "accounts",
+            "amount",
+            "avg",
         )
         assert metrics["A"] == pytest.approx(120.0 / 4)
         assert metrics["B"] == pytest.approx(15.0)
@@ -215,12 +230,20 @@ class TestAggregateMetric:
         geo_path = _write_geo(tmp_path, _basic_geo_table())
         ctx_path = _write_ctx(tmp_path, _basic_ctx_table())
         m_min, _ = aggregate_metric(
-            geo_path, ctx_path, _accounts_pattern(),
-            "accounts", "amount", "min",
+            geo_path,
+            ctx_path,
+            _accounts_pattern(),
+            "accounts",
+            "amount",
+            "min",
         )
         m_max, _ = aggregate_metric(
-            geo_path, ctx_path, _accounts_pattern(),
-            "accounts", "amount", "max",
+            geo_path,
+            ctx_path,
+            _accounts_pattern(),
+            "accounts",
+            "amount",
+            "max",
         )
         assert m_min["A"] == 10.0
         assert m_max["A"] == 40.0
@@ -230,16 +253,24 @@ class TestAggregateMetric:
         ctx_path = _write_ctx(tmp_path, _basic_ctx_table())
         with pytest.raises(ValueError, match="agg_fn must be one of"):
             aggregate_metric(
-                geo_path, ctx_path, _accounts_pattern(),
-                "accounts", "amount", "stddev",
+                geo_path,
+                ctx_path,
+                _accounts_pattern(),
+                "accounts",
+                "amount",
+                "stddev",
             )
 
     def test_no_matching_relation(self, tmp_path):
         geo_path = _write_geo(tmp_path, _basic_geo_table())
         ctx_path = _write_ctx(tmp_path, _basic_ctx_table())
         metrics, counts = aggregate_metric(
-            geo_path, ctx_path, _accounts_pattern(),
-            "merchants", "amount", "sum",
+            geo_path,
+            ctx_path,
+            _accounts_pattern(),
+            "merchants",
+            "amount",
+            "sum",
         )
         assert metrics == {} and counts == {}
 
@@ -253,8 +284,12 @@ class TestAggregateFilteredMetric:
         ctx_path = _write_ctx(tmp_path, _basic_ctx_table())
         # Only count edges of polygons whose accounts include A
         metrics, counts = aggregate_filtered_metric(
-            geo_path, ctx_path, _accounts_pattern(),
-            "accounts", "amount", "sum",
+            geo_path,
+            ctx_path,
+            _accounts_pattern(),
+            "accounts",
+            "amount",
+            "sum",
             resolved_filters=[("accounts", {"A"})],
             event_line_id="transactions",
         )
@@ -269,8 +304,12 @@ class TestAggregateFilteredMetric:
         ctx_path = _write_ctx(tmp_path, _basic_ctx_table())
         # Filter on the event line itself — polygons whose primary_key in {t1, t2}
         metrics, counts = aggregate_filtered_metric(
-            geo_path, ctx_path, _accounts_pattern(),
-            "accounts", "amount", "sum",
+            geo_path,
+            ctx_path,
+            _accounts_pattern(),
+            "accounts",
+            "amount",
+            "sum",
             resolved_filters=[("transactions", {"t1", "t2"})],
             event_line_id="transactions",
         )
@@ -285,8 +324,12 @@ class TestAggregateFilteredMetric:
         ctx_path = _write_ctx(tmp_path, _basic_ctx_table())
         # Filter accounts={A} AND currencies={USD} → polygons t1, t3, t4
         metrics, counts = aggregate_filtered_metric(
-            geo_path, ctx_path, _accounts_pattern(),
-            "accounts", "amount", "sum",
+            geo_path,
+            ctx_path,
+            _accounts_pattern(),
+            "accounts",
+            "amount",
+            "sum",
             resolved_filters=[("accounts", {"A"}), ("currencies", {"USD"})],
             event_line_id="transactions",
         )
@@ -299,8 +342,12 @@ class TestAggregateFilteredMetric:
         geo_path = _write_geo(tmp_path, _basic_geo_table())
         ctx_path = _write_ctx(tmp_path, _basic_ctx_table())
         metrics, counts = aggregate_filtered_metric(
-            geo_path, ctx_path, _accounts_pattern(),
-            "accounts", "amount", "sum",
+            geo_path,
+            ctx_path,
+            _accounts_pattern(),
+            "accounts",
+            "amount",
+            "sum",
             resolved_filters=[("accounts", set())],
             event_line_id="transactions",
         )
@@ -313,13 +360,21 @@ class TestAggregateFilteredMetric:
 class TestAggregatePivot:
     def test_count_only_pivot(self, tmp_path):
         geo_path = _write_geo(tmp_path, _basic_geo_table())
-        ctx_path = _write_ctx(tmp_path, pa.table({
-            "primary_key": ["t1", "t2", "t3", "t4"],
-            "channel": ["online", "atm", "online", "atm"],
-        }))
+        ctx_path = _write_ctx(
+            tmp_path,
+            pa.table(
+                {
+                    "primary_key": ["t1", "t2", "t3", "t4"],
+                    "channel": ["online", "atm", "online", "atm"],
+                }
+            ),
+        )
         results = aggregate_pivot(
-            geo_path, ctx_path, _accounts_pattern(),
-            "accounts", "channel",
+            geo_path,
+            ctx_path,
+            _accounts_pattern(),
+            "accounts",
+            "channel",
         )
         cells = {(r["group_key"], r["pivot_val"]): r["count"] for r in results}
         # A in [t1, t3, t4×2]: online=2 (t1, t3), atm=2 (t4, t4)
@@ -328,17 +383,26 @@ class TestAggregatePivot:
 
     def test_metric_pivot(self, tmp_path):
         geo_path = _write_geo(tmp_path, _basic_geo_table())
-        event_path = _write_ctx(tmp_path, pa.table({
-            "primary_key": ["t1", "t2", "t3", "t4"],
-            "channel": ["online", "atm", "online", "atm"],
-        }))
+        event_path = _write_ctx(
+            tmp_path,
+            pa.table(
+                {
+                    "primary_key": ["t1", "t2", "t3", "t4"],
+                    "channel": ["online", "atm", "online", "atm"],
+                }
+            ),
+        )
         amt_path = str(tmp_path / "amt.lance")
         lance.write_dataset(_basic_ctx_table(), amt_path, data_storage_version="2.2")
         results = aggregate_pivot(
-            geo_path, event_path, _accounts_pattern(),
-            "accounts", "channel",
+            geo_path,
+            event_path,
+            _accounts_pattern(),
+            "accounts",
+            "channel",
             ctx_lance_path=amt_path,
-            metric_col="amount", agg_fn="sum",
+            metric_col="amount",
+            agg_fn="sum",
         )
         cells = {(r["group_key"], r["pivot_val"]): r["metric"] for r in results}
         assert cells[("A", "online")] == pytest.approx(40.0)  # t1 + t3
@@ -351,13 +415,22 @@ class TestAggregatePivot:
 class TestAggregateProperty:
     def test_distinct_count_per_prop_val(self, tmp_path):
         geo_path = _write_geo(tmp_path, _basic_geo_table())
-        prop_path = _write_ctx(tmp_path, pa.table({
-            "primary_key": ["A", "B", "C"],
-            "tier": ["gold", "silver", "gold"],
-        }))
+        prop_path = _write_ctx(
+            tmp_path,
+            pa.table(
+                {
+                    "primary_key": ["A", "B", "C"],
+                    "tier": ["gold", "silver", "gold"],
+                }
+            ),
+        )
         result = aggregate_property(
-            geo_path, prop_path, _accounts_pattern(),
-            "accounts", "accounts", "tier",
+            geo_path,
+            prop_path,
+            _accounts_pattern(),
+            "accounts",
+            "accounts",
+            "tier",
             distinct=True,
         )
         # gold = {A, C} = 2 distinct, silver = {B} = 1
@@ -365,30 +438,49 @@ class TestAggregateProperty:
 
     def test_unsafe_prop_name_identifier_raises(self, tmp_path):
         geo_path = _write_geo(tmp_path, _basic_geo_table())
-        prop_path = _write_ctx(tmp_path, pa.table({
-            "primary_key": ["A", "B", "C"],
-            "tier": ["gold", "silver", "gold"],
-        }))
+        prop_path = _write_ctx(
+            tmp_path,
+            pa.table(
+                {
+                    "primary_key": ["A", "B", "C"],
+                    "tier": ["gold", "silver", "gold"],
+                }
+            ),
+        )
         with pytest.raises(ValueError, match="not a safe SQL identifier"):
             aggregate_property(
-                geo_path, prop_path, _accounts_pattern(),
-                "accounts", "accounts", "tier; DROP TABLE x; --",
+                geo_path,
+                prop_path,
+                _accounts_pattern(),
+                "accounts",
+                "accounts",
+                "tier; DROP TABLE x; --",
             )
 
     def test_metric_sum_by_prop(self, tmp_path):
         """Property aggregation with metric sum."""
         geo_path = _write_geo(tmp_path, _basic_geo_table())
-        prop_path = _write_ctx(tmp_path, pa.table({
-            "primary_key": ["A", "B", "C"],
-            "tier": ["gold", "silver", "gold"],
-        }))
+        prop_path = _write_ctx(
+            tmp_path,
+            pa.table(
+                {
+                    "primary_key": ["A", "B", "C"],
+                    "tier": ["gold", "silver", "gold"],
+                }
+            ),
+        )
         amt_path = str(tmp_path / "amt.lance")
         lance.write_dataset(_basic_ctx_table(), amt_path, data_storage_version="2.2")
         result = aggregate_property(
-            geo_path, prop_path, _accounts_pattern(),
-            "accounts", "accounts", "tier",
+            geo_path,
+            prop_path,
+            _accounts_pattern(),
+            "accounts",
+            "accounts",
+            "tier",
             ctx_lance_path=amt_path,
-            metric_col="amount", agg_fn="sum",
+            metric_col="amount",
+            agg_fn="sum",
         )
         assert "results" in result
         cells = {(r["group_key"], r["prop_val"]): r["metric"] for r in result["results"]}
@@ -396,22 +488,33 @@ class TestAggregateProperty:
 
     def test_cross_line_property(self, tmp_path):
         """Property from a different line than group_by_line."""
-        geo = pa.table({
-            "primary_key": ["t1", "t2", "t3"],
-            "entity_keys": pa.array(
-                [["A", "USD"], ["B", "EUR"], ["A", "USD"]],
-                type=pa.list_(pa.string()),
-            ),
-        })
+        geo = pa.table(
+            {
+                "primary_key": ["t1", "t2", "t3"],
+                "entity_keys": pa.array(
+                    [["A", "USD"], ["B", "EUR"], ["A", "USD"]],
+                    type=pa.list_(pa.string()),
+                ),
+            }
+        )
         geo_path = _write_geo(tmp_path, geo)
-        prop_path = _write_ctx(tmp_path, pa.table({
-            "primary_key": ["USD", "EUR"],
-            "region": ["americas", "europe"],
-        }))
+        prop_path = _write_ctx(
+            tmp_path,
+            pa.table(
+                {
+                    "primary_key": ["USD", "EUR"],
+                    "region": ["americas", "europe"],
+                }
+            ),
+        )
         pat = _Pat(relations=[_Rel("accounts"), _Rel("currencies")])
         result = aggregate_property(
-            geo_path, prop_path, pat,
-            "accounts", "currencies", "region",
+            geo_path,
+            prop_path,
+            pat,
+            "accounts",
+            "currencies",
+            "region",
         )
         cells = {(r["group_key"], r["prop_val"]): r["count"] for r in result["results"]}
         assert ("A", "americas") in cells
@@ -419,13 +522,22 @@ class TestAggregateProperty:
 
     def test_count_by_prop(self, tmp_path):
         geo_path = _write_geo(tmp_path, _basic_geo_table())
-        prop_path = _write_ctx(tmp_path, pa.table({
-            "primary_key": ["A", "B", "C"],
-            "tier": ["gold", "silver", "gold"],
-        }))
+        prop_path = _write_ctx(
+            tmp_path,
+            pa.table(
+                {
+                    "primary_key": ["A", "B", "C"],
+                    "tier": ["gold", "silver", "gold"],
+                }
+            ),
+        )
         result = aggregate_property(
-            geo_path, prop_path, _accounts_pattern(),
-            "accounts", "accounts", "tier",
+            geo_path,
+            prop_path,
+            _accounts_pattern(),
+            "accounts",
+            "accounts",
+            "tier",
         )
         cells = {(r["group_key"], r["prop_val"]): r["count"] for r in result["results"]}
         assert cells[("A", "gold")] == 4  # A appears 4 times across positions
@@ -441,8 +553,12 @@ class TestAggregatePercentile:
         geo_path = _write_geo(tmp_path, _basic_geo_table())
         ctx_path = _write_ctx(tmp_path, _basic_ctx_table())
         metrics, counts = aggregate_percentile(
-            geo_path, ctx_path, _accounts_pattern(),
-            "accounts", "amount", percentile=0.5,
+            geo_path,
+            ctx_path,
+            _accounts_pattern(),
+            "accounts",
+            "amount",
+            percentile=0.5,
         )
         # A's amounts: [10, 30, 40, 40] — median = 35.0 (approx)
         assert metrics["A"] == pytest.approx(35.0, abs=10.0)
@@ -453,8 +569,12 @@ class TestAggregatePercentile:
         ctx_path = _write_ctx(tmp_path, _basic_ctx_table())
         with pytest.raises(ValueError, match="percentile must be in"):
             aggregate_percentile(
-                geo_path, ctx_path, _accounts_pattern(),
-                "accounts", "amount", percentile=1.5,
+                geo_path,
+                ctx_path,
+                _accounts_pattern(),
+                "accounts",
+                "amount",
+                percentile=1.5,
             )
 
     def test_unsafe_metric_col_identifier_raises(self, tmp_path):
@@ -463,24 +583,31 @@ class TestAggregatePercentile:
         ctx_path = _write_ctx(tmp_path, _basic_ctx_table())
         with pytest.raises(ValueError, match="not a safe SQL identifier"):
             aggregate_percentile(
-                geo_path, ctx_path, _accounts_pattern(),
-                "accounts", "amount; DROP TABLE x; --", percentile=0.5,
+                geo_path,
+                ctx_path,
+                _accounts_pattern(),
+                "accounts",
+                "amount; DROP TABLE x; --",
+                percentile=0.5,
             )
 
     def test_invalid_threshold(self, tmp_path):
         from hypertopos.engine.lance_sql_agg import find_anomalies as _fa
+
         p = _write_geo(tmp_path, _basic_geo_table())
         with pytest.raises(ValueError, match="finite"):
             _fa(p, threshold=float("nan"), top_n=5)
 
     def test_negative_top_n(self, tmp_path):
         from hypertopos.engine.lance_sql_agg import find_anomalies as _fa
+
         p = _write_geo(tmp_path, _basic_geo_table())
         with pytest.raises(ValueError, match="top_n"):
             _fa(p, threshold=0, top_n=-1)
 
     def test_negative_offset(self, tmp_path):
         from hypertopos.engine.lance_sql_agg import find_anomalies as _fa
+
         p = _write_geo(tmp_path, _basic_geo_table())
         with pytest.raises(ValueError, match="offset"):
             _fa(p, threshold=0, top_n=5, offset=-1)
@@ -493,10 +620,12 @@ class TestFindAnomalies:
     def test_top_n_above_threshold(self, tmp_path):
         p = str(tmp_path / "g.lance")
         lance.write_dataset(
-            pa.table({
-                "primary_key": ["A", "B", "C", "D"],
-                "delta_norm": [5.0, 4.0, 3.0, 1.0],
-            }),
+            pa.table(
+                {
+                    "primary_key": ["A", "B", "C", "D"],
+                    "delta_norm": [5.0, 4.0, 3.0, 1.0],
+                }
+            ),
             p,
             data_storage_version="2.2",
         )
@@ -508,10 +637,12 @@ class TestFindAnomalies:
     def test_dedupes_duplicate_primary_keys(self, tmp_path):
         p = str(tmp_path / "g.lance")
         lance.write_dataset(
-            pa.table({
-                "primary_key": ["A", "A", "B"],
-                "delta_norm": [3.0, 5.0, 4.0],
-            }),
+            pa.table(
+                {
+                    "primary_key": ["A", "A", "B"],
+                    "delta_norm": [3.0, 5.0, 4.0],
+                }
+            ),
             p,
             data_storage_version="2.2",
         )
@@ -523,10 +654,12 @@ class TestFindAnomalies:
     def test_offset_skips(self, tmp_path):
         p = str(tmp_path / "g.lance")
         lance.write_dataset(
-            pa.table({
-                "primary_key": ["A", "B", "C"],
-                "delta_norm": [5.0, 4.0, 3.0],
-            }),
+            pa.table(
+                {
+                    "primary_key": ["A", "B", "C"],
+                    "delta_norm": [5.0, 4.0, 3.0],
+                }
+            ),
             p,
             data_storage_version="2.2",
         )
@@ -536,10 +669,12 @@ class TestFindAnomalies:
     def test_offset_beyond_total(self, tmp_path):
         p = str(tmp_path / "g.lance")
         lance.write_dataset(
-            pa.table({
-                "primary_key": ["A", "B"],
-                "delta_norm": [5.0, 4.0],
-            }),
+            pa.table(
+                {
+                    "primary_key": ["A", "B"],
+                    "delta_norm": [5.0, 4.0],
+                }
+            ),
             p,
             data_storage_version="2.2",
         )

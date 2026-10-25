@@ -2,9 +2,11 @@
 
 Builder integration tests build real spheres from synthetic data and assert
 sphere.json + calibration_history/ on disk."""
+
 from __future__ import annotations
 
 import json
+from datetime import UTC
 from pathlib import Path
 
 import pytest
@@ -47,6 +49,7 @@ def test_compute_schema_hash_for_pattern_def_matches_node_round_trip():
 # tiny_sphere_factory — builds a minimal 1-pattern event sphere into a path.
 # Calling it twice on the same path exercises the increment branch.
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def tiny_sphere_factory():
@@ -135,6 +138,71 @@ def tiny_sphere_factory():
 # Integration tests
 # ---------------------------------------------------------------------------
 
+
+@pytest.fixture
+def tiny_anchor_sphere_factory():
+    """Like ``tiny_sphere_factory`` but with an anchor pattern that has temporal
+    history: six accounts, three daily windows of transactions, two derived
+    dimensions, ``build()`` + ``build_temporal()``. Rebuildable into the same
+    path (keeps ``_gds_meta/``) so a second call writes calibration v=2.
+
+    Returns the pattern_id ``"acct_pattern"`` on every call.
+    """
+    import shutil
+    from datetime import datetime
+
+    import pyarrow as pa
+
+    from hypertopos.builder import GDSBuilder
+
+    accounts = [f"A-{i}" for i in range(1, 7)]
+
+    def _build(sphere_path: Path) -> str:
+        sphere_path.mkdir(parents=True, exist_ok=True)
+        for subdir in ("points", "geometry", "temporal"):
+            target = sphere_path / subdir
+            if target.exists():
+                shutil.rmtree(target)
+        rows = [
+            {
+                "tx_id": f"TX-{day}-{n}",
+                "from_account": accounts[(day * 7 + n) % 6],
+                "to_account": accounts[(day + n + 1) % 6],
+                "amount": float((day * 13 + n * 7) % 50 + 1),
+                "timestamp": datetime(2024, 1, day),
+            }
+            for day in (1, 2, 3)
+            for n in range(12)
+        ]
+        b = GDSBuilder("test", str(sphere_path))
+        b.add_line(
+            "transactions",
+            pa.table({k: [r[k] for r in rows] for k in rows[0]}),
+            key_col="tx_id",
+            source_id="test",
+            role="event",
+        )
+        b.add_line(
+            "accounts",
+            pa.table({"primary_key": accounts}),
+            key_col="primary_key",
+            source_id="test",
+            role="anchor",
+        )
+        b.add_derived_dimension(
+            "accounts", "transactions", "from_account", "count", None, "tx_count"
+        )
+        b.add_derived_dimension(
+            "accounts", "transactions", "from_account", "sum", "amount", "amount_sum"
+        )
+        b.add_pattern("acct_pattern", "anchor", "accounts", relations=[])
+        b.build()
+        b.build_temporal("timestamp", "1d")
+        return "acct_pattern"
+
+    return _build
+
+
 def test_build_once_writes_v1(tiny_sphere_factory, tmp_path):
     """First builder run on a fresh dir writes v=1.json with schema_hash and
     sphere.json with format_version=3.0 + calibration_epoch=1."""
@@ -163,8 +231,9 @@ def test_build_once_writes_v1(tiny_sphere_factory, tmp_path):
 def test_build_twice_increments_epoch(tiny_sphere_factory, tmp_path):
     """Second build on the same path increments calibration_epoch to 2 and
     writes v=2.json; both epochs are readable by the reader."""
-    from hypertopos.storage.reader import GDSReader
     import numpy as np
+
+    from hypertopos.storage.reader import GDSReader
 
     sphere_path = tmp_path / "sphere"
     pid = tiny_sphere_factory(sphere_path)
@@ -210,14 +279,14 @@ def test_last_k_one_effective_replace(tiny_sphere_factory, tmp_path):
     from hypertopos.storage.reader import GDSReader
 
     sphere_path = tmp_path / "sphere"
-    pid = tiny_sphere_factory(sphere_path)          # epoch 1, last_k=5
+    pid = tiny_sphere_factory(sphere_path)  # epoch 1, last_k=5
 
     sp = sphere_path / "_gds_meta" / "sphere.json"
     meta = json.loads(sp.read_text())
     meta["calibration_history_policy"] = {"last_k": 1}
     sp.write_text(json.dumps(meta))
 
-    tiny_sphere_factory(sphere_path)                 # epoch 2, reads last_k=1 → trims to v=2 only
+    tiny_sphere_factory(sphere_path)  # epoch 2, reads last_k=1 → trims to v=2 only
 
     reader = GDSReader(sphere_path)
     versions_after_trim = reader.list_calibration_versions(pid)
@@ -229,6 +298,7 @@ def test_last_k_one_effective_replace(tiny_sphere_factory, tmp_path):
 # ---------------------------------------------------------------------------
 # Additional fixtures for edge-case tests
 # ---------------------------------------------------------------------------
+
 
 def _build_tiny_sphere(
     sphere_path: Path,
@@ -306,7 +376,7 @@ def _build_tiny_sphere(
             {"doc": "D-005", "cust_id": "C-4", "cc_id": "CC-01", "amount": 250.0},
             {"doc": "D-006", "cust_id": None, "cc_id": "CC-01", "amount": 50.0},
             {"doc": "D-007", "cust_id": None, "cc_id": "CC-02", "amount": 75.0},
-            {"doc": "D-008", "cust_id": None, "cc_id": None,    "amount": 10.0},
+            {"doc": "D-008", "cust_id": None, "cc_id": None, "amount": 10.0},
         ],
         key_col="doc",
         source_id="test",
@@ -373,6 +443,7 @@ def tiny_sphere_factory_with_dim_kind():
 
     Returns the pattern_id ``"gl_entry_pattern"`` on every call.
     """
+
     def _build(sphere_path: Path, dim_kind: str = "bernoulli") -> str:
         # bernoulli → FK-only schema (2 dims, both bernoulli)
         # gaussian  → adds a continuous event dimension → different schema_hash
@@ -393,6 +464,7 @@ def tiny_two_pattern_factory():
     Returns ``(pid_a, pid_b)`` where ``pid_b`` is ``None`` when
     ``include_b=False``.
     """
+
     def _build(sphere_path: Path, include_b: bool) -> tuple[str, str | None]:
         patterns = ["gl_entry_pattern"]
         if include_b:
@@ -409,6 +481,7 @@ def tiny_two_pattern_factory():
 # Edge-case integration tests
 # ---------------------------------------------------------------------------
 
+
 def test_schema_change_resets_to_v1(tiny_sphere_factory_with_dim_kind, tmp_path):
     """Changing dimension_kinds triggers schema_hash drift → wipes history,
     resets to v=1."""
@@ -419,9 +492,9 @@ def test_schema_change_resets_to_v1(tiny_sphere_factory_with_dim_kind, tmp_path)
     pid = tiny_sphere_factory_with_dim_kind(sphere_path, dim_kind="bernoulli")
     # History now has v=1 and v=2.
 
-    h_before = json.loads(
-        (sphere_path / "_gds_meta" / "sphere.json").read_text()
-    )["patterns"][pid]["schema_hash"]
+    h_before = json.loads((sphere_path / "_gds_meta" / "sphere.json").read_text())["patterns"][pid][
+        "schema_hash"
+    ]
 
     # Re-build with gaussian event dim — schema_hash changes → reset
     pid = tiny_sphere_factory_with_dim_kind(sphere_path, dim_kind="gaussian")
@@ -487,6 +560,7 @@ def test_legacy_sphere_first_build_writes_3_0(tiny_sphere_factory, tmp_path):
     history_root = sphere_path / "_gds_meta" / "calibration_history"
     if history_root.exists():
         import shutil
+
         shutil.rmtree(history_root)
 
     # Re-build — fresh 3.0 metadata.
@@ -497,22 +571,23 @@ def test_legacy_sphere_first_build_writes_3_0(tiny_sphere_factory, tmp_path):
     assert meta_after["calibration_history_policy"] == {"last_k": 5}
     assert meta_after["patterns"][pid]["calibration_epoch"] == 1
     assert "schema_hash" in meta_after["patterns"][pid]
-    assert (
-        sphere_path / "_gds_meta" / "calibration_history" / pid / "v=1.json"
-    ).exists()
+    assert (sphere_path / "_gds_meta" / "calibration_history" / pid / "v=1.json").exists()
 
 
 # ---------------------------------------------------------------------------
 # P13 — Welford sidecar isolation
 # ---------------------------------------------------------------------------
 
+
 def test_welford_sidecar_byte_identical_after_history_write(tiny_sphere_factory, tmp_path):
     """Writing a new history epoch must NOT touch _gds_meta/calibration/{pid}.json."""
+    import shutil
+    from datetime import datetime
+
+    import numpy as np
+
     from hypertopos.model.sphere import CalibrationFit
     from hypertopos.storage.calibration_history import write_calibration_history_epoch
-    import shutil
-    from datetime import datetime, timezone
-    import numpy as np
 
     sphere_path = tmp_path / "sphere"
     pid = tiny_sphere_factory(sphere_path)
@@ -539,8 +614,8 @@ def test_welford_sidecar_byte_identical_after_history_write(tiny_sphere_factory,
         group_stats=None,
         gmm_components=None,
         edge_max=None,
-        computed_at=datetime.now(timezone.utc),
-        last_calibrated_at=datetime.now(timezone.utc),
+        computed_at=datetime.now(UTC),
+        last_calibrated_at=datetime.now(UTC),
     )
     write_calibration_history_epoch(work, fit, last_k=5)
 
@@ -550,11 +625,13 @@ def test_welford_sidecar_byte_identical_after_history_write(tiny_sphere_factory,
 
 def test_welford_sidecar_byte_identical_after_gc(tiny_sphere_factory, tmp_path):
     """GC (trimming oldest history files) must NOT touch the Welford sidecar."""
+    import shutil
+    from datetime import datetime
+
+    import numpy as np
+
     from hypertopos.model.sphere import CalibrationFit
     from hypertopos.storage.calibration_history import write_calibration_history_epoch
-    import shutil
-    from datetime import datetime, timezone
-    import numpy as np
 
     sphere_path = tmp_path / "sphere"
     pid = tiny_sphere_factory(sphere_path)
@@ -568,22 +645,35 @@ def test_welford_sidecar_byte_identical_after_gc(tiny_sphere_factory, tmp_path):
 
     for n in range(2, 9):
         fit = CalibrationFit(
-            pattern_id=pid, calibration_epoch=n, schema_version=1, schema_hash="z" * 64,
-            mu=np.array([0.0], dtype=np.float32), sigma_diag=np.array([1.0], dtype=np.float32),
-            theta=np.array([3.0], dtype=np.float32), population_size=1,
-            dimension_weights=None, dimension_kinds=None, dim_percentiles=None,
-            group_stats=None, gmm_components=None, edge_max=None,
-            computed_at=datetime.now(timezone.utc), last_calibrated_at=datetime.now(timezone.utc),
+            pattern_id=pid,
+            calibration_epoch=n,
+            schema_version=1,
+            schema_hash="z" * 64,
+            mu=np.array([0.0], dtype=np.float32),
+            sigma_diag=np.array([1.0], dtype=np.float32),
+            theta=np.array([3.0], dtype=np.float32),
+            population_size=1,
+            dimension_weights=None,
+            dimension_kinds=None,
+            dim_percentiles=None,
+            group_stats=None,
+            gmm_components=None,
+            edge_max=None,
+            computed_at=datetime.now(UTC),
+            last_calibrated_at=datetime.now(UTC),
         )
         write_calibration_history_epoch(work, fit, last_k=5)
 
-    assert (work / "_gds_meta" / "calibration" / f"{pid}.json").read_bytes() == welford_baseline_bytes
+    assert (
+        work / "_gds_meta" / "calibration" / f"{pid}.json"
+    ).read_bytes() == welford_baseline_bytes
 
 
 def test_welford_sidecar_byte_identical_after_reset(tiny_sphere_factory, tmp_path):
     """reset_calibration_history must NOT touch the Welford sidecar."""
-    from hypertopos.storage.calibration_history import reset_calibration_history
     import shutil
+
+    from hypertopos.storage.calibration_history import reset_calibration_history
 
     sphere_path = tmp_path / "sphere"
     pid = tiny_sphere_factory(sphere_path)
@@ -597,17 +687,21 @@ def test_welford_sidecar_byte_identical_after_reset(tiny_sphere_factory, tmp_pat
 
     reset_calibration_history(work, pid)
 
-    assert (work / "_gds_meta" / "calibration" / f"{pid}.json").read_bytes() == welford_baseline_bytes
+    assert (
+        work / "_gds_meta" / "calibration" / f"{pid}.json"
+    ).read_bytes() == welford_baseline_bytes
 
 
 # ---------------------------------------------------------------------------
 # P14 — dim_percentiles + gmm_components round-trip on built sphere
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def tiny_sphere_with_percentiles_factory():
     """Builds a tiny sphere whose entity line has a float column, so the
     builder's _compute_dim_percentiles produces a non-empty dict."""
+
     def _build(sphere_path: Path) -> str:
         # _build_tiny_sphere always includes `amount` (float) on gl_entries.
         # _compute_dim_percentiles scans all float columns in the entity line
@@ -665,7 +759,7 @@ def tiny_sphere_with_gmm_factory():
                 {"doc": "D-005", "cust_id": "C-4", "cc_id": "CC-01", "amount": 250.0},
                 {"doc": "D-006", "cust_id": None, "cc_id": "CC-01", "amount": 50.0},
                 {"doc": "D-007", "cust_id": None, "cc_id": "CC-02", "amount": 75.0},
-                {"doc": "D-008", "cust_id": None, "cc_id": None,    "amount": 10.0},
+                {"doc": "D-008", "cust_id": None, "cc_id": None, "amount": 10.0},
             ],
             key_col="doc",
             source_id="test",
@@ -748,7 +842,8 @@ def test_sphere_overview_surfaces_theta_sensitivity_summary(tiny_sphere_factory,
         assert isinstance(ts["stable_band_length"], int)
         assert isinstance(ts["n_cliffs"], int)
         assert ts["theta_at_p95"] is None or isinstance(
-            ts["theta_at_p95"], float,
+            ts["theta_at_p95"],
+            float,
         )
     finally:
         session.close()
@@ -814,15 +909,15 @@ def test_theta_sensitivity_round_trip_on_built_sphere(tiny_sphere_factory, tmp_p
 
     reader = GDSReader(sphere_path)
     fit = reader.read_calibration_fit(pid)
-    assert fit.theta_sensitivity is not None, (
-        "Builder did not populate theta_sensitivity"
-    )
+    assert fit.theta_sensitivity is not None, "Builder did not populate theta_sensitivity"
     assert isinstance(fit.theta_sensitivity, dict)
     # Default percentile sweep p90..p99
     assert set(fit.theta_sensitivity.keys()) == {f"p{p}" for p in range(90, 100)}
     expected_fields = {
-        "theta_mean", "theta_std",
-        "anomaly_count_mean", "anomaly_count_std",
+        "theta_mean",
+        "theta_std",
+        "anomaly_count_mean",
+        "anomaly_count_std",
         "anomaly_rate",
     }
     for p_key, stats in fit.theta_sensitivity.items():
@@ -832,9 +927,7 @@ def test_theta_sensitivity_round_trip_on_built_sphere(tiny_sphere_factory, tmp_p
         assert fit.theta_sensitivity[f"p{p}"]["theta_std"] == 0.0
         assert fit.theta_sensitivity[f"p{p}"]["anomaly_count_std"] == 0.0
     # anomaly_count is monotonically non-increasing in percentile
-    counts = [
-        fit.theta_sensitivity[f"p{p}"]["anomaly_count_mean"] for p in range(90, 100)
-    ]
+    counts = [fit.theta_sensitivity[f"p{p}"]["anomaly_count_mean"] for p in range(90, 100)]
     for i in range(len(counts) - 1):
         assert counts[i] >= counts[i + 1]
 
@@ -868,45 +961,30 @@ def test_compare_calibrations_on_built_sphere(tiny_sphere_factory, tmp_path):
         session.close()
 
 
-def test_decompose_drift_on_built_sphere(tiny_sphere_factory, tmp_path):
-    """Build the same tiny sphere twice — drift between v=1 and v=2 should
-    be near-zero (same data, only theta bootstrap noise) and the report
-    fields should be sensible. Skipped if the tiny sphere has no temporal
-    history for the pattern (M3 requires anchor + temporal)."""
+def test_decompose_drift_on_built_sphere(tiny_anchor_sphere_factory, tmp_path):
+    """Build the same anchor sphere twice — drift between v=1 and v=2 should
+    be near-zero (same data) and the report fields should be sensible."""
     import json as _json
 
     from hypertopos.sphere import HyperSphere
     from hypertopos.storage.reader import GDSReader
 
     sphere_path = tmp_path / "sphere"
-    pid = tiny_sphere_factory(sphere_path)
-    pid_again = tiny_sphere_factory(sphere_path)
-    assert pid == pid_again
+    pid = tiny_anchor_sphere_factory(sphere_path)
+    assert tiny_anchor_sphere_factory(sphere_path) == pid
 
     reader = GDSReader(sphere_path)
-    sphere_obj_check = reader.read_sphere()
-    pattern = sphere_obj_check.patterns[pid]
-    if pattern.pattern_type != "anchor":
-        import pytest as _pt
-        _pt.skip(f"tiny_sphere_factory pattern is {pattern.pattern_type}; M3 requires anchor")
+    assert reader.read_sphere().patterns[pid].pattern_type == "anchor"
 
     sphere_obj = HyperSphere.open(str(sphere_path))
     session = sphere_obj.session(agent_id="m3_test")
     try:
         nav = session.navigator()
-        candidate_keys = ["C-1", "C-2", "C-3", "C-4", "C-5"]
-        chosen = None
-        for k in candidate_keys:
-            tbl = reader.read_temporal(pid, k, agent_id="m3_test")
-            if tbl.num_rows >= 2:
-                chosen = k
-                break
-        if chosen is None:
-            import pytest as _pt
-            _pt.skip(
-                "tiny_sphere_factory produced no entity with >= 2 temporal slices; "
-                "M3 cannot smoke-test"
-            )
+        chosen = next(
+            k
+            for k in (f"A-{i}" for i in range(1, 7))
+            if reader.read_temporal(pid, k, agent_id="m3_test").num_rows >= 2
+        )
 
         report = nav.decompose_drift(chosen, pid, top_n=5, verbose=True)
         assert report.v_from == 1
@@ -921,37 +999,33 @@ def test_decompose_drift_on_built_sphere(tiny_sphere_factory, tmp_path):
         session.close()
 
 
-def test_find_calibration_influencers_on_built_sphere(tiny_sphere_factory, tmp_path):
-    """Build the tiny sphere once, run find_calibration_influencers(classify='all'),
+def test_find_calibration_influencers_on_built_sphere(tiny_anchor_sphere_factory, tmp_path):
+    """Build the anchor sphere once, run find_calibration_influencers(classify='all'),
     verify cell_counts sum to N, classifications consistent with delta_norm
-    + total_impact ranking. Skipped if the tiny sphere has no anchor pattern
-    (M4 requires anchor — population statistics undefined for event)."""
+    + total_impact ranking."""
     from hypertopos.sphere import HyperSphere
-    from hypertopos.storage.reader import GDSReader
 
     sphere_path = tmp_path / "sphere"
-    pid = tiny_sphere_factory(sphere_path)
-
-    reader = GDSReader(sphere_path)
-    sphere_obj_check = reader.read_sphere()
-    pattern = sphere_obj_check.patterns[pid]
-    if pattern.pattern_type != "anchor":
-        import pytest as _pt
-        _pt.skip(f"tiny_sphere_factory pattern is {pattern.pattern_type}; M4 requires anchor")
+    pid = tiny_anchor_sphere_factory(sphere_path)
 
     sphere_obj = HyperSphere.open(str(sphere_path))
     session = sphere_obj.session(agent_id="m4_test")
     try:
         nav = session.navigator()
         report = nav.find_calibration_influencers(
-            pattern_id=pid, classify="all", top_n=5,
+            pattern_id=pid,
+            classify="all",
+            top_n=5,
         )
         assert report.population_size >= 2
         assert sum(report.cell_counts.values()) == report.population_size
         assert len(report.entries) <= 5
         for entry in report.entries:
             assert entry.classification in {
-                "hidden", "distorter", "standard_anomaly", "normal",
+                "hidden",
+                "distorter",
+                "standard_anomaly",
+                "normal",
             }
             assert entry.total_impact >= 0.0
             assert len(entry.top_dim_contributions) >= 1

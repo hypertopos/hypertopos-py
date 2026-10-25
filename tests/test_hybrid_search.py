@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 
 import pyarrow as pa
 import pytest
+
 from hypertopos.navigation.navigator import GDSNavigator
 
 

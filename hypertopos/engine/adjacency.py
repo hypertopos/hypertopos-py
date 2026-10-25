@@ -23,6 +23,7 @@ class _LazyEdgeMap:
     ``bool(map)``, and iteration — all without materializing the full
     edge list upfront.
     """
+
     __slots__ = ("_adj", "_kind")
 
     def __init__(self, adj: AdjacencyIndex, kind: str) -> None:
@@ -77,11 +78,38 @@ def temporal_bisect(
 ) -> list[tuple[Any, ...]]:
     """Bisect-based temporal filter on sorted edge lists."""
     from bisect import bisect_left, bisect_right
+
     if not edges:
         return []
     lo = bisect_left(edges, ts_from, key=lambda e: e[ts_index]) if ts_from is not None else 0
     hi = bisect_right(edges, ts_to, key=lambda e: e[ts_index]) if ts_to is not None else len(edges)
     return edges[lo:hi]
+
+
+def _order_lists(grouped: pa.Table) -> pa.Table:
+    """Sort every list column of ``grouped`` within each group by ``_row_list``,
+    then drop ``_row_list``."""
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    rows = grouped["_row_list"].combine_chunks()
+    order = pc.sort_indices(
+        pa.table({"g": pc.list_parent_indices(rows), "r": pc.list_flatten(rows)}),
+        sort_keys=[("g", "ascending"), ("r", "ascending")],
+    )
+    lengths = pc.list_value_length(rows).to_numpy(zero_copy_only=False)
+    offsets = pa.array(np.concatenate([[0], np.cumsum(lengths)]).astype(np.int32))
+    columns = {}
+    for name in grouped.column_names:
+        if name == "_row_list":
+            continue
+        col = grouped[name]
+        if name.endswith("_list"):
+            values = pc.list_flatten(col.combine_chunks()).take(order)
+            col = pa.ListArray.from_arrays(offsets, values)
+        columns[name] = col
+    return pa.table(columns)
 
 
 @dataclass
@@ -93,6 +121,7 @@ class AdjacencyIndex:
     are materialized lazily on first call to ``neighbors_out`` /
     ``neighbors_in`` and cached in-instance for the session.
     """
+
     _out_grouped: pa.Table = field(repr=False)
     _out_key_to_idx: dict[str, int] = field(repr=False)
     _in_grouped: pa.Table = field(repr=False)
@@ -105,6 +134,13 @@ class AdjacencyIndex:
     _out_distinct_count: dict[str, int] = field(default_factory=dict, repr=False)
     _in_distinct_count: dict[str, int] = field(default_factory=dict, repr=False)
     _out_max_amount_excl_self: dict[str, float] = field(default_factory=dict, repr=False)
+    _sorted_out_keys: list[str] | None = field(default=None, repr=False)
+
+    def sorted_out_keys(self) -> list[str]:
+        """Every key with outgoing edges, sorted; computed once per index."""
+        if self._sorted_out_keys is None:
+            self._sorted_out_keys = sorted(self._out_key_to_idx)
+        return self._sorted_out_keys
 
     @property
     def _out(self) -> _LazyEdgeMap:
@@ -126,18 +162,26 @@ class AdjacencyIndex:
         if not from_keys:
             return cls._empty()
         import pyarrow as pa
-        tbl = pa.table({
-            "from_key": from_keys,
-            "to_key": to_keys,
-            "timestamp": timestamps,
-            "amount": amounts,
-            "event_key": event_keys,
-        })
+
+        tbl = pa.table(
+            {
+                "from_key": from_keys,
+                "to_key": to_keys,
+                "timestamp": timestamps,
+                "amount": amounts,
+                "event_key": event_keys,
+            }
+        )
         return cls._from_table(tbl)
 
     @classmethod
     def from_lance(cls, reader: Any, pattern_id: str) -> AdjacencyIndex:
-        table = reader.read_edges(pattern_id)
+        return cls.from_table(reader.read_edges(pattern_id))
+
+    @classmethod
+    def from_table(cls, table: pa.Table) -> AdjacencyIndex:
+        """Index over an edge table (``from_key``, ``to_key``, ``timestamp``,
+        ``amount``, ``event_key``), built as ``from_lance`` builds it."""
         if table.num_rows == 0:
             return cls._empty()
         return cls._from_table(table)
@@ -145,20 +189,25 @@ class AdjacencyIndex:
     @classmethod
     def _empty(cls) -> AdjacencyIndex:
         import pyarrow as pa
-        empty_grouped = pa.table({
-            "from_key": pa.array([], type=pa.string()),
-            "to_key_list": pa.array([], type=pa.list_(pa.string())),
-            "timestamp_list": pa.array([], type=pa.list_(pa.float64())),
-            "amount_list": pa.array([], type=pa.list_(pa.float64())),
-            "event_key_list": pa.array([], type=pa.list_(pa.string())),
-        })
-        empty_in = pa.table({
-            "to_key": pa.array([], type=pa.string()),
-            "from_key_list": pa.array([], type=pa.list_(pa.string())),
-            "timestamp_list": pa.array([], type=pa.list_(pa.float64())),
-            "amount_list": pa.array([], type=pa.list_(pa.float64())),
-            "event_key_list": pa.array([], type=pa.list_(pa.string())),
-        })
+
+        empty_grouped = pa.table(
+            {
+                "from_key": pa.array([], type=pa.string()),
+                "to_key_list": pa.array([], type=pa.list_(pa.string())),
+                "timestamp_list": pa.array([], type=pa.list_(pa.float64())),
+                "amount_list": pa.array([], type=pa.list_(pa.float64())),
+                "event_key_list": pa.array([], type=pa.list_(pa.string())),
+            }
+        )
+        empty_in = pa.table(
+            {
+                "to_key": pa.array([], type=pa.string()),
+                "from_key_list": pa.array([], type=pa.list_(pa.string())),
+                "timestamp_list": pa.array([], type=pa.list_(pa.float64())),
+                "amount_list": pa.array([], type=pa.list_(pa.float64())),
+                "event_key_list": pa.array([], type=pa.list_(pa.string())),
+            }
+        )
         return cls(
             _out_grouped=empty_grouped,
             _out_key_to_idx={},
@@ -171,13 +220,15 @@ class AdjacencyIndex:
 
     @classmethod
     def _from_table(cls, tbl: pa.Table) -> AdjacencyIndex:
-        # Per-key list ordering = timestamp ascending. Achieved by sorting
-        # the whole table by timestamp first, then relying on pyarrow's
-        # `list` aggregator preserving input row order within each group
-        # (verified pyarrow 23; if a future version changes this, callers
-        # of neighbors_out / neighbors_in would silently see unsorted lists
-        # and temporal_bisect would return wrong slices).
+        # Per-key list ordering = timestamp ascending, ties in input row
+        # order. The table is sorted by timestamp (stable) and numbered, but
+        # the threaded `list` aggregator does not keep row order within a
+        # group, so each list is re-sorted by that row number afterwards.
+        import numpy as np
+        import pyarrow as pa
+
         sorted_tbl = tbl.sort_by("timestamp")
+        sorted_tbl = sorted_tbl.append_column("_row", pa.array(np.arange(sorted_tbl.num_rows)))
 
         # Two independent group_by aggregations on the same sorted_tbl —
         # parallelize via ThreadPoolExecutor. pyarrow's group_by releases the
@@ -189,20 +240,30 @@ class AdjacencyIndex:
         from concurrent.futures import ThreadPoolExecutor
 
         def _build_out_grouped() -> pa.Table:
-            return sorted_tbl.group_by("from_key").aggregate([
-                ("to_key", "list"),
-                ("timestamp", "list"),
-                ("amount", "list"),
-                ("event_key", "list"),
-            ])
+            return _order_lists(
+                sorted_tbl.group_by("from_key").aggregate(
+                    [
+                        ("to_key", "list"),
+                        ("timestamp", "list"),
+                        ("amount", "list"),
+                        ("event_key", "list"),
+                        ("_row", "list"),
+                    ]
+                )
+            )
 
         def _build_in_grouped() -> pa.Table:
-            return sorted_tbl.group_by("to_key").aggregate([
-                ("from_key", "list"),
-                ("timestamp", "list"),
-                ("amount", "list"),
-                ("event_key", "list"),
-            ])
+            return _order_lists(
+                sorted_tbl.group_by("to_key").aggregate(
+                    [
+                        ("from_key", "list"),
+                        ("timestamp", "list"),
+                        ("amount", "list"),
+                        ("event_key", "list"),
+                        ("_row", "list"),
+                    ]
+                )
+            )
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             future_out = executor.submit(_build_out_grouped)
@@ -218,9 +279,7 @@ class AdjacencyIndex:
         import pyarrow.compute as pc
 
         # Single all-pairs aggregate — includes self-loops (matches legacy pair_counts semantic)
-        all_pairs = sorted_tbl.group_by(["from_key", "to_key"]).aggregate(
-            [("event_key", "count")]
-        )
+        all_pairs = sorted_tbl.group_by(["from_key", "to_key"]).aggregate([("event_key", "count")])
         fk_list = all_pairs["from_key"].to_pylist()
         tk_list = all_pairs["to_key"].to_pylist()
         count_list = all_pairs["event_key_count"].to_pylist()
@@ -244,11 +303,13 @@ class AdjacencyIndex:
         max_amount_grouped = non_self_with_amount.group_by("from_key").aggregate(
             [("amount", "max")]
         )
-        out_max_amount_excl_self: dict[str, float] = dict(zip(
-            max_amount_grouped["from_key"].to_pylist(),
-            max_amount_grouped["amount_max"].to_pylist(),
-            strict=True,
-        ))
+        out_max_amount_excl_self: dict[str, float] = dict(
+            zip(
+                max_amount_grouped["from_key"].to_pylist(),
+                max_amount_grouped["amount_max"].to_pylist(),
+                strict=True,
+            )
+        )
 
         nodes: set[str] = set(out_keys) | set(in_keys)
         return cls(
@@ -339,13 +400,13 @@ class AdjacencyIndex:
         invalid = [c for c in columns if c not in valid]
         if invalid:
             raise ValueError(
-                f"neighbors_out_window: unknown columns {invalid}; "
-                f"valid: {sorted(valid)}",
+                f"neighbors_out_window: unknown columns {invalid}; valid: {sorted(valid)}",
             )
         idx = self._out_key_to_idx.get(key)
         if idx is None:
             return {col: [] for col in columns}
         import pyarrow.compute as pc
+
         ts_array = self._out_grouped["timestamp_list"][idx].values
         mask = pc.greater_equal(ts_array, ts_min) if ts_min is not None else None
         result: dict[str, list[Any]] = {}
@@ -378,13 +439,13 @@ class AdjacencyIndex:
         invalid = [c for c in columns if c not in valid]
         if invalid:
             raise ValueError(
-                f"neighbors_in_window: unknown columns {invalid}; "
-                f"valid: {sorted(valid)}",
+                f"neighbors_in_window: unknown columns {invalid}; valid: {sorted(valid)}",
             )
         idx = self._in_key_to_idx.get(key)
         if idx is None:
             return {col: [] for col in columns}
         import pyarrow.compute as pc
+
         ts_array = self._in_grouped["timestamp_list"][idx].values
         mask = pc.greater_equal(ts_array, ts_min) if ts_min is not None else None
         result: dict[str, list[Any]] = {}
@@ -437,6 +498,16 @@ class AdjacencyIndex:
             for tgt, ts, amt, ek in self._materialize_out(src):
                 yield src, tgt, ts, amt, ek
 
+    def all_edge_endpoints(self) -> tuple[pa.Array, pa.Array]:
+        """``(from_keys, to_keys)`` of every edge, in :meth:`all_edges` order, as Arrow."""
+        import pyarrow.compute as pc
+
+        to_lists = self._out_grouped["to_key_list"].combine_chunks()
+        from_keys = pc.take(
+            self._out_grouped["from_key"].combine_chunks(), pc.list_parent_indices(to_lists)
+        )
+        return from_keys, pc.list_flatten(to_lists)
+
     def node_count(self) -> int:
         return len(self._nodes)
 
@@ -456,6 +527,8 @@ class AdjacencyIndex:
 
     @staticmethod
     def _temporal_slice(
-        edges: list[EdgeTuple], ts_from: float | None, ts_to: float | None,
+        edges: list[EdgeTuple],
+        ts_from: float | None,
+        ts_to: float | None,
     ) -> list[EdgeTuple]:
         return temporal_bisect(edges, ts_from, ts_to, ts_index=1)

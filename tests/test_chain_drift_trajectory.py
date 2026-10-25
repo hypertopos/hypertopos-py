@@ -12,6 +12,7 @@ unknown-id gates. `engine.build_solid` is monkeypatched throughout so
 tests inject deterministic SolidSlice trajectories without exercising
 the temporal Lance reader.
 """
+
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
@@ -19,6 +20,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+
 from hypertopos import HyperSphere
 from hypertopos.model.objects import Polygon, Solid, SolidSlice
 
@@ -77,11 +79,13 @@ def _make_build_solid(trajectories: dict[str, list[float] | str]):
       - list[float] of delta_norms -> Solid with those slices in order
       - "missing" -> raises ValueError (member key not in geometry)
     """
+
     def fake(primary_key, pattern_id, manifest, filters=None, timestamp=None):
         traj = trajectories.get(primary_key)
         if traj is None or traj == "missing":
             raise ValueError(f"unknown entity {primary_key!r}")
         return _make_solid(primary_key, traj)
+
     return fake
 
 
@@ -253,13 +257,15 @@ def test_short_history_is_soft_skip(synthetic_nav, monkeypatch):
     """
     rising = [float(i) for i in range(8)]
     short = [1.0, 2.0]
-    fake = _make_build_solid({
-        "A1": rising,
-        "A2": short,
-        "B1": short,
-        "A3": rising,
-        "A4": short,
-    })
+    fake = _make_build_solid(
+        {
+            "A1": rising,
+            "A2": short,
+            "B1": short,
+            "A3": rising,
+            "A4": short,
+        }
+    )
     monkeypatch.setattr(synthetic_nav._engine, "build_solid", fake)
     out = synthetic_nav.chain_drift_trajectory(
         "CH-009",
@@ -280,18 +286,21 @@ def test_short_history_is_soft_skip(synthetic_nav, monkeypatch):
 
 
 def test_skipped_member_is_distinct_from_short_history(
-    synthetic_nav, monkeypatch,
+    synthetic_nav,
+    monkeypatch,
 ):
     """Member whose build_solid RAISES is counted as n_members_skipped, not
     n_members_short_history. Position gap still preserved.
     """
     rising = [float(i) for i in range(8)]
-    fake = _make_build_solid({
-        "A1": rising,
-        "A2": "missing",   # build_solid raises
-        "A3": rising,
-        "A4": rising,
-    })
+    fake = _make_build_solid(
+        {
+            "A1": rising,
+            "A2": "missing",  # build_solid raises
+            "A3": rising,
+            "A4": rising,
+        }
+    )
     monkeypatch.setattr(synthetic_nav._engine, "build_solid", fake)
     out = synthetic_nav.chain_drift_trajectory(
         "CH-001",
@@ -312,9 +321,14 @@ def test_all_members_short_raises(synthetic_nav, monkeypatch):
     triggers ValueError.
     """
     short = [1.0, 2.0]
-    fake = _make_build_solid({
-        "A1": short, "A2": short, "A3": short, "A4": short,
-    })
+    fake = _make_build_solid(
+        {
+            "A1": short,
+            "A2": short,
+            "A3": short,
+            "A4": short,
+        }
+    )
     monkeypatch.setattr(synthetic_nav._engine, "build_solid", fake)
     with pytest.raises(ValueError, match="n_members_with_history"):
         synthetic_nav.chain_drift_trajectory(
@@ -328,9 +342,14 @@ def test_all_members_short_raises(synthetic_nav, monkeypatch):
 def test_determinism(synthetic_nav, monkeypatch):
     """Same input twice — identical output ordering."""
     rising = [float(i) for i in range(8)]
-    fake = _make_build_solid({
-        "A1": rising, "A2": rising, "A3": rising, "A4": rising,
-    })
+    fake = _make_build_solid(
+        {
+            "A1": rising,
+            "A2": rising,
+            "A3": rising,
+            "A4": rising,
+        }
+    )
     monkeypatch.setattr(synthetic_nav._engine, "build_solid", fake)
     out1 = synthetic_nav.chain_drift_trajectory(
         "CH-001",
@@ -356,9 +375,12 @@ def test_nan_slice_sanitised_to_none(synthetic_nav, monkeypatch):
     """
     rising_with_nan = [0.0, 1.0, float("nan"), 3.0, 4.0, 5.0, 6.0, 7.0]
     rising = [float(i) for i in range(8)]
-    fake = _make_build_solid({
-        "A1": rising_with_nan, "A2": rising,
-    })
+    fake = _make_build_solid(
+        {
+            "A1": rising_with_nan,
+            "A2": rising,
+        }
+    )
     monkeypatch.setattr(synthetic_nav._engine, "build_solid", fake)
     out = synthetic_nav.chain_drift_trajectory(
         "CH-005",
@@ -382,8 +404,7 @@ def test_stride_sample_correctness(synthetic_nav, monkeypatch):
     slices [0,1], [2,3], [4,5], [6,7], tail slices [8,9] dropped.
     Verify exact per-window means.
     """
-    delta_norms = [10.0, 20.0,  30.0, 40.0,  50.0, 60.0,  70.0, 80.0,
-                   999.0, 999.0]  # tail dropped
+    delta_norms = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 999.0, 999.0]  # tail dropped
     fake = _make_build_solid({"A1": delta_norms, "A2": delta_norms})
     monkeypatch.setattr(synthetic_nav._engine, "build_solid", fake)
     out = synthetic_nav.chain_drift_trajectory(
@@ -435,7 +456,9 @@ def test_zero_theta_norm_labels_all_flat(synthetic_nav, monkeypatch):
         return sphere
 
     monkeypatch.setattr(
-        synthetic_nav._storage, "read_sphere", patched_read,
+        synthetic_nav._storage,
+        "read_sphere",
+        patched_read,
     )
     out = synthetic_nav.chain_drift_trajectory(
         "CH-005",
@@ -449,7 +472,8 @@ def test_zero_theta_norm_labels_all_flat(synthetic_nav, monkeypatch):
 
 
 def test_chain_drift_score_weighted_by_last_window(
-    synthetic_nav, monkeypatch,
+    synthetic_nav,
+    monkeypatch,
 ):
     """chain_drift_score = sum(|slope_i| * last_window_i) / sum(last_window_i).
     Engineer two members: one with large final delta_norm + steep slope,
@@ -470,13 +494,9 @@ def test_chain_drift_score_weighted_by_last_window(
         n_windows=4,
     )
     slopes = [e["slope"] for e in out["per_position_trajectory"]]
-    last_windows = [
-        e["delta_norms_over_time"][-1]
-        for e in out["per_position_trajectory"]
-    ]
-    weighted = (
-        sum(abs(s) * w for s, w in zip(slopes, last_windows, strict=True))
-        / sum(last_windows)
+    last_windows = [e["delta_norms_over_time"][-1] for e in out["per_position_trajectory"]]
+    weighted = sum(abs(s) * w for s, w in zip(slopes, last_windows, strict=True)) / sum(
+        last_windows
     )
     assert abs(out["chain_drift_score"] - weighted) < 1e-6
 
@@ -516,7 +536,9 @@ def test_non_anchor_chain_pattern_raises(synthetic_nav, monkeypatch):
         return sphere
 
     monkeypatch.setattr(
-        synthetic_nav._storage, "read_sphere", patched_read,
+        synthetic_nav._storage,
+        "read_sphere",
+        patched_read,
     )
     with pytest.raises(ValueError, match="anchor pattern"):
         synthetic_nav.chain_drift_trajectory(
@@ -527,7 +549,8 @@ def test_non_anchor_chain_pattern_raises(synthetic_nav, monkeypatch):
 
 
 def test_uniform_fallback_when_all_last_window_zero(
-    synthetic_nav, monkeypatch,
+    synthetic_nav,
+    monkeypatch,
 ):
     """When every member's final-window delta_norm is 0.0, the weighted-mean
     denominator collapses to zero and the score falls back to an unweighted

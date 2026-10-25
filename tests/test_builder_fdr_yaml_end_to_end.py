@@ -5,6 +5,7 @@
 """Tests for end-to-end YAML → builder wiring of fdr_hierarchy and
 fdr_temporal_hierarchy: schema pass-through, CLI build conversion, and
 the auto-discover event-pattern helper used by the builder."""
+
 from __future__ import annotations
 
 import json
@@ -12,6 +13,7 @@ from pathlib import Path
 
 import pyarrow as pa
 import pytest
+
 from hypertopos.builder.builder import (
     EdgeTableConfig,
     GDSBuilder,
@@ -127,12 +129,20 @@ def _make_builder_with_patterns(tmp_path: Path) -> GDSBuilder:
     """
     builder = GDSBuilder(sphere_id="t", output_path=str(tmp_path))
     builder.add_line(
-        "accounts", _empty_table(), key_col="primary_key", source_id="src1",
-        role="anchor", entity_type="account",
+        "accounts",
+        _empty_table(),
+        key_col="primary_key",
+        source_id="src1",
+        role="anchor",
+        entity_type="account",
     )
     builder.add_line(
-        "transactions", _empty_table(), key_col="primary_key", source_id="src1",
-        role="event", entity_type="tx",
+        "transactions",
+        _empty_table(),
+        key_col="primary_key",
+        source_id="src1",
+        role="event",
+        entity_type="tx",
     )
     return builder
 
@@ -151,12 +161,16 @@ class TestAutoDiscoverEventPattern:
             entity_line="transactions",
             relations=[
                 RelationSpec(
-                    line_id="accounts", fk_col="from_account",
-                    direction="in", required=True,
+                    line_id="accounts",
+                    fk_col="from_account",
+                    direction="in",
+                    required=True,
                 ),
                 RelationSpec(
-                    line_id="accounts", fk_col="to_account",
-                    direction="in", required=False,
+                    line_id="accounts",
+                    fk_col="to_account",
+                    direction="in",
+                    required=False,
                 ),
             ],
             edge_table=EdgeTableConfig(
@@ -172,7 +186,8 @@ class TestAutoDiscoverEventPattern:
             relations=[],
             fdr_temporal_hierarchy=[
                 FDRTemporalLevel(
-                    level="quarter", slice_dimension="temporal_bucket",
+                    level="quarter",
+                    slice_dimension="temporal_bucket",
                 ),
             ],
         )
@@ -190,7 +205,8 @@ class TestAutoDiscoverEventPattern:
             relations=[],
             fdr_temporal_hierarchy=[
                 FDRTemporalLevel(
-                    level="quarter", slice_dimension="temporal_bucket",
+                    level="quarter",
+                    slice_dimension="temporal_bucket",
                 ),
             ],
         )
@@ -201,9 +217,12 @@ class TestAutoDiscoverEventPattern:
     def test_multiple_candidates_raises(self, tmp_path: Path):
         b = _make_builder_with_patterns(tmp_path)
         b.add_line(
-            "transactions_2", _empty_table(),
-            key_col="primary_key", source_id="src1",
-            role="event", entity_type="tx",
+            "transactions_2",
+            _empty_table(),
+            key_col="primary_key",
+            source_id="src1",
+            role="event",
+            entity_type="tx",
         )
         b.add_pattern(
             "tx_pattern_a",
@@ -211,12 +230,15 @@ class TestAutoDiscoverEventPattern:
             entity_line="transactions",
             relations=[
                 RelationSpec(
-                    line_id="accounts", fk_col="from_account",
-                    direction="in", required=True,
+                    line_id="accounts",
+                    fk_col="from_account",
+                    direction="in",
+                    required=True,
                 ),
             ],
             edge_table=EdgeTableConfig(
-                from_col="from_account", to_col="to_account",
+                from_col="from_account",
+                to_col="to_account",
                 timestamp_col="timestamp",
             ),
         )
@@ -226,12 +248,15 @@ class TestAutoDiscoverEventPattern:
             entity_line="transactions_2",
             relations=[
                 RelationSpec(
-                    line_id="accounts", fk_col="from_account",
-                    direction="in", required=True,
+                    line_id="accounts",
+                    fk_col="from_account",
+                    direction="in",
+                    required=True,
                 ),
             ],
             edge_table=EdgeTableConfig(
-                from_col="from_account", to_col="to_account",
+                from_col="from_account",
+                to_col="to_account",
                 timestamp_col="timestamp",
             ),
         )
@@ -242,13 +267,15 @@ class TestAutoDiscoverEventPattern:
             relations=[],
             fdr_temporal_hierarchy=[
                 FDRTemporalLevel(
-                    level="quarter", slice_dimension="temporal_bucket",
+                    level="quarter",
+                    slice_dimension="temporal_bucket",
                 ),
             ],
         )
         anchor = b._patterns["account_pattern"]
         with pytest.raises(
-            ValueError, match="Multiple event patterns|ambiguous",
+            ValueError,
+            match="Multiple event patterns|ambiguous",
         ):
             _auto_discover_event_pattern_for_anchor(anchor, b._patterns)
 
@@ -263,8 +290,10 @@ class TestAutoDiscoverEventPattern:
             entity_line="transactions",
             relations=[
                 RelationSpec(
-                    line_id="accounts", fk_col="from_account",
-                    direction="in", required=True,
+                    line_id="accounts",
+                    fk_col="from_account",
+                    direction="in",
+                    required=True,
                 ),
             ],
             # No edge_table.
@@ -276,7 +305,8 @@ class TestAutoDiscoverEventPattern:
             relations=[],
             fdr_temporal_hierarchy=[
                 FDRTemporalLevel(
-                    level="quarter", slice_dimension="temporal_bucket",
+                    level="quarter",
+                    slice_dimension="temporal_bucket",
                 ),
             ],
         )
@@ -292,12 +322,15 @@ class TestAutoDiscoverEventPattern:
             entity_line="transactions",
             relations=[
                 RelationSpec(
-                    line_id="accounts", fk_col="from_account",
-                    direction="in", required=True,
+                    line_id="accounts",
+                    fk_col="from_account",
+                    direction="in",
+                    required=True,
                 ),
             ],
             edge_table=EdgeTableConfig(
-                from_col="from_account", to_col="to_account",
+                from_col="from_account",
+                to_col="to_account",
                 timestamp_col=None,
             ),
         )
@@ -308,7 +341,8 @@ class TestAutoDiscoverEventPattern:
             relations=[],
             fdr_temporal_hierarchy=[
                 FDRTemporalLevel(
-                    level="quarter", slice_dimension="temporal_bucket",
+                    level="quarter",
+                    slice_dimension="temporal_bucket",
                 ),
             ],
         )

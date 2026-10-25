@@ -9,6 +9,7 @@ import json
 import numpy as np
 import pyarrow as pa
 import pytest
+
 from hypertopos.builder.builder import GDSBuilder
 
 # ---------- Helpers ----------
@@ -34,10 +35,18 @@ def _build_accounts():
 def _make_builder(tmp_path, events=None, accounts=None):
     builder = GDSBuilder("test", str(tmp_path / "sphere"))
     builder.add_line(
-        "transactions", events or _build_basic_events(), key_col="primary_key", source_id="test", role="event"
+        "transactions",
+        events or _build_basic_events(),
+        key_col="primary_key",
+        source_id="test",
+        role="event",
     )
     builder.add_line(
-        "accounts", accounts or _build_accounts(), key_col="primary_key", source_id="test", role="anchor"
+        "accounts",
+        accounts or _build_accounts(),
+        key_col="primary_key",
+        source_id="test",
+        role="anchor",
     )
     return builder
 
@@ -221,7 +230,13 @@ class TestAddDerivedDimension:
     def test_missing_anchor_line_raises(self, tmp_path):
         """Referencing non-existent anchor line raises ValueError."""
         builder = GDSBuilder("test", str(tmp_path / "sphere"))
-        builder.add_line("transactions", _build_basic_events(), key_col="primary_key", source_id="test", role="event")
+        builder.add_line(
+            "transactions",
+            _build_basic_events(),
+            key_col="primary_key",
+            source_id="test",
+            role="event",
+        )
         builder.add_derived_dimension(
             "nonexistent",
             "transactions",
@@ -300,8 +315,12 @@ class TestTemporalWindow:
         )
         accounts = pa.table({"primary_key": ["A"]})
         builder = GDSBuilder("test", str(tmp_path / "sphere"))
-        builder.add_line("transactions", events, key_col="primary_key", source_id="test", role="event")
-        builder.add_line("accounts", accounts, key_col="primary_key", source_id="test", role="anchor")
+        builder.add_line(
+            "transactions", events, key_col="primary_key", source_id="test", role="event"
+        )
+        builder.add_line(
+            "accounts", accounts, key_col="primary_key", source_id="test", role="anchor"
+        )
         builder.add_derived_dimension(
             "accounts",
             "transactions",
@@ -344,8 +363,12 @@ class TestTemporalWindow:
         )
         accounts = pa.table({"primary_key": ["A"]})
         builder = GDSBuilder("test", str(tmp_path / "sphere"))
-        builder.add_line("transactions", events, key_col="primary_key", source_id="test", role="event")
-        builder.add_line("accounts", accounts, key_col="primary_key", source_id="test", role="anchor")
+        builder.add_line(
+            "transactions", events, key_col="primary_key", source_id="test", role="event"
+        )
+        builder.add_line(
+            "accounts", accounts, key_col="primary_key", source_id="test", role="anchor"
+        )
         builder.add_derived_dimension(
             "accounts",
             "transactions",
@@ -377,7 +400,9 @@ class TestAddCompositeLine:
             key_cols=["from_account", "to_account"],
         )
         builder.add_pattern(
-            "pair_pattern", "anchor", "account_pairs",
+            "pair_pattern",
+            "anchor",
+            "account_pairs",
             relations=[
                 RelationSpec(line_id="account_pairs", fk_col=None, direction="self"),
             ],
@@ -493,8 +518,12 @@ class TestAddGraphFeatures:
         )
         accounts = pa.table({"primary_key": ["A", "B", "C", "D"]})
         builder = GDSBuilder("test", str(tmp_path / "sphere"))
-        builder.add_line("transactions", events, key_col="primary_key", source_id="test", role="event")
-        builder.add_line("accounts", accounts, key_col="primary_key", source_id="test", role="anchor")
+        builder.add_line(
+            "transactions", events, key_col="primary_key", source_id="test", role="event"
+        )
+        builder.add_line(
+            "accounts", accounts, key_col="primary_key", source_id="test", role="anchor"
+        )
         builder.add_graph_features(
             "accounts",
             "transactions",
@@ -528,8 +557,12 @@ class TestAddGraphFeatures:
         )
         accounts = pa.table({"primary_key": ["A", "B", "C"]})
         builder = GDSBuilder("test", str(tmp_path / "sphere"))
-        builder.add_line("transactions", events, key_col="primary_key", source_id="test", role="event")
-        builder.add_line("accounts", accounts, key_col="primary_key", source_id="test", role="anchor")
+        builder.add_line(
+            "transactions", events, key_col="primary_key", source_id="test", role="event"
+        )
+        builder.add_line(
+            "accounts", accounts, key_col="primary_key", source_id="test", role="anchor"
+        )
         builder.add_graph_features(
             "accounts",
             "transactions",
@@ -585,8 +618,12 @@ class TestCounterpartOverlap:
         )
         accounts = pa.table({"primary_key": ["A", "B", "C"]})
         builder = GDSBuilder("test", str(tmp_path / "sphere"))
-        builder.add_line("transactions", events, key_col="primary_key", source_id="test", role="event")
-        builder.add_line("accounts", accounts, key_col="primary_key", source_id="test", role="anchor")
+        builder.add_line(
+            "transactions", events, key_col="primary_key", source_id="test", role="event"
+        )
+        builder.add_line(
+            "accounts", accounts, key_col="primary_key", source_id="test", role="anchor"
+        )
         builder.add_graph_features(
             "accounts",
             "transactions",
@@ -612,8 +649,12 @@ class TestCounterpartOverlap:
         )
         accounts = pa.table({"primary_key": ["A", "B", "C"]})
         builder = GDSBuilder("test", str(tmp_path / "sphere"))
-        builder.add_line("transactions", events, key_col="primary_key", source_id="test", role="event")
-        builder.add_line("accounts", accounts, key_col="primary_key", source_id="test", role="anchor")
+        builder.add_line(
+            "transactions", events, key_col="primary_key", source_id="test", role="event"
+        )
+        builder.add_line(
+            "accounts", accounts, key_col="primary_key", source_id="test", role="anchor"
+        )
         builder.add_graph_features(
             "accounts",
             "transactions",
@@ -639,8 +680,12 @@ class TestCounterpartOverlap:
         )
         accounts = pa.table({"primary_key": ["A", "B", "C", "D", "E"]})
         builder = GDSBuilder("test", str(tmp_path / "sphere"))
-        builder.add_line("transactions", events, key_col="primary_key", source_id="test", role="event")
-        builder.add_line("accounts", accounts, key_col="primary_key", source_id="test", role="anchor")
+        builder.add_line(
+            "transactions", events, key_col="primary_key", source_id="test", role="event"
+        )
+        builder.add_line(
+            "accounts", accounts, key_col="primary_key", source_id="test", role="anchor"
+        )
         builder.add_graph_features(
             "accounts",
             "transactions",
@@ -666,10 +711,17 @@ class TestCounterpartOverlap:
         )
         accounts = pa.table({"primary_key": ["A", "B"]})
         builder = GDSBuilder("test", str(tmp_path / "sphere"))
-        builder.add_line("transactions", events, key_col="primary_key", source_id="test", role="event")
-        builder.add_line("accounts", accounts, key_col="primary_key", source_id="test", role="anchor")
+        builder.add_line(
+            "transactions", events, key_col="primary_key", source_id="test", role="event"
+        )
+        builder.add_line(
+            "accounts", accounts, key_col="primary_key", source_id="test", role="anchor"
+        )
         builder.add_graph_features(
-            "accounts", "transactions", "from_account", "to_account",
+            "accounts",
+            "transactions",
+            "from_account",
+            "to_account",
         )
         builder.add_pattern("p", "anchor", "accounts", relations=[])
         builder.build()
@@ -811,8 +863,12 @@ class TestBuildTemporal:
         events = self._make_temporal_events(n_days)
         accounts = pa.table({"primary_key": ["A", "B", "C"]})
         builder = GDSBuilder("test", str(tmp_path / "sphere"))
-        builder.add_line("transactions", events, key_col="primary_key", source_id="test", role="event")
-        builder.add_line("accounts", accounts, key_col="primary_key", source_id="test", role="anchor")
+        builder.add_line(
+            "transactions", events, key_col="primary_key", source_id="test", role="event"
+        )
+        builder.add_line(
+            "accounts", accounts, key_col="primary_key", source_id="test", role="anchor"
+        )
         builder.add_derived_dimension(
             "accounts",
             "transactions",
@@ -879,8 +935,12 @@ class TestBuildTemporal:
         builder = GDSBuilder("test", str(tmp_path / "sphere"))
         events = self._make_temporal_events(3)
         accounts = pa.table({"primary_key": ["A", "B", "C"]})
-        builder.add_line("transactions", events, key_col="primary_key", source_id="test", role="event")
-        builder.add_line("accounts", accounts, key_col="primary_key", source_id="test", role="anchor")
+        builder.add_line(
+            "transactions", events, key_col="primary_key", source_id="test", role="event"
+        )
+        builder.add_line(
+            "accounts", accounts, key_col="primary_key", source_id="test", role="anchor"
+        )
         builder.add_derived_dimension(
             "accounts",
             "transactions",
@@ -993,8 +1053,12 @@ class TestChunkedGeometryWrite:
         )
 
         builder = GDSBuilder("test_chunked", str(tmp_path / "sphere"))
-        builder.add_line("transactions", events, key_col="primary_key", source_id="test", role="event")
-        builder.add_line("accounts", accounts, key_col="primary_key", source_id="test", role="anchor")
+        builder.add_line(
+            "transactions", events, key_col="primary_key", source_id="test", role="event"
+        )
+        builder.add_line(
+            "accounts", accounts, key_col="primary_key", source_id="test", role="anchor"
+        )
         builder.add_derived_dimension(
             "accounts",
             "transactions",
@@ -1263,13 +1327,15 @@ class TestPipelineBuild:
         accounts = ["A", "B", "C"]
         for day in range(1, n_days + 1):
             for _ in range(10):
-                rows.append({
-                    "primary_key": f"TX-{tx_id}",
-                    "from_account": accounts[tx_id % 3],
-                    "to_account": accounts[(tx_id + 1) % 3],
-                    "amount": (tx_id + 1) * 10,
-                    "timestamp": datetime(2024, 1, day),
-                })
+                rows.append(
+                    {
+                        "primary_key": f"TX-{tx_id}",
+                        "from_account": accounts[tx_id % 3],
+                        "to_account": accounts[(tx_id + 1) % 3],
+                        "amount": (tx_id + 1) * 10,
+                        "timestamp": datetime(2024, 1, day),
+                    }
+                )
                 tx_id += 1
         return pa.table({k: [r[k] for r in rows] for k in rows[0]})
 
@@ -1277,16 +1343,26 @@ class TestPipelineBuild:
         accounts = pa.table({"primary_key": ["A", "B", "C"]})
         builder = GDSBuilder("test", str(path))
         builder.add_line(
-            "transactions", events,
-            key_col="primary_key", source_id="test", role="event",
+            "transactions",
+            events,
+            key_col="primary_key",
+            source_id="test",
+            role="event",
         )
         builder.add_line(
-            "accounts", accounts,
-            key_col="primary_key", source_id="test", role="anchor",
+            "accounts",
+            accounts,
+            key_col="primary_key",
+            source_id="test",
+            role="anchor",
         )
         builder.add_derived_dimension(
-            "accounts", "transactions", "from_account",
-            "count", None, "tx_count",
+            "accounts",
+            "transactions",
+            "from_account",
+            "count",
+            None,
+            "tx_count",
         )
         builder.add_pattern("acct_pattern", "anchor", "accounts", relations=[])
         return builder
@@ -1306,10 +1382,14 @@ class TestPipelineBuild:
         # Pipeline: build(temporal_configs=...)
         pipe_path = tmp_path / "pipe"
         b_pipe = self._make_builder(pipe_path, events)
-        b_pipe.build(temporal_configs=[{
-            "time_col": "timestamp",
-            "time_window": "1d",
-        }])
+        b_pipe.build(
+            temporal_configs=[
+                {
+                    "time_col": "timestamp",
+                    "time_window": "1d",
+                }
+            ]
+        )
 
         # Compare geometry
         for suffix in [
@@ -1350,10 +1430,14 @@ class TestPipelineBuild:
         pipe_pat = pipe_sj["patterns"]["acct_pattern"]
         np.testing.assert_allclose(seq_pat["mu"], pipe_pat["mu"], atol=1e-6)
         np.testing.assert_allclose(
-            seq_pat["sigma_diag"], pipe_pat["sigma_diag"], atol=1e-6,
+            seq_pat["sigma_diag"],
+            pipe_pat["sigma_diag"],
+            atol=1e-6,
         )
         np.testing.assert_allclose(
-            seq_pat["theta"], pipe_pat["theta"], atol=1e-6,
+            seq_pat["theta"],
+            pipe_pat["theta"],
+            atol=1e-6,
         )
 
     def test_pipeline_build_without_temporal_configs(self, tmp_path):
@@ -1376,13 +1460,15 @@ class TestPipelineBuild:
         tx_id = 0
         for day in range(1, 6):
             for _ in range(10):
-                rows.append({
-                    "primary_key": f"TX-{tx_id}",
-                    "from_account": ["A", "B", "C"][tx_id % 3],
-                    "category": ["X", "Y"][tx_id % 2],
-                    "amount": (tx_id + 1) * 10,
-                    "timestamp": datetime(2024, 1, day),
-                })
+                rows.append(
+                    {
+                        "primary_key": f"TX-{tx_id}",
+                        "from_account": ["A", "B", "C"][tx_id % 3],
+                        "category": ["X", "Y"][tx_id % 2],
+                        "amount": (tx_id + 1) * 10,
+                        "timestamp": datetime(2024, 1, day),
+                    }
+                )
                 tx_id += 1
         events = pa.table({k: [r[k] for r in rows] for k in rows[0]})
         accounts = pa.table({"primary_key": ["A", "B", "C"]})
@@ -1390,20 +1476,34 @@ class TestPipelineBuild:
 
         path = tmp_path / "sphere"
         builder = GDSBuilder("test", str(path))
-        builder.add_line("transactions", events, key_col="primary_key", source_id="test", role="event")
-        builder.add_line("accounts", accounts, key_col="primary_key", source_id="test", role="anchor")
-        builder.add_line("categories", categories, key_col="primary_key", source_id="test", role="anchor")
-        builder.add_derived_dimension("accounts", "transactions", "from_account", "count", None, "tx_count")
-        builder.add_derived_dimension("categories", "transactions", "category", "count", None, "cat_count")
+        builder.add_line(
+            "transactions", events, key_col="primary_key", source_id="test", role="event"
+        )
+        builder.add_line(
+            "accounts", accounts, key_col="primary_key", source_id="test", role="anchor"
+        )
+        builder.add_line(
+            "categories", categories, key_col="primary_key", source_id="test", role="anchor"
+        )
+        builder.add_derived_dimension(
+            "accounts", "transactions", "from_account", "count", None, "tx_count"
+        )
+        builder.add_derived_dimension(
+            "categories", "transactions", "category", "count", None, "cat_count"
+        )
         builder.add_pattern("acct_pattern", "anchor", "accounts", relations=[])
         builder.add_pattern("cat_pattern", "anchor", "categories", relations=[])
 
-        builder.build(temporal_configs=[{
-            "time_col": "timestamp",
-            "time_window": "1d",
-            "event_line": "transactions",
-            "anchor_pattern": "acct_pattern",
-        }])
+        builder.build(
+            temporal_configs=[
+                {
+                    "time_col": "timestamp",
+                    "time_window": "1d",
+                    "event_line": "transactions",
+                    "anchor_pattern": "acct_pattern",
+                }
+            ]
+        )
 
         # Geometry for both patterns
         assert (path / "geometry/acct_pattern/data.lance").exists()
@@ -1420,3 +1520,118 @@ class TestPipelineBuild:
         # Sphere.json has both patterns
         sj = json.loads((path / "_gds_meta/sphere.json").read_text())
         assert len(sj["patterns"]) == 2
+
+
+def test_string_time_column_is_parsed_once_for_all_time_dims(tmp_path, monkeypatch):
+    """Burst and inter-event-time dims on one string timestamp column share one parse."""
+    from datetime import datetime, timedelta
+
+    import hypertopos.builder.derived as derived_mod
+    import hypertopos.utils.time as time_mod
+    from hypertopos.builder.derived import compute_derived_dimension
+
+    base = datetime(2024, 1, 1)
+    events = pa.table(
+        {
+            "primary_key": [f"TX-{i}" for i in range(12)],
+            "from_account": ["A", "B"] * 6,
+            "to_account": ["B", "A"] * 6,
+            "timestamp": [(base + timedelta(hours=7 * i * i)).isoformat() for i in range(12)],
+        }
+    )
+    accounts = pa.table({"primary_key": ["A", "B", "C"]})
+    specs = [
+        ("count", "burst", {"time_window": "7d", "window_aggregation": "max"}),
+        ("iet_mean", "gap_mean", {}),
+        ("iet_std", "gap_std", {}),
+    ]
+    expected = {
+        name: compute_derived_dimension(
+            events,
+            accounts["primary_key"],
+            "from_account",
+            metric,
+            None,
+            "auto",
+            99.0,
+            time_col="timestamp",
+            **kw,
+        )[0].tolist()
+        for metric, name, kw in specs
+    }
+
+    string_parses = []
+    real = time_mod.to_epoch_seconds
+
+    def counting(values, **kwargs):
+        if pa.types.is_string(values.type):
+            string_parses.append(1)
+        return real(values, **kwargs)
+
+    monkeypatch.setattr(time_mod, "to_epoch_seconds", counting)
+    monkeypatch.setattr(derived_mod, "to_epoch_seconds", counting)
+
+    builder = GDSBuilder("test", str(tmp_path / "sphere"))
+    builder.add_line("transactions", events, key_col="primary_key", source_id="t", role="event")
+    builder.add_line("accounts", accounts, key_col="primary_key", source_id="t", role="anchor")
+    for metric, name, kw in specs:
+        builder.add_derived_dimension(
+            "accounts",
+            "transactions",
+            "from_account",
+            metric,
+            None,
+            name,
+            time_col="timestamp",
+            **kw,
+        )
+    builder.add_pattern("p", "anchor", "accounts", relations=[])
+    builder._resolve_derived()
+
+    table = builder._lines["accounts"].table
+    for _metric, name, _kw in specs:
+        assert table[name].to_pylist() == expected[name]
+    assert len(string_parses) == 1
+
+
+@pytest.mark.parametrize("agg", ["mean", "std", "min"])
+def test_iet_aggregates_match_a_per_entity_reference(agg):
+    """Inter-event-time aggregates against a per-entity numpy reference."""
+    import random
+
+    import numpy as np
+
+    from hypertopos.builder.derived import compute_derived_dimension
+
+    rng = random.Random(17)
+    anchors = [f"A{i}" for i in range(200)] + ["NO-EVENTS"]
+    keys, ts = [], []
+    for i, a in enumerate(anchors[:-1]):
+        n = rng.randrange(1, 9)
+        base = float(rng.randrange(10**9, 2 * 10**9))
+        for _ in range(n):
+            keys.append(a)
+            ts.append(
+                base if i % 5 == 0 else base + rng.randrange(0, 50_000)
+            )  # constant groups too
+    keys += ["NOT-AN-ANCHOR"] * 3
+    ts += [1.0, 5.0, 9.0]
+    order = list(range(len(keys)))
+    rng.shuffle(order)
+    events = pa.table({"fk": [keys[i] for i in order], "t": [ts[i] for i in order]})
+
+    by_key: dict[str, list[float]] = {}
+    for k, t in zip(events["fk"].to_pylist(), events["t"].to_pylist(), strict=True):
+        by_key.setdefault(k, []).append(t)
+    expected = []
+    for a in anchors:
+        d = np.diff(np.sort(np.asarray(by_key.get(a, []))))
+        expected.append(0.0 if len(d) == 0 else float(getattr(d, agg)()))
+
+    values, _ = compute_derived_dimension(
+        events, pa.array(anchors), "fk", f"iet_{agg}", None, "auto", 99.0, time_col="t"
+    )
+    np.testing.assert_allclose(values, expected, rtol=1e-12, atol=1e-9)
+    if agg == "std":
+        constant = [i for i in range(len(anchors) - 1) if i % 5 == 0]
+        assert (values[constant] == 0.0).all()

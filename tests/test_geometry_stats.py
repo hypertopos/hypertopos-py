@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 import pytest
+
 from hypertopos.storage.reader import GDSReader
 from hypertopos.storage.writer import GDSWriter
 
@@ -146,7 +147,7 @@ class TestWriteLanceGeometryAutoStats:
         Callers who know theta_norm must call write_geometry_stats explicitly."""
         writer = GDSWriter(str(tmp_path))
         reader = GDSReader(str(tmp_path))
-        geo_dir = tmp_path / "geometry" / "pat" 
+        geo_dir = tmp_path / "geometry" / "pat"
         table = self._make_geo_table(10)
 
         writer.write_lance_geometry(table, geo_dir)
@@ -220,9 +221,11 @@ class TestAnomalySummaryUsesCache:
         # total_anomalies is recounted from stored delta_norm (not from stats
         # cache) — verify it matches a live count from geometry.
         geo = reader.read_geometry("customer_pattern", 1, columns=["delta_norm"])
-        theta_norm = float(np.linalg.norm(
-            np.array(reader.read_sphere().patterns["customer_pattern"].theta, dtype=np.float32),
-        ))
+        theta_norm = float(
+            np.linalg.norm(
+                np.array(reader.read_sphere().patterns["customer_pattern"].theta, dtype=np.float32),
+            )
+        )
         expected = int((geo["delta_norm"].to_numpy().astype(np.float64) >= theta_norm).sum())
         assert summary["total_anomalies"] == expected
         assert (
@@ -340,6 +343,7 @@ def test_write_geometry_stats_theta_zero_reports_zero_anomalies(tmp_path: Path) 
     import json
 
     import numpy as np
+
     from hypertopos.storage.writer import GDSWriter
 
     writer = GDSWriter(tmp_path)

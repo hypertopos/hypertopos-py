@@ -14,12 +14,26 @@ SIGMA_EPS: float = 1e-2  # minimum sigma — matches engine/geometry.py SIGMA_EP
 SIGMA_EPS_PROP: float = 0.2  # minimum sigma for binary prop_columns — caps deltas at ±5
 
 
+def validate_mahalanobis_weights(pattern_id: str, weights: list[float]) -> None:
+    """Reject non-positive explicit ``dimension_weights`` on a Mahalanobis pattern.
+
+    Whitened coordinates mix every earlier dimension, so a weight of 0 erases
+    information that later coordinates depend on and the pattern's deltas can
+    no longer be mapped back to shapes; a negative weight flips the metric.
+    """
+    bad = [i for i, w in enumerate(weights) if not w > 0.0]
+    if bad:
+        raise ValueError(
+            f"Pattern '{pattern_id}': dimension_weights must all be > 0 when "
+            f"use_mahalanobis is set; non-positive weight(s) at index {bad}"
+        )
+
+
 def compute_stats(
     shape_vectors: np.ndarray,
     anomaly_percentile: float = 95.0,
     use_mahalanobis: bool = False,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
-           np.ndarray | None]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
     """
     Auto-compute pattern statistics from a population of shape vectors.
 
@@ -48,7 +62,7 @@ def compute_stats(
     if use_mahalanobis and D > 1:
         # Full covariance with Tikhonov regularization
         cov = np.cov(shape_vectors.T).astype(np.float64)
-        cov += (SIGMA_EPS ** 2) * np.eye(D)
+        cov += (SIGMA_EPS**2) * np.eye(D)
         try:
             L = np.linalg.cholesky(cov)
             centered = (shape_vectors - mu).astype(np.float64)
@@ -56,14 +70,12 @@ def compute_stats(
             L_inv = np.linalg.inv(L).astype(np.float32)
             cholesky_inv = L_inv
         except np.linalg.LinAlgError:
-            logger.warning(
-                "Cholesky decomposition failed — falling back to diagonal sigma"
-            )
+            logger.warning("Cholesky decomposition failed — falling back to diagonal sigma")
             deltas = ((shape_vectors - mu) / sigma).astype(np.float32)
     else:
         deltas = ((shape_vectors - mu) / sigma).astype(np.float32)
 
-    delta_norms = np.sqrt(np.einsum('ij,ij->i', deltas, deltas)).astype(np.float32)
+    delta_norms = np.sqrt(np.einsum("ij,ij->i", deltas, deltas)).astype(np.float32)
 
     # Target scalar radius: p-th percentile of delta_norms
     theta_scalar = float(np.percentile(delta_norms, anomaly_percentile))
@@ -80,16 +92,33 @@ def compute_stats(
             "Anomaly rate %.1f%% exceeds %.1f\u00d7 expected %.1f%% \u2014 "
             "discrete delta_norm distribution (unique values: %d). "
             "Consider increasing population diversity or adjusting anomaly_percentile.",
-            actual_rate * 100, actual_rate / expected_rate, expected_rate * 100,
+            actual_rate * 100,
+            actual_rate / expected_rate,
+            expected_rate * 100,
             len(np.unique(delta_norms)),
         )
 
     return mu, sigma, theta, deltas, delta_norms, cholesky_inv
 
 
+def population_left_ranks(values: np.ndarray) -> np.ndarray:
+    """Number of population values strictly below each value.
+
+    Same result as ``np.searchsorted(np.sort(values), values, side="left")``,
+    but the binary searches run over sorted keys, which keeps them
+    cache-friendly; with millions of unsorted keys the direct form is several
+    times slower.
+    """
+    order = np.argsort(values, kind="stable")
+    ordered = values[order]
+    ranks = np.empty(len(values), dtype=np.intp)
+    ranks[order] = np.searchsorted(ordered, ordered, side="left")
+    return ranks
+
+
 def compute_conformal_p(
     delta_norms: np.ndarray,
-    sorted_norms: np.ndarray | None = None,
+    left_ranks: np.ndarray | None = None,
 ) -> np.ndarray:
     """Compute conformal p-values from delta norms.
 
@@ -98,18 +127,16 @@ def compute_conformal_p(
 
     Args:
         delta_norms: Per-entity delta norms.
-        sorted_norms: Pre-sorted delta_norms. If provided, skips the internal
-            sort — allows callers that already hold a sorted copy to avoid
-            duplicate work.
+        left_ranks: ``population_left_ranks(delta_norms)``, when the caller
+            already holds it (it also yields ``delta_rank_pct``).
     """
     n = len(delta_norms)
     if n == 0:
         return np.array([], dtype=np.float32)
-    if sorted_norms is None:
-        sorted_norms = np.sort(delta_norms)
+    if left_ranks is None:
+        left_ranks = population_left_ranks(delta_norms)
     # Number of entities with norm >= this entity's norm
-    right_ranks = n - np.searchsorted(sorted_norms, delta_norms, side="left")
-    return (right_ranks / n).astype(np.float32)
+    return ((n - left_ranks) / n).astype(np.float32)
 
 
 def compute_stats_grouped(
@@ -149,32 +176,36 @@ def compute_stats_grouped(
             sigma_g = np.full(D, SIGMA_EPS, dtype=np.float32)
             if prop_dim_start is not None:
                 sigma_g[prop_dim_start:] = np.maximum(
-                    sigma_g[prop_dim_start:], SIGMA_EPS_PROP,
+                    sigma_g[prop_dim_start:],
+                    SIGMA_EPS_PROP,
                 )
             theta_g = np.zeros(D, dtype=np.float32)
             deltas[mask] = ((group_shape - mu_g) / sigma_g).astype(np.float32)
             _masked = deltas[mask]
             delta_norms[mask] = np.sqrt(
-                np.einsum('ij,ij->i', _masked, _masked),
+                np.einsum("ij,ij->i", _masked, _masked),
             ).astype(np.float32)
             group_results[gid_str] = (mu_g, sigma_g, theta_g, int(mask.sum()))
             continue
 
         mu_g, sigma_g, theta_g, group_deltas, group_norms, _ = compute_stats(
-            group_shape, anomaly_percentile,
+            group_shape,
+            anomaly_percentile,
         )
 
         if prop_dim_start is not None:
             sigma_g[prop_dim_start:] = np.maximum(
-                sigma_g[prop_dim_start:], SIGMA_EPS_PROP,
+                sigma_g[prop_dim_start:],
+                SIGMA_EPS_PROP,
             )
             group_deltas = ((group_shape - mu_g) / sigma_g).astype(np.float32)
             group_norms = np.sqrt(
-                np.einsum('ij,ij->i', group_deltas, group_deltas),
+                np.einsum("ij,ij->i", group_deltas, group_deltas),
             ).astype(np.float32)
             g_theta_scalar = (
                 float(np.percentile(group_norms, anomaly_percentile))
-                if len(group_norms) > 1 else 0.0
+                if len(group_norms) > 1
+                else 0.0
             )
             g_comp = g_theta_scalar / np.sqrt(D) if D > 0 else 0.0
             theta_g = np.full(D, g_comp, dtype=np.float32)
@@ -213,8 +244,8 @@ def compute_dimension_weights(
         sigma = np.maximum(raw_sigma, SIGMA_EPS)
         z = (shape_vectors - shape_vectors.mean(axis=0)) / sigma
         z[:, low_var] = 0.0  # prevent inf from near-zero sigma
-        kurt = (z ** 4).mean(axis=0) - 3.0
-        weights = np.maximum(1.0, (kurt + 3.0) / 3.0).astype(np.float32)
+        kurt = (z**4).mean(axis=0) - 3.0
+        weights: np.ndarray = np.maximum(1.0, (kurt + 3.0) / 3.0).astype(np.float32)
         # Near-constant dims have no informative signal — reset to 1.0
         weights[low_var] = 1.0
         return weights
@@ -222,20 +253,36 @@ def compute_dimension_weights(
     raise ValueError(f"Unknown weight method: {method!r}")
 
 
-def compute_per_dim_anomaly_count(
+def per_dim_anomaly_thresholds(
     deltas: np.ndarray,
     percentile: float = 99.0,
 ) -> np.ndarray:
+    """Per-dimension p-th percentile of ``|deltas[:, d]|`` — shape (D,)."""
+    thresholds: np.ndarray = np.percentile(np.abs(deltas), percentile, axis=0)
+    return thresholds
+
+
+def compute_per_dim_anomaly_count(
+    deltas: np.ndarray,
+    percentile: float = 99.0,
+    thresholds: np.ndarray | None = None,
+) -> np.ndarray:
     """Count dimensions where |delta[d]| exceeds the p-th percentile of |deltas[:, d]|.
+
+    ``thresholds`` (D,) replaces the percentile computed from ``deltas`` —
+    used to score new entities against the thresholds of the population
+    the pattern was built on.
 
     Returns (N,) int32 — number of anomalous dimensions per entity.
     Entity with count >= 3 has multi-dimensional anomaly signal even if global
     delta_norm is below theta.
     """
     abs_deltas = np.abs(deltas)
-    thresholds = np.percentile(abs_deltas, percentile, axis=0)  # (D,)
+    if thresholds is None:
+        thresholds = np.percentile(abs_deltas, percentile, axis=0)
     exceeds = (abs_deltas > thresholds).astype(np.int32)
-    return exceeds.sum(axis=1).astype(np.int32)
+    counts: np.ndarray = exceeds.sum(axis=1).astype(np.int32)
+    return counts
 
 
 def fit_kmeans_components(
@@ -258,10 +305,9 @@ def fit_kmeans_components(
     centers = np.zeros((n_components, D), dtype=np.float32)
     centers[0] = shape_vectors[rng.integers(n)]
     for k in range(1, n_components):
-        dists = np.min([
-            np.sum((shape_vectors - centers[j]) ** 2, axis=1)
-            for j in range(k)
-        ], axis=0)
+        dists = np.min(
+            [np.sum((shape_vectors - centers[j]) ** 2, axis=1) for j in range(k)], axis=0
+        )
         probs = dists / dists.sum()
         centers[k] = shape_vectors[rng.choice(n, p=probs)]
 
@@ -269,10 +315,9 @@ def fit_kmeans_components(
     assignments = np.zeros(n, dtype=np.int32)
     for _ in range(max_iter):
         # Assign to nearest center
-        dists = np.stack([
-            np.sum((shape_vectors - centers[k]) ** 2, axis=1)
-            for k in range(n_components)
-        ], axis=1)
+        dists = np.stack(
+            [np.sum((shape_vectors - centers[k]) ** 2, axis=1) for k in range(n_components)], axis=1
+        )
         new_assignments = dists.argmin(axis=1).astype(np.int32)
         if np.array_equal(new_assignments, assignments):
             break
@@ -299,7 +344,8 @@ def fit_kmeans_components(
             continue
 
         mu_k, sigma_k, theta_k, _, _, _ = compute_stats(
-            cluster_shapes, anomaly_percentile,
+            cluster_shapes,
+            anomaly_percentile,
         )
         components.append((mu_k, sigma_k, theta_k, pop))
 
@@ -334,7 +380,7 @@ def welford_batch_update(
     new_n = n_total + m
     delta = batch_mean - running_mean
     running_mean = running_mean + delta * m / new_n
-    running_m2 = running_m2 + batch_m2 + delta ** 2 * n_total * m / new_n
+    running_m2 = running_m2 + batch_m2 + delta**2 * n_total * m / new_n
     return running_mean, running_m2, new_n
 
 

@@ -52,7 +52,9 @@ def _prepare_trips() -> pa.Table:
     )
 
     # Filter: fare > 0, distance > 0
-    raw = raw.filter(pc.and_(pc.greater(raw["fare_amount"], 0), pc.greater(raw["trip_distance"], 0)))
+    raw = raw.filter(
+        pc.and_(pc.greater(raw["fare_amount"], 0), pc.greater(raw["trip_distance"], 0))
+    )
 
     # Compute duration in minutes
     pickup_us = pc.cast(raw["tpep_pickup_datetime"], pa.int64())
@@ -62,7 +64,9 @@ def _prepare_trips() -> pa.Table:
 
     # Filter: duration > 0 and <= 300 min
     raw = raw.filter(
-        pc.and_(pc.greater(raw["trip_duration_min"], 0), pc.less_equal(raw["trip_duration_min"], 300))
+        pc.and_(
+            pc.greater(raw["trip_duration_min"], 0), pc.less_equal(raw["trip_duration_min"], 300)
+        )
     )
 
     # Speed mph (capped at 100)
@@ -84,10 +88,12 @@ def _prepare_trips() -> pa.Table:
     _ts_min = pa.scalar(1546300800000000, pa.int64())  # 2019-01-01 00:00 UTC in us
     _ts_max = pa.scalar(1548979200000000, pa.int64())  # 2019-02-01 00:00 UTC in us
     _pickup_int = pc.cast(_pickup_ts, pa.int64())
-    raw = raw.filter(pc.and_(
-        pc.greater_equal(_pickup_int, _ts_min),
-        pc.less(_pickup_int, _ts_max),
-    ))
+    raw = raw.filter(
+        pc.and_(
+            pc.greater_equal(_pickup_int, _ts_min),
+            pc.less(_pickup_int, _ts_max),
+        )
+    )
 
     # Cast to timestamp without tz (Windows tzdata workaround)
     pickup_no_tz = raw["tpep_pickup_datetime"].cast(pa.timestamp("us"))
@@ -118,45 +124,54 @@ def _prepare_trips() -> pa.Table:
 
 def _prepare_zones() -> pa.Table:
     import csv
+
     rows = []
     with open(SRC / "taxi_zone_lookup.csv") as f:
         for r in csv.DictReader(f):
-            rows.append({
-                "primary_key": r["LocationID"],
-                "borough": r["Borough"],
-                "zone_name": r["Zone"],
-                "service_zone": r["service_zone"],
-            })
+            rows.append(
+                {
+                    "primary_key": r["LocationID"],
+                    "borough": r["Borough"],
+                    "zone_name": r["Zone"],
+                    "service_zone": r["service_zone"],
+                }
+            )
     return pa.Table.from_pylist(rows)
 
 
 def _prepare_vendors() -> pa.Table:
-    return pa.Table.from_pylist([
-        {"primary_key": "1", "name": "Creative Mobile Technologies"},
-        {"primary_key": "2", "name": "VeriFone Inc"},
-    ])
+    return pa.Table.from_pylist(
+        [
+            {"primary_key": "1", "name": "Creative Mobile Technologies"},
+            {"primary_key": "2", "name": "VeriFone Inc"},
+        ]
+    )
 
 
 def _prepare_rate_codes() -> pa.Table:
-    return pa.Table.from_pylist([
-        {"primary_key": "1", "name": "Standard rate"},
-        {"primary_key": "2", "name": "JFK"},
-        {"primary_key": "3", "name": "Newark"},
-        {"primary_key": "4", "name": "Nassau/Westchester"},
-        {"primary_key": "5", "name": "Negotiated fare"},
-        {"primary_key": "6", "name": "Group ride"},
-    ])
+    return pa.Table.from_pylist(
+        [
+            {"primary_key": "1", "name": "Standard rate"},
+            {"primary_key": "2", "name": "JFK"},
+            {"primary_key": "3", "name": "Newark"},
+            {"primary_key": "4", "name": "Nassau/Westchester"},
+            {"primary_key": "5", "name": "Negotiated fare"},
+            {"primary_key": "6", "name": "Group ride"},
+        ]
+    )
 
 
 def _prepare_payment_types() -> pa.Table:
-    return pa.Table.from_pylist([
-        {"primary_key": "1", "name": "Credit card"},
-        {"primary_key": "2", "name": "Cash"},
-        {"primary_key": "3", "name": "No charge"},
-        {"primary_key": "4", "name": "Dispute"},
-        {"primary_key": "5", "name": "Unknown"},
-        {"primary_key": "6", "name": "Voided trip"},
-    ])
+    return pa.Table.from_pylist(
+        [
+            {"primary_key": "1", "name": "Credit card"},
+            {"primary_key": "2", "name": "Cash"},
+            {"primary_key": "3", "name": "No charge"},
+            {"primary_key": "4", "name": "Dispute"},
+            {"primary_key": "5", "name": "Unknown"},
+            {"primary_key": "6", "name": "Voided trip"},
+        ]
+    )
 
 
 def main():
@@ -203,7 +218,7 @@ def main():
     fast = pc.sum(pc.greater(speed, 80.0)).as_py()
     expensive = pc.sum(pc.greater(fare, 200.0)).as_py()
     short = pc.sum(pc.less(dur, 1.0)).as_py()
-    print(f"\nAnomaly candidates:")
+    print("\nAnomaly candidates:")
     print(f"  Speed > 80 mph: {fast:,}")
     print(f"  Fare > $200: {expensive:,}")
     print(f"  Duration < 1 min: {short:,}")

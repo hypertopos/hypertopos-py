@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
+
 from hypertopos.engine.forecast import (
     AnomalyForecast,
     ForecastProvider,

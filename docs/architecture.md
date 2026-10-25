@@ -30,12 +30,12 @@ The core package is split into a few layers:
 - **Builder**: transforms source data into a complete sphere
 - **CLI**: builds and inspects spheres from the command line
 
-The `hypertopos-mcp` package sits on top of this core library and exposes the same capabilities to agents via 80 MCP tools.
+The `hypertopos-mcp` package sits on top of this core library and exposes the same capabilities to agents as MCP tools, over stdio or streamable HTTP.
 
 The split is deliberate:
 
-- the **model** defines the vocabulary of the system, including Manifest/Contract for MVCC version pinning
-- **storage** owns physical reads and writes, scoped by manifest version
+- the **model** defines the vocabulary of the system, including the Manifest/Contract pair that records which line and pattern versions a session reads
+- **storage** owns physical reads and writes on Lance datasets; every read goes through the session's snapshot pins, and sphere branches live here
 - the **engine** computes derived geometry and analysis, with CalibrationTracker for online drift monitoring
 - **navigation** orchestrates stateful movement through that geometry
 - **PassiveScanner** runs batch screening across multiple geometric sources without manual primitive chaining
@@ -54,6 +54,9 @@ A sphere is stored as a directory tree. The exact storage rules are defined by t
 - edges store entity-to-entity relationships (Lance, BTREE indexed) for graph traversal and chain discovery
 - temporal data stores shape history
 - auxiliary caches store precomputed summaries
+- branch metadata (`_gds_meta/branches/<name>/`) records each sphere branch: its provenance, its copy of the metadata files and its recipe log
+
+Every dataset is a Lance dataset. Lance versions every commit, which is what makes snapshot sessions and copy-free branches possible: a session pins versions instead of copying data, and a branch is a set of Lance references and recorded versions instead of a second copy of the sphere.
 
 The important point is that the system is designed for on-demand loading. The session does not read every file at startup.
 
@@ -113,12 +116,12 @@ For a denser top-down view, this stack is a useful shorthand:
 
 ```text
 ┌─────────────────────────────────────┐
-│  MCP Server (hypertopos-mcp)        │  101 tools, smart detection mode
+│  MCP Server (hypertopos-mcp)        │  stdio / HTTP, smart detection mode
 ├─────────────────────────────────────┤
 │  PassiveScanner                     │  multi-source batch screening
 ├─────────────────────────────────────┤
 │  Navigation (navigator.py)          │  π1–π12 primitives + edge table graph traversal
-│                                     │  (find_geometric_path, discover_chains, entity_flow,
+│                                     │  (find_geometric_path, extract_chains, entity_flow,
 │                                     │   contagion_score, propagate_influence, cluster_bridges, ...)
 ├─────────────────────────────────────┤
 │  Engine (geometry.py)               │  delta vectors, metrics, scoring, clustering
@@ -126,7 +129,8 @@ For a denser top-down view, this stack is a useful shorthand:
 ├─────────────────────────────────────┤
 │  Storage (reader.py, writer.py)     │  Lance storage (points, geometry, edges, temporal),
 │                                     │  PyArrow transport, partition filtering, BTREE edge indexes
-│  Manifest / Contract                │  MVCC version pinning (incl. edge table snapshots)
+│  Snapshot pins, sphere branches     │  per-session Lance version pins + metadata;
+│                                     │  copy-free branches with a recipe log
 ├─────────────────────────────────────┤
 │  Model (sphere.py, objects.py)      │  Point, Edge, Polygon, Solid, Pattern, Alias
 ├─────────────────────────────────────┤
@@ -152,9 +156,9 @@ flowchart LR
     Manifest --> Contract
 ```
 
-Manifest pins a specific version of every line, pattern, and alias. Contract declares the
-structural guarantees of that version snapshot. Together they provide MVCC isolation: multiple
-agents can hold different manifests and see consistent, non-interfering views of the same sphere.
+A session's Manifest records the line and pattern versions of the snapshot it reads; its
+Contract lists the patterns that snapshot offers. The snapshot itself — which Lance version of
+each dataset the session reads — is held by the session's reader (see [MVCC Model](#mvcc-model)).
 
 ```mermaid
 flowchart TB
@@ -175,17 +179,37 @@ graph LR
     ST --> E["Engine\ngeometry, delta,\nclustering, DTW"]
     E --> N["Navigator\nπ1–π12, detect_*"]
     N --> PS["PassiveScanner\nmulti-source\nbatch screening"]
-    N --> MCP["MCP Server\n101 tools\nstdio transport"]
+    N --> MCP["MCP Server\nstdio / HTTP transport"]
     MCP --> Agent["AI Agent"]
     CT["CalibrationTracker\nonline drift\nWelford stats"] -.-> E
-    M["Manifest\nMVCC version pin"] -.-> ST
+    M["Snapshot pin\nper session"] -.-> ST
+    BR["Sphere branches\ncopy-free what-if"] -.-> ST
 ```
 
 ## MVCC Model
 
-Multiple agents can open sessions against the same sphere concurrently. Each session is pinned
-to a manifest version at open time. The builder may append new versions in the background, but
-existing sessions continue to see their pinned snapshot until they explicitly refresh.
+Multiple agents can open sessions against the same sphere concurrently. A session reads one
+consistent snapshot of the sphere — the state current when it opened — while ingests and
+recalibrations from other processes commit new Lance versions underneath it.
+
+**What is pinned.** `HyperSphere.session(agent_id)` gives the session its own reader and pins,
+in one step, the latest Lance version of the geometry, temporal and edge datasets and of the
+derived sidecar datasets (trajectory index, temporal centroids, contagion stats, edge
+features, population forecasts), together with the sphere metadata files under `_gds_meta`
+(`sphere.json`: pattern statistics, line version lists). The versions are read before and
+after the metadata; when a writer commits in between, the snapshot is retaken. Every Lance
+read in the storage layer goes through one resolver that applies the pin — scans, the Lance
+SQL pushdowns that large patterns use for anomaly search and aggregation, vector-neighbour
+search, entity-key lookups and temporal history. Points are versioned by directory, and the
+session's manifest records which line version it reads.
+
+**Who repins.** Nothing moves a session automatically. `HyperSession.is_stale()` returns a
+`SnapshotStatus` (`pinned_at`, `stale`, `metadata_changed`, `pinned_versions`,
+`latest_versions`) that reports whether a newer state exists, a rebuilt sidecar included;
+`HyperSession.refresh()` drops everything read under the old snapshot and pins the latest
+state. A session sees its own `recalibrate` immediately. In the MCP server,
+`get_session_stats` carries a `snapshot` block and `open_sphere(path)` reopens on the latest
+state.
 
 ```mermaid
 sequenceDiagram
@@ -193,18 +217,50 @@ sequenceDiagram
     participant A2 as Agent B
     participant S as Sphere
 
-    A1->>S: session("agent-a") @ v3
-    A2->>S: session("agent-b") @ v3
-    Note over S: Builder appends v4
+    A1->>S: session("agent-a") pins v3
+    Note over S: an ingest commits v4
+    A2->>S: session("agent-b") pins v4
     A1->>S: read geometry (sees v3)
-    A2->>S: read geometry (sees v3)
-    Note over A1,S: v3 snapshot — consistent for both agents
+    A2->>S: read geometry (sees v4)
+    A1->>S: is_stale() → stale, then refresh() pins v4
 ```
 
-This isolation is provided by the Manifest/Contract pair. The manifest records which version
-of each line, pattern, and alias the session should use. The contract declares the structural
-guarantees of that version. Storage reads are filtered through the manifest, so concurrent
-sessions never interfere with each other or with an ongoing build.
+![Sessions and branches](images/sessions-and-branches.svg)
+
+*Sessions never change under you; branches never touch main.*
+
+## Sphere Branches
+
+A sphere branch is a copy-free what-if workspace: a recalibration without suspected
+influencers, or a trial ingest, runs on the branch while main stays as it is. Writes on a
+branch never touch main; the default ref is `main`.
+
+**Layout.** `HyperSphere.create_branch(name)` copies no data file:
+
+- the datasets a branch write can rewrite — geometry and temporal centroids — get a native
+  Lance branch named after the sphere branch, created from their latest version;
+- every other dataset (points, temporal, edges, trajectory, other sidecars) is pinned at the
+  version current when the branch was created;
+- `_gds_meta/branches/<name>/` holds a copy of every metadata file and `branch.json` —
+  provenance, the pinned versions and the recipe log.
+
+A full build is the only writer of the pinned datasets, so a build into the sphere directory
+(`hypertopos build`, `GDSBuilder.build()`) is refused while the sphere has branches.
+
+**Lifecycle.** A branch is read with `HyperSphere.open(path, branch=name)` or
+`HyperSphere.session(agent_id, branch=name)`; those sessions are pinned like any other.
+`HyperSession.recalibrate(pattern_id, branch=name, exclude_keys=[...])` writes the new fit on
+the branch (creating it when absent) and appends a recipe to its log;
+`GDSBuilder.incremental_update(..., branch=name)` ingests into the branch only.
+`GDSNavigator.compare_branches(pattern_id, branch)` returns a `BranchDiffReport` — anomaly
+counts on both sides, `flipped_in` / `flipped_out`, `jaccard`, `top_movers` and the
+calibration drift between the two fits. `HyperSphere.promote_branch(name)` replays the
+branch's recipes on main, then deletes the branch; it is refused unless main is still at the
+state the branch was created from and every branch commit has a recipe, and each replayed
+recalibration must reproduce the branch's fit exactly. `HyperSphere.delete_branch(name)`
+discards it. Delete and promote are refused while a session in the same process reads the
+branch. The CLI exposes the same operations as `hypertopos sphere branch
+{list,create,delete,promote}` and `hypertopos sphere ingest --branch`.
 
 ## PassiveScanner
 
@@ -246,13 +302,15 @@ This is where expensive work should happen. The runtime session should mostly re
 
 In practice, the builder is the place where the package turns raw source data into a reusable geometric asset. If something can be computed once and reused many times, it belongs here rather than in the navigation path.
 
+After the first build, later batches arrive through `GDSBuilder.incremental_update` (CLI `hypertopos sphere ingest`), and `HyperSession.recalibrate` refits a pattern's population statistics on the stored shapes. Both commit new Lance versions; open sessions keep reading their snapshot. A rebuild and a recalibration each record a calibration epoch, so the calibration tools can compare the fit before and after either one.
+
 ## Session and Navigation
 
-A session is the agent's working context: open a sphere → create a session (MVCC-pinned) → navigate → close.
+A session is the agent's working context: open a sphere → create a session (pinned to a snapshot of main or of a branch) → navigate → refresh when the agent chooses → close.
 
 Sessions are stateful. The agent starts with a position and moves from there — jump to an entity, walk a line, inspect a polygon, dive into temporal history, compare populations. Primitives compose: some move the position, some inspect it, some expand it into a population-level view.
 
-Opening a session is lightweight (no rebuild). Navigation reuses existing geometry. The session is the working memory of the investigation flow.
+Opening a session is lightweight (no rebuild, no data copied): it pins versions and reads a few metadata files. Navigators created from a session share its reader, so they read the same snapshot and follow it on `refresh()`. The session is the working memory of the investigation flow.
 
 ## Engine Responsibilities
 
@@ -281,10 +339,16 @@ The MCP package is a transport and tool layer.
 
 It does not define the core GDS model. Instead, it:
 
-- opens and closes spheres
-- exposes 67 navigation and analysis tools
-- formats results as JSON
+- opens and closes spheres, on main or on a branch (`open_sphere(path, branch=...)`), holding one `HyperSession` per client session
+- exposes the navigation, analysis and branch operations as tools (`manage_branch`, `compare_branches`, `recalibrate(..., branch=..., exclude_keys=...)`)
+- formats results as JSON in a compact response format: labelled `{dim: value}` maps, one `properties` table per entity list, and an `omitted` map naming what was left out and how to get it (`open_sphere(response_format="full")` turns it off)
 - manages session state for an agentic client
+
+The server runs over stdio for one local agent, or over streamable HTTP
+(`python -m hypertopos_mcp.main --transport http`, with `--port`, `--session-idle-timeout` and
+`--max-sessions`). Over HTTP each client session — identified by the `Mcp-Session-Id` the server assigns —
+keeps its own open sphere, tool phases and call statistics,
+and calls from different sessions run concurrently.
 
 The MCP layer should stay thinner than the core library. Most behavior belongs in `hypertopos`, not in the transport wrapper.
 

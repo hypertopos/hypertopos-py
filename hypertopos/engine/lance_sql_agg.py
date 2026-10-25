@@ -18,11 +18,16 @@ returns a small post-aggregate result.
 
 from __future__ import annotations
 
+import math
 import re
+from typing import Any
 
-import lance as _lance
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
+
+from hypertopos.storage._lance_branches import Pin
+from hypertopos.storage._lance_session import open_dataset
 
 _AGG_OP_MAP = {
     "sum": "sum",
@@ -30,6 +35,70 @@ _AGG_OP_MAP = {
     "min": "min",
     "max": "max",
 }
+
+
+def group_aggregate(table: pa.Table, keys: list[str], value_col: str, op: str) -> pa.Table:
+    """``table.group_by(keys).aggregate([(value_col, op), (value_col, "count")])``
+    whose float ``sum`` / ``mean`` do not depend on row order.
+
+    The joins that feed the metric aggregates return rows in a different order
+    on every call, and a float sum in a different order differs in its last
+    digits. For a floating ``value_col`` a ``sum`` / ``mean`` is computed as
+    the correctly rounded exact sum of each group (``math.fsum``), so the
+    result depends only on the values in the group. Every other op or type
+    goes to Arrow unchanged. Output columns and null handling match Arrow.
+    """
+    if op not in ("sum", "mean") or not pa.types.is_floating(table.schema.field(value_col).type):
+        return table.group_by(keys).aggregate([(value_col, op), (value_col, "count")])
+
+    encoded = [
+        pc.dictionary_encode(table[key], null_encoding="encode").combine_chunks() for key in keys
+    ]
+    key_columns: dict[str, Any]
+    if len(keys) == 1:
+        # Dictionary indices already number the groups 0..G-1.
+        group_of_row = encoded[0].indices.to_numpy().astype(np.int64)
+        n_groups = len(encoded[0].dictionary)
+        key_columns = {keys[0]: encoded[0].dictionary}
+    else:
+        codes = np.zeros(table.num_rows, dtype=np.int64)
+        for enc in encoded:
+            codes = codes * len(enc.dictionary) + enc.indices.to_numpy().astype(np.int64)
+        _, first_row, group_of_row = np.unique(codes, return_index=True, return_inverse=True)
+        n_groups = len(first_row)
+        take = pa.array(first_row, type=pa.int64())
+        key_columns = {key: table[key].take(take) for key in keys}
+
+    values = table[value_col].combine_chunks()
+    is_valid = pc.is_valid(values)
+    group_of_value = group_of_row[is_valid.to_numpy(zero_copy_only=False)]
+    present = values.filter(is_valid).to_numpy(zero_copy_only=False).astype(np.float64)
+    # Narrow ints let numpy's stable sort use radix sort.
+    narrow = np.uint16 if n_groups <= np.iinfo(np.uint16).max else np.uint32
+    order = np.argsort(group_of_value.astype(narrow), kind="stable")
+    present_sorted = present[order]
+    counts = np.bincount(group_of_value, minlength=n_groups)
+    bounds = np.concatenate(([0], np.cumsum(counts)))
+
+    results: list[float | None] = []
+    for g in range(n_groups):
+        if counts[g] == 0:
+            results.append(None)
+            continue
+        group_values = present_sorted[bounds[g] : bounds[g + 1]]
+        try:
+            total = math.fsum(group_values)
+        except (OverflowError, ValueError):
+            # The exact sum is not finite (overflow, or inf + -inf): sum the
+            # sorted values so the inf / nan outcome is still order-independent.
+            with np.errstate(over="ignore", invalid="ignore"):
+                total = float(np.sort(group_values).sum())
+        results.append(total if op == "sum" else total / int(counts[g]))
+
+    columns = dict(key_columns)
+    columns[f"{value_col}_{op}"] = pa.array(results, type=pa.float64())
+    columns[f"{value_col}_count"] = pa.array(counts, type=pa.int64())
+    return pa.table(columns)
 
 
 # A column or line identifier that is safe to inline into a Lance SQL query
@@ -61,19 +130,14 @@ def _escape_sql_string(value: str) -> str:
     of silently producing wrong results or executing injected SQL.
     """
     if not isinstance(value, str):
-        raise TypeError(
-            f"_escape_sql_string: expected str, got {type(value).__name__}"
-        )
+        raise TypeError(f"_escape_sql_string: expected str, got {type(value).__name__}")
     if "\\" in value:
-        raise ValueError(
-            f"_escape_sql_string: backslash not allowed in key: {value!r}"
-        )
+        raise ValueError(f"_escape_sql_string: backslash not allowed in key: {value!r}")
     for ch in value:
         cp = ord(ch)
-        if cp < 0x20 or cp == 0x7f:
+        if cp < 0x20 or cp == 0x7F:
             raise ValueError(
-                f"_escape_sql_string: control character U+{cp:04X} not allowed "
-                f"in key: {value!r}"
+                f"_escape_sql_string: control character U+{cp:04X} not allowed in key: {value!r}"
             )
     return value.replace("'", "''")
 
@@ -90,9 +154,7 @@ def _validate_sql_identifier(value: str) -> str:
     loudly instead of being passed through to the SQL parser.
     """
     if not isinstance(value, str):
-        raise TypeError(
-            f"_validate_sql_identifier: expected str, got {type(value).__name__}"
-        )
+        raise TypeError(f"_validate_sql_identifier: expected str, got {type(value).__name__}")
     if not _SQL_IDENT_RE.match(value):
         raise ValueError(
             f"_validate_sql_identifier: {value!r} is not a safe SQL identifier "
@@ -113,10 +175,25 @@ def _line_positions(pattern: object, line_id: str) -> list[int]:
     return positions
 
 
+def _open_geometry(geo_lance_path: str, lance_version: Pin | None) -> Any:
+    """Open the geometry dataset at the session-pinned Lance version, if any."""
+    ds = open_dataset(geo_lance_path)
+    if lance_version is not None and lance_version != ds.latest_version:
+        ds = ds.checkout_version(lance_version)
+    return ds
+
+
+def _open_points(points_lance_path: str) -> Any:
+    """Open an event / property line's points dataset (versioned by directory)."""
+    return open_dataset(points_lance_path)
+
+
 def aggregate_count(
     geo_lance_path: str,
     pattern: object,
     group_by_line: str,
+    *,
+    lance_version: Pin | None = None,
 ) -> dict[str, int]:
     """COUNT(*) GROUP BY group_by_line via Lance SQL on entity_keys.
 
@@ -146,7 +223,7 @@ def aggregate_count(
     if not positions:
         return {}
 
-    ds = _lance.dataset(geo_lance_path)
+    ds = _open_geometry(geo_lance_path, lance_version)
     union_parts = " UNION ALL ".join(
         f"SELECT entity_keys[{p}] AS k FROM dataset" for p in positions
     )
@@ -159,7 +236,7 @@ def aggregate_count(
     return _batches_to_int_dict(ds.sql(sql).build().to_batch_records())
 
 
-def _batches_to_int_dict(batches: list) -> dict[str, int]:
+def _batches_to_int_dict(batches: list[pa.RecordBatch]) -> dict[str, int]:
     """Collapse a list of (group_key, value) record batches into a dict."""
     result: dict[str, int] = {}
     for batch in batches:
@@ -177,6 +254,8 @@ def _read_geo_edge_pairs(
     geo_lance_path: str,
     pattern: object,
     group_by_line: str,
+    *,
+    lance_version: Pin | None = None,
 ) -> pa.Table:
     """Stream (event_polygon_pk, group_key) pairs from the event geometry.
 
@@ -188,21 +267,24 @@ def _read_geo_edge_pairs(
     """
     positions = _line_positions(pattern, group_by_line)
     if not positions:
-        return pa.table({
-            "primary_key": pa.array([], type=pa.string()),
-            "k": pa.array([], type=pa.string()),
-        })
-    ds = _lance.dataset(geo_lance_path)
+        return pa.table(
+            {
+                "primary_key": pa.array([], type=pa.string()),
+                "k": pa.array([], type=pa.string()),
+            }
+        )
+    ds = _open_geometry(geo_lance_path, lance_version)
     union_parts = " UNION ALL ".join(
-        f"SELECT primary_key, entity_keys[{p}] AS k FROM dataset"
-        for p in positions
+        f"SELECT primary_key, entity_keys[{p}] AS k FROM dataset" for p in positions
     )
     batches = ds.sql(union_parts).build().to_batch_records()
     if not batches:
-        return pa.table({
-            "primary_key": pa.array([], type=pa.string()),
-            "k": pa.array([], type=pa.string()),
-        })
+        return pa.table(
+            {
+                "primary_key": pa.array([], type=pa.string()),
+                "k": pa.array([], type=pa.string()),
+            }
+        )
     return pa.Table.from_batches(batches)
 
 
@@ -220,17 +302,21 @@ def _read_metric_pairs(
     inlines ``metric_col`` into a SQL string.
     """
     metric_col = _validate_sql_identifier(metric_col)
-    ds = _lance.dataset(ctx_lance_path)
+    ds = _open_points(ctx_lance_path)
     batches = ds.scanner(columns=["primary_key", metric_col]).to_table()
     if batches.num_rows == 0:
-        return pa.table({
-            "primary_key": pa.array([], type=pa.string()),
-            metric_col: pa.array([], type=pa.float64()),
-        })
-    return pa.table({
-        "primary_key": batches["primary_key"],
-        metric_col: pc.cast(batches[metric_col], pa.float64()),
-    })
+        return pa.table(
+            {
+                "primary_key": pa.array([], type=pa.string()),
+                metric_col: pa.array([], type=pa.float64()),
+            }
+        )
+    return pa.table(
+        {
+            "primary_key": batches["primary_key"],
+            metric_col: pc.cast(batches[metric_col], pa.float64()),
+        }
+    )
 
 
 def _build_filter_predicates(
@@ -253,18 +339,14 @@ def _build_filter_predicates(
     for line, key_set in resolved_filters:
         if not key_set:
             return ["1=0"]
-        keys_in = ", ".join(
-            f"'{_escape_sql_string(k)}'" for k in sorted(key_set)
-        )
+        keys_in = ", ".join(f"'{_escape_sql_string(k)}'" for k in sorted(key_set))
         if line == event_line_id:
             predicates.append(f"primary_key IN ({keys_in})")
             continue
         positions = _line_positions(pattern, line)
         if not positions:
             return ["1=0"]
-        per_pos = " OR ".join(
-            f"entity_keys[{p}] IN ({keys_in})" for p in positions
-        )
+        per_pos = " OR ".join(f"entity_keys[{p}] IN ({keys_in})" for p in positions)
         predicates.append(f"({per_pos})")
     return predicates
 
@@ -275,32 +357,39 @@ def _read_filtered_geo_edge_pairs(
     group_by_line: str,
     resolved_filters: list[tuple[str, set[str]]],
     event_line_id: str,
+    *,
+    lance_version: Pin | None = None,
 ) -> pa.Table:
     """Same as :func:`_read_geo_edge_pairs` but pre-filters polygons by
     ``resolved_filters`` directly inside the Lance SQL ``WHERE`` clause.
     """
     positions = _line_positions(pattern, group_by_line)
     if not positions:
-        return pa.table({
-            "primary_key": pa.array([], type=pa.string()),
-            "k": pa.array([], type=pa.string()),
-        })
+        return pa.table(
+            {
+                "primary_key": pa.array([], type=pa.string()),
+                "k": pa.array([], type=pa.string()),
+            }
+        )
     predicates = _build_filter_predicates(
-        pattern, resolved_filters, event_line_id,
+        pattern,
+        resolved_filters,
+        event_line_id,
     )
     where = " AND ".join(predicates) if predicates else None
     where_clause = f" WHERE {where}" if where else ""
     union_parts = " UNION ALL ".join(
-        f"SELECT primary_key, entity_keys[{p}] AS k FROM dataset{where_clause}"
-        for p in positions
+        f"SELECT primary_key, entity_keys[{p}] AS k FROM dataset{where_clause}" for p in positions
     )
-    ds = _lance.dataset(geo_lance_path)
+    ds = _open_geometry(geo_lance_path, lance_version)
     batches = ds.sql(union_parts).build().to_batch_records()
     if not batches:
-        return pa.table({
-            "primary_key": pa.array([], type=pa.string()),
-            "k": pa.array([], type=pa.string()),
-        })
+        return pa.table(
+            {
+                "primary_key": pa.array([], type=pa.string()),
+                "k": pa.array([], type=pa.string()),
+            }
+        )
     return pa.Table.from_batches(batches)
 
 
@@ -309,9 +398,9 @@ def find_anomalies(
     threshold: float,
     top_n: int,
     offset: int = 0,
-    lance_version: int | None = None,
+    lance_version: Pin | None = None,
     min_confidence: float = 0.0,
-) -> dict:
+) -> dict[str, Any]:
     """Top-N polygons by ``delta_norm`` above ``threshold`` via Lance SQL.
 
     Returns ``{"keys": list[str], "delta_norms": list[float], "total_found": int}``,
@@ -326,6 +415,7 @@ def find_anomalies(
     min_confidence`` are included.
     """
     import math
+
     if not math.isfinite(threshold):
         raise ValueError(f"find_anomalies: threshold must be finite, got {threshold}")
     if top_n < 1:
@@ -333,9 +423,7 @@ def find_anomalies(
     if offset < 0:
         raise ValueError(f"find_anomalies: offset must be >= 0, got {offset}")
 
-    ds = _lance.dataset(geo_lance_path)
-    if lance_version is not None and lance_version != ds.latest_version:
-        ds = ds.checkout_version(lance_version)
+    ds = _open_geometry(geo_lance_path, lance_version)
 
     base_filter = f"delta_norm >= {threshold}"
     if min_confidence > 0.0:
@@ -380,6 +468,8 @@ def aggregate_percentile(
     group_by_line: str,
     metric_col: str,
     percentile: float,
+    *,
+    lance_version: Pin | None = None,
 ) -> tuple[dict[str, float], dict[str, int]]:
     """Per-group percentile of ``metric_col`` GROUP BY group_by_line.
 
@@ -393,12 +483,12 @@ def aggregate_percentile(
     fallback that aggregation.py keeps for the small-table case.
     """
     if not (0.0 <= percentile <= 1.0):
-        raise ValueError(
-            f"aggregate_percentile: percentile must be in [0, 1], got {percentile}"
-        )
+        raise ValueError(f"aggregate_percentile: percentile must be in [0, 1], got {percentile}")
     metric_col = _validate_sql_identifier(metric_col)
 
-    geo_pairs = _read_geo_edge_pairs(geo_lance_path, pattern, group_by_line)
+    geo_pairs = _read_geo_edge_pairs(
+        geo_lance_path, pattern, group_by_line, lance_version=lance_version
+    )
     if geo_pairs.num_rows == 0:
         return {}, {}
 
@@ -407,7 +497,9 @@ def aggregate_percentile(
         return {}, {}
 
     joined = geo_pairs.join(
-        metric_pairs, keys="primary_key", join_type="inner",
+        metric_pairs,
+        keys="primary_key",
+        join_type="inner",
     )
     valid = pc.and_(pc.is_valid(joined[metric_col]), pc.is_valid(joined["k"]))
     filtered = joined.filter(valid)
@@ -419,15 +511,18 @@ def aggregate_percentile(
     # already happened in pyarrow, so writing the small joined table is
     # cheap and the percentile computation streams from disk.
     import tempfile
+
     with tempfile.TemporaryDirectory() as td:
         tmp_path = f"{td}/joined.lance"
-        from hypertopos.storage.writer import _LANCE_WRITE_DEFAULTS
-        _lance.write_dataset(
+        from hypertopos.storage.writer import _write_lance
+
+        # Use the handle write_dataset returns: the throwaway dataset stays out
+        # of the shared read session's caches.
+        tmp_ds = _write_lance(
             filtered.select(["k", metric_col]).combine_chunks(),
             tmp_path,
-            **_LANCE_WRITE_DEFAULTS,
+            mode="create",
         )
-        tmp_ds = _lance.dataset(tmp_path)
         sql = (
             f"SELECT k AS group_key, "
             f"approx_percentile_cont({metric_col}, {percentile}) AS metric, "
@@ -462,7 +557,10 @@ def aggregate_property(
     ctx_lance_path: str | None = None,
     metric_col: str | None = None,
     agg_fn: str | None = None,
-) -> dict:
+    *,
+    lance_version: Pin | None = None,
+    event_line_id: str | None = None,
+) -> dict[str, Any]:
     """Group-by-property aggregation: GROUP BY (group_by_line, prop_value).
 
     The property value is read from a separate line's points dataset by
@@ -475,41 +573,57 @@ def aggregate_property(
 
     Returns a dict shaped like the legacy ``_property_aggregate_tables`` output:
     either ``{"results": [...]}`` or ``{"distinct_results": {...}}``.
+
+    When ``prop_line_id`` is ``event_line_id`` the property belongs to the
+    event itself and is looked up by the polygon's own primary key.
     """
     prop_name = _validate_sql_identifier(prop_name)
 
-    geo_pairs_g = _read_geo_edge_pairs(geo_lance_path, pattern, group_by_line)
+    geo_pairs_g = _read_geo_edge_pairs(
+        geo_lance_path, pattern, group_by_line, lance_version=lance_version
+    )
     if geo_pairs_g.num_rows == 0:
         return {"distinct_results": {}} if distinct else {"results": []}
 
     if prop_line_id == group_by_line:
         # Single-line case: prop_entity is the same as group_key
         joined_pe = geo_pairs_g.append_column(
-            "prop_entity", geo_pairs_g["k"],
+            "prop_entity",
+            geo_pairs_g["k"],
         )
+    elif prop_line_id == event_line_id:
+        joined_pe = geo_pairs_g.append_column("prop_entity", geo_pairs_g["primary_key"])
     else:
-        geo_pairs_p = _read_geo_edge_pairs(geo_lance_path, pattern, prop_line_id)
+        geo_pairs_p = _read_geo_edge_pairs(
+            geo_lance_path, pattern, prop_line_id, lance_version=lance_version
+        )
         if geo_pairs_p.num_rows == 0:
             return {"distinct_results": {}} if distinct else {"results": []}
         # Join group-line and prop-line edges of the same polygon
         geo_pairs_p = geo_pairs_p.rename_columns(["primary_key", "prop_entity"])
         joined_pe = geo_pairs_g.join(
-            geo_pairs_p, keys="primary_key", join_type="inner",
+            geo_pairs_p,
+            keys="primary_key",
+            join_type="inner",
         )
 
-    prop_ds = _lance.dataset(prop_lance_path)
+    prop_ds = _open_points(prop_lance_path)
     prop_table = prop_ds.scanner(
         columns=["primary_key", prop_name],
     ).to_table()
     if prop_table.num_rows == 0:
         return {"distinct_results": {}} if distinct else {"results": []}
-    prop_lookup = pa.table({
-        "prop_entity": prop_table["primary_key"],
-        "prop_val": pc.cast(prop_table[prop_name], pa.string()),
-    })
+    prop_lookup = pa.table(
+        {
+            "prop_entity": prop_table["primary_key"],
+            "prop_val": pc.cast(prop_table[prop_name], pa.string()),
+        }
+    )
 
     enriched = joined_pe.join(
-        prop_lookup, keys="prop_entity", join_type="inner",
+        prop_lookup,
+        keys="prop_entity",
+        join_type="inner",
     )
     valid = pc.and_(pc.is_valid(enriched["k"]), pc.is_valid(enriched["prop_val"]))
     f = enriched.filter(valid)
@@ -520,16 +634,14 @@ def aggregate_property(
         result = f.group_by("prop_val").aggregate([("k", "count_distinct")])
         return {
             "distinct_results": {
-                row["prop_val"]: row["k_count_distinct"]
-                for row in result.to_pylist()
+                row["prop_val"]: row["k_count_distinct"] for row in result.to_pylist()
             },
         }
 
     if agg_fn and ctx_lance_path and metric_col:
         if agg_fn not in _AGG_OP_MAP:
             raise ValueError(
-                f"aggregate_property: agg_fn must be one of {sorted(_AGG_OP_MAP)}, "
-                f"got {agg_fn!r}"
+                f"aggregate_property: agg_fn must be one of {sorted(_AGG_OP_MAP)}, got {agg_fn!r}"
             )
         metric_pairs = _read_metric_pairs(ctx_lance_path, metric_col)
         f = f.join(metric_pairs, keys="primary_key", join_type="inner")
@@ -537,9 +649,7 @@ def aggregate_property(
         if f.num_rows == 0:
             return {"results": []}
         arrow_op = _AGG_OP_MAP[agg_fn]
-        result = f.group_by(["k", "prop_val"]).aggregate(
-            [(metric_col, arrow_op), (metric_col, "count")],
-        )
+        result = group_aggregate(f, ["k", "prop_val"], metric_col, arrow_op)
         metric_field = f"{metric_col}_{arrow_op}"
         count_field = f"{metric_col}_count"
         return {
@@ -548,10 +658,7 @@ def aggregate_property(
                     "group_key": r["k"],
                     "prop_val": r["prop_val"],
                     "count": int(r[count_field]),
-                    "metric": (
-                        float(r[metric_field])
-                        if r[metric_field] is not None else None
-                    ),
+                    "metric": (float(r[metric_field]) if r[metric_field] is not None else None),
                 }
                 for r in result.to_pylist()
             ],
@@ -579,7 +686,9 @@ def aggregate_pivot(
     ctx_lance_path: str | None = None,
     metric_col: str | None = None,
     agg_fn: str | None = None,
-) -> list[dict]:
+    *,
+    lance_version: Pin | None = None,
+) -> list[dict[str, Any]]:
     """Pivot aggregation: GROUP BY (group_key, pivot_val) over the
     event geometry.
 
@@ -594,54 +703,61 @@ def aggregate_pivot(
     """
     pivot_field = _validate_sql_identifier(pivot_field)
 
-    geo_pairs = _read_geo_edge_pairs(geo_lance_path, pattern, group_by_line)
+    geo_pairs = _read_geo_edge_pairs(
+        geo_lance_path, pattern, group_by_line, lance_version=lance_version
+    )
     if geo_pairs.num_rows == 0:
         return []
 
-    event_ds = _lance.dataset(event_lance_path)
+    event_ds = _open_points(event_lance_path)
     event_table = event_ds.scanner(
         columns=["primary_key", pivot_field],
     ).to_table()
     if event_table.num_rows == 0:
         return []
-    event_pivot = pa.table({
-        "primary_key": event_table["primary_key"],
-        "pivot_val": pc.cast(event_table[pivot_field], pa.string()),
-    })
+    event_pivot = pa.table(
+        {
+            "primary_key": event_table["primary_key"],
+            "pivot_val": pc.cast(event_table[pivot_field], pa.string()),
+        }
+    )
 
     joined = geo_pairs.join(
-        event_pivot, keys="primary_key", join_type="inner",
+        event_pivot,
+        keys="primary_key",
+        join_type="inner",
     )
     valid = pc.and_(pc.is_valid(joined["k"]), pc.is_valid(joined["pivot_val"]))
 
     if agg_fn and ctx_lance_path and metric_col:
         if agg_fn not in _AGG_OP_MAP:
             raise ValueError(
-                f"aggregate_pivot: agg_fn must be one of {sorted(_AGG_OP_MAP)}, "
-                f"got {agg_fn!r}"
+                f"aggregate_pivot: agg_fn must be one of {sorted(_AGG_OP_MAP)}, got {agg_fn!r}"
             )
         metric_pairs = _read_metric_pairs(ctx_lance_path, metric_col)
         joined = joined.join(
-            metric_pairs, keys="primary_key", join_type="inner",
+            metric_pairs,
+            keys="primary_key",
+            join_type="inner",
         )
         valid = pc.and_(valid, pc.is_valid(joined[metric_col]))
         f = joined.filter(valid)
         if f.num_rows == 0:
             return []
         arrow_op = _AGG_OP_MAP[agg_fn]
-        result = f.group_by(["k", "pivot_val"]).aggregate(
-            [(metric_col, arrow_op), (metric_col, "count")],
-        )
+        result = group_aggregate(f, ["k", "pivot_val"], metric_col, arrow_op)
         metric_field = f"{metric_col}_{arrow_op}"
         count_field = f"{metric_col}_count"
-        rows: list[dict] = []
+        rows: list[dict[str, Any]] = []
         for r in result.to_pylist():
-            rows.append({
-                "group_key": r["k"],
-                "pivot_val": r["pivot_val"],
-                "count": int(r[count_field]),
-                "metric": float(r[metric_field]) if r[metric_field] is not None else None,
-            })
+            rows.append(
+                {
+                    "group_key": r["k"],
+                    "pivot_val": r["pivot_val"],
+                    "count": int(r[count_field]),
+                    "metric": float(r[metric_field]) if r[metric_field] is not None else None,
+                }
+            )
         return rows
 
     f = joined.filter(valid)
@@ -650,11 +766,13 @@ def aggregate_pivot(
     result = f.group_by(["k", "pivot_val"]).aggregate([("k", "count")])
     rows = []
     for r in result.to_pylist():
-        rows.append({
-            "group_key": r["k"],
-            "pivot_val": r["pivot_val"],
-            "count": int(r["k_count"]),
-        })
+        rows.append(
+            {
+                "group_key": r["k"],
+                "pivot_val": r["pivot_val"],
+                "count": int(r["k_count"]),
+            }
+        )
     return rows
 
 
@@ -667,6 +785,8 @@ def aggregate_filtered_metric(
     agg_fn: str,
     resolved_filters: list[tuple[str, set[str]]],
     event_line_id: str,
+    *,
+    lance_version: Pin | None = None,
 ) -> tuple[dict[str, float], dict[str, int]]:
     """Same shape as :func:`aggregate_metric` but pre-filters polygons by
     a list of ``(line_id, allowed_keys)`` constraints. Each filter is
@@ -683,7 +803,12 @@ def aggregate_filtered_metric(
         )
 
     geo_pairs = _read_filtered_geo_edge_pairs(
-        geo_lance_path, pattern, group_by_line, resolved_filters, event_line_id,
+        geo_lance_path,
+        pattern,
+        group_by_line,
+        resolved_filters,
+        event_line_id,
+        lance_version=lance_version,
     )
     if geo_pairs.num_rows == 0:
         return {}, {}
@@ -693,7 +818,9 @@ def aggregate_filtered_metric(
         return {}, {}
 
     joined = geo_pairs.join(
-        metric_pairs, keys="primary_key", join_type="inner",
+        metric_pairs,
+        keys="primary_key",
+        join_type="inner",
     )
     valid = pc.and_(pc.is_valid(joined[metric_col]), pc.is_valid(joined["k"]))
     filtered = joined.filter(valid)
@@ -701,9 +828,7 @@ def aggregate_filtered_metric(
         return {}, {}
 
     arrow_op = _AGG_OP_MAP[agg_fn]
-    result = filtered.group_by("k").aggregate(
-        [(metric_col, arrow_op), (metric_col, "count")],
-    )
+    result = group_aggregate(filtered, ["k"], metric_col, arrow_op)
     metric_field = f"{metric_col}_{arrow_op}"
     count_field = f"{metric_col}_count"
     metrics: dict[str, float] = {}
@@ -727,6 +852,8 @@ def aggregate_metric(
     group_by_line: str,
     metric_col: str,
     agg_fn: str,
+    *,
+    lance_version: Pin | None = None,
 ) -> tuple[dict[str, float], dict[str, int]]:
     """sum / avg / min / max GROUP BY group_by_line via Lance SQL + pyarrow.
 
@@ -765,11 +892,12 @@ def aggregate_metric(
     """
     if agg_fn not in _AGG_OP_MAP:
         raise ValueError(
-            f"aggregate_metric: agg_fn must be one of {sorted(_AGG_OP_MAP)}, "
-            f"got {agg_fn!r}"
+            f"aggregate_metric: agg_fn must be one of {sorted(_AGG_OP_MAP)}, got {agg_fn!r}"
         )
 
-    geo_pairs = _read_geo_edge_pairs(geo_lance_path, pattern, group_by_line)
+    geo_pairs = _read_geo_edge_pairs(
+        geo_lance_path, pattern, group_by_line, lance_version=lance_version
+    )
     if geo_pairs.num_rows == 0:
         return {}, {}
 
@@ -778,7 +906,9 @@ def aggregate_metric(
         return {}, {}
 
     joined = geo_pairs.join(
-        metric_pairs, keys="primary_key", join_type="inner",
+        metric_pairs,
+        keys="primary_key",
+        join_type="inner",
     )
     valid = pc.and_(pc.is_valid(joined[metric_col]), pc.is_valid(joined["k"]))
     filtered = joined.filter(valid)
@@ -786,9 +916,7 @@ def aggregate_metric(
         return {}, {}
 
     arrow_op = _AGG_OP_MAP[agg_fn]
-    result = filtered.group_by("k").aggregate(
-        [(metric_col, arrow_op), (metric_col, "count")],
-    )
+    result = group_aggregate(filtered, ["k"], metric_col, arrow_op)
     metric_field = f"{metric_col}_{arrow_op}"
     count_field = f"{metric_col}_count"
     metrics: dict[str, float] = {}

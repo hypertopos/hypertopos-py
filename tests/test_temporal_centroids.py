@@ -10,6 +10,7 @@ from datetime import datetime
 
 import lance
 import pyarrow as pa
+
 from hypertopos.builder.builder import GDSBuilder
 from hypertopos.storage.reader import GDSReader
 
@@ -306,6 +307,8 @@ class TestPi12UsesCache:
         result = nav.π12_attract_regime_change("acct_pattern", n_regimes=3)
         assert isinstance(result, list)
         for item in result:
+            if "warning" in item:  # no shift above threshold: same shape as the scan path
+                continue
             assert "timestamp" in item
             assert "magnitude" in item
             assert "top_changed_dimensions" in item
@@ -337,7 +340,7 @@ class TestPi12UsesCache:
         assert len(result_filtered) <= len(result_full)
 
     def test_pi12_cache_empty_range_returns_empty(self, tmp_path):
-        """pi12 returns empty list when time filter matches fewer than 2 windows."""
+        """pi12 returns an insufficient-data warning when the filter keeps < 2 windows."""
         from hypertopos.sphere import HyperSphere
 
         TestTemporalCentroids._build_with_temporal(
@@ -355,4 +358,5 @@ class TestPi12UsesCache:
             timestamp_to="2025-07-01",
             n_regimes=3,
         )
-        assert result == []
+        assert len(result) == 1
+        assert result[0]["warning"].startswith("insufficient temporal data")

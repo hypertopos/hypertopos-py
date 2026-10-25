@@ -31,6 +31,7 @@ Pure numerics: no Lance, no pyarrow, no builder state. Two surfaces:
   on-demand CI estimation (e.g. from the MCP tool). Default
   `n_bootstraps=0` delegates to the cheap path.
 """
+
 from __future__ import annotations
 
 import numpy as np
@@ -122,11 +123,7 @@ def derive_stable_band_and_cliffs(
             )
         if ratio < STABLE_BAND_RATIO_THRESHOLD:
             run_length = (i + 1) - current_run_lo_idx
-            best_length = (
-                -1
-                if longest_run_lo_idx < 0
-                else longest_run_hi_idx - longest_run_lo_idx
-            )
+            best_length = -1 if longest_run_lo_idx < 0 else longest_run_hi_idx - longest_run_lo_idx
             if run_length > best_length:
                 longest_run_lo_idx = current_run_lo_idx
                 longest_run_hi_idx = i + 1

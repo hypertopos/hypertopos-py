@@ -8,6 +8,7 @@ import math
 
 import numpy as np
 import pytest
+
 from hypertopos.engine.composition import (
     co_dispersion,
     fisher_combine_pvalues,

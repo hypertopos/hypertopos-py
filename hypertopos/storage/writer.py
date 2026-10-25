@@ -6,27 +6,31 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
+import tempfile
+import time
 import warnings
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import lance as _lance  # type: ignore[import-untyped]
+import lance as _lance
 import numpy as np
 import pyarrow as pa
 
 from hypertopos.model.objects import SolidSlice
+from hypertopos.storage.exceptions import GDSStorageError
+
+if TYPE_CHECKING:
+    from hypertopos.engine.calibration import CalibrationTracker
 
 logger = logging.getLogger(__name__)
 
-# Lance write defaults — applied to ALL write_dataset calls via _write_lance().
-# data_storage_version="2.2" pins the explicit format version. The "stable"
-# alias in pylance moves across major versions; 2.2 is pinned explicitly for
-# reproducibility under pylance 6.0 (verified 2026-05-14: 4.x-written spheres
-# at format 2.2 open transparently under pylance 6.0). Newer storage formats
-# are not adopted here — sphere format compatibility with existing 2.4 spheres
-# outweighs micro-perf from a newer storage format.
+# Lance write defaults — every hypertopos write_dataset call goes through
+# _write_lance() so all datasets share one explicit file format. The pylance
+# "stable" alias moves between releases (2.1 → 2.2 in pylance 12), so the
+# format is pinned to 2.2 for reproducible on-disk spheres.
 #
 # Schema constraint enforced by GDSBuilder: pattern delta vectors must have
 # width >= 1. A zero-width fixed-size-list column triggers a Lance write
@@ -47,6 +51,10 @@ _LANCE_WRITE_DEFAULTS: dict[str, Any] = {
 # path already falls back to when no index is present.
 _IVF_MIN_ROWS_PER_PARTITION = 256
 
+# How long write_sphere_json keeps retrying a replace that another open
+# handle blocks (Windows file-sharing semantics).
+_REPLACE_RETRY_SECONDS = 1.0
+
 
 def _ivf_num_partitions(n_rows: int) -> int:
     """IVF partition count for an n-row vector dataset.
@@ -56,7 +64,7 @@ def _ivf_num_partitions(n_rows: int) -> int:
     (:func:`_ivf_index_worthwhile`) is computed against the exact value the
     index would be built with.
     """
-    return min(64, max(16, int(n_rows ** 0.5)))
+    return min(64, max(16, int(n_rows**0.5)))
 
 
 def _ivf_index_worthwhile(n_rows: int) -> bool:
@@ -71,30 +79,73 @@ def _ivf_index_worthwhile(n_rows: int) -> bool:
 
 
 def _write_lance(
-    table: pa.Table,
+    table: pa.Table | pa.RecordBatchReader,
     path: str,
     mode: str = "create",
     **kwargs: Any,
 ) -> _lance.LanceDataset:
-    """Write Arrow table to Lance with optimized defaults."""
+    """Write an Arrow table (or a stream of record batches) to Lance with optimized defaults."""
     merged = {**_LANCE_WRITE_DEFAULTS, **kwargs}
     return _lance.write_dataset(table, path, mode=mode, **merged)
 
-_TEMPORAL_SCHEMA = pa.schema([
-    pa.field("primary_key",      pa.string()),
-    pa.field("slice_index",      pa.int32()),
-    pa.field("timestamp",        pa.timestamp("us", tz="UTC")),
-    pa.field("deformation_type", pa.string()),
-    pa.field("shape_snapshot",   pa.list_(pa.float32())),
-    pa.field("pattern_ver",      pa.int32()),
-    pa.field("changed_property", pa.string()),
-    pa.field("changed_line_id",  pa.string()),
-])
+
+def write_sphere_json(meta_dir: Path, data: dict[str, Any]) -> None:
+    """Replace ``meta_dir / "sphere.json"`` atomically (see ``write_json_atomic``)."""
+    write_json_atomic(meta_dir / "sphere.json", data)
+
+
+def write_json_atomic(path: Path, data: Any, indent: int | None = 2) -> None:
+    """Replace ``path`` with ``data`` as JSON atomically.
+
+    The JSON goes to a uniquely named temporary sibling first and then
+    replaces the file, so a reader never sees a half-written file and two
+    writers never share a temporary file. On Windows the replace fails while
+    another handle has the file open (a session taking its snapshot), so it
+    is retried for up to ``_REPLACE_RETRY_SECONDS``.
+    """
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f"{path.name}.", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(data, indent=indent))
+        deadline = time.monotonic() + _REPLACE_RETRY_SECONDS
+        while True:
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.02)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+_TEMPORAL_SCHEMA = pa.schema(
+    [
+        pa.field("primary_key", pa.string()),
+        pa.field("slice_index", pa.int32()),
+        pa.field("timestamp", pa.timestamp("us", tz="UTC")),
+        pa.field("deformation_type", pa.string()),
+        pa.field("shape_snapshot", pa.list_(pa.float32())),
+        pa.field("pattern_ver", pa.int32()),
+        pa.field("changed_property", pa.string()),
+        pa.field("changed_line_id", pa.string()),
+    ]
+)
 
 
 class GDSWriter:
-    def __init__(self, base_path: str) -> None:
+    def __init__(self, base_path: str, branch: str | None = None) -> None:
         self._base = Path(base_path)
+        # Geometry rewrites (ranks, reindex) commit to this sphere branch's
+        # head when set, to main otherwise.
+        self._branch = branch
+
+    def _dataset(self, path: Path) -> _lance.LanceDataset:
+        from hypertopos.storage._lance_branches import open_ref
+
+        return open_ref(path, self._branch)
 
     def append_temporal_slice(
         self,
@@ -118,14 +169,14 @@ class GDSWriter:
 
         table = pa.table(
             {
-                "primary_key":      [primary_key],
-                "slice_index":      [solid_slice.slice_index],
-                "timestamp":        [solid_slice.timestamp],
+                "primary_key": [primary_key],
+                "slice_index": [solid_slice.slice_index],
+                "timestamp": [solid_slice.timestamp],
                 "deformation_type": [solid_slice.deformation_type],
-                "shape_snapshot":   [shape_snapshot.tolist()],
-                "pattern_ver":      [solid_slice.pattern_ver],
+                "shape_snapshot": [shape_snapshot.tolist()],
+                "pattern_ver": [solid_slice.pattern_ver],
                 "changed_property": [solid_slice.changed_property],
-                "changed_line_id":  [solid_slice.changed_line_id],
+                "changed_line_id": [solid_slice.changed_line_id],
             },
             schema=_TEMPORAL_SCHEMA,
         )
@@ -183,73 +234,6 @@ class GDSWriter:
             return
         ds.create_scalar_index("primary_key", index_type="BTREE")
 
-    def migrate_temporal_to_shape_snapshot(
-        self,
-        pattern_id: str,
-        mu: np.ndarray,
-        sigma_diag: np.ndarray,
-    ) -> int:
-        """Migrate temporal Lance datasets from delta_snapshot to shape_snapshot schema.
-
-        Reads all rows, reverses z-scoring to recover shape vectors, writes back
-        with the new schema, and rebuilds the temporal index.  Returns the total
-        count of migrated rows across the main dataset and all agent-scoped paths.
-        """
-        _sigma = np.maximum(sigma_diag, 1e-2)
-        total = 0
-
-        def _migrate_one(lance_path: Path) -> int:
-            if not lance_path.exists():
-                return 0
-            ds = _lance.dataset(str(lance_path))
-            field_names = {f.name for f in ds.schema}
-            if "delta_snapshot" not in field_names:
-                return 0
-            tbl = ds.to_table()
-            rows = tbl.num_rows
-            if rows == 0:
-                return 0
-            # Vectorized: read entire delta_snapshot column as (rows, D) matrix,
-            # apply z-score reversal and clip in a single numpy operation.
-            D = len(mu)
-            flat = tbl["delta_snapshot"].combine_chunks().values.to_numpy(
-                zero_copy_only=False
-            )
-            delta_matrix = flat.reshape(rows, D).astype(np.float32)
-            shape_matrix = np.clip(delta_matrix * _sigma + mu, 0.0, 1.0)
-            shapes = pa.FixedSizeListArray.from_arrays(
-                pa.array(shape_matrix.ravel(), type=pa.float32()),
-                list_size=D,
-            ).cast(pa.list_(pa.float32()))
-            new_table = pa.table(
-                {
-                    "primary_key":      tbl["primary_key"],
-                    "slice_index":      tbl["slice_index"],
-                    "timestamp":        tbl["timestamp"],
-                    "deformation_type": tbl["deformation_type"],
-                    "shape_snapshot":   shapes,
-                    "pattern_ver":      tbl["pattern_ver"],
-                    "changed_property": tbl["changed_property"],
-                    "changed_line_id":  tbl["changed_line_id"],
-                },
-                schema=_TEMPORAL_SCHEMA,
-            )
-            _write_lance(new_table, str(lance_path), mode="overwrite")
-            return rows
-
-        main_path = self._base / "temporal" / pattern_id / "data.lance"
-        total += _migrate_one(main_path)
-
-        agents_dir = self._base / "temporal" / "_agents"
-        if agents_dir.exists():
-            for agent_lance in agents_dir.glob(f"*/{pattern_id}/data.lance"):
-                total += _migrate_one(agent_lance)
-
-        if total > 0:
-            self.build_temporal_index(pattern_id)
-
-        return total
-
     def write_geometry_stats(
         self,
         pattern_id: str,
@@ -299,9 +283,7 @@ class GDSWriter:
             counts, bin_edges = np.histogram(delta_norms, bins=50)
             mode_bin = int(np.argmax(counts))
             mode_count = int(counts[mode_bin])
-            mode_center = float(
-                (bin_edges[mode_bin] + bin_edges[mode_bin + 1]) / 2
-            )
+            mode_center = float((bin_edges[mode_bin] + bin_edges[mode_bin + 1]) / 2)
             median_val = float(np.median(delta_norms))
             if mode_count / n > 0.25 and mode_center < median_val:
                 threshold = float(bin_edges[mode_bin + 1])
@@ -311,14 +293,9 @@ class GDSWriter:
         stats["inactive_ratio"] = inactive_ratio
         stats["inactive_count"] = inactive_count
 
-        path = (
-            self._base
-            / "_gds_meta"
-            / "geometry_stats"
-            / f"{pattern_id}_v{version}.json"
-        )
+        path = self._base / "_gds_meta" / "geometry_stats" / f"{pattern_id}_v{version}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(stats))
+        write_json_atomic(path, stats, indent=None)
 
     def write_lance_geometry(self, table: pa.Table, output_dir: Path) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -352,7 +329,11 @@ class GDSWriter:
         self._build_indices_on_lance_path(lance_path, n_rows=table.num_rows, list_size=list_size)
 
     def build_index_if_needed(
-        self, pattern_id: str, version: int = 1, *, _ds: Any = None,
+        self,
+        pattern_id: str,
+        version: int = 1,
+        *,
+        _ds: Any = None,
         skip_vector_index: bool = False,
     ) -> None:
         """Build IVF_FLAT and scalar indices on an existing geometry Lance dataset.
@@ -389,7 +370,10 @@ class GDSWriter:
                 stacklevel=2,
             )
         self._build_indices_on_lance_path(
-            lance_path, n_rows=n_rows, list_size=list_size, ds=ds,
+            lance_path,
+            n_rows=n_rows,
+            list_size=list_size,
+            ds=ds,
             skip_vector_index=skip_vector_index,
         )
 
@@ -411,7 +395,7 @@ class GDSWriter:
         lance_path = self._base / "geometry" / pattern_id / "data.lance"
         if not lance_path.exists():
             return False
-        ds = _lance.dataset(str(lance_path))
+        ds = self._dataset(lance_path)
         n_rows = ds.count_rows()
         if n_rows == 0:
             return False
@@ -444,17 +428,15 @@ class GDSWriter:
 
         delta_field = ds.schema.field("delta")
         list_size: int | None = (
-            delta_field.type.list_size
-            if hasattr(delta_field.type, "list_size")
-            else None
+            delta_field.type.list_size if hasattr(delta_field.type, "list_size") else None
         )
         if list_size is None or n_rows < 256:
             # Cannot build IVF_FLAT without fixed-size list or sufficient rows
             return False
 
-        num_partitions = min(64, max(16, int(n_rows ** 0.5)))
+        num_partitions = min(64, max(16, int(n_rows**0.5)))
         try:
-            ds = _lance.dataset(str(lance_path))
+            ds = self._dataset(lance_path)
             ds.create_index(
                 "delta",
                 index_type="IVF_FLAT",
@@ -482,25 +464,7 @@ class GDSWriter:
         appends and calling recompute_delta_rank_pct only at the end of each ingestion
         session rather than on every individual append.
         """
-        lance_path = self._base / "geometry" / pattern_id / "data.lance"
-        if not lance_path.exists():
-            return
-        ds = _lance.dataset(str(lance_path))
-        if "delta_rank_pct" not in {f.name for f in ds.schema}:
-            return
-        tbl = ds.to_table(columns=["primary_key", "delta_norm"])
-        delta_norms = tbl["delta_norm"].to_numpy(zero_copy_only=False)
-        n = len(delta_norms)
-        if n == 0:
-            return
-        sorted_norms = np.sort(delta_norms)
-        ranks = np.searchsorted(sorted_norms, delta_norms, side="left")
-        new_pcts = (ranks / n * 100).astype(np.float32)
-        updates = pa.table({
-            "primary_key": tbl["primary_key"],
-            "delta_rank_pct": pa.array(new_pcts, type=pa.float32()),
-        })
-        ds.merge_insert("primary_key").when_matched_update_all().execute(updates)
+        self._rewrite_population_ranks(pattern_id, rank=True, conformal=False)
 
     def recompute_conformal_p(self, pattern_id: str) -> None:
         """Recompute conformal_p globally across all entities in the pattern geometry.
@@ -513,65 +477,160 @@ class GDSWriter:
         ingested rows carry a p-value relative only to their ingest batch.
         Same O(N) cost profile and call sites as ``recompute_delta_rank_pct``.
         """
-        from hypertopos.builder._stats import compute_conformal_p
-
-        lance_path = self._base / "geometry" / pattern_id / "data.lance"
-        if not lance_path.exists():
-            return
-        ds = _lance.dataset(str(lance_path))
-        if "conformal_p" not in {f.name for f in ds.schema}:
-            return
-        tbl = ds.to_table(columns=["primary_key", "delta_norm"])
-        delta_norms = tbl["delta_norm"].to_numpy(zero_copy_only=False)
-        if len(delta_norms) == 0:
-            return
-        new_cp = compute_conformal_p(delta_norms)
-        updates = pa.table({
-            "primary_key": tbl["primary_key"],
-            "conformal_p": pa.array(new_cp, type=pa.float32()),
-        })
-        ds.merge_insert("primary_key").when_matched_update_all().execute(updates)
+        self._rewrite_population_ranks(pattern_id, rank=False, conformal=True)
 
     def recompute_rank_stats(self, pattern_id: str) -> None:
         """Recompute the population-relative geometry stats — ``delta_rank_pct``
         and ``conformal_p`` — in a single pass.
 
         Both are O(N) whole-population statistics over ``delta_norm``. Computing
-        them together reads the geometry once and issues one ``merge_insert``,
-        halving the append-path recompute I/O versus calling
-        ``recompute_delta_rank_pct`` and ``recompute_conformal_p`` back to back.
-        Recomputes whichever of the two columns the geometry actually carries.
+        them together reads the geometry once and issues one commit, halving the
+        append-path recompute I/O versus calling ``recompute_delta_rank_pct`` and
+        ``recompute_conformal_p`` back to back. Recomputes whichever of the two
+        columns the geometry actually carries.
         """
-        from hypertopos.builder._stats import compute_conformal_p
+        self._rewrite_population_ranks(pattern_id, rank=True, conformal=True)
+
+    def _rewrite_population_ranks(self, pattern_id: str, *, rank: bool, conformal: bool) -> None:
+        """Rewrite the population rank columns in place, one fragment at a time.
+
+        Both columns are functions of a row's ``delta_norm`` and the sorted
+        population, so each fragment's values are computed against the global
+        sort and joined back on row id inside that fragment, then committed as
+        one update. Join memory is bounded by fragment size (compaction caps
+        fragments) instead of population size, and only indexes on the
+        rewritten columns go stale. A key-joined upsert of the whole population
+        exhausts the query memory pool on multi-million-row patterns and also
+        drops the key-lookup index.
+
+        Like any read-then-commit rewrite, rows appended by another writer
+        between the read and the commit keep their batch-local values until
+        the next recompute.
+        """
+        from hypertopos.builder._stats import compute_conformal_p, population_left_ranks
 
         lance_path = self._base / "geometry" / pattern_id / "data.lance"
         if not lance_path.exists():
             return
-        ds = _lance.dataset(str(lance_path))
+        ds = self._dataset(lance_path)
         field_names = {f.name for f in ds.schema}
-        has_rank = "delta_rank_pct" in field_names
-        has_cp = "conformal_p" in field_names
-        if not (has_rank or has_cp):
+        rank = rank and "delta_rank_pct" in field_names
+        conformal = conformal and "conformal_p" in field_names
+        if not (rank or conformal):
             return
-        tbl = ds.to_table(columns=["primary_key", "delta_norm"])
-        delta_norms = tbl["delta_norm"].to_numpy(zero_copy_only=False)
+        fragments = ds.get_fragments()
+        parts = [f.to_table(columns=["delta_norm"], with_row_id=True) for f in fragments]
+        if not parts:
+            return
+        delta_norms = np.concatenate(
+            [p["delta_norm"].to_numpy(zero_copy_only=False) for p in parts]
+        )
         n = len(delta_norms)
         if n == 0:
             return
-        cols: dict[str, Any] = {"primary_key": tbl["primary_key"]}
-        if has_rank:
-            sorted_norms = np.sort(delta_norms)
-            ranks = np.searchsorted(sorted_norms, delta_norms, side="left")
-            cols["delta_rank_pct"] = pa.array(
-                (ranks / n * 100).astype(np.float32), type=pa.float32()
-            )
-        if has_cp:
-            cols["conformal_p"] = pa.array(
-                compute_conformal_p(delta_norms), type=pa.float32()
-            )
-        ds.merge_insert("primary_key").when_matched_update_all().execute(
-            pa.table(cols)
+        ranks = population_left_ranks(delta_norms)
+        values: dict[str, np.ndarray] = {}
+        if rank:
+            values["delta_rank_pct"] = (ranks / n * 100).astype(np.float32)
+        if conformal:
+            values["conformal_p"] = compute_conformal_p(delta_norms, ranks)
+
+        bounds = np.cumsum([0] + [p.num_rows for p in parts])
+        updated: list[Any] = []
+        modified: set[int] = set()
+        for fragment, part, lo, hi in zip(fragments, parts, bounds[:-1], bounds[1:], strict=True):
+            if hi == lo:
+                continue
+            columns: dict[str, Any] = {"_rowid": part["_rowid"]}
+            for name, column in values.items():
+                columns[name] = pa.array(column[lo:hi], type=pa.float32())
+            # _rowid is the fragment-local row address here: geometry datasets
+            # do not enable stable row ids.
+            metadata, field_ids = fragment.update_columns(pa.table(columns), left_on="_rowid")
+            updated.append(metadata)
+            modified.update(field_ids)
+        _lance.LanceDataset.commit(
+            ds if self._branch else str(lance_path),
+            _lance.LanceOperation.Update(
+                updated_fragments=updated, fields_modified=sorted(modified)
+            ),
+            read_version=ds.version,
         )
+        # The update drops the rewritten fragments from indexes on those
+        # columns; fold them back in so filters on the ranks stay indexed.
+        ds = self._dataset(lance_path)
+        stale = [i.name for i in ds.describe_indices() if set(i.field_names) & values.keys()]
+        if stale:
+            ds.optimize.optimize_indices(index_names=stale)
+
+    def replace_geometry_columns(
+        self,
+        lance_path: Path,
+        branch: str | None,
+        row_ids: list[pa.Array],
+        values: dict[str, pa.Array],
+    ) -> Any:
+        """Replace whole columns of a geometry dataset in one commit; reindex only them.
+
+        ``row_ids`` holds each fragment's ``_rowid`` array in ``get_fragments()``
+        order and ``values`` full-length columns in the same row order — the
+        order a per-fragment read with ``with_row_id=True`` returns. Columns
+        not in ``values`` and their indexes (``primary_key``, ``entity_keys``)
+        are not rewritten. Commits on ``branch``'s head when given, else on
+        main. Returns the dataset at the new head.
+        """
+        from hypertopos.storage import _lance_branches
+
+        ds = _lance_branches.open_ref(lance_path, branch)
+        fragments = ds.get_fragments()
+        if len(fragments) != len(row_ids):
+            raise GDSStorageError(
+                f"{lance_path}: {len(fragments)} fragments but row ids for {len(row_ids)}"
+            )
+        bounds = np.cumsum([0] + [len(r) for r in row_ids])
+        updated: list[Any] = []
+        modified: set[int] = set()
+        for fragment, rid, lo, hi in zip(fragments, row_ids, bounds[:-1], bounds[1:], strict=True):
+            if hi == lo:
+                continue
+            if int(rid[0].as_py()) >> 32 != fragment.fragment_id:
+                raise GDSStorageError(f"{lance_path}: row ids do not match the fragments")
+            columns: dict[str, Any] = {"_rowid": rid}
+            for name, column in values.items():
+                columns[name] = column.slice(int(lo), int(hi - lo))
+            # _rowid is the fragment-local row address: geometry datasets do
+            # not enable stable row ids.
+            metadata, field_ids = fragment.update_columns(pa.table(columns), left_on="_rowid")
+            updated.append(metadata)
+            modified.update(field_ids)
+        _lance.LanceDataset.commit(
+            ds if branch else str(lance_path),
+            _lance.LanceOperation.Update(
+                updated_fragments=updated, fields_modified=sorted(modified)
+            ),
+            read_version=ds.version,
+        )
+        ds = _lance_branches.open_ref(lance_path, branch)
+        n_rows = ds.count_rows()
+        if "delta" in values and n_rows >= 256:
+            ds.create_index(
+                "delta",
+                index_type="IVF_FLAT",
+                num_partitions=min(64, max(16, int(n_rows**0.5))),
+                replace=True,
+            )
+            ds = _lance_branches.open_ref(lance_path, branch)
+        # The update drops the rewritten fragments from scalar indexes on those
+        # columns; fold them back in so filters on them stay indexed.
+        stale = [
+            i.name
+            for i in ds.describe_indices()
+            if set(i.field_names) & values.keys() and i.field_names != ["delta"]
+        ]
+        if stale:
+            ds.optimize.optimize_indices(index_names=stale)
+            ds = _lance_branches.open_ref(lance_path, branch)
+        return ds
 
     def append_geometry(self, table: pa.Table, pattern_id: str) -> None:
         """Append new geometry rows to an existing Lance geometry dataset.
@@ -604,15 +663,22 @@ class GDSWriter:
             # Upsert: replace existing rows with same primary_key, insert new ones.
             # Prevents duplicate rows from accumulating after interrupted incremental_update.
             ds = _lance.dataset(str(lance_path))
-            ds.merge_insert("primary_key").when_matched_update_all().when_not_matched_insert_all().execute(table)
+            ds.merge_insert(
+                "primary_key"
+            ).when_matched_update_all().when_not_matched_insert_all().execute(table)
         else:
             _write_lance(table, str(lance_path), mode="create")
         self._maybe_reindex_geometry(pattern_id)
         self.recompute_rank_stats(pattern_id)
 
     def _build_indices_on_lance_path(
-        self, lance_path: Path, n_rows: int, list_size: int | None,
-        *, ds: Any = None, skip_vector_index: bool = False,
+        self,
+        lance_path: Path,
+        n_rows: int,
+        list_size: int | None,
+        *,
+        ds: Any = None,
+        skip_vector_index: bool = False,
     ) -> None:
         """Build IVF_FLAT vector index and scalar indices on geometry Lance dataset."""
         if ds is None:
@@ -622,7 +688,7 @@ class GDSWriter:
         # 6M rows: IVF_FLAT builds in ~3s, IVF_PQ takes 60-120s.
         # Query: 23ms vs 14ms — negligible for agent workloads.
         if list_size is not None and n_rows >= 256 and not skip_vector_index:
-            num_partitions = min(64, max(16, int(n_rows ** 0.5)))
+            num_partitions = min(64, max(16, int(n_rows**0.5)))
             try:
                 ds.create_index(
                     "delta",
@@ -646,11 +712,13 @@ class GDSWriter:
             ("delta_rank_pct", "BTREE"),
             ("entity_keys", "LABEL_LIST"),
         ]
-        # delta_dim_* columns rely on Lance zone-map (min/max per row
-        # group) filtering instead of explicit BTREE indices.  Zone-maps
-        # handle the range predicates used by geometry_filters and
-        # aggregation pushdown efficiently, and skipping per-dim BTREE
-        # saves ~40-60s on 500K+ entity spheres (28 sequential index builds).
+        # delta_dim_* columns are deliberately left unindexed: Lance prunes
+        # only through an explicit scalar index, so geometry_filters and
+        # aggregation pushdown on a delta_dim_k predicate scan that column.
+        # One BTREE per dimension would make those filters several times
+        # faster, but costs an index build per dimension on every pattern
+        # for an occasional, user-chosen filter. A ZONEMAP barely helps,
+        # since rows are stored in key order, not by delta value.
 
         for col, idx_type in scalar_indices:
             if col not in field_names:
@@ -663,68 +731,55 @@ class GDSWriter:
         pattern_id: str,
         shape_tensor: np.ndarray,
         primary_keys: list[str],
-        bucket_timestamps: list,
-        mu: np.ndarray | None = None,
-        sigma_diag: np.ndarray | None = None,
+        bucket_timestamps: list[Any],
+        *,
+        raw_shapes: np.ndarray,
     ) -> int:
-        """Build trajectory vectors directly from in-memory shape tensor.
+        """Build trajectory vectors directly from an in-memory delta tensor.
 
         Eliminates the need to re-read temporal Lance data. Called by
-        build_temporal() with the shape tensor already in memory.
+        build_temporal() with the tensor already in memory and already
+        converted to deltas in the pattern's metric.
 
-        shape_tensor: (n_entities, n_buckets, D) float32
+        Only each entity's active windows count (the rule drift uses), judged
+        on ``raw_shapes``; entities with fewer than two active windows get no
+        trajectory.
+
+        shape_tensor: (n_entities, n_buckets, D) float32 deltas
         primary_keys: list of entity keys, len == n_entities
         bucket_timestamps: list of datetime per bucket
+        raw_shapes: (n_entities, n_buckets, D) shape snapshots behind the deltas
         """
+        from hypertopos.engine.geometry import active_window_trajectories
+
         n, n_buckets, D = shape_tensor.shape
         if n == 0 or n_buckets < 2:
             return 0
 
         d2 = D * 2
-        _sigma = (
-            np.maximum(sigma_diag, 1e-2) if sigma_diag is not None else None
+        kept, traj_vectors, displacements, num_slices_arr, first_w, last_w = (
+            active_window_trajectories(raw_shapes, shape_tensor)
         )
-
-        # Z-score shape → delta if mu/sigma provided.
-        # Trajectory tensor covers only the time-varying dims; pattern
-        # mu/sigma may include trailing time-invariant aggregates
-        # (edge_dim_aggregations) — slice to match.
-        if mu is not None and _sigma is not None:
-            D_shape = shape_tensor.shape[-1]
-            mu_slice = mu[:D_shape]
-            sigma_slice = _sigma[:D_shape]
-            data = (shape_tensor - mu_slice) / sigma_slice
-        else:
-            data = shape_tensor
-
-        # Vectorized: mean and std across buckets axis
-        traj_mean = data.mean(axis=1)  # (n, D)
-        traj_std = data.std(axis=1)    # (n, D)
-        traj_vectors = np.concatenate([traj_mean, traj_std], axis=1).astype(np.float32)
-
-        # Displacement: ||last_bucket - first_bucket||
-        displacements = np.linalg.norm(
-            data[:, -1, :] - data[:, 0, :], axis=1,
-        ).astype(np.float32)
-
-        num_slices_arr = np.full(n, n_buckets, dtype=np.int32)
-
-        first_ts = bucket_timestamps[0]
-        last_ts = bucket_timestamps[-1]
+        n = len(kept)
+        if n == 0:
+            return 0
+        primary_keys = [primary_keys[i] for i in kept]
 
         traj_vec_col = pa.FixedSizeListArray.from_arrays(
             pa.array(traj_vectors.ravel(), type=pa.float32()),
             list_size=d2,
         ).cast(pa.list_(pa.float32(), d2))
 
-        traj_schema = pa.schema([
-            pa.field("primary_key", pa.string()),
-            pa.field("trajectory_vector", pa.list_(pa.float32(), d2)),
-            pa.field("displacement", pa.float32()),
-            pa.field("num_slices", pa.int32()),
-            pa.field("first_timestamp", pa.timestamp("us", tz="UTC")),
-            pa.field("last_timestamp", pa.timestamp("us", tz="UTC")),
-        ])
+        traj_schema = pa.schema(
+            [
+                pa.field("primary_key", pa.string()),
+                pa.field("trajectory_vector", pa.list_(pa.float32(), d2)),
+                pa.field("displacement", pa.float32()),
+                pa.field("num_slices", pa.int32()),
+                pa.field("first_timestamp", pa.timestamp("us", tz="UTC")),
+                pa.field("last_timestamp", pa.timestamp("us", tz="UTC")),
+            ]
+        )
 
         traj_table = pa.table(
             {
@@ -733,10 +788,12 @@ class GDSWriter:
                 "displacement": pa.array(displacements, type=pa.float32()),
                 "num_slices": pa.array(num_slices_arr, type=pa.int32()),
                 "first_timestamp": pa.array(
-                    [first_ts] * n, type=pa.timestamp("us", tz="UTC"),
+                    [bucket_timestamps[i] for i in first_w],
+                    type=pa.timestamp("us", tz="UTC"),
                 ),
                 "last_timestamp": pa.array(
-                    [last_ts] * n, type=pa.timestamp("us", tz="UTC"),
+                    [bucket_timestamps[i] for i in last_w],
+                    type=pa.timestamp("us", tz="UTC"),
                 ),
             },
             schema=traj_schema,
@@ -762,30 +819,30 @@ class GDSWriter:
             logger.info(
                 "trajectory %s: %d rows below ANN training threshold "
                 "(%d) — using full-scan fallback",
-                pattern_id, n,
+                pattern_id,
+                n,
                 _ivf_num_partitions(n) * _IVF_MIN_ROWS_PER_PARTITION,
             )
 
-        return n
+        return int(n)
 
-    def build_trajectory_index(
-        self,
-        pattern_id: str,
-        mu: np.ndarray | None = None,
-        sigma_diag: np.ndarray | None = None,
-    ) -> int:
+    def build_trajectory_index(self, pattern_id: str) -> int:
         """Build trajectory summary vectors from temporal slices.
 
-        Trajectory vector = concat([mean(deltas), std(deltas)]) over all
-        temporal deformations for each entity. Captures both direction and
-        volatility of geometric change.
-
-        mu / sigma_diag: when provided, shape vectors are z-scored to delta before
-        building the trajectory. When absent, shape vectors are used directly
-        (acceptable for spheres that have not been recalibrated).
+        Trajectory vector = concat([mean(deltas), std(deltas)]) over each
+        entity's active windows (the rule drift uses; entities with fewer than
+        two get no row). Captures both direction and volatility of geometric
+        change. Shape snapshots are converted to deltas in the pattern's stored
+        metric (as recorded in sphere.json), the same conversion the build uses.
 
         Returns the number of entities indexed, or 0 if no temporal data exists.
         """
+        from hypertopos.engine.geometry import (
+            active_window_rows,
+            slice_deltas,
+            trajectory_summary,
+        )
+        from hypertopos.storage.reader import GDSReader
 
         temporal_path = self._base / "temporal" / pattern_id / "data.lance"
         if not temporal_path.exists():
@@ -799,12 +856,10 @@ class GDSWriter:
         if "shape_snapshot" not in {f.name for f in ds.schema}:
             raise ValueError(
                 f"Temporal data for '{pattern_id}' uses legacy schema (delta_snapshot). "
-                "Run migrate_temporal_to_shape_snapshot() to upgrade first."
+                "Rebuild the sphere to upgrade first."
             )
 
-        _sigma: np.ndarray | None = (
-            np.maximum(sigma_diag, 1e-2) if sigma_diag is not None else None
-        )
+        pattern = GDSReader(str(self._base)).read_sphere().patterns[pattern_id]
 
         # Read all temporal data at once — sort by (pk, timestamp) for grouped processing
         full_table = ds.to_table(
@@ -815,9 +870,9 @@ class GDSWriter:
 
         # Sort by (primary_key, timestamp) — Arrow sort, no Python
         import pyarrow.compute as pc
+
         sort_idx = pc.sort_indices(
-            full_table, sort_keys=[("primary_key", "ascending"),
-                                    ("timestamp", "ascending")]
+            full_table, sort_keys=[("primary_key", "ascending"), ("timestamp", "ascending")]
         )
         full_table = full_table.take(sort_idx)
 
@@ -830,57 +885,39 @@ class GDSWriter:
         shape_col = full_table["shape_snapshot"]
         if isinstance(shape_col, pa.ChunkedArray):
             shape_col = shape_col.combine_chunks()
-        D_shape = (shape_col.type.list_size
-                   if hasattr(shape_col.type, "list_size")
-                   else len(shape_col[0].as_py()))
-        shape_matrix = shape_col.values.to_numpy(
-            zero_copy_only=False
-        ).reshape(-1, D_shape).astype(np.float32)
+        D_shape = (
+            shape_col.type.list_size
+            if hasattr(shape_col.type, "list_size")
+            else len(shape_col[0].as_py())
+        )
+        shape_matrix = (
+            shape_col.values.to_numpy(zero_copy_only=False).reshape(-1, D_shape).astype(np.float32)
+        )
 
-        if mu is not None and _sigma is not None:
-            shape_matrix = (shape_matrix - mu) / _sigma
+        def _group_starts(keys: pa.Array) -> np.ndarray:
+            boundary = np.ones(len(keys), dtype=bool)
+            boundary[1:] = pc.not_equal(keys[1:], keys[:-1]).to_numpy(zero_copy_only=False)
+            return np.flatnonzero(boundary)
 
-        # Find group boundaries via Arrow — no Python loop over all rows
-        n_total = full_table.num_rows
-        is_new = pc.not_equal(pk_arr[1:], pk_arr[:-1])
-        boundary_np = np.empty(n_total, dtype=bool)
-        boundary_np[0] = True
-        boundary_np[1:] = is_new.to_numpy(zero_copy_only=False)
+        # Only active windows count (the rule drift uses); entities left with
+        # fewer than two get no trajectory.
+        group_starts = _group_starts(pk_arr)
+        active = active_window_rows(shape_matrix, group_starts)
+        n_active = np.add.reduceat(active.astype(np.int64), group_starts)
+        counts_all = np.diff(np.append(group_starts, len(active)))
+        active &= np.repeat(n_active >= 2, counts_all)
+        if not active.any():
+            return 0
+        row_idx = np.flatnonzero(active)
+        pk_arr = pk_arr.take(pa.array(row_idx))
+        ts_arr = ts_arr.take(pa.array(row_idx))
+        shape_matrix = slice_deltas(shape_matrix[row_idx], pattern)
 
-        group_starts = np.flatnonzero(boundary_np)
-        group_ends = np.empty(len(group_starts), dtype=np.intp)
-        group_ends[:-1] = group_starts[1:]
-        group_ends[-1] = n_total
-
-        # Fully vectorized per-entity trajectory computation — no Python loop
+        group_starts = _group_starts(pk_arr)
+        group_ends = np.append(group_starts[1:], len(row_idx))
         n = len(group_starts)
-        D = shape_matrix.shape[1]
-        d2 = D * 2
-
-        counts = group_ends - group_starts  # (n,)
-
-        # Mean via reduceat
-        group_sums = np.add.reduceat(shape_matrix, group_starts, axis=0)  # (n, D)
-        group_means = group_sums / counts[:, None]
-
-        # Std via reduceat: std = sqrt(E[x²] - E[x]²)
-        group_sq_sums = np.add.reduceat(shape_matrix ** 2, group_starts, axis=0)
-        group_var = group_sq_sums / counts[:, None] - group_means ** 2
-        np.maximum(group_var, 0.0, out=group_var)
-        group_stds = np.sqrt(group_var)
-        group_stds[counts == 1] = 0.0
-
-        traj_vectors = np.zeros((n, d2), dtype=np.float32)
-        traj_vectors[:, :D] = group_means
-        traj_vectors[:, D:] = group_stds
-
-        # Displacement: ||last_slice - first_slice|| per entity
-        first_rows = shape_matrix[group_starts]
-        last_rows = shape_matrix[group_ends - 1]
-        diff = last_rows - first_rows
-        displacements = np.linalg.norm(diff, axis=1).astype(np.float32)
-        displacements[counts == 1] = 0.0
-
+        d2 = shape_matrix.shape[1] * 2
+        traj_vectors, displacements, counts = trajectory_summary(shape_matrix, group_starts)
         num_slices = counts.astype(np.int32)
 
         # Extract pk/ts via numpy indexing — no Python to_pylist() on full arrays
@@ -898,25 +935,25 @@ class GDSWriter:
             list_size=d2,
         ).cast(pa.list_(pa.float32(), d2))
 
-        traj_schema = pa.schema([
-            pa.field("primary_key",       pa.string()),
-            pa.field("trajectory_vector", pa.list_(pa.float32(), d2)),
-            pa.field("displacement",      pa.float32()),
-            pa.field("num_slices",        pa.int32()),
-            pa.field("first_timestamp",   pa.timestamp("us", tz="UTC")),
-            pa.field("last_timestamp",    pa.timestamp("us", tz="UTC")),
-        ])
+        traj_schema = pa.schema(
+            [
+                pa.field("primary_key", pa.string()),
+                pa.field("trajectory_vector", pa.list_(pa.float32(), d2)),
+                pa.field("displacement", pa.float32()),
+                pa.field("num_slices", pa.int32()),
+                pa.field("first_timestamp", pa.timestamp("us", tz="UTC")),
+                pa.field("last_timestamp", pa.timestamp("us", tz="UTC")),
+            ]
+        )
 
         traj_table = pa.table(
             {
-                "primary_key":       pa.array(pks, type=pa.string()),
+                "primary_key": pa.array(pks, type=pa.string()),
                 "trajectory_vector": traj_vec_col,
-                "displacement":      pa.array(displacements, type=pa.float32()),
-                "num_slices":        pa.array(num_slices, type=pa.int32()),
-                "first_timestamp":   pa.array(first_ts,
-                                              type=pa.timestamp("us", tz="UTC")),
-                "last_timestamp":    pa.array(last_ts,
-                                              type=pa.timestamp("us", tz="UTC")),
+                "displacement": pa.array(displacements, type=pa.float32()),
+                "num_slices": pa.array(num_slices, type=pa.int32()),
+                "first_timestamp": pa.array(first_ts, type=pa.timestamp("us", tz="UTC")),
+                "last_timestamp": pa.array(last_ts, type=pa.timestamp("us", tz="UTC")),
             },
             schema=traj_schema,
         )
@@ -950,7 +987,8 @@ class GDSWriter:
             logger.info(
                 "trajectory %s: %d rows below ANN training threshold "
                 "(%d) — using full-scan fallback",
-                pattern_id, n,
+                pattern_id,
+                n,
                 _ivf_num_partitions(n) * _IVF_MIN_ROWS_PER_PARTITION,
             )
         return n
@@ -958,36 +996,52 @@ class GDSWriter:
     def write_temporal_centroids(
         self,
         pattern_id: str,
-        centroids: list[dict],
+        centroids: list[dict[str, Any]],
     ) -> None:
         """Write pre-computed per-window centroids for pi11/pi12 fast path."""
-        table = pa.table({
-            "window_start": pa.array(
-                [c["window_start"] for c in centroids],
-                type=pa.timestamp("us", tz="UTC"),
-            ),
-            "window_end": pa.array(
-                [c["window_end"] for c in centroids],
-                type=pa.timestamp("us", tz="UTC"),
-            ),
-            "centroid": pa.array(
-                [c["centroid"] for c in centroids],
-                type=pa.list_(pa.float32()),
-            ),
-            "entity_count": pa.array(
-                [c["entity_count"] for c in centroids],
-                type=pa.int32(),
-            ),
-            "anomaly_rate": pa.array(
-                [c.get("anomaly_rate", 0.0) for c in centroids],
-                type=pa.float32(),
-            ),
-        })
+        table = pa.table(
+            {
+                "window_start": pa.array(
+                    [c["window_start"] for c in centroids],
+                    type=pa.timestamp("us", tz="UTC"),
+                ),
+                "window_end": pa.array(
+                    [c["window_end"] for c in centroids],
+                    type=pa.timestamp("us", tz="UTC"),
+                ),
+                "centroid": pa.array(
+                    [c["centroid"] for c in centroids],
+                    type=pa.list_(pa.float32()),
+                ),
+                "entity_count": pa.array(
+                    [c["entity_count"] for c in centroids],
+                    type=pa.int32(),
+                ),
+                "anomaly_rate": pa.array(
+                    [c.get("anomaly_rate", 0.0) for c in centroids],
+                    type=pa.float32(),
+                ),
+            }
+        )
 
         out_dir = self._base / "_gds_meta" / "temporal_centroids"
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"{pattern_id}.lance"
         _write_lance(table, str(out_path), mode="overwrite")
+
+    def invalidate_temporal_centroids(self, pattern_id: str, *, _ds: Any = None) -> None:
+        """Empty the temporal centroid cache; an empty cache reads as absent.
+
+        Rows are deleted rather than the dataset removed: sphere branches hold
+        a Lance branch on this dataset. ``_ds`` is the handle to commit
+        through (a branch head); by default the main dataset.
+        """
+        if _ds is not None:
+            _ds.delete("true")
+            return
+        path = self._base / "_gds_meta" / "temporal_centroids" / f"{pattern_id}.lance"
+        if path.exists():
+            _lance.dataset(str(path)).delete("true")
 
     # ── Edge table ──────────────────────────────────────────────
 
@@ -1030,14 +1084,16 @@ class GDSWriter:
         with suppress(Exception):
             ds.create_scalar_index("to_key", index_type="BTREE", replace=True)
 
-    def write_edge_stats(self, pattern_id: str, stats: dict) -> None:
+    def write_edge_stats(self, pattern_id: str, stats: dict[str, Any]) -> None:
         """Cache edge table statistics as JSON for fast reads."""
         path = self._base / "_gds_meta" / "edge_stats"
         path.mkdir(parents=True, exist_ok=True)
-        (path / f"{pattern_id}.json").write_text(json.dumps(stats, indent=2))
+        write_json_atomic(path / f"{pattern_id}.json", stats)
 
     def write_contagion_stats(
-        self, pattern_id: str, table: pa.Table,
+        self,
+        pattern_id: str,
+        table: pa.Table,
     ) -> None:
         """Persist precomputed per-entity contagion statistics.
 
@@ -1055,11 +1111,15 @@ class GDSWriter:
         if ds.count_rows() > 0:
             with suppress(Exception):
                 ds.create_scalar_index(
-                    "primary_key", index_type="BTREE", replace=True,
+                    "primary_key",
+                    index_type="BTREE",
+                    replace=True,
                 )
 
     def write_calibration_tracker(
-        self, pattern_id: str, tracker: CalibrationTracker,  # noqa: F821
+        self,
+        pattern_id: str,
+        tracker: CalibrationTracker,
     ) -> None:
         """Persist calibration tracker to _gds_meta/calibration/{pattern_id}.json."""
         from hypertopos.engine.calibration import RESERVOIR_K
@@ -1081,5 +1141,4 @@ class GDSWriter:
             "norm_reservoir": tracker.norm_reservoir[:k].tolist(),
             "norm_reservoir_count": tracker.norm_reservoir_count,
         }
-        path = cal_dir / f"{pattern_id}.json"
-        path.write_text(json.dumps(data, indent=2))
+        write_json_atomic(cal_dir / f"{pattern_id}.json", data)

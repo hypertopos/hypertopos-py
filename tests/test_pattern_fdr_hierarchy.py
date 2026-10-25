@@ -2,9 +2,11 @@
 # Licensed under the Business Source License 1.1 (the "License");
 # you may not use this file except in compliance with the License.
 """Tests for Pattern.fdr_hierarchy + fdr_temporal_hierarchy fields."""
+
 from __future__ import annotations
 
 import yaml
+
 from hypertopos.model.sphere import Pattern
 from hypertopos.storage.reader import GDSReader
 

@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from hypertopos.builder._bootstrap import compute_bootstrap_confidence
 
@@ -79,7 +78,9 @@ class TestBootstrapConfidence:
             X, kinds, anomaly_percentile=95.0, B=200, seed=42, group_ids=group_ids
         )
         assert conf is not None
-        assert conf[0] >= 0.85, f"Expected outlier confidence >= 0.85 with stratified sampling, got {conf[0]}"
+        assert conf[0] >= 0.85, (
+            f"Expected outlier confidence >= 0.85 with stratified sampling, got {conf[0]}"
+        )
 
     def test_mixed_kinds(self):
         """Works with heterogeneous kinds (gaussian + poisson + bernoulli)."""

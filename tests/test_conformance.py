@@ -12,6 +12,7 @@ Covers:
   * rule-set hash determinism and order invariance
   * navigator-level hash-mismatch warning
 """
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -20,6 +21,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pyarrow as pa
+
 from hypertopos.builder.conformance import (
     compile_predicate,
     evaluate_conformance_rules,
@@ -35,6 +37,7 @@ from hypertopos.model.sphere import (
     compute_rule_set_hash,
 )
 from hypertopos.navigation.navigator import GDSNavigator
+from hypertopos.storage.reader import GDSReader
 
 _DT = datetime(2024, 1, 1, tzinfo=UTC)
 
@@ -142,9 +145,7 @@ def test_predicate_compiler_handles_nested_and_or_not():
     expr = compile_predicate(pred)
     filtered = _five_row_table().filter(expr)
     pks = sorted(filtered.column("primary_key").to_pylist())
-    assert pks == ["E1", "E5"], (
-        f"hand-computed truth: only E1, E5 satisfy; got {pks}"
-    )
+    assert pks == ["E1", "E5"], f"hand-computed truth: only E1, E5 satisfy; got {pks}"
 
 
 def test_predicate_compiler_handles_comparison_ops():
@@ -154,31 +155,40 @@ def test_predicate_compiler_handles_comparison_ops():
     # !=  → all rows where a is not 1 → E2, E3, E5
     expr = compile_predicate(ConformancePredicate(op="!=", prop="a", value=1))
     assert sorted(tbl.filter(expr).column("primary_key").to_pylist()) == [
-        "E2", "E3", "E5",
+        "E2",
+        "E3",
+        "E5",
     ]
 
     # <  → a < 3 → E1, E2, E4
     expr = compile_predicate(ConformancePredicate(op="<", prop="a", value=3))
     assert sorted(tbl.filter(expr).column("primary_key").to_pylist()) == [
-        "E1", "E2", "E4",
+        "E1",
+        "E2",
+        "E4",
     ]
 
     # <=  → a <= 2 → E1, E2, E4
     expr = compile_predicate(ConformancePredicate(op="<=", prop="a", value=2))
     assert sorted(tbl.filter(expr).column("primary_key").to_pylist()) == [
-        "E1", "E2", "E4",
+        "E1",
+        "E2",
+        "E4",
     ]
 
     # >  → c > 6 → E1, E5
     expr = compile_predicate(ConformancePredicate(op=">", prop="c", value=6))
     assert sorted(tbl.filter(expr).column("primary_key").to_pylist()) == [
-        "E1", "E5",
+        "E1",
+        "E5",
     ]
 
     # >=  → c >= 6 → E1, E3, E5
     expr = compile_predicate(ConformancePredicate(op=">=", prop="c", value=6))
     assert sorted(tbl.filter(expr).column("primary_key").to_pylist()) == [
-        "E1", "E3", "E5",
+        "E1",
+        "E3",
+        "E5",
     ]
 
     # in  → region in {EU, APAC} → E1, E3, E4
@@ -186,7 +196,9 @@ def test_predicate_compiler_handles_comparison_ops():
         ConformancePredicate(op="in", prop="region", value=["EU", "APAC"]),
     )
     assert sorted(tbl.filter(expr).column("primary_key").to_pylist()) == [
-        "E1", "E3", "E4",
+        "E1",
+        "E3",
+        "E4",
     ]
 
 
@@ -212,7 +224,9 @@ def test_evaluate_conformance_rules_returns_violations():
             rule_id="rule_low",
             severity="low",
             violates_when=ConformancePredicate(
-                op="==", prop="region", value="XX",
+                op="==",
+                prop="region",
+                value="XX",
             ),
         ),
     ]
@@ -269,6 +283,7 @@ def test_sidecar_manifest_carries_rule_set_hash(tmp_path: Path):
     )
 
     _, manifest = read_violations(
+        reader=GDSReader(str(tmp_path)),
         base_path=tmp_path,
         pattern_id=pattern.pattern_id,
         version=1,
@@ -292,7 +307,9 @@ def test_read_violations_filters_by_rule_id(tmp_path: Path):
             rule_id="rule_low",
             severity="low",
             violates_when=ConformancePredicate(
-                op="==", prop="region", value="XX",
+                op="==",
+                prop="region",
+                value="XX",
             ),
         ),
     ]
@@ -308,6 +325,7 @@ def test_read_violations_filters_by_rule_id(tmp_path: Path):
     )
 
     out, _ = read_violations(
+        reader=GDSReader(str(tmp_path)),
         base_path=tmp_path,
         pattern_id=pattern.pattern_id,
         version=1,
@@ -330,7 +348,9 @@ def test_read_violations_filters_by_severity_min(tmp_path: Path):
             rule_id="rule_low",
             severity="low",
             violates_when=ConformancePredicate(
-                op="==", prop="region", value="XX",
+                op="==",
+                prop="region",
+                value="XX",
             ),
         ),
     ]
@@ -346,6 +366,7 @@ def test_read_violations_filters_by_severity_min(tmp_path: Path):
     )
 
     out, _ = read_violations(
+        reader=GDSReader(str(tmp_path)),
         base_path=tmp_path,
         pattern_id=pattern.pattern_id,
         version=1,
@@ -378,6 +399,7 @@ def test_read_violations_top_n_caps(tmp_path: Path):
 
     # Underlying dataset has 3 violations (E0, E1, E2).
     out_2, _ = read_violations(
+        reader=GDSReader(str(tmp_path)),
         base_path=tmp_path,
         pattern_id=pattern.pattern_id,
         version=1,
@@ -386,6 +408,7 @@ def test_read_violations_top_n_caps(tmp_path: Path):
     assert len(out_2) == 2
 
     out_10, _ = read_violations(
+        reader=GDSReader(str(tmp_path)),
         base_path=tmp_path,
         pattern_id=pattern.pattern_id,
         version=1,
@@ -412,7 +435,9 @@ def test_find_conformance_violations_warns_on_rule_set_hash_mismatch(
         rule_id="rule_b",  # different rule_id → different hash
         severity="low",
         violates_when=ConformancePredicate(
-            op="==", prop="region", value="XX",
+            op="==",
+            prop="region",
+            value="XX",
         ),
     )
 
@@ -439,6 +464,7 @@ def test_find_conformance_violations_warns_on_rule_set_hash_mismatch(
 
     storage = MagicMock()
     storage._base = tmp_path
+    storage.meta_root = tmp_path
     storage.read_sphere.return_value = sphere
     manifest = MagicMock()
     manifest.pattern_version.return_value = 1
@@ -467,7 +493,9 @@ def test_compute_rule_set_hash_deterministic_across_rule_order():
         rule_id="beta",
         severity="low",
         violates_when=ConformancePredicate(
-            op="==", prop="region", value="XX",
+            op="==",
+            prop="region",
+            value="XX",
         ),
     )
     h_ab = compute_rule_set_hash([r1, r2])

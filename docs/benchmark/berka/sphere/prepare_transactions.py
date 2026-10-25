@@ -1,6 +1,7 @@
 # Copyright (C) 2026 Karol Kędzia
 # SPDX-License-Identifier: Apache-2.0
 """Tier 3 prepare script — builds transactions table from trans.csv."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -38,14 +39,18 @@ def prepare() -> pa.Table:
     opts = pcsv.ParseOptions(delimiter=";")
     trans_df = pcsv.read_csv(DATA_DIR / "trans.csv", parse_options=opts)
     n = trans_df.num_rows
-    return pa.table({
-        "primary_key": pa.array([f"TX-{i:07d}" for i in range(n)], type=pa.string()),
-        "account_id": pa.array([str(v) for v in trans_df["account_id"].to_pylist()], type=pa.string()),
-        "date": _parse_berka_date(trans_df["date"]),
-        "type": _col_to_str(trans_df["type"]),
-        "operation": _col_to_str(trans_df["operation"]),
-        "amount": trans_df["amount"].cast(pa.float64()),
-        "balance": trans_df["balance"].cast(pa.float64()),
-        "k_symbol": _col_to_str(trans_df["k_symbol"]),
-        "bank": _col_to_str(trans_df["bank"]),
-    })
+    return pa.table(
+        {
+            "primary_key": pa.array([f"TX-{i:07d}" for i in range(n)], type=pa.string()),
+            "account_id": pa.array(
+                [str(v) for v in trans_df["account_id"].to_pylist()], type=pa.string()
+            ),
+            "date": _parse_berka_date(trans_df["date"]),
+            "type": _col_to_str(trans_df["type"]),
+            "operation": _col_to_str(trans_df["operation"]),
+            "amount": trans_df["amount"].cast(pa.float64()),
+            "balance": trans_df["balance"].cast(pa.float64()),
+            "k_symbol": _col_to_str(trans_df["k_symbol"]),
+            "bank": _col_to_str(trans_df["bank"]),
+        }
+    )

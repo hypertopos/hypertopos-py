@@ -91,7 +91,7 @@ one suspect list per threshold measured against both GTs.
 
 ### Layer 3 — Typology filter (rule-based)
 
-14 typology rules from [`gds-fraud-investigator`](../../packages/hypertopos-skills/gds-fraud-investigator/SKILL.md)
+14 typology rules from [`gds-fraud-investigator`](https://github.com/hypertopos/hypertopos-skills/blob/main/gds-fraud-investigator/SKILL.md)
 skill applied to XGBoost output from each stream. Each suspect is classified against
 AML typologies (round-tripping, geographic spread, concentrator, shell/pass-through, etc.)
 using sphere data only. Suspects matching >= 1 typology are retained; zero-match suspects

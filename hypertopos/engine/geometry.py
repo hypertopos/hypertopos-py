@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import random
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 
@@ -20,8 +20,10 @@ from hypertopos.navigation.navigator import GDSNavigationError
 from hypertopos.utils.arrow import delta_matrix_from_arrow
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from hypertopos.model.manifest import Manifest
-    from hypertopos.model.sphere import Pattern, RelationDef
+    from hypertopos.model.sphere import DimPairLeadLag, LeadLagReport, Pattern, RelationDef
     from hypertopos.storage.cache import GDSCache
     from hypertopos.storage.reader import GDSReader
 
@@ -40,20 +42,22 @@ def _reconstruct_edges_from_entity_keys(
     for i, rel in enumerate(relations):
         key = keys[i] if i < len(keys) else ""
         alive = bool(key)
-        edges.append(Edge(
-            line_id=rel.line_id,
-            point_key=key,
-            status="alive" if alive else "dead",
-            direction=rel.direction,
-            is_jumpable=alive,
-        ))
+        edges.append(
+            Edge(
+                line_id=rel.line_id,
+                point_key=key,
+                status="alive" if alive else "dead",
+                direction=rel.direction,
+                is_jumpable=alive,
+            )
+        )
     return edges
 
 
 class GDSEngine:
     def __init__(self, storage: GDSReader | None, cache: GDSCache | None) -> None:
-        self._storage = storage
-        self._cache = cache
+        self._storage: GDSReader = storage  # type: ignore[assignment]  # None only for pure-compute use; storage-backed methods require a reader
+        self._cache: GDSCache = cache  # type: ignore[assignment]  # same contract as _storage
 
     def build_polygon(
         self,
@@ -61,22 +65,31 @@ class GDSEngine:
         pattern_id: str,
         manifest: Manifest,
     ) -> Polygon:
-        cached = self._cache.get_polygon(primary_key, pattern_id)
+        snapshot_id = getattr(self._storage, "snapshot_id", 0)
+        cached = self._cache.get_polygon(primary_key, pattern_id, snapshot_id)
         if cached is not None:
             return cached
 
         version = manifest.pattern_version(pattern_id)
         if version is None:
-            raise GDSNavigationError(
-                f"No geometry version for pattern '{pattern_id}' in manifest."
-            )
+            raise GDSNavigationError(f"No geometry version for pattern '{pattern_id}' in manifest.")
         _poly_cols = [
-            "primary_key", "scale", "delta", "delta_norm", "delta_rank_pct",
-            "is_anomaly", "last_refresh_at", "updated_at",
-            "edges", "entity_keys",
+            "primary_key",
+            "scale",
+            "delta",
+            "delta_norm",
+            "delta_rank_pct",
+            "is_anomaly",
+            "last_refresh_at",
+            "updated_at",
+            "edges",
+            "entity_keys",
         ]
         table = self._storage.read_geometry(
-            pattern_id, version, primary_key=primary_key, columns=_poly_cols,
+            pattern_id,
+            version,
+            primary_key=primary_key,
+            columns=_poly_cols,
         )
         if table.num_rows == 0:
             raise KeyError(f"No geometry for {primary_key} in {pattern_id} v{version}")
@@ -100,7 +113,8 @@ class GDSEngine:
         else:
             # Event geometry: reconstruct from entity_keys + pattern.relations
             edges = _reconstruct_edges_from_entity_keys(
-                row.get("entity_keys"), pattern.relations,
+                row.get("entity_keys"),
+                pattern.relations,
             )
 
         polygon = Polygon(
@@ -116,8 +130,7 @@ class GDSEngine:
             last_refresh_at=row["last_refresh_at"],
             updated_at=row["updated_at"],
             delta_rank_pct=(
-                None if row.get("delta_rank_pct") is None
-                else float(row["delta_rank_pct"])
+                None if row.get("delta_rank_pct") is None else float(row["delta_rank_pct"])
             ),
         )
         if pattern.edge_max is None:
@@ -139,7 +152,7 @@ class GDSEngine:
         # _polygon_to_shape_vector yields alive_count=1 for every entity (single edge,
         # point_key="") — recomputation would produce identical delta for all entities.
 
-        self._cache.put_polygon(polygon)
+        self._cache.put_polygon(polygon, snapshot_id)
         return polygon
 
     SIGMA_EPSILON = 1e-2
@@ -176,7 +189,8 @@ class GDSEngine:
             delta = (shape_vector - pattern.mu) / sigma
         if pattern.dimension_weights is not None:
             delta = delta * pattern.dimension_weights
-        return delta
+        result: np.ndarray = delta
+        return result
 
     @staticmethod
     def decompose_displacement(
@@ -221,8 +235,7 @@ class GDSEngine:
         ld = np.asarray(label_direction, dtype=np.float64).ravel()
         if d.shape != ld.shape:
             raise ValueError(
-                f"delta and label_direction shape mismatch: "
-                f"{d.shape} vs {ld.shape}",
+                f"delta and label_direction shape mismatch: {d.shape} vs {ld.shape}",
             )
         ld_norm = float(np.linalg.norm(ld))
         if ld_norm <= 0.0:
@@ -234,14 +247,11 @@ class GDSEngine:
         extrinsic = float(np.sqrt(residual_sq))
         return {"intrinsic": intrinsic, "extrinsic": extrinsic}
 
-    def _polygon_to_shape_vector(
-        self, polygon: Polygon, pattern: Pattern
-    ) -> np.ndarray:
+    def _polygon_to_shape_vector(self, polygon: Polygon, pattern: Pattern) -> np.ndarray:
         vector = np.zeros(len(pattern.relations), dtype=np.float32)
         for i, relation in enumerate(pattern.relations):
             alive_count = sum(
-                1 for e in polygon.edges
-                if e.line_id == relation.line_id and e.is_alive()
+                1 for e in polygon.edges if e.line_id == relation.line_id and e.is_alive()
             )
             if pattern.edge_max is not None:
                 max_val = pattern.edge_max[i] if pattern.edge_max[i] > 0 else 1.0
@@ -261,17 +271,28 @@ class GDSEngine:
     ) -> Solid:
         base = self.build_polygon(primary_key, pattern_id, manifest)
         table = self._storage.read_temporal(
-            pattern_id, primary_key, filters=filters, agent_id=manifest.agent_id,
+            pattern_id,
+            primary_key,
+            filters=filters,
+            agent_id=manifest.agent_id,
         )
         if table.num_rows > 0 and "shape_snapshot" not in table.schema.names:
             raise GDSNavigationError(
                 f"Temporal data for pattern '{pattern_id}' uses legacy schema "
-                "(delta_snapshot). Run GDSWriter.migrate_temporal_to_shape_snapshot() "
+                "(delta_snapshot). Rebuild the sphere "
                 "to upgrade."
             )
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns[pattern_id]
-        sigma = np.maximum(pattern.sigma_diag, self.SIGMA_EPSILON)
+        snapshots = (
+            [np.array(s, dtype=np.float32) for s in table["shape_snapshot"].to_pylist()]
+            if table.num_rows > 0
+            else []
+        )
+        if len({s.shape[-1] for s in snapshots}) == 1:
+            deltas = list(slice_deltas(np.stack(snapshots), pattern))
+        else:
+            deltas = [slice_deltas(s[None, :], pattern)[0] for s in snapshots]
         slices: list[SolidSlice] = []
         # When counterfactual_frozen_population is requested, capture each
         # slice's raw shape_snapshot so the frozen-trajectory recompute can
@@ -280,29 +301,22 @@ class GDSEngine:
         raw_shapes: list[np.ndarray] = []
         for i in range(table.num_rows):
             row = {col: table[col][i].as_py() for col in table.schema.names}
-            shape = np.array(row["shape_snapshot"], dtype=np.float32)
-            # Temporal shape_snapshot carries structural dims only; aggregated
-            # edge_dim dims have no temporal history. Slice calibration arrays
-            # to the snapshot width before the broadcast.
-            _w = shape.shape[-1]
-            if pattern.cholesky_inv is not None:
-                delta = pattern.cholesky_inv[:_w, :_w] @ (shape - pattern.mu[:_w])
-            else:
-                delta = (shape - pattern.mu[:_w]) / sigma[:_w]
-            if pattern.dimension_weights is not None:
-                delta = delta * pattern.dimension_weights[:_w]
+            shape = snapshots[i]
+            delta = deltas[i]
             delta_norm = float(np.linalg.norm(delta))
-            slices.append(SolidSlice(
-                slice_index=row["slice_index"],
-                timestamp=row["timestamp"],
-                deformation_type=row["deformation_type"],
-                delta_snapshot=delta,
-                delta_norm_snapshot=delta_norm,
-                pattern_ver=row["pattern_ver"],
-                changed_property=row.get("changed_property"),
-                changed_line_id=row.get("changed_line_id"),
-                added_edge=None,
-            ))
+            slices.append(
+                SolidSlice(
+                    slice_index=row["slice_index"],
+                    timestamp=row["timestamp"],
+                    deformation_type=row["deformation_type"],
+                    delta_snapshot=delta,
+                    delta_norm_snapshot=delta_norm,
+                    pattern_ver=row["pattern_ver"],
+                    changed_property=row.get("changed_property"),
+                    changed_line_id=row.get("changed_line_id"),
+                    added_edge=None,
+                )
+            )
             if counterfactual_frozen_population:
                 raw_shapes.append(shape)
         # Pair raw_shapes with their slice and sort jointly so the
@@ -322,7 +336,8 @@ class GDSEngine:
                 timestamp = timestamp.replace(tzinfo=UTC)
             if counterfactual_frozen_population:
                 surviving = [
-                    (s, r) for s, r in zip(slices, raw_shapes, strict=True)
+                    (s, r)
+                    for s, r in zip(slices, raw_shapes, strict=True)
                     if s.timestamp <= timestamp
                 ]
                 slices = [p[0] for p in surviving]
@@ -333,17 +348,19 @@ class GDSEngine:
             from hypertopos.engine.counterfactual import (
                 recompute_delta_norm_against_frozen,
             )
+
             mu_frozen = raw_shapes[0]
             _w = mu_frozen.shape[-1]
-            sigma_frozen = sigma[:_w]
+            sigma_frozen = np.maximum(pattern.sigma_diag[:_w], self.SIGMA_EPSILON)
             for slc, raw in zip(slices, raw_shapes, strict=True):
                 slc.delta_norm_frozen_pop = recompute_delta_norm_against_frozen(
                     shape=raw,
                     mu_frozen=mu_frozen,
                     sigma=sigma_frozen,
                 )
-        return Solid(primary_key=primary_key, pattern_id=pattern_id,
-                     base_polygon=base, slices=slices)
+        return Solid(
+            primary_key=primary_key, pattern_id=pattern_id, base_polygon=base, slices=slices
+        )
 
     def compute_distance_temporal(self, solid_a: Solid, solid_b: Solid) -> float:
         seq_a = [s.delta_snapshot for s in solid_a.slices]
@@ -352,80 +369,44 @@ class GDSEngine:
             return 0.0
         return self._dtw(seq_a, seq_b)
 
-    def _dtw(
-        self, seq_a: list[np.ndarray], seq_b: list[np.ndarray]
-    ) -> float:
+    def _dtw(self, seq_a: list[np.ndarray], seq_b: list[np.ndarray]) -> float:
         n, m = len(seq_a), len(seq_b)
         dtw = np.full((n + 1, m + 1), np.inf)
         dtw[0, 0] = 0.0
         for i in range(1, n + 1):
             for j in range(1, m + 1):
                 cost = float(np.linalg.norm(seq_a[i - 1] - seq_b[j - 1]))
-                dtw[i, j] = cost + min(dtw[i-1, j], dtw[i, j-1], dtw[i-1, j-1])
+                dtw[i, j] = cost + min(dtw[i - 1, j], dtw[i, j - 1], dtw[i - 1, j - 1])
         return float(dtw[n, m])
 
-    def _find_common_polygons(
-        self, polygon_a: Polygon, polygon_b: Polygon
-    ) -> set[tuple[str, str]]:
+    def _find_common_polygons(self, polygon_a: Polygon, polygon_b: Polygon) -> set[tuple[str, str]]:
         """Return alive (line_id, point_key) pairs common to both polygons.
 
         Uses set intersection — O(|B(Φ_A)| + |B(Φ_B)|).
         """
-        alive_a = {
-            (e.line_id, e.point_key) for e in polygon_a.edges if e.is_alive()
-        }
-        alive_b = {
-            (e.line_id, e.point_key) for e in polygon_b.edges if e.is_alive()
-        }
+        alive_a = {(e.line_id, e.point_key) for e in polygon_a.edges if e.is_alive()}
+        alive_b = {(e.line_id, e.point_key) for e in polygon_b.edges if e.is_alive()}
         return alive_a & alive_b
 
-    def classify_anomalies(
-        self, polygons: list[Polygon], pattern: Pattern
-    ) -> list[dict]:
-        clusters: dict[tuple, list[Polygon]] = {}
+    def classify_anomalies(self, polygons: list[Polygon], pattern: Pattern) -> list[dict[str, Any]]:
+        # Group by label: a rounded continuous delta is unique per entity, so
+        # grouping by it gave one "cluster" per anomaly.
+        names = cluster_dim_names(pattern)
+        clusters: dict[str, list[tuple[Polygon, np.ndarray]]] = {}
         for p in polygons:
             if not p.is_anomaly:
                 continue
-            key = tuple(np.round(p.delta, 1).tolist())
-            clusters.setdefault(key, []).append(p)
-        result = []
-        k = len(pattern.relations)
-
-        def _dim_name(i: int) -> str:
-            if i < k:
-                rel = pattern.relations[i]
-                return rel.display_name or rel.line_id
-            prop_idx = i - k
-            if prop_idx < len(pattern.prop_columns):
-                return f"prop:{pattern.prop_columns[prop_idx]}"
-            return f"dim_{i}"
-
-        for delta_key, members in sorted(clusters.items(), key=lambda x: -len(x[1])):
-            dims = sorted(
-                [(_dim_name(i), v) for i, v in enumerate(delta_key) if abs(v) > 0.05],
-                key=lambda x: -abs(x[1]),
-            )
-            elevated = [name for name, v in dims if v > 0]
-            missing = [name for name, v in dims if v < 0]
-            # Put the dominant-sign group first (determined by the top driver)
-            if dims and dims[0][1] > 0:
-                parts = (
-                    ([f"elevated: {', '.join(elevated[:3])}"] if elevated else [])
-                    + ([f"missing: {', '.join(missing[:3])}"] if missing else [])
-                )
-            else:
-                parts = (
-                    ([f"missing: {', '.join(missing[:3])}"] if missing else [])
-                    + ([f"elevated: {', '.join(elevated[:3])}"] if elevated else [])
-                )
-            label = "; ".join(parts) if parts else "no deviation"
-            result.append({
-                "delta": list(delta_key),
+            rounded = np.round(p.delta, 1)
+            clusters.setdefault(cluster_label(rounded.tolist(), names), []).append((p, rounded))
+        return [
+            {
+                "delta": np.round(np.mean([r for _, r in members], axis=0), 1).tolist(),
                 "label": label,
                 "count": len(members),
-                "examples": [p.primary_key for p in members[:3]],
-            })
-        return result
+                "examples": [p.primary_key for p, _ in members[:3]],
+            }
+            for label, members in sorted(clusters.items(), key=lambda x: -len(x[1]))
+        ]
 
     def count_inside_alias(self, alias: Any, geo: Any) -> int:
         """Count entities geometrically inside the alias segment (signed_dist > 0).
@@ -443,8 +424,11 @@ class GDSEngine:
         return int((scores > 0).sum())
 
     _DELTA_OPS: dict[str, Any] = {
-        "gt": np.greater, "gte": np.greater_equal,
-        "lt": np.less, "lte": np.less_equal, "eq": np.equal,
+        "gt": np.greater,
+        "gte": np.greater_equal,
+        "lt": np.less,
+        "lte": np.less_equal,
+        "eq": np.equal,
     }
 
     def filter_geometry_inside_alias(self, geo: Any, alias: Any) -> Any:
@@ -454,6 +438,7 @@ class GDSEngine:
         Returns geo unchanged if alias has no cutting_plane or geo is empty.
         """
         import pyarrow as pa
+
         if geo.num_rows == 0:
             return geo
         cp = alias.filter.cutting_plane
@@ -464,7 +449,7 @@ class GDSEngine:
         return geo.filter(pa.array(inside_mask))
 
     def filter_geometry_by_delta_dim(
-        self, geo: Any, pattern: Any, delta_dim_spec: dict
+        self, geo: Any, pattern: Any, delta_dim_spec: dict[str, Any]
     ) -> Any:
         """Filter geometry Arrow table by per-dimension delta values.
 
@@ -473,6 +458,7 @@ class GDSEngine:
         Raises ValueError for unknown dimension names or operators.
         """
         import pyarrow as pa
+
         if geo.num_rows == 0:
             return geo
         delta_matrix = delta_matrix_from_arrow(geo)
@@ -494,7 +480,7 @@ class GDSEngine:
         mask_a: np.ndarray,
         mask_b: np.ndarray,
         dim_labels: list[str] | None = None,
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """Compute per-dimension contrast between two entity groups.
 
         Returns dimensions ranked by |effect_size| descending, answering
@@ -528,22 +514,24 @@ class GDSEngine:
 
         sigma_a = group_a.std(axis=0)
         sigma_b = group_b.std(axis=0)
-        pooled = np.sqrt((sigma_a ** 2 + sigma_b ** 2) / 2.0)
+        pooled = np.sqrt((sigma_a**2 + sigma_b**2) / 2.0)
         with np.errstate(divide="ignore", invalid="ignore"):
             effect_size = np.where(pooled > 0, diff / pooled, diff)
 
         n_dims = delta_matrix.shape[1]
-        results = []
+        results: list[dict[str, Any]] = []
         for i in range(n_dims):
             label = dim_labels[i] if dim_labels and i < len(dim_labels) else f"dim_{i}"
-            results.append({
-                "dim_index": i,
-                "dim_label": label,
-                "mean_a": round(float(mean_a[i]), 6),
-                "mean_b": round(float(mean_b[i]), 6),
-                "diff": round(float(diff[i]), 6),
-                "effect_size": round(float(effect_size[i]), 6),
-            })
+            results.append(
+                {
+                    "dim_index": i,
+                    "dim_label": label,
+                    "mean_a": round(float(mean_a[i]), 6),
+                    "mean_b": round(float(mean_b[i]), 6),
+                    "diff": round(float(diff[i]), 6),
+                    "effect_size": round(float(effect_size[i]), 6),
+                }
+            )
         results.sort(key=lambda x: abs(x["effect_size"]), reverse=True)
         return results
 
@@ -554,7 +542,8 @@ class GDSEngine:
         dim_labels: list[str] | None = None,
         entity_keys: list[str] | None = None,
         max_representatives: int = 3,
-    ) -> dict:
+        max_groups: int | None = None,
+    ) -> dict[str, Any]:
         """Compute global + per-group centroids from delta matrix.
 
         Args:
@@ -566,16 +555,20 @@ class GDSEngine:
                 reservoir sample of up to ``max_representatives`` entity keys drawn
                 uniformly from that group's actual members.
             max_representatives: reservoir size for member_samples (default 3).
+            max_groups: when the grouping has more groups, keep the largest
+                ``max_groups`` by member count, with the structural outlier of the
+                full grouping always kept, and report ``n_groups_total``. Pairwise
+                distances cover the kept groups only. None keeps every group.
 
         Returns:
             Dict with global_centroid, group_centroids, inter_centroid_distances,
-            structural_outlier, dimensions.
+            structural_outlier, dimensions, and n_groups_total when groups were dropped.
         """
         if delta_matrix.shape[0] == 0:
             raise ValueError("Cannot compute centroid map from empty delta matrix.")
 
         n, d = delta_matrix.shape
-        norms = np.sqrt(np.einsum('ij,ij->i', delta_matrix, delta_matrix))
+        norms = np.sqrt(np.einsum("ij,ij->i", delta_matrix, delta_matrix))
 
         # Global centroid
         global_vec = delta_matrix.mean(axis=0)
@@ -590,6 +583,7 @@ class GDSEngine:
         # before the per-label mask loop (O(N) rather than O(N×k)).
         group_reservoirs: dict[str, list[str]] = {}
         group_counts: dict[str, int] = {}
+        reservoir_rng = random.Random(0)
         if entity_keys is not None:
             for _idx, (label, key) in enumerate(zip(group_labels, entity_keys, strict=False)):
                 count = group_counts.get(label, 0) + 1
@@ -598,51 +592,64 @@ class GDSEngine:
                 if len(reservoir) < max_representatives:
                     reservoir.append(key)
                 else:
-                    j = random.randint(0, count - 1)  # noqa: S311
+                    j = reservoir_rng.randint(0, count - 1)  # noqa: S311
                     if j < max_representatives:
                         reservoir[j] = key
 
-        # Per-group centroids
-        unique_labels = sorted(set(group_labels))
+        # Per-group centroids: one stable sort by label, then each group is a
+        # contiguous slice holding its rows in their original order.
+        label_arr = np.asarray(group_labels, dtype=str)
+        unique_arr, inverse, counts = np.unique(label_arr, return_inverse=True, return_counts=True)
+        unique_labels: list[str] = unique_arr.tolist()
+        order = np.argsort(inverse, kind="stable")
+        sorted_deltas = delta_matrix[order]
+        sorted_norms = norms[order]
+        bounds = np.concatenate(([0], np.cumsum(counts)))
         group_centroids = []
         centroid_vectors: dict[str, np.ndarray] = {}
-
-        # Pre-convert to numpy array for vectorized comparison (O(N) once, not O(N×k))
-        group_arr = np.array(group_labels, dtype=object)
-
-        for label in unique_labels:
-            mask = group_arr == label
-            group_deltas = delta_matrix[mask]
-            group_norms = norms[mask]
-            vec = group_deltas.mean(axis=0)
-            dist_to_global = float(np.linalg.norm(vec - global_vec))
+        for gi, label in enumerate(unique_labels):
+            lo, hi = bounds[gi], bounds[gi + 1]
+            vec = sorted_deltas[lo:hi].mean(axis=0)
+            group_norms = sorted_norms[lo:hi]
             centroid_vectors[label] = vec
-            entry: dict = {
+            entry: dict[str, Any] = {
                 "key": label,
                 "vector": vec.tolist(),
                 "radius": round(float(group_norms.mean()), 6),
                 "spread": round(float(group_norms.std()), 6),
-                "count": int(mask.sum()),
-                "distance_to_global": round(dist_to_global, 6),
+                "count": int(counts[gi]),
+                "distance_to_global": round(float(np.linalg.norm(vec - global_vec)), 6),
             }
             if label in group_reservoirs:
                 entry["member_samples"] = group_reservoirs[label]
             group_centroids.append(entry)
 
-        # Inter-centroid pairwise L2 distances
-        inter_distances = []
-        for i, la in enumerate(unique_labels):
-            for lb in unique_labels[i + 1:]:
-                dist = float(np.linalg.norm(centroid_vectors[la] - centroid_vectors[lb]))
-                inter_distances.append({
-                    "pair": [la, lb],
-                    "distance": round(dist, 6),
-                })
-
-        # Structural outlier = group with max distance_to_global
+        # Structural outlier = group with max distance_to_global (full grouping)
         outlier = max(group_centroids, key=lambda g: g["distance_to_global"])
 
-        return {
+        n_groups_total = len(group_centroids)
+        truncated = max_groups is not None and n_groups_total > max_groups
+        if truncated:
+            assert max_groups is not None
+            kept = sorted(group_centroids, key=lambda g: g["count"], reverse=True)[:max_groups]
+            if outlier["key"] not in {g["key"] for g in kept}:
+                kept = kept[: max_groups - 1] + [outlier]
+            group_centroids = kept
+
+        # Inter-centroid pairwise L2 distances between the returned groups
+        pair_labels = sorted(g["key"] for g in group_centroids)
+        inter_distances = []
+        for i, la in enumerate(pair_labels):
+            for lb in pair_labels[i + 1 :]:
+                dist = float(np.linalg.norm(centroid_vectors[la] - centroid_vectors[lb]))
+                inter_distances.append(
+                    {
+                        "pair": [la, lb],
+                        "distance": round(dist, 6),
+                    }
+                )
+
+        result: dict[str, Any] = {
             "global_centroid": global_centroid,
             "group_centroids": group_centroids,
             "inter_centroid_distances": inter_distances,
@@ -652,6 +659,9 @@ class GDSEngine:
             },
             "dimensions": dim_labels or [f"dim_{i}" for i in range(d)],
         }
+        if truncated:
+            result["n_groups_total"] = n_groups_total
+        return result
 
     def find_nearest(
         self,
@@ -677,25 +687,33 @@ class GDSEngine:
         if _ann_fn is not None and not need_rerank:
             ann = _ann_fn(pattern_id, version, ref_delta, top_n, exclude_keys, filter_expr)
             if ann is not None:
-                return ann
+                return cast("list[tuple[str, float]]", ann)  # find_nearest_lance return type
 
         # Over-fetch from ANN when we need to re-rank
         if _ann_fn is not None and need_rerank:
             ann = _ann_fn(
-                pattern_id, version, ref_delta, top_n * 5,
-                exclude_keys, filter_expr,
+                pattern_id,
+                version,
+                ref_delta,
+                top_n * 5,
+                exclude_keys,
+                filter_expr,
             )
             if ann is not None:
                 ann_keys = {k for k, _ in ann}
                 geo = self._storage.read_geometry(
-                    pattern_id, version,
+                    pattern_id,
+                    version,
                     columns=["primary_key", "delta"],
                     point_keys=list(ann_keys),
                 )
                 keys = geo["primary_key"].to_pylist()
                 deltas = delta_matrix_from_arrow(geo)
                 distances = self._compute_distances(
-                    ref_delta, deltas, dim_mask_indices, metric,
+                    ref_delta,
+                    deltas,
+                    dim_mask_indices,
+                    metric,
                 )
                 if exclude_keys:
                     mask = np.array([k in exclude_keys for k in keys])
@@ -704,13 +722,18 @@ class GDSEngine:
 
         # Fallback: brute-force NumPy
         geo = self._storage.read_geometry(
-            pattern_id, version, columns=["primary_key", "delta"],
+            pattern_id,
+            version,
+            columns=["primary_key", "delta"],
         )
         keys = geo["primary_key"].to_pylist()
         deltas = delta_matrix_from_arrow(geo)
 
         distances = self._compute_distances(
-            ref_delta, deltas, dim_mask_indices, metric,
+            ref_delta,
+            deltas,
+            dim_mask_indices,
+            metric,
         )
 
         if exclude_keys:
@@ -739,11 +762,13 @@ class GDSEngine:
             cand_norms = np.linalg.norm(cand, axis=1)
             safe_denom = np.maximum(ref_norm * cand_norms, 1e-10)
             cos_sim = cand @ ref_f / safe_denom
-            return 1.0 - cos_sim
+            cos_dist: np.ndarray = 1.0 - cos_sim
+            return cos_dist
 
         # L2 (default)
         diff = cand - ref_f
-        return np.sqrt(np.einsum('ij,ij->i', diff, diff))
+        dist: np.ndarray = np.sqrt(np.einsum("ij,ij->i", diff, diff))
+        return dist
 
     @staticmethod
     def _top_n_from_distances(
@@ -771,7 +796,7 @@ class GDSEngine:
         n_clusters: int,
         dim_names: list[str],
         seed: int = 42,
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """Cluster entities by delta vector shape using k-means++.
 
         Returns list of cluster dicts sorted by size descending. Each dict:
@@ -789,7 +814,7 @@ class GDSEngine:
 
         labels, centroids = self._kmeans(delta_matrix, n_clusters, seed=seed)
 
-        result: list[dict] = []
+        result: list[dict[str, Any]] = []
         for k in range(centroids.shape[0]):
             mask = labels == k
             indices = np.where(mask)[0]
@@ -801,27 +826,29 @@ class GDSEngine:
 
             # Sort by distance to centroid (closest first → representative)
             _mc_diff = members - centroid
-            dists_to_centroid = np.sqrt(np.einsum('ij,ij->i', _mc_diff, _mc_diff))
+            dists_to_centroid = np.sqrt(np.einsum("ij,ij->i", _mc_diff, _mc_diff))
             sorted_order = np.argsort(dists_to_centroid)
             sorted_indices = indices[sorted_order]
 
             anomaly_flags = [is_anomaly_flags[i] for i in sorted_indices]
             dn = [delta_norms[i] for i in sorted_indices]
 
-            result.append({
-                "cluster_id": int(k),
-                "size": int(len(sorted_indices)),
-                "anomaly_rate": float(sum(anomaly_flags) / len(anomaly_flags)),
-                "centroid_delta": centroid.tolist(),
-                "delta_norm_mean": float(np.mean(dn)),
-                "delta_norm_std": float(np.std(dn)),
-                "representative_key": str(keys[sorted_indices[0]]),
-                "dim_profile": [
-                    {"dimension": name, "centroid_value": float(centroid[i])}
-                    for i, name in enumerate(dim_names)
-                ],
-                "member_keys": [str(keys[i]) for i in sorted_indices],
-            })
+            result.append(
+                {
+                    "cluster_id": int(k),
+                    "size": int(len(sorted_indices)),
+                    "anomaly_rate": float(sum(anomaly_flags) / len(anomaly_flags)),
+                    "centroid_delta": centroid.tolist(),
+                    "delta_norm_mean": float(np.mean(dn)),
+                    "delta_norm_std": float(np.std(dn)),
+                    "representative_key": str(keys[sorted_indices[0]]),
+                    "dim_profile": [
+                        {"dimension": name, "centroid_value": float(centroid[i])}
+                        for i, name in enumerate(dim_names)
+                    ],
+                    "member_keys": [str(keys[i]) for i in sorted_indices],
+                }
+            )
 
         # Sort by size descending; renumber cluster_id after sort
         result.sort(key=lambda c: c["size"], reverse=True)
@@ -835,7 +862,7 @@ class GDSEngine:
         delta_matrix: np.ndarray,
         k_max: int = 15,
         seed: int = 42,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Find optimal cluster count via silhouette search over k=2..k_max.
 
         Subsamples to 5000 for silhouette computation (O(N^2)).
@@ -863,9 +890,7 @@ class GDSEngine:
         sil_n = sil_matrix.shape[0]
         # Precompute pairwise distances once
         sq_norms = np.sum(sil_matrix**2, axis=1)
-        dist_sq = (
-            sq_norms[:, None] + sq_norms[None, :] - 2 * sil_matrix @ sil_matrix.T
-        )
+        dist_sq = sq_norms[:, None] + sq_norms[None, :] - 2 * sil_matrix @ sil_matrix.T
         np.maximum(dist_sq, 0, out=dist_sq)
         dist_matrix = np.sqrt(dist_sq)
 
@@ -932,7 +957,8 @@ class GDSEngine:
 
         # k-means++ initialisation with running min-distance (O(N) memory)
         def _sq_norms(d: np.ndarray) -> np.ndarray:
-            return np.einsum('ij,ij->i', d, d)
+            sq: np.ndarray = np.einsum("ij,ij->i", d, d)
+            return sq
 
         first = int(rng.integers(0, N))
         centroid_list: list[np.ndarray] = [delta_matrix[first]]
@@ -950,10 +976,10 @@ class GDSEngine:
 
         for _ in range(max_iter):
             # ||x - c||^2 = ||x||^2 - 2*x·c^T + ||c||^2  →  (N,K) not (N,K,D)
-            x_sq = np.einsum('ij,ij->i', delta_matrix, delta_matrix)  # (N,)
-            c_sq = np.einsum('ij,ij->i', centroids, centroids)        # (K,)
-            cross = delta_matrix @ centroids.T                         # (N, K)
-            sq_dists = x_sq[:, None] - 2 * cross + c_sq[None, :]      # (N, K)
+            x_sq = np.einsum("ij,ij->i", delta_matrix, delta_matrix)  # (N,)
+            c_sq = np.einsum("ij,ij->i", centroids, centroids)  # (K,)
+            cross = delta_matrix @ centroids.T  # (N, K)
+            sq_dists = x_sq[:, None] - 2 * cross + c_sq[None, :]  # (N, K)
             new_labels = np.argmin(sq_dists, axis=1).astype(np.int32)
             if np.array_equal(new_labels, labels):
                 break
@@ -1043,36 +1069,40 @@ class GDSEngine:
                 ]
             elif has_entity_keys_col and relations:
                 edges = _reconstruct_edges_from_entity_keys(
-                    row.get("entity_keys"), relations,
+                    row.get("entity_keys"),
+                    relations,
                 )
             else:
                 edges = []
 
-            results.append(Polygon(
-                primary_key=pk,
-                pattern_id=row.get("pattern_id", pattern_id),
-                pattern_ver=row.get("pattern_ver", pattern_ver),
-                pattern_type=row.get("pattern_type", pattern_type),
-                scale=row["scale"],
-                delta=np.array(row["delta"], dtype=np.float32),
-                delta_norm=delta_norm,
-                is_anomaly=bool(row["is_anomaly"]),
-                edges=edges,
-                last_refresh_at=row["last_refresh_at"],
-                updated_at=row["updated_at"],
-                delta_rank_pct=(
-                    None if row.get("delta_rank_pct") is None
-                    else float(row["delta_rank_pct"])
-                ),
-                bregman_divergence=(
-                    None if row.get("bregman_divergence") is None
-                    else float(row["bregman_divergence"])
-                ),
-                anomaly_confidence=(
-                    None if row.get("anomaly_confidence") is None
-                    else float(row["anomaly_confidence"])
-                ),
-            ))
+            results.append(
+                Polygon(
+                    primary_key=pk,
+                    pattern_id=row.get("pattern_id", pattern_id),
+                    pattern_ver=row.get("pattern_ver", pattern_ver),
+                    pattern_type=row.get("pattern_type", pattern_type),
+                    scale=row["scale"],
+                    delta=np.array(row["delta"], dtype=np.float32),
+                    delta_norm=delta_norm,
+                    is_anomaly=bool(row["is_anomaly"]),
+                    edges=edges,
+                    last_refresh_at=row["last_refresh_at"],
+                    updated_at=row["updated_at"],
+                    delta_rank_pct=(
+                        None if row.get("delta_rank_pct") is None else float(row["delta_rank_pct"])
+                    ),
+                    bregman_divergence=(
+                        None
+                        if row.get("bregman_divergence") is None
+                        else float(row["bregman_divergence"])
+                    ),
+                    anomaly_confidence=(
+                        None
+                        if row.get("anomaly_confidence") is None
+                        else float(row["anomaly_confidence"])
+                    ),
+                )
+            )
 
         results.sort(key=lambda p: (-p.delta_norm, p.primary_key))
         if top_n is not None:
@@ -1088,14 +1118,14 @@ class GDSEngine:
         delta: list[float] | np.ndarray,
         dim_labels: list[str],
         top_n: int = 3,
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """Top-N dimensions by squared contribution to delta_norm.
 
         Returns list of ``{dim, label, delta, contribution_pct}`` sorted by
         contribution descending.  Dimensions contributing < 5 % are excluded.
         """
         delta_arr = np.array(delta, dtype=np.float32)
-        sq = delta_arr ** 2
+        sq = delta_arr**2
         total = sq.sum()
         if total < 1e-10:
             return []
@@ -1108,7 +1138,8 @@ class GDSEngine:
                 "delta": round(float(delta_arr[i]), 4),
                 "contribution_pct": round(float(contributions[i]), 1),
             }
-            for i in top_idx if contributions[i] > 5.0
+            for i in top_idx
+            if contributions[i] > 5.0
         ]
 
     @staticmethod
@@ -1199,7 +1230,7 @@ class GDSEngine:
         delta: list[float] | np.ndarray,
         theta_norm: float,
         dim_labels: list[str],
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Minimal subset of dimensions that certifies the anomaly.
 
         Greedy: add dimensions in order of |delta[d]|^2 until partial norm > theta_norm.
@@ -1208,10 +1239,10 @@ class GDSEngine:
         delta_norm = float(np.linalg.norm(delta))
         if delta_norm <= theta_norm or theta_norm <= 0:
             return {"witness_size": 0, "witness_dims": [], "delta_norm": round(delta_norm, 4)}
-        sq = delta ** 2
+        sq = delta**2
         order = np.argsort(sq)[::-1]
         cumsum = np.cumsum(sq[order])
-        k = int(np.searchsorted(cumsum, theta_norm ** 2, side="left")) + 1
+        k = int(np.searchsorted(cumsum, theta_norm**2, side="left")) + 1
         k = min(k, len(delta))
         dims = []
         for i in range(k):
@@ -1229,7 +1260,7 @@ class GDSEngine:
         delta: list[float] | np.ndarray,
         theta_norm: float,
         dim_labels: list[str],
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Minimal subset of dimensions to zero-out to make entity non-anomalous.
 
         Greedy: remove dimensions in order of |delta[d]|^2 until residual norm < theta_norm.
@@ -1238,7 +1269,7 @@ class GDSEngine:
         delta_norm = float(np.linalg.norm(delta))
         if delta_norm <= theta_norm:
             return {"repair_size": 0, "repair_dims": [], "residual_norm": round(delta_norm, 4)}
-        sq = delta ** 2
+        sq = delta**2
         order = np.argsort(sq)[::-1]
         total_sq = float(np.sum(sq))
         removed_sq = 0.0
@@ -1247,7 +1278,7 @@ class GDSEngine:
             removed_sq += sq[order[i]]
             k += 1
             residual = total_sq - removed_sq
-            if residual < theta_norm ** 2:
+            if residual < theta_norm**2:
                 break
         dims = []
         for i in range(k):
@@ -1265,7 +1296,7 @@ class GDSEngine:
     def compute_reputation(
         delta_norms: np.ndarray,
         theta_norm: float,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Beta distribution reputation from longitudinal anomaly history.
 
         reputation = (alpha + 1) / (alpha + beta + 2) — Bayesian posterior mean
@@ -1296,57 +1327,244 @@ class GDSEngine:
         }
 
 
+def cluster_dim_names(pattern: Pattern) -> list[str]:
+    """Dimension names for cluster labels: ``dim_labels`` with props prefixed ``prop:``."""
+    names = list(pattern.dim_labels)
+    start = len(pattern.relations) + len(pattern.event_dimensions) + len(pattern.edge_dim_names)
+    for i in range(start, start + len(pattern.prop_columns)):
+        names[i] = f"prop:{names[i]}"
+    return names
+
+
+def cluster_label(delta_key: Sequence[float], names: list[str]) -> str:
+    """Label a rounded delta by its top-3 elevated and missing dimensions."""
+    dims = sorted(
+        [
+            (names[i] if i < len(names) else f"dim_{i}", v)
+            for i, v in enumerate(delta_key)
+            if abs(v) > 0.05
+        ],
+        key=lambda x: -abs(x[1]),
+    )
+    elevated = [name for name, v in dims if v > 0]
+    missing = [name for name, v in dims if v < 0]
+    groups = [("elevated", elevated), ("missing", missing)]
+    # Put the dominant-sign group first (determined by the top driver)
+    if dims and dims[0][1] < 0:
+        groups.reverse()
+    parts = [f"{tag}: {', '.join(group[:3])}" for tag, group in groups if group]
+    return "; ".join(parts) if parts else "no deviation"
+
+
+def slice_deltas(shapes: np.ndarray, pattern: Pattern) -> np.ndarray:
+    """Delta vectors for temporal shape snapshots, in the pattern's stored metric.
+
+    ``shapes`` is ``(n, w)``. Temporal snapshots carry the structural dims
+    only, so calibration is clamped to the snapshot width ``w``: Mahalanobis
+    via ``cholesky_inv[:w, :w]`` (the leading block of a lower-triangular
+    inverse is the inverse of the leading Cholesky block) when the pattern has
+    one, otherwise ``sigma_diag[:w]`` floored at ``SIGMA_EPSILON``; then
+    ``dimension_weights[:w]``. Same maths as the stored polygon delta.
+    """
+    return calibrated_deltas(
+        shapes,
+        mu=pattern.mu,
+        sigma_diag=pattern.sigma_diag,
+        cholesky_inv=pattern.cholesky_inv,
+        dimension_weights=pattern.dimension_weights,
+    )
+
+
+def active_window_rows(shapes: np.ndarray, group_starts: np.ndarray) -> np.ndarray:
+    """Which temporal slices hold activity, for entities stored as row groups.
+
+    ``shapes`` is ``(N, w)`` raw shape snapshots sorted so each entity's slices
+    form one contiguous group starting at ``group_starts``. A window without
+    events has every time-varying dim at zero; dims that do not vary across the
+    entity's slices (anchor-level values broadcast into every window) do not
+    count. When nothing varies for an entity, every one of its slices is kept.
+    """
+    counts = np.diff(np.append(group_starts, len(shapes)))
+    varying = (
+        np.maximum.reduceat(shapes, group_starts, axis=0)
+        - np.minimum.reduceat(shapes, group_starts, axis=0)
+    ) > 0
+    active = ((shapes != 0) & np.repeat(varying, counts, axis=0)).any(axis=1)
+    keep_all = np.repeat(~varying.any(axis=1), counts)
+    out: np.ndarray = active | keep_all
+    return out
+
+
+def trajectory_summary(
+    deltas: np.ndarray, group_starts: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-entity trajectory vector, displacement and slice count.
+
+    ``deltas`` is ``(N, D)`` with each entity's slices in time order as one
+    contiguous group starting at ``group_starts``. Returns
+    ``concat([mean, std])`` per entity as ``(n, 2D)`` float32, the norm of
+    last minus first slice, and the slice count.
+    """
+    n_rows = len(deltas)
+    counts = np.diff(np.append(group_starts, n_rows))
+    group_ends = group_starts + counts
+    means = np.add.reduceat(deltas, group_starts, axis=0) / counts[:, None]
+    centered = deltas - np.repeat(means, counts, axis=0)
+    centered *= centered
+    stds = np.sqrt(np.add.reduceat(centered, group_starts, axis=0) / counts[:, None])
+    vectors = np.concatenate([means, stds], axis=1).astype(np.float32)
+    displacement = np.linalg.norm(deltas[group_ends - 1] - deltas[group_starts], axis=1).astype(
+        np.float32
+    )
+    return vectors, displacement, counts
+
+
+def active_window_trajectories(
+    shapes: np.ndarray, deltas: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Trajectory summaries over each entity's active windows only.
+
+    ``shapes`` (raw) and ``deltas`` are ``(n, w, D)`` window tensors. Entities
+    with fewer than two active windows are dropped, as drift drops them.
+    Returns ``(kept_idx, vectors, displacement, num_slices, first_window,
+    last_window)`` where the window indices locate the first and last active
+    window of each kept entity.
+    """
+    n, w, d = shapes.shape
+    active = active_window_rows(shapes.reshape(n * w, d), np.arange(n) * w).reshape(n, w)
+    kept = np.flatnonzero(active.sum(axis=1) >= 2)
+    if len(kept) == 0:
+        none = np.zeros(0, dtype=np.intp)
+        return (
+            kept,
+            np.zeros((0, 2 * d), dtype=np.float32),
+            np.zeros(0, np.float32),
+            none,
+            none,
+            none,
+        )
+    active[active.sum(axis=1) < 2] = False
+    rows = deltas[active]
+    active = active[kept]
+    counts = active.sum(axis=1)
+    starts = np.concatenate([[0], np.cumsum(counts)[:-1]]).astype(np.intp)
+    vectors, displacement, num_slices = trajectory_summary(rows, starts)
+    first = active.argmax(axis=1)
+    last = w - 1 - active[:, ::-1].argmax(axis=1)
+    return kept, vectors, displacement, num_slices, first, last
+
+
+def calibrated_deltas(
+    shapes: np.ndarray,
+    *,
+    mu: np.ndarray,
+    sigma_diag: np.ndarray,
+    cholesky_inv: np.ndarray | None,
+    dimension_weights: np.ndarray | None,
+) -> np.ndarray:
+    """:func:`slice_deltas` on raw calibration arrays (``shapes`` ``(..., w)``).
+
+    Keeps float32 input in float32 (build-time tensors can be large); other
+    inputs are computed in float64.
+    """
+    shapes = np.atleast_2d(np.asarray(shapes))
+    dtype = np.result_type(shapes.dtype, np.float32)
+    w = shapes.shape[-1]
+    delta: np.ndarray = shapes - np.asarray(mu[:w], dtype=dtype)
+    if cholesky_inv is not None:
+        delta = delta @ np.asarray(cholesky_inv, dtype=dtype)[:w, :w].T
+    else:
+        delta /= np.maximum(np.asarray(sigma_diag[:w], dtype=dtype), GDSEngine.SIGMA_EPSILON)
+    if dimension_weights is not None:
+        delta *= np.asarray(dimension_weights[:w], dtype=dtype)
+    return delta
+
+
+def shapes_from_deltas(deltas: np.ndarray, pattern: Pattern) -> np.ndarray:
+    """Shape vectors recovered from stored deltas — inverse of :func:`slice_deltas`.
+
+    ``deltas`` is ``(..., w)``; the output has the same shape. Calibration is
+    clamped to width ``w`` exactly like the forward direction: un-weight by
+    ``dimension_weights[:w]``, then either solve the lower-triangular
+    ``cholesky_inv[:w, :w]`` system (Mahalanobis) or scale by ``sigma_diag[:w]``
+    floored at ``SIGMA_EPSILON``, and add ``mu[:w]``.
+
+    A coordinate with dimension weight 0 carries no information in the stored
+    delta, so it is returned as ``mu``; under Mahalanobis its whitened value is
+    taken as 0, which leaves the later coordinates that mix it approximate.
+
+    Keeps float32 input in float32; other inputs are computed in float64.
+    """
+    return calibrated_shapes(
+        deltas,
+        mu=pattern.mu,
+        sigma_diag=pattern.sigma_diag,
+        cholesky_inv=pattern.cholesky_inv,
+        dimension_weights=pattern.dimension_weights,
+    )
+
+
+def calibrated_shapes(
+    deltas: np.ndarray,
+    *,
+    mu: np.ndarray,
+    sigma_diag: np.ndarray,
+    cholesky_inv: np.ndarray | None,
+    dimension_weights: np.ndarray | None,
+) -> np.ndarray:
+    """:func:`shapes_from_deltas` on raw calibration arrays (inverse of
+    :func:`calibrated_deltas`)."""
+    from scipy.linalg import solve_triangular
+
+    deltas = np.asarray(deltas)
+    dtype = np.result_type(deltas.dtype, np.float32)
+    w = deltas.shape[-1]
+    z = deltas.astype(dtype, copy=True)
+    known: np.ndarray | None = None
+    if dimension_weights is not None:
+        weights = np.asarray(dimension_weights[:w], dtype=dtype)
+        known = weights != 0.0
+        np.divide(z, weights, out=z, where=known)
+        z[..., ~known] = 0.0
+    mu_w = np.asarray(mu[:w], dtype=dtype)
+    if cholesky_inv is not None:
+        l_inv = np.asarray(cholesky_inv, dtype=dtype)[:w, :w]
+        flat = z.reshape(-1, w)
+        solved = solve_triangular(l_inv, flat.T, lower=True, check_finite=False)
+        shapes: np.ndarray = np.asarray(solved.T, dtype=dtype).reshape(z.shape) + mu_w
+    else:
+        sigma = np.maximum(np.asarray(sigma_diag[:w], dtype=dtype), GDSEngine.SIGMA_EPSILON)
+        shapes = z * sigma + mu_w
+    if known is not None and not known.all():
+        shapes[..., ~known] = mu_w[~known]
+    return shapes
+
+
 _M3_SIGMA_SAFE_FLOOR = 1e-12
 
 
-def _per_dim_anomaly_contributions(
-    delta: np.ndarray,
-    *,
-    dimension_kinds: list[str] | None,
-    sigma: np.ndarray | None,
-    mu: np.ndarray | None,
-    dimension_weights: np.ndarray | None,
-) -> np.ndarray:
-    """Per-dim anomaly contribution vector — matches build_explanation routing.
+def _per_dim_anomaly_contributions(delta: np.ndarray) -> np.ndarray:
+    """Per-dim anomaly contribution vector: ``delta**2``.
 
-    When ``dimension_kinds + sigma + mu`` are all available, returns the
-    Bregman divergence per dim (the canonical mixed-family attribution used
-    by ``explain_anomaly.top_dimensions``). Falls back to ``delta**2`` —
-    matches ``GDSEngine.anomaly_dimensions`` and ``witness_set`` — when the
-    calibration trio is missing or shapes mismatch.
+    Attribution follows the detection metric: ``delta_norm`` (and so
+    ``is_anomaly``) is the L2 norm of the stored calibrated delta, so dim
+    ``i`` contributes ``delta[i]**2`` and its share of ``delta_norm**2`` is
+    the drop in ``delta_norm**2`` when that dim is set back to its
+    population mu — the same quantity ``witness_set``, ``anti_witness``,
+    ``anomaly_dimensions`` and ``simulate_dimension_change`` use. Under a
+    Cholesky-whitened pattern the stored delta is in whitened coordinates,
+    so ``delta[i]**2`` attributes to whitened coordinate ``i``.
 
-    Output is non-negative and same length as ``delta``. Reliability-flag
-    routing and any future per-dim consumer should call this helper so that
-    ``reliability_flags.dominant_dim`` and ``explain_anomaly`` agree on the
-    same polygon.
+    The keyword arguments are accepted and ignored; the contribution does
+    not depend on the dims' distribution family or calibration.
+
+    Output is non-negative and same length as ``delta``. Every per-dim
+    consumer (``explain_anomaly.top_dimensions``,
+    ``reliability_flags.dominant_dim``, ``find_diverse_explanations``)
+    goes through this helper so they agree on the same polygon.
     """
     d = np.asarray(delta, dtype=np.float64)
-    if (
-        dimension_kinds is not None
-        and sigma is not None
-        and mu is not None
-        and len(dimension_kinds) == len(d)
-        and len(sigma) == len(d)
-        and len(mu) == len(d)
-    ):
-        from hypertopos.builder._bregman import bregman_divergence
-        if dimension_weights is not None:
-            w = np.maximum(
-                np.asarray(dimension_weights, dtype=np.float64), 1e-9
-            )
-            d_unw = d / w
-        else:
-            d_unw = d
-        shape = d_unw * np.asarray(sigma, dtype=np.float64) + np.asarray(
-            mu, dtype=np.float64
-        )
-        return bregman_divergence(
-            shape,
-            np.asarray(mu, dtype=np.float64),
-            np.asarray(sigma, dtype=np.float64),
-            dimension_kinds,
-        )
-    return d ** 2
+    return d**2
 
 
 def compute_reliability_flags(
@@ -1356,13 +1574,13 @@ def compute_reliability_flags(
     anomaly_confidence: float | None = None,
     dominant_dim_threshold: float = 0.7,
     confidence_threshold: float = 0.5,
-) -> dict:
+) -> dict[str, Any]:
     """Surface per-polygon reliability warnings.
 
     Two flags fire independently:
 
-    - ``single_dim_driven`` — the dominant dimension contributes more than
-      ``dominant_dim_threshold`` of total anomaly attribution.
+    - ``single_dim_driven`` — the dominant dimension carries more than
+      ``dominant_dim_threshold`` of ``delta_norm**2``.
       Investigator action: a single-dim-driven anomaly is more likely to be
       a data-quality artefact (a saturated counter, an outlier on one
       property) than a multi-dim fraud signal. Worth a sanity check on the
@@ -1382,27 +1600,20 @@ def compute_reliability_flags(
     value, and ``flags`` — the list of triggered flag names (subset of
     ``{"single_dim_driven", "low_confidence_bucket"}``). ``confidence``
     sanitises ``NaN`` / ``±inf`` to ``None`` per the strict-JSON
-    convention. The dominant-dim attribution routes through the same
-    per-dim contribution primitive (``_per_dim_anomaly_contributions``)
-    that ``explain_anomaly.top_dimensions`` uses, so the two surfaces
-    always pick the same dim for the same polygon.
+    convention. ``dominant_dim_share`` is the dominant dim's share of
+    ``delta_norm**2``, computed by the same per-dim contribution primitive
+    (``_per_dim_anomaly_contributions``) that
+    ``explain_anomaly.top_dimensions`` uses, so the two surfaces always
+    pick the same dim for the same polygon.
     """
     delta_arr = np.asarray(delta, dtype=np.float64)
     dim_labels = pattern.dim_labels
-    contributions = _per_dim_anomaly_contributions(
-        delta_arr,
-        dimension_kinds=pattern.dimension_kinds,
-        sigma=pattern.sigma_diag,
-        mu=pattern.mu,
-        dimension_weights=pattern.dimension_weights,
-    )
+    contributions = _per_dim_anomaly_contributions(delta_arr)
     total = float(contributions.sum())
     if total > 0:
         dom_idx = int(np.argmax(contributions))
         dom_share = float(contributions[dom_idx]) / total
-        dom_label = (
-            dim_labels[dom_idx] if 0 <= dom_idx < len(dim_labels) else None
-        )
+        dom_label = dim_labels[dom_idx] if 0 <= dom_idx < len(dim_labels) else None
     else:
         dom_idx = -1
         dom_share = 0.0
@@ -1469,12 +1680,15 @@ def _decomposition_scalars(
     and ranking are not needed.
     """
     _, intrinsic, extrinsic = _compute_decomposition_vectors(
-        shape_a, shape_b, fit_v1, fit_v2,
+        shape_a,
+        shape_b,
+        fit_v1,
+        fit_v2,
     )
     intrinsic_disp = float(np.linalg.norm(intrinsic))
     extrinsic_disp = float(np.linalg.norm(extrinsic))
-    denom = intrinsic_disp ** 2 + extrinsic_disp ** 2
-    intrinsic_fraction = float(intrinsic_disp ** 2 / denom) if denom > 0.0 else 0.0
+    denom = intrinsic_disp**2 + extrinsic_disp**2
+    intrinsic_fraction = float(intrinsic_disp**2 / denom) if denom > 0.0 else 0.0
     return intrinsic_disp, extrinsic_disp, intrinsic_fraction
 
 
@@ -1498,15 +1712,18 @@ def _compute_intrinsic_extrinsic_decomposition(
     and slice availability before calling. Helper trusts its inputs.
     """
     total, intrinsic, extrinsic = _compute_decomposition_vectors(
-        shape_a, shape_b, fit_v1, fit_v2,
+        shape_a,
+        shape_b,
+        fit_v1,
+        fit_v2,
     )
 
     intrinsic_disp = float(np.linalg.norm(intrinsic))
     extrinsic_disp = float(np.linalg.norm(extrinsic))
     total_disp = float(np.linalg.norm(total))
 
-    denom = intrinsic_disp ** 2 + extrinsic_disp ** 2
-    intrinsic_fraction = float(intrinsic_disp ** 2 / denom) if denom > 0.0 else 0.0
+    denom = intrinsic_disp**2 + extrinsic_disp**2
+    intrinsic_fraction = float(intrinsic_disp**2 / denom) if denom > 0.0 else 0.0
 
     kinds_v1 = fit_v1.dimension_kinds
     D = total.shape[0]
@@ -1572,27 +1789,25 @@ def _compute_leave_one_out_impact(
     """
     N, D = shapes.shape
     if N < 2:
-        raise ValueError(
-            f"_compute_leave_one_out_impact: requires N >= 2; got N={N}"
-        )
+        raise ValueError(f"_compute_leave_one_out_impact: requires N >= 2; got N={N}")
 
     sum_s = shapes.sum(axis=0)
-    sum_s_sq = (shapes ** 2).sum(axis=0)
+    sum_s_sq = (shapes**2).sum(axis=0)
 
     sigma_full_safe = np.maximum(sigma_full, _M4_SIGMA_SAFE_FLOOR)
 
     mu_without = (sum_s[None, :] - shapes) / (N - 1)
-    var_without = (sum_s_sq[None, :] - shapes ** 2) / (N - 1) - mu_without ** 2
+    var_without = (sum_s_sq[None, :] - shapes**2) / (N - 1) - mu_without**2
     var_without = np.maximum(var_without, 0.0)
     sigma_without = np.sqrt(var_without)
 
     mu_shift = (mu_full[None, :] - mu_without) / sigma_full_safe[None, :]
     sigma_shift = (sigma_full[None, :] - sigma_without) / sigma_full_safe[None, :]
 
-    contributions = np.sqrt(mu_shift ** 2 + sigma_shift ** 2)
+    contributions = np.sqrt(mu_shift**2 + sigma_shift**2)
     mu_impact = np.linalg.norm(mu_shift, axis=1)
     sigma_impact = np.linalg.norm(sigma_shift, axis=1)
-    total_impact = np.sqrt(mu_impact ** 2 + sigma_impact ** 2)
+    total_impact = np.sqrt(mu_impact**2 + sigma_impact**2)
 
     if not np.all(np.isfinite(total_impact)):
         raise ValueError(
@@ -1650,7 +1865,7 @@ def _count_cascading_flips(
     after removing entity E from the population stats."""
     N, _ = shapes.shape
     mu_without = (sum_s - shape_E) / (N - 1)
-    var_without = (sum_s_sq - shape_E ** 2) / (N - 1) - mu_without ** 2
+    var_without = (sum_s_sq - shape_E**2) / (N - 1) - mu_without**2
     var_without = np.maximum(var_without, 0.0)
     sigma_without = np.sqrt(var_without)
     sigma_without_safe = np.maximum(sigma_without, _M4_SIGMA_SAFE_FLOOR)
@@ -1675,9 +1890,7 @@ def _compute_leave_set_out_impact(
     N, D = shapes.shape
     k = len(members_idx)
     if k < 2:
-        raise ValueError(
-            f"_compute_leave_set_out_impact: group must have >=2 members; got {k}"
-        )
+        raise ValueError(f"_compute_leave_set_out_impact: group must have >=2 members; got {k}")
     if k >= N:
         raise ValueError(
             f"_compute_leave_set_out_impact: group size {k} >= N={N}; "
@@ -1685,13 +1898,13 @@ def _compute_leave_set_out_impact(
         )
 
     sum_s = shapes.sum(axis=0)
-    sum_s_sq = (shapes ** 2).sum(axis=0)
+    sum_s_sq = (shapes**2).sum(axis=0)
     set_shapes = shapes[members_idx]
     set_sum = set_shapes.sum(axis=0)
-    set_sum_sq = (set_shapes ** 2).sum(axis=0)
+    set_sum_sq = (set_shapes**2).sum(axis=0)
 
     mu_without_set = (sum_s - set_sum) / (N - k)
-    var_without_set = (sum_s_sq - set_sum_sq) / (N - k) - mu_without_set ** 2
+    var_without_set = (sum_s_sq - set_sum_sq) / (N - k) - mu_without_set**2
     var_without_set = np.maximum(var_without_set, 0.0)
     sigma_without_set = np.sqrt(var_without_set)
 
@@ -1699,12 +1912,10 @@ def _compute_leave_set_out_impact(
     mu_shift = (mu_full - mu_without_set) / sigma_full_safe
     sigma_shift = (sigma_full - sigma_without_set) / sigma_full_safe
 
-    contributions = np.sqrt(mu_shift ** 2 + sigma_shift ** 2)
+    contributions = np.sqrt(mu_shift**2 + sigma_shift**2)
     mu_impact_set = float(np.linalg.norm(mu_shift))
     sigma_impact_set = float(np.linalg.norm(sigma_shift))
-    total_impact_set = float(
-        np.sqrt(mu_impact_set ** 2 + sigma_impact_set ** 2)
-    )
+    total_impact_set = float(np.sqrt(mu_impact_set**2 + sigma_impact_set**2))
     return mu_impact_set, sigma_impact_set, total_impact_set, contributions
 
 
@@ -1712,9 +1923,9 @@ def _compute_leave_set_out_impact(
 
 
 def _compute_centroid_drift_series(
-    shapes: np.ndarray,           # (n_epochs, n_entities, D), float32
-    mu: np.ndarray,               # (D,)
-    sigma: np.ndarray,             # (D,)
+    shapes: np.ndarray,  # (n_epochs, n_entities, D), float32
+    mu: np.ndarray,  # (D,)
+    sigma: np.ndarray,  # (D,)
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Population centroid drift + per-entity volatility series + raw mu_pop.
 
@@ -1732,16 +1943,14 @@ def _compute_centroid_drift_series(
     diff_pop = np.diff(mu_pop, axis=0)
     centroid_drift = np.sqrt(np.einsum("ij,ij->i", diff_pop, diff_pop)).astype(np.float64)
     diff_per_entity = np.diff(delta, axis=0)
-    per_entity_step = np.sqrt(
-        np.einsum("ijk,ijk->ij", diff_per_entity, diff_per_entity)
-    )
+    per_entity_step = np.sqrt(np.einsum("ijk,ijk->ij", diff_per_entity, diff_per_entity))
     volatility = per_entity_step.mean(axis=1).astype(np.float64)
     return centroid_drift, volatility, mu_pop.astype(np.float64)
 
 
 def _cross_correlate_with_lag(
-    a: np.ndarray,            # (L_full,)
-    b: np.ndarray,            # (L_full,)
+    a: np.ndarray,  # (L_full,)
+    b: np.ndarray,  # (L_full,)
     max_lag: int,
 ) -> tuple[np.ndarray, int, float]:
     """Cross-correlate two equal-length series at lags [-max_lag, +max_lag].
@@ -1756,13 +1965,10 @@ def _cross_correlate_with_lag(
     """
     L_full = a.shape[0]
     if L_full != b.shape[0]:
-        raise ValueError(
-            f"_cross_correlate_with_lag: length mismatch {L_full} vs {b.shape[0]}"
-        )
+        raise ValueError(f"_cross_correlate_with_lag: length mismatch {L_full} vs {b.shape[0]}")
     if L_full <= 2 * max_lag:
         raise ValueError(
-            f"_cross_correlate_with_lag: series length {L_full} too short for "
-            f"max_lag={max_lag}"
+            f"_cross_correlate_with_lag: series length {L_full} too short for max_lag={max_lag}"
         )
     L = L_full - 2 * max_lag
     corr_by_lag = np.empty(2 * max_lag + 1, dtype=np.float64)
@@ -1782,15 +1988,15 @@ def _cross_correlate_with_lag(
 
 
 def _compute_per_dim_lead_lag(
-    mu_pop_a: np.ndarray,         # (n_epochs, D_a)
-    mu_pop_b: np.ndarray,         # (n_epochs, D_b)
+    mu_pop_a: np.ndarray,  # (n_epochs, D_a)
+    mu_pop_b: np.ndarray,  # (n_epochs, D_b)
     *,
     max_lag: int,
     fdr_alpha: float,
-    fdr_method: str,              # "bh" | "storey"
+    fdr_method: str,  # "bh" | "storey"
     dim_labels_a: list[str] | None,
     dim_labels_b: list[str] | None,
-) -> tuple[list, np.ndarray, np.ndarray]:
+) -> tuple[list[DimPairLeadLag], np.ndarray, np.ndarray]:
     """D_A x D_B per-dim cross-pattern lead-lag with BH or Storey FDR.
 
     Differences each population centroid coordinate to a length-(n_epochs-1)
@@ -1844,14 +2050,10 @@ def _compute_per_dim_lead_lag(
                 dim_index_a=i,
                 dim_index_b=j,
                 dim_label_a=(
-                    dim_labels_a[i]
-                    if dim_labels_a is not None and i < len(dim_labels_a)
-                    else None
+                    dim_labels_a[i] if dim_labels_a is not None and i < len(dim_labels_a) else None
                 ),
                 dim_label_b=(
-                    dim_labels_b[j]
-                    if dim_labels_b is not None and j < len(dim_labels_b)
-                    else None
+                    dim_labels_b[j] if dim_labels_b is not None and j < len(dim_labels_b) else None
                 ),
                 lag=int(lag),
                 correlation=round(float(corr), 4),
@@ -1879,15 +2081,15 @@ def _compute_lead_lag_report(
     pattern_a: str,
     pattern_b: str,
     entity_key: str | None,
-    shapes_a: np.ndarray,           # (n_epochs, n_entities, D_a)
-    shapes_b: np.ndarray,           # (n_epochs, n_entities, D_b)
+    shapes_a: np.ndarray,  # (n_epochs, n_entities, D_a)
+    shapes_b: np.ndarray,  # (n_epochs, n_entities, D_b)
     mu_a: np.ndarray,
     sigma_a: np.ndarray,
     mu_b: np.ndarray,
     sigma_b: np.ndarray,
     dim_labels_a: list[str] | None,
     dim_labels_b: list[str] | None,
-    timestamps: list,                # list[datetime] of length n_epochs
+    timestamps: list[datetime],  # list[datetime] of length n_epochs
     n_dropped_a: int,
     n_dropped_b: int,
     cohort_size: int,
@@ -1898,7 +2100,7 @@ def _compute_lead_lag_report(
     fdr_alpha: float,
     fdr_method: str,
     verbose: bool,
-):
+) -> LeadLagReport:
     """Pure-numpy orchestrator. Builds LeadLagReport from aligned shape tensors.
 
     Caller is responsible for time alignment, cohort selection, and reading
@@ -1923,10 +2125,14 @@ def _compute_lead_lag_report(
         )
 
     centroid_a, vol_a, mu_pop_a = _compute_centroid_drift_series(
-        shapes_a, mu_a, sigma_a,
+        shapes_a,
+        mu_a,
+        sigma_a,
     )
     centroid_b, vol_b, mu_pop_b = _compute_centroid_drift_series(
-        shapes_b, mu_b, sigma_b,
+        shapes_b,
+        mu_b,
+        sigma_b,
     )
 
     # Degenerate-signal guard: when either centroid drift series is
@@ -1934,16 +2140,17 @@ def _compute_lead_lag_report(
     # shapes per epoch), Pearson correlation is undefined and the navigator
     # would silently report corr=0 across all dim pairs. Surface this
     # explicitly so the agent does not over-claim signal absence.
-    degenerate_signal = bool(
-        float(centroid_a.std()) < 1e-12
-        or float(centroid_b.std()) < 1e-12
-    )
+    degenerate_signal = bool(float(centroid_a.std()) < 1e-12 or float(centroid_b.std()) < 1e-12)
 
     corr_centroid_full, peak_lag, peak_corr = _cross_correlate_with_lag(
-        centroid_a, centroid_b, max_lag,
+        centroid_a,
+        centroid_b,
+        max_lag,
     )
     _, peak_lag_vol, peak_corr_vol = _cross_correlate_with_lag(
-        vol_a, vol_b, max_lag,
+        vol_a,
+        vol_b,
+        max_lag,
     )
 
     if degenerate_signal:
@@ -1968,7 +2175,8 @@ def _compute_lead_lag_report(
     is_significant = bool(abs(peak_corr) > max_corr_threshold)
 
     pairs, p_values, q_values = _compute_per_dim_lead_lag(
-        mu_pop_a, mu_pop_b,
+        mu_pop_a,
+        mu_pop_b,
         max_lag=max_lag,
         fdr_alpha=fdr_alpha,
         fdr_method=fdr_method,

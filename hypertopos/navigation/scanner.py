@@ -3,15 +3,18 @@
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
 """PassiveScanner — batch multi-source anomaly screening."""
+
 from __future__ import annotations
 
 import logging
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 if TYPE_CHECKING:
+    import pyarrow as pa
+
     from hypertopos.model.manifest import Manifest
     from hypertopos.model.sphere import Sphere
     from hypertopos.storage.reader import GDSReader
@@ -27,7 +30,9 @@ class ScanSource:
 
     name: str
     pattern_id: str
-    key_type: Literal["direct", "sibling", "composite", "chain", "borderline", "points", "compound", "graph"]
+    key_type: Literal[
+        "direct", "sibling", "composite", "chain", "borderline", "points", "compound", "graph"
+    ]
     weight: float = 1.0
     filter_expr: str | None = None
     # -- borderline --
@@ -76,7 +81,7 @@ class ScanResult:
     elapsed_ms: float
 
 
-def _apply_simple_filter(table: "pa.Table", expr: str) -> "pa.Table":  # type: ignore[name-defined]
+def _apply_simple_filter(table: pa.Table, expr: str) -> pa.Table:
     """Apply a simple column comparison filter to a PyArrow table.
 
     Supports: "col >= val", "col > val", "col <= val", "col < val", "col = val".
@@ -144,13 +149,15 @@ class PassiveScanner:
         """
         if key_type is None:
             key_type = self._detect_key_type(pattern_id)
-        self._sources.append(ScanSource(
-            name=name,
-            pattern_id=pattern_id,
-            key_type=key_type,
-            weight=weight,
-            filter_expr=filter_expr,
-        ))
+        self._sources.append(
+            ScanSource(
+                name=name,
+                pattern_id=pattern_id,
+                key_type=key_type,
+                weight=weight,
+                filter_expr=filter_expr,
+            )
+        )
         return self
 
     def add_borderline_source(
@@ -161,14 +168,16 @@ class PassiveScanner:
         weight: float = 1.0,
     ) -> PassiveScanner:
         """Register a borderline source — near-threshold, non-anomalous entities."""
-        self._sources.append(ScanSource(
-            name=name,
-            pattern_id=pattern_id,
-            key_type="borderline",
-            weight=weight,
-            filter_expr=f"delta_rank_pct >= {rank_threshold} AND is_anomaly = false",
-            rank_threshold=rank_threshold,
-        ))
+        self._sources.append(
+            ScanSource(
+                name=name,
+                pattern_id=pattern_id,
+                key_type="borderline",
+                weight=weight,
+                filter_expr=f"delta_rank_pct >= {rank_threshold} AND is_anomaly = false",
+                rank_threshold=rank_threshold,
+            )
+        )
         return self
 
     def add_points_source(
@@ -185,15 +194,17 @@ class PassiveScanner:
                ">=", ">", "<=", "<", "==", "!=".
         combine: "AND" (all rules must match) or "OR" (any rule matches).
         """
-        self._sources.append(ScanSource(
-            name=name,
-            pattern_id="",  # not used for points sources
-            key_type="points",
-            weight=weight,
-            line_id=line_id,
-            rules=rules,
-            rules_combine=combine,
-        ))
+        self._sources.append(
+            ScanSource(
+                name=name,
+                pattern_id="",  # not used for points sources
+                key_type="points",
+                weight=weight,
+                line_id=line_id,
+                rules=rules,
+                rules_combine=combine,
+            )
+        )
         return self
 
     def add_compound_source(
@@ -215,19 +226,21 @@ class PassiveScanner:
         """
         if geometry_key_type is None:
             geometry_key_type = self._detect_key_type(geometry_pattern_id)
-        self._sources.append(ScanSource(
-            name=name,
-            pattern_id=geometry_pattern_id,
-            key_type="compound",
-            weight=weight,
-            filter_expr=geometry_filter_expr,
-            line_id=line_id,
-            rules=rules,
-            rules_combine=combine,
-            geometry_pattern_id=geometry_pattern_id,
-            geometry_key_type=geometry_key_type,
-            chain_filter_expr=chain_filter_expr,
-        ))
+        self._sources.append(
+            ScanSource(
+                name=name,
+                pattern_id=geometry_pattern_id,
+                key_type="compound",
+                weight=weight,
+                filter_expr=geometry_filter_expr,
+                line_id=line_id,
+                rules=rules,
+                rules_combine=combine,
+                geometry_pattern_id=geometry_pattern_id,
+                geometry_key_type=geometry_key_type,
+                chain_filter_expr=chain_filter_expr,
+            )
+        )
         return self
 
     def add_graph_source(
@@ -242,13 +255,15 @@ class PassiveScanner:
 
         Requires event pattern with edge table.
         """
-        self._sources.append(ScanSource(
-            name=name,
-            pattern_id=pattern_id,
-            key_type="graph",
-            weight=weight,
-            contagion_threshold=contagion_threshold,
-        ))
+        self._sources.append(
+            ScanSource(
+                name=name,
+                pattern_id=pattern_id,
+                key_type="graph",
+                weight=weight,
+                contagion_threshold=contagion_threshold,
+            )
+        )
         return self
 
     def auto_discover(
@@ -271,11 +286,13 @@ class PassiveScanner:
         for pat_id in self._sphere.patterns:
             key_type = self._classify_for_line(pat_id, home_line_id)
             if key_type is not None:
-                self._sources.append(ScanSource(
-                    name=pat_id,
-                    pattern_id=pat_id,
-                    key_type=key_type,
-                ))
+                self._sources.append(
+                    ScanSource(
+                        name=pat_id,
+                        pattern_id=pat_id,
+                        key_type=key_type,
+                    )
+                )
                 if include_borderline and key_type in ("direct", "sibling"):
                     self.add_borderline_source(
                         f"{pat_id}_borderline",
@@ -314,31 +331,35 @@ class PassiveScanner:
             version = self._resolve_version(source.pattern_id) if source.pattern_id else None
             if version is None and source.key_type not in ("points", "graph"):
                 return source.name, {}
+            # Non-None for every key_type except points/graph (guard above).
+            ver = cast(int, version)
 
             if source.key_type in ("direct", "sibling"):
-                hits = self._scan_direct(source, version)
+                hits = self._scan_direct(source, ver)
             elif source.key_type == "composite":
-                hits = self._scan_composite(source, version)
+                hits = self._scan_composite(source, ver)
             elif source.key_type == "chain":
-                hits = self._scan_chain(source, version)
+                hits = self._scan_chain(source, ver)
             elif source.key_type == "borderline":
-                hits = self._scan_direct(source, version)
+                hits = self._scan_direct(source, ver)
             elif source.key_type == "points":
                 hits = self._scan_points(source)
             elif source.key_type == "compound":
-                hits = self._scan_compound(source, version)
+                hits = self._scan_compound(source, ver)
             elif source.key_type == "graph":
                 hits = self._scan_graph(source)
             else:
                 return source.name, {}
             return source.name, hits
 
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor
 
         max_workers = min(len(self._sources), 4) if self._sources else 1
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = [pool.submit(_scan_one, s) for s in self._sources]
-            for future in as_completed(futures):
+            # Collected in registration order, not completion order, so the
+            # output never depends on which thread finished first.
+            for future in futures:
                 name, hits = future.result()
                 source_hits[name] = hits
                 sources_summary[name] = len(hits)
@@ -354,28 +375,27 @@ class PassiveScanner:
         for entity_key, per_source in all_entities.items():
             score = len(per_source)
             weighted = 0.0
-            for _src_name, sh in per_source.items():
-                if sh.anomaly_intensity > 0:
-                    weighted += sh.anomaly_intensity
-                else:
-                    related = max(sh.related_count, 1)
-                    weighted += sh.anomalous_count / related
+            for sh in per_source.values():
+                weighted += sh.anomaly_intensity
 
             if scoring == "count" and score < threshold:
                 continue
             if scoring == "weighted" and weighted < threshold:
                 continue
 
-            result_hits.append(ScanHit(
-                primary_key=entity_key,
-                score=score,
-                weighted_score=round(weighted, 4),
-                sources=per_source,
-            ))
+            result_hits.append(
+                ScanHit(
+                    primary_key=entity_key,
+                    score=score,
+                    weighted_score=round(weighted, 4),
+                    sources=per_source,
+                )
+            )
 
-        # Sort by score desc, then weighted desc
-        result_hits.sort(key=lambda h: (-h.score, -h.weighted_score))
+        # Sort by score desc, then weighted desc, then key (ties at the top_n cut)
+        result_hits.sort(key=lambda h: (-h.score, -h.weighted_score, h.primary_key))
 
+        total_flagged = len(result_hits)
         if top_n is not None:
             result_hits = result_hits[:top_n]
 
@@ -393,7 +413,7 @@ class PassiveScanner:
         return ScanResult(
             home_line_id=home_line_id,
             total_entities=total_entities,
-            total_flagged=len(result_hits),
+            total_flagged=total_flagged,
             hits=result_hits,
             sources_summary=sources_summary,
             elapsed_ms=round(elapsed, 2),
@@ -404,12 +424,15 @@ class PassiveScanner:
     # ------------------------------------------------------------------
 
     def _scan_direct(
-        self, source: ScanSource, version: int,
+        self,
+        source: ScanSource,
+        version: int,
     ) -> dict[str, ScanSourceHit]:
         """Scan direct pattern — entity keys = geometry primary_keys."""
         filt = source.filter_expr or "is_anomaly = true"
         geo = self._reader.read_geometry(
-            source.pattern_id, version,
+            source.pattern_id,
+            version,
             columns=["primary_key", "delta_norm"],
             filter=filt,
         )
@@ -418,7 +441,8 @@ class PassiveScanner:
         result: dict[str, ScanSourceHit] = {}
         for pk, norm in zip(
             geo["primary_key"].to_pylist(),
-            geo["delta_norm"].to_pylist(), strict=False,
+            geo["delta_norm"].to_pylist(),
+            strict=False,
         ):
             dn = float(norm) if norm is not None else 0.0
             intensity = dn / theta_norm if theta_norm > 0 else 1.0
@@ -431,12 +455,15 @@ class PassiveScanner:
         return result
 
     def _scan_composite(
-        self, source: ScanSource, version: int,
+        self,
+        source: ScanSource,
+        version: int,
     ) -> dict[str, ScanSourceHit]:
         """Scan composite pattern — split composite keys to entity keys."""
         filt = source.filter_expr or "is_anomaly = true"
         geo = self._reader.read_geometry(
-            source.pattern_id, version,
+            source.pattern_id,
+            version,
             columns=["primary_key", "delta_norm"],
             filter=filt,
         )
@@ -453,7 +480,8 @@ class PassiveScanner:
         entity_hits: dict[str, list[float]] = defaultdict(list)
         for pk, norm in zip(
             pks,
-            geo["delta_norm"].to_pylist(), strict=False,
+            geo["delta_norm"].to_pylist(),
+            strict=False,
         ):
             norm_f = float(norm) if norm is not None else 0.0
             parts = pk.split(sep)
@@ -466,7 +494,8 @@ class PassiveScanner:
         entity_total_count: dict[str, int] = defaultdict(int)
         try:
             all_geo = self._reader.read_geometry(
-                source.pattern_id, version,
+                source.pattern_id,
+                version,
                 columns=["primary_key"],
             )
             for all_pk in all_geo["primary_key"].to_pylist():
@@ -480,15 +509,19 @@ class PassiveScanner:
 
         result: dict[str, ScanSourceHit] = {}
         for ek, norms in entity_hits.items():
+            related = entity_total_count.get(ek, len(norms))
             result[ek] = ScanSourceHit(
                 anomalous_count=len(norms),
-                related_count=entity_total_count.get(ek, len(norms)),
+                related_count=related,
                 max_delta_norm=max(norms),
+                anomaly_intensity=len(norms) / max(related, 1),
             )
         return result
 
     def _scan_chain(
-        self, source: ScanSource, version: int,
+        self,
+        source: ScanSource,
+        version: int,
     ) -> dict[str, ScanSourceHit]:
         """Scan chain pattern — reverse index chain_keys → entity keys."""
         entity_line_id = self._sphere.entity_line(source.pattern_id)
@@ -505,6 +538,7 @@ class PassiveScanner:
         if source.chain_filter_expr:
             # Extract column name from filter expression (e.g. "col >= 0.5")
             import re
+
             m = re.match(r"(\w+)\s*[><=!]", source.chain_filter_expr)
             if m and m.group(1) not in needed_cols:
                 needed_cols.append(m.group(1))
@@ -521,16 +555,20 @@ class PassiveScanner:
         chain_to_entities: dict[str, list[str]] = defaultdict(list)
         for pk, ck in zip(
             pts["primary_key"].to_pylist(),
-            pts["chain_keys"].to_pylist(), strict=False,
+            pts["chain_keys"].to_pylist(),
+            strict=False,
         ):
             if ck:
                 for k in ck.split(","):
                     chain_to_entities[pk].append(k)
 
         # Read chains — None → anomalous only (default), "" → all chains
-        filt: str | None = "is_anomaly = true" if source.filter_expr is None else (source.filter_expr or None)
+        filt: str | None = (
+            "is_anomaly = true" if source.filter_expr is None else (source.filter_expr or None)
+        )
         geo = self._reader.read_geometry(
-            source.pattern_id, version,
+            source.pattern_id,
+            version,
             columns=["primary_key", "delta_norm"],
             filter=filt,
         )
@@ -546,7 +584,8 @@ class PassiveScanner:
         entity_hits: dict[str, list[float]] = defaultdict(list)
         for chain_pk, norm in zip(
             geo["primary_key"].to_pylist(),
-            geo["delta_norm"].to_pylist(), strict=False,
+            geo["delta_norm"].to_pylist(),
+            strict=False,
         ):
             norm_f = float(norm) if norm is not None else 0.0
             for ek in chain_to_entities.get(chain_pk, []):
@@ -554,17 +593,20 @@ class PassiveScanner:
 
         result: dict[str, ScanSourceHit] = {}
         for ek, norms in entity_hits.items():
+            related = entity_total_count.get(ek, len(norms))
             result[ek] = ScanSourceHit(
                 anomalous_count=len(norms),
-                related_count=entity_total_count.get(ek, len(norms)),
+                related_count=related,
                 max_delta_norm=max(norms),
+                anomaly_intensity=len(norms) / max(related, 1),
             )
         return result
 
     _RULE_OPS = frozenset({">=", ">", "<=", "<", "==", "!="})
 
     def _scan_points(
-        self, source: ScanSource,
+        self,
+        source: ScanSource,
     ) -> dict[str, ScanSourceHit]:
         """Scan points line with threshold rules."""
         import pyarrow.compute as pc
@@ -596,6 +638,7 @@ class PassiveScanner:
             col_arr = pts[col]
             # Cast threshold to match column type
             import pyarrow as pa
+
             if pa.types.is_integer(col_arr.type):
                 val = int(val)
             elif pa.types.is_floating(col_arr.type):
@@ -632,11 +675,14 @@ class PassiveScanner:
                 anomalous_count=1,
                 related_count=0,
                 max_delta_norm=0.0,
+                anomaly_intensity=1.0,
             )
         return result
 
     def _scan_compound(
-        self, source: ScanSource, version: int,
+        self,
+        source: ScanSource,
+        version: int,
     ) -> dict[str, ScanSourceHit]:
         """Scan compound source — geometry expansion intersected with points rules."""
         # Step 1: geometry expansion (reuse existing scan methods)
@@ -680,7 +726,8 @@ class PassiveScanner:
         return result
 
     def _scan_graph(
-        self, source: ScanSource,
+        self,
+        source: ScanSource,
     ) -> dict[str, ScanSourceHit]:
         """Scan graph contagion — flag entities whose anomalous neighbor ratio
         exceeds threshold. Reads the precomputed
@@ -698,7 +745,8 @@ class PassiveScanner:
                 "_gds_meta/contagion_stats/%s.lance is missing. Rebuild the "
                 "sphere under hypertopos >= 0.3.0 to enable graph contagion "
                 "for this pattern.",
-                source.pattern_id, source.pattern_id,
+                source.pattern_id,
+                source.pattern_id,
             )
             return {}
 
@@ -738,7 +786,8 @@ class PassiveScanner:
     # ------------------------------------------------------------------
 
     def _detect_key_type(
-        self, pattern_id: str,
+        self,
+        pattern_id: str,
     ) -> Literal["direct", "composite", "chain"]:
         """Auto-detect key_type from sphere schema."""
         # Check all possible home lines
@@ -756,7 +805,8 @@ class PassiveScanner:
         if version is not None:
             try:
                 sample = self._reader.read_geometry(
-                    pattern_id, version,
+                    pattern_id,
+                    version,
                     columns=["primary_key"],
                     sample_size=1,
                 )
@@ -776,7 +826,9 @@ class PassiveScanner:
     ) -> Literal["direct", "sibling", "composite", "chain"] | None:
         """Classify pattern relative to a specific home line (cached)."""
         if not hasattr(self, "_classify_cache"):
-            self._classify_cache: dict[tuple[str, str], str | None] = {}
+            self._classify_cache: dict[
+                tuple[str, str], Literal["direct", "sibling", "composite", "chain"] | None
+            ] = {}
         cache_key = (pattern_id, home_line_id)
         if cache_key in self._classify_cache:
             return self._classify_cache[cache_key]
@@ -814,7 +866,8 @@ class PassiveScanner:
             if version is not None:
                 try:
                     sample = self._reader.read_geometry(
-                        pattern_id, version,
+                        pattern_id,
+                        version,
                         columns=["primary_key"],
                         sample_size=1,
                     )

@@ -7,11 +7,14 @@
 Parses a ``sphere.yaml`` file into typed dataclasses that the build bridge
 can translate into GDSBuilder calls.
 """
+
 from __future__ import annotations
 
+import difflib
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 import yaml
 
@@ -21,13 +24,146 @@ _VALID_ROLES: frozenset[str] = frozenset({"anchor", "event", "context"})
 _VALID_PATTERN_TYPES: frozenset[str] = frozenset({"anchor", "event"})
 _VALID_DIRECTIONS: frozenset[str] = frozenset({"in", "out", "self"})
 _VALID_JOIN_TYPES: frozenset[str] = frozenset({"left", "inner"})
-_VALID_CAST_TYPES: frozenset[str] = frozenset({
-    "string", "int32", "int64", "float32", "float64", "bool",
-})
-_VALID_METRICS: frozenset[str] = frozenset({
-    "count", "count_distinct", "sum", "max", "std", "mean", "avg",
-    "iet_mean", "iet_std", "iet_min",
-})
+_VALID_CAST_TYPES: frozenset[str] = frozenset(
+    {
+        "string",
+        "int32",
+        "int64",
+        "float32",
+        "float64",
+        "bool",
+    }
+)
+_VALID_METRICS: frozenset[str] = frozenset(
+    {
+        "count",
+        "count_distinct",
+        "sum",
+        "max",
+        "std",
+        "mean",
+        "avg",
+        "iet_mean",
+        "iet_std",
+        "iet_min",
+    }
+)
+
+# ── known keys per YAML section ──────────────────────────────────────
+
+_TOP_KEYS = frozenset(
+    {
+        "version",
+        "sphere_id",
+        "name",
+        "description",
+        "sources",
+        "lines",
+        "patterns",
+        "aliases",
+        "composite_lines",
+        "chain_lines",
+        "temporal",
+        "label_audit",
+    }
+)
+_SOURCE_KEYS = frozenset({"path", "script", "format", "delimiter", "encoding", "join", "transform"})
+_JOIN_KEYS = frozenset({"file", "on", "type", "columns"})
+_TRANSFORM_KEYS = frozenset({"type", "fill_null"})
+_LINE_KEYS = frozenset({"source", "key", "role", "columns", "fts", "partition_col", "description"})
+_PATTERN_KEYS = frozenset(
+    {
+        "type",
+        "entity_line",
+        "relations",
+        "event_dimensions",
+        "derived_dimensions",
+        "precomputed_dimensions",
+        "graph_features",
+        "edge_table",
+        "anomaly_percentile",
+        "dimension_weights",
+        "gmm_n_components",
+        "group_by_property",
+        "tracked_properties",
+        "use_mahalanobis",
+        "description",
+        "geo_properties",
+        "metric_properties",
+        "semantic_dim",
+        "edge_dimensions",
+        "edge_dim_aggregations",
+        "fdr_hierarchy",
+        "fdr_temporal_hierarchy",
+        "conformance_rules",
+        "bootstrap_iterations",
+    }
+)
+_RELATION_KEYS = frozenset(
+    {"line", "direction", "key_on_entity", "required", "display_name", "edge_max"}
+)
+_EVENT_DIM_KEYS = frozenset({"column", "display_name"})
+_PRECOMPUTED_KEYS = frozenset({"column", "edge_max", "percentile", "display_name"})
+_GRAPH_FEATURES_KEYS = frozenset({"event_line", "from_col", "to_col", "features"})
+_EDGE_TABLE_KEYS = frozenset({"from_col", "to_col", "timestamp_col", "amount_col"})
+_SEMANTIC_DIM_KEYS = frozenset({"columns", "n_components"})
+_DERIVED_GROUP_KEYS = frozenset({"from_pattern", "anchor_fk", "features"})
+_COMPOSITE_KEYS = frozenset(
+    {
+        "event_line",
+        "key_cols",
+        "separator",
+        "derived_dimensions",
+        "anomaly_percentile",
+        "dimension_weights",
+        "description",
+    }
+)
+_TEMPORAL_KEYS = frozenset({"pattern", "event_line", "timestamp_col", "window"})
+_ALIAS_KEYS = frozenset({"base_pattern", "cutting_plane", "description"})
+_CUTTING_PLANE_KEYS = frozenset({"dimension", "threshold", "normal", "bias"})
+_LABEL_AUDIT_KEYS = frozenset({"label_column", "label_positive_value", "patterns"})
+_CHAIN_LINE_KEYS = frozenset(
+    {
+        "event_line",
+        "from_col",
+        "to_col",
+        "features",
+        "seed_percentile_fan_out",
+        "seed_percentile_cross_bank",
+        "seed_multi_currency",
+        "seed_pass_through",
+        "time_window_hours",
+        "max_hops",
+        "min_hops",
+        "max_chains",
+        "bidirectional",
+        "anomaly_percentile",
+        "description",
+        "edge_dim_aggregations",
+        "timestamp_col",
+        "amount_col",
+        "category_col",
+    }
+)
+
+
+def _warn_unknown_keys(where: str, spec: dict[Any, Any], known: frozenset[str]) -> None:
+    """Warn on keys the parser does not read — a misspelled key would otherwise
+    fall back to its default silently."""
+    unknown = [str(k) for k in spec if k not in known]
+    if not unknown:
+        return
+    described = []
+    for key in unknown:
+        close = difflib.get_close_matches(key, known, n=1)
+        described.append(f"'{key}' (did you mean '{close[0]}'?)" if close else f"'{key}'")
+    warnings.warn(
+        f"{where}: unknown key(s) {', '.join(described)} ignored. Valid: {sorted(known)}",
+        UserWarning,
+        stacklevel=3,
+    )
+
 
 # ── dataclasses ──────────────────────────────────────────────────────
 
@@ -43,6 +179,7 @@ class JoinSpec:
 @dataclass
 class TransformSpec:
     """Per-column transform (cast type and/or fill_null)."""
+
     type: str | None = None
     fill_null: Any = None
 
@@ -72,7 +209,7 @@ class LineConfig:
 @dataclass
 class RelationConfig:
     line: str
-    direction: str = "in"
+    direction: Literal["in", "out", "self"] = "in"
     key_on_entity: str | None = None
     required: bool = True
     display_name: str | None = None
@@ -88,6 +225,7 @@ class EventDimConfig:
 @dataclass
 class FeatureSpec:
     """Parsed feature like ``tx_count: count`` or ``burst_daily: count:window=1d:agg=max``."""
+
     dimension_name: str
     metric: str
     metric_col: str | None = None
@@ -105,7 +243,7 @@ class DerivedDimGroup:
 
 @dataclass
 class PatternConfig:
-    type: str
+    type: Literal["anchor", "event"]
     entity_line: str
     relations: list[RelationConfig] | str | None = None  # list, "auto", or None
     event_dimensions: list[EventDimConfig] | None = None
@@ -123,20 +261,25 @@ class PatternConfig:
     # --- Generalized dimension blocks ---
     geo_properties: list[str] | None = None
     metric_properties: list[str] | None = None
-    semantic_dim: dict | None = None  # {"columns": [...], "n_components": int}
+    semantic_dim: dict[str, Any] | None = None  # {"columns": [...], "n_components": int}
     # --- Edge-derived dimensions ---
-    edge_dimensions: list | None = None  # list[str | dict] from YAML — parsed lazily
-    edge_dim_aggregations: dict | None = None  # {"from": <event_pid>, "dims": [...]} — parsed lazily
+    edge_dimensions: list[Any] | None = None  # list[str | dict] from YAML — parsed lazily
+    edge_dim_aggregations: dict[str, Any] | None = (
+        None  # {"from": <event_pid>, "dims": [...]} — parsed lazily
+    )
     # --- Multi-resolution FDR hierarchies ---
     # Raw YAML lists. Converted to FDRHierarchyLevel / FDRTemporalLevel
     # in cli.build._add_pattern before being passed to builder.add_pattern.
-    fdr_hierarchy: list | None = None  # list[dict] with {level, from_dimension}
-    fdr_temporal_hierarchy: list | None = None  # list[dict] with {level, slice_dimension, bucket?}
+    fdr_hierarchy: list[dict[str, Any]] | None = None  # {level, from_dimension}
+    fdr_temporal_hierarchy: list[dict[str, Any]] | None = (
+        None  # list[dict] with {level, slice_dimension, bucket?}
+    )
     # --- Declarative conformance rules ---
     # Raw YAML list of rule entries. Parsed in cli.build._add_pattern via
     # builder.conformance_mapping.parse_conformance_rules before being
     # passed to builder.add_pattern(conformance_rules=...).
-    conformance_rules: list | None = None
+    conformance_rules: list[Any] | None = None
+    bootstrap_iterations: int = 200
 
 
 @dataclass
@@ -168,6 +311,7 @@ class GraphFeaturesConfig:
 @dataclass
 class AliasConfig:
     """Alias spec parsed from YAML — either dimension+threshold or normal+bias."""
+
     base_pattern: str
     cutting_plane_dimension: int | str | None = None
     cutting_plane_threshold: float | None = None
@@ -193,7 +337,10 @@ class ChainLineConfig:
     bidirectional: bool = True
     anomaly_percentile: float = 95.0
     description: str | None = None
-    edge_dim_aggregations: dict | None = None
+    edge_dim_aggregations: dict[str, Any] | None = None
+    timestamp_col: str | None = None
+    amount_col: str | None = None
+    category_col: str | None = None
 
 
 @dataclass
@@ -224,6 +371,7 @@ class LabelAuditConfig:
     that carries the binary label; ``label_positive_value`` is the value
     treated as the positive class (anything not equal to it is negative).
     """
+
     label_column: str
     label_positive_value: Any
     patterns: list[str] = field(default_factory=list)
@@ -258,6 +406,7 @@ def parse_config(yaml_path: str | Path) -> SphereConfig:
     if not isinstance(raw, dict):
         got = type(raw).__name__ if raw is not None else "empty file"
         raise ValueError(f"sphere.yaml must be a YAML mapping, got {got}")
+    _warn_unknown_keys("sphere.yaml", raw, _TOP_KEYS)
 
     # Version check
     yaml_version = str(raw.get("version", "0.1.0"))
@@ -284,7 +433,8 @@ def parse_config(yaml_path: str | Path) -> SphereConfig:
         auto_pid = f"{extra_id}_pattern"
         if auto_pid not in all_patterns:
             all_patterns[auto_pid] = PatternConfig(
-                type="anchor", entity_line=extra_id,
+                type="anchor",
+                entity_line=extra_id,
             )
     temporal = _parse_temporal(raw.get("temporal") or [], all_patterns)
     aliases = _parse_aliases(raw.get("aliases") or {}, all_patterns)
@@ -369,22 +519,23 @@ def _parse_sources(raw: dict[str, Any]) -> dict[str, SourceConfig]:
 
 
 def _parse_one_source(name: str, spec: dict[str, Any]) -> SourceConfig:
+    _warn_unknown_keys(f"Source '{name}'", spec, _SOURCE_KEYS)
     path = spec.get("path")
     script = spec.get("script")
 
     if not path and not script:
-        raise ValueError(
-            f"Source '{name}' must specify either 'path' or 'script'"
-        )
+        raise ValueError(f"Source '{name}' must specify either 'path' or 'script'")
     if path and script:
-        raise ValueError(
-            f"Source '{name}' cannot specify both 'path' and 'script'"
-        )
+        raise ValueError(f"Source '{name}' cannot specify both 'path' and 'script'")
 
     joins: list[JoinSpec] = []
     for j in spec.get("join") or []:
         if not isinstance(j, dict):
             raise ValueError(f"Source '{name}' join entry must be a mapping")
+        # YAML 1.1 parses bare `on:` as boolean True
+        _warn_unknown_keys(
+            f"Source '{name}' join entry", {k: v for k, v in j.items() if k is not True}, _JOIN_KEYS
+        )
         if "file" not in j:
             raise ValueError(f"Source '{name}' join entry must specify 'file'")
         # YAML 1.1 parses bare `on:` as boolean True — handle both
@@ -394,23 +545,24 @@ def _parse_one_source(name: str, spec: dict[str, Any]) -> SourceConfig:
         jtype = str(j.get("type", "left"))
         if jtype not in _VALID_JOIN_TYPES:
             raise ValueError(
-                f"Source '{name}' join type '{jtype}' invalid. "
-                f"Valid: {sorted(_VALID_JOIN_TYPES)}"
+                f"Source '{name}' join type '{jtype}' invalid. Valid: {sorted(_VALID_JOIN_TYPES)}"
             )
-        joins.append(JoinSpec(
-            file=str(j["file"]),
-            on=str(on_val),
-            type=jtype,
-            columns=j.get("columns"),
-        ))
+        joins.append(
+            JoinSpec(
+                file=str(j["file"]),
+                on=str(on_val),
+                type=jtype,
+                columns=j.get("columns"),
+            )
+        )
 
     transforms: dict[str, TransformSpec] = {}
     for col_name, tspec in (spec.get("transform") or {}).items():
         if not isinstance(tspec, dict):
-            raise ValueError(
-                f"Source '{name}' transform for column '{col_name}' "
-                "must be a mapping"
-            )
+            raise ValueError(f"Source '{name}' transform for column '{col_name}' must be a mapping")
+        _warn_unknown_keys(
+            f"Source '{name}' transform for column '{col_name}'", tspec, _TRANSFORM_KEYS
+        )
         cast_type = tspec.get("type")
         if cast_type and str(cast_type) not in _VALID_CAST_TYPES:
             raise ValueError(
@@ -444,6 +596,7 @@ def _parse_lines(
     for line_id, spec in raw.items():
         if not isinstance(spec, dict):
             raise ValueError(f"Line '{line_id}' must be a mapping")
+        _warn_unknown_keys(f"Line '{line_id}'", spec, _LINE_KEYS)
         source_name = spec.get("source")
         if not source_name:
             raise ValueError(f"Line '{line_id}' must specify 'source'")
@@ -458,8 +611,7 @@ def _parse_lines(
         role = str(spec.get("role", "anchor"))
         if role not in _VALID_ROLES:
             raise ValueError(
-                f"Line '{line_id}' has invalid role '{role}'. "
-                f"Valid: {sorted(_VALID_ROLES)}"
+                f"Line '{line_id}' has invalid role '{role}'. Valid: {sorted(_VALID_ROLES)}"
             )
 
         # fts: true | false | [col1, col2]
@@ -505,8 +657,9 @@ def _parse_one_pattern(
     pid: str,
     spec: dict[str, Any],
     lines: dict[str, LineConfig],
-    _composite_line_ids: set[str] | None = None,
+    _composite_line_ids: set[str],
 ) -> PatternConfig:
+    _warn_unknown_keys(f"Pattern '{pid}'", spec, _PATTERN_KEYS)
     entity_line = spec.get("entity_line")
     if not entity_line:
         raise ValueError(f"Pattern '{pid}' must specify 'entity_line'")
@@ -519,8 +672,7 @@ def _parse_one_pattern(
     ptype = str(spec.get("type", "event"))
     if ptype not in _VALID_PATTERN_TYPES:
         raise ValueError(
-            f"Pattern '{pid}' has invalid type '{ptype}'. "
-            f"Valid: {sorted(_VALID_PATTERN_TYPES)}"
+            f"Pattern '{pid}' has invalid type '{ptype}'. Valid: {sorted(_VALID_PATTERN_TYPES)}"
         )
 
     # relations: list of dicts | "auto" | None
@@ -533,8 +685,7 @@ def _parse_one_pattern(
         relations = [_parse_relation(pid, r, all_line_ids) for r in raw_rels]
     elif raw_rels is not None:
         raise ValueError(
-            f"Pattern '{pid}' relations must be a list or 'auto', "
-            f"got {type(raw_rels).__name__}"
+            f"Pattern '{pid}' relations must be a list or 'auto', got {type(raw_rels).__name__}"
         )
 
     # event_dimensions
@@ -544,13 +695,14 @@ def _parse_one_pattern(
         event_dims = []
         for ed in raw_ed:
             if not isinstance(ed, dict) or "column" not in ed:
-                raise ValueError(
-                    f"Pattern '{pid}' event_dimensions entries must have 'column'"
+                raise ValueError(f"Pattern '{pid}' event_dimensions entries must have 'column'")
+            _warn_unknown_keys(f"Pattern '{pid}' event_dimensions entry", ed, _EVENT_DIM_KEYS)
+            event_dims.append(
+                EventDimConfig(
+                    column=str(ed["column"]),
+                    display_name=ed.get("display_name"),
                 )
-            event_dims.append(EventDimConfig(
-                column=str(ed["column"]),
-                display_name=ed.get("display_name"),
-            ))
+            )
 
     # derived_dimensions
     derived_dims: list[DerivedDimGroup] | None = None
@@ -568,12 +720,17 @@ def _parse_one_pattern(
                 raise ValueError(
                     f"Pattern '{pid}' precomputed_dimensions entries must have 'column'"
                 )
-            precomp_dims.append(PrecomputedDimConfig(
-                column=str(pc["column"]),
-                edge_max=pc.get("edge_max", "auto"),
-                percentile=float(pc.get("percentile", 99.0)),
-                display_name=pc.get("display_name"),
-            ))
+            _warn_unknown_keys(
+                f"Pattern '{pid}' precomputed_dimensions entry", pc, _PRECOMPUTED_KEYS
+            )
+            precomp_dims.append(
+                PrecomputedDimConfig(
+                    column=str(pc["column"]),
+                    edge_max=pc.get("edge_max", "auto"),
+                    percentile=float(pc.get("percentile", 99.0)),
+                    display_name=pc.get("display_name"),
+                )
+            )
 
     # graph_features
     graph_feat: GraphFeaturesConfig | None = None
@@ -581,6 +738,7 @@ def _parse_one_pattern(
     if raw_gf:
         if not isinstance(raw_gf, dict):
             raise ValueError(f"Pattern '{pid}' graph_features must be a mapping")
+        _warn_unknown_keys(f"Pattern '{pid}' graph_features", raw_gf, _GRAPH_FEATURES_KEYS)
         gf_event_line = str(raw_gf.get("event_line", ""))
         if gf_event_line and gf_event_line not in lines:
             raise ValueError(
@@ -598,6 +756,7 @@ def _parse_one_pattern(
     edge_tbl_cfg: EdgeTableYamlConfig | None = None
     raw_et = spec.get("edge_table")
     if raw_et and isinstance(raw_et, dict):
+        _warn_unknown_keys(f"Pattern '{pid}' edge_table", raw_et, _EDGE_TABLE_KEYS)
         edge_tbl_cfg = EdgeTableYamlConfig(
             from_col=str(raw_et.get("from_col", "")),
             to_col=str(raw_et.get("to_col", "")),
@@ -619,8 +778,7 @@ def _parse_one_pattern(
     if raw_geo:
         if not isinstance(raw_geo, list):
             raise ValueError(
-                f"Pattern '{pid}' geo_properties must be a list, "
-                f"got {type(raw_geo).__name__}"
+                f"Pattern '{pid}' geo_properties must be a list, got {type(raw_geo).__name__}"
             )
         geo_props = [str(c) for c in raw_geo]
 
@@ -629,40 +787,36 @@ def _parse_one_pattern(
     if raw_mp:
         if not isinstance(raw_mp, list):
             raise ValueError(
-                f"Pattern '{pid}' metric_properties must be a list, "
-                f"got {type(raw_mp).__name__}"
+                f"Pattern '{pid}' metric_properties must be a list, got {type(raw_mp).__name__}"
             )
         metric_props = [str(c) for c in raw_mp]
 
-    semantic_dim: dict | None = None
+    semantic_dim: dict[str, Any] | None = None
     raw_sd = spec.get("semantic_dim")
     if raw_sd:
         if not isinstance(raw_sd, dict):
             raise ValueError(
-                f"Pattern '{pid}' semantic_dim must be a mapping, "
-                f"got {type(raw_sd).__name__}"
+                f"Pattern '{pid}' semantic_dim must be a mapping, got {type(raw_sd).__name__}"
             )
         if "columns" not in raw_sd or "n_components" not in raw_sd:
-            raise ValueError(
-                f"Pattern '{pid}' semantic_dim must have 'columns' and 'n_components'"
-            )
+            raise ValueError(f"Pattern '{pid}' semantic_dim must have 'columns' and 'n_components'")
+        _warn_unknown_keys(f"Pattern '{pid}' semantic_dim", raw_sd, _SEMANTIC_DIM_KEYS)
         semantic_dim = {
             "columns": [str(c) for c in raw_sd["columns"]],
             "n_components": int(raw_sd["n_components"]),
         }
 
     fdr_hier_raw = spec.get("fdr_hierarchy")
-    fdr_hierarchy: list | None = None
+    fdr_hierarchy: list[dict[str, Any]] | None = None
     if fdr_hier_raw is not None:
         if not isinstance(fdr_hier_raw, list):
             raise ValueError(
-                f"Pattern '{pid}' fdr_hierarchy must be a list, "
-                f"got {type(fdr_hier_raw).__name__}"
+                f"Pattern '{pid}' fdr_hierarchy must be a list, got {type(fdr_hier_raw).__name__}"
             )
         fdr_hierarchy = [dict(level) for level in fdr_hier_raw]
 
     fdr_temporal_raw = spec.get("fdr_temporal_hierarchy")
-    fdr_temporal_hierarchy: list | None = None
+    fdr_temporal_hierarchy: list[dict[str, Any]] | None = None
     if fdr_temporal_raw is not None:
         if not isinstance(fdr_temporal_raw, list):
             raise ValueError(
@@ -673,15 +827,27 @@ def _parse_one_pattern(
 
     conformance_rules_raw = spec.get("conformance_rules")
     if conformance_rules_raw is not None and not isinstance(
-        conformance_rules_raw, list,
+        conformance_rules_raw,
+        list,
     ):
         raise ValueError(
             f"Pattern '{pid}' conformance_rules must be a list, "
             f"got {type(conformance_rules_raw).__name__}"
         )
+    if spec.get("use_mahalanobis") and spec.get("group_by_property"):
+        # Grouped calibration standardises per group with diagonal sigma; the
+        # full-covariance metric would be silently dropped.
+        raise ValueError(
+            f"Pattern '{pid}': use_mahalanobis cannot be combined with group_by_property "
+            "— remove one of the two options"
+        )
+    if spec.get("use_mahalanobis") and isinstance(dim_weights, list):
+        from hypertopos.builder._stats import validate_mahalanobis_weights
+
+        validate_mahalanobis_weights(pid, dim_weights)
 
     return PatternConfig(
-        type=ptype,
+        type=cast(Literal["anchor", "event"], ptype),  # validated above
         entity_line=str(entity_line),
         relations=relations,
         event_dimensions=event_dims,
@@ -704,6 +870,7 @@ def _parse_one_pattern(
         fdr_hierarchy=fdr_hierarchy,
         fdr_temporal_hierarchy=fdr_temporal_hierarchy,
         conformance_rules=conformance_rules_raw,
+        bootstrap_iterations=int(spec.get("bootstrap_iterations", 200)),
     )
 
 
@@ -716,6 +883,7 @@ def _parse_relation(
         raise ValueError(f"Pattern '{pid}' relation must be a mapping")
     if "line" not in raw:
         raise ValueError(f"Pattern '{pid}' relation must specify 'line'")
+    _warn_unknown_keys(f"Pattern '{pid}' relation", raw, _RELATION_KEYS)
     line = str(raw["line"])
     if known_lines is not None and line not in known_lines:
         raise ValueError(
@@ -732,7 +900,7 @@ def _parse_relation(
     edge_max = int(raw_em) if raw_em is not None else None
     return RelationConfig(
         line=line,
-        direction=direction,
+        direction=cast(Literal["in", "out", "self"], direction),  # validated above
         key_on_entity=raw.get("key_on_entity"),
         required=bool(raw.get("required", True)),
         display_name=raw.get("display_name"),
@@ -742,15 +910,12 @@ def _parse_relation(
 
 def _parse_derived_group(pid: str, raw: Any) -> DerivedDimGroup:
     if not isinstance(raw, dict):
-        raise ValueError(
-            f"Pattern '{pid}' derived_dimensions entry must be a mapping"
-        )
+        raise ValueError(f"Pattern '{pid}' derived_dimensions entry must be a mapping")
+    _warn_unknown_keys(f"Pattern '{pid}' derived_dimensions entry", raw, _DERIVED_GROUP_KEYS)
     from_pattern = raw.get("from_pattern")
     raw_features = raw.get("features")
     if not raw_features:
-        raise ValueError(
-            f"Pattern '{pid}' derived_dimensions entry must have 'features'"
-        )
+        raise ValueError(f"Pattern '{pid}' derived_dimensions entry must have 'features'")
     features = [_parse_feature_spec(pid, f) for f in raw_features]
     anchor_fk = raw.get("anchor_fk")
     return DerivedDimGroup(
@@ -818,8 +983,7 @@ def _parse_feature_spec(pid: str, raw: Any) -> FeatureSpec:
                 )
         else:
             raise ValueError(
-                f"Pattern '{pid}' feature '{dim_name}' unexpected token "
-                f"'{kv}' in spec '{spec_str}'"
+                f"Pattern '{pid}' feature '{dim_name}' unexpected token '{kv}' in spec '{spec_str}'"
             )
         idx += 1
 
@@ -843,11 +1007,10 @@ def _parse_composite_lines(
     for cl_id, spec in raw.items():
         if not isinstance(spec, dict):
             raise ValueError(f"Composite line '{cl_id}' must be a mapping")
+        _warn_unknown_keys(f"Composite line '{cl_id}'", spec, _COMPOSITE_KEYS)
         event_line = spec.get("event_line")
         if not event_line:
-            raise ValueError(
-                f"Composite line '{cl_id}' must specify 'event_line'"
-            )
+            raise ValueError(f"Composite line '{cl_id}' must specify 'event_line'")
         if str(event_line) not in lines:
             raise ValueError(
                 f"Composite line '{cl_id}' references unknown event_line "
@@ -855,16 +1018,12 @@ def _parse_composite_lines(
             )
         key_cols = spec.get("key_cols")
         if not key_cols or not isinstance(key_cols, list):
-            raise ValueError(
-                f"Composite line '{cl_id}' must specify 'key_cols' as a list"
-            )
+            raise ValueError(f"Composite line '{cl_id}' must specify 'key_cols' as a list")
 
         derived_dims: list[DerivedDimGroup] | None = None
         raw_dd = spec.get("derived_dimensions")
         if raw_dd:
-            derived_dims = [
-                _parse_derived_group(cl_id, g) for g in raw_dd
-            ]
+            derived_dims = [_parse_derived_group(cl_id, g) for g in raw_dd]
 
         dw_raw = spec.get("dimension_weights")
         dim_weights: str | list[float] | None = None
@@ -896,13 +1055,13 @@ def _parse_temporal(
     for i, entry in enumerate(raw):
         if not isinstance(entry, dict):
             raise ValueError(f"temporal[{i}] must be a mapping")
+        _warn_unknown_keys(f"temporal[{i}]", entry, _TEMPORAL_KEYS)
         pattern = entry.get("pattern")
         if not pattern:
             raise ValueError(f"temporal[{i}] must specify 'pattern'")
         if str(pattern) not in patterns:
             raise ValueError(
-                f"temporal[{i}] references unknown pattern '{pattern}'. "
-                f"Available: {list(patterns)}"
+                f"temporal[{i}] references unknown pattern '{pattern}'. Available: {list(patterns)}"
             )
         event_line = entry.get("event_line")
         if not event_line:
@@ -914,12 +1073,14 @@ def _parse_temporal(
         if not window:
             raise ValueError(f"temporal[{i}] must specify 'window'")
 
-        result.append(TemporalConfig(
-            pattern=str(pattern),
-            event_line=str(event_line),
-            timestamp_col=str(ts_col),
-            window=str(window),
-        ))
+        result.append(
+            TemporalConfig(
+                pattern=str(pattern),
+                event_line=str(event_line),
+                timestamp_col=str(ts_col),
+                window=str(window),
+            )
+        )
     return result
 
 
@@ -934,6 +1095,7 @@ def _parse_aliases(
     for alias_id, spec in raw.items():
         if not isinstance(spec, dict):
             raise ValueError(f"Alias '{alias_id}' must be a mapping")
+        _warn_unknown_keys(f"Alias '{alias_id}'", spec, _ALIAS_KEYS)
         base_pattern = spec.get("base_pattern")
         if not base_pattern:
             raise ValueError(f"Alias '{alias_id}' must specify 'base_pattern'")
@@ -944,9 +1106,8 @@ def _parse_aliases(
             )
         cp = spec.get("cutting_plane")
         if not cp or not isinstance(cp, dict):
-            raise ValueError(
-                f"Alias '{alias_id}' must specify 'cutting_plane' as a mapping"
-            )
+            raise ValueError(f"Alias '{alias_id}' must specify 'cutting_plane' as a mapping")
+        _warn_unknown_keys(f"Alias '{alias_id}' cutting_plane", cp, _CUTTING_PLANE_KEYS)
         # Two modes: dimension+threshold (sugar) or normal+bias (explicit)
         normal = cp.get("normal")
         bias = cp.get("bias")
@@ -981,29 +1142,21 @@ def _parse_label_audit(
     if raw is None:
         return None
     if not isinstance(raw, dict):
-        raise ValueError(
-            f"label_audit must be a YAML mapping, got {type(raw).__name__}"
-        )
+        raise ValueError(f"label_audit must be a YAML mapping, got {type(raw).__name__}")
+    _warn_unknown_keys("label_audit", raw, _LABEL_AUDIT_KEYS)
     label_column = raw.get("label_column")
     if not label_column or not isinstance(label_column, str):
-        raise ValueError(
-            "label_audit must specify 'label_column' (non-empty string)"
-        )
+        raise ValueError("label_audit must specify 'label_column' (non-empty string)")
     if "label_positive_value" not in raw:
-        raise ValueError(
-            "label_audit must specify 'label_positive_value'"
-        )
+        raise ValueError("label_audit must specify 'label_positive_value'")
     raw_pats = raw.get("patterns")
     if not raw_pats or not isinstance(raw_pats, list):
-        raise ValueError(
-            "label_audit must specify 'patterns' as a non-empty list"
-        )
+        raise ValueError("label_audit must specify 'patterns' as a non-empty list")
     pattern_ids = [str(p) for p in raw_pats]
     for pid in pattern_ids:
         if pid not in patterns:
             raise ValueError(
-                f"label_audit references unknown pattern '{pid}'. "
-                f"Available: {sorted(patterns)}"
+                f"label_audit references unknown pattern '{pid}'. Available: {sorted(patterns)}"
             )
     return LabelAuditConfig(
         label_column=str(label_column),
@@ -1023,6 +1176,7 @@ def _parse_chain_lines(
     for cl_id, spec in raw.items():
         if not isinstance(spec, dict):
             raise ValueError(f"chain_lines.{cl_id} must be a mapping")
+        _warn_unknown_keys(f"chain_lines.{cl_id}", spec, _CHAIN_LINE_KEYS)
         event_line = spec.get("event_line")
         if not event_line:
             raise ValueError(f"chain_lines.{cl_id} must specify 'event_line'")
@@ -1034,9 +1188,7 @@ def _parse_chain_lines(
         from_col = spec.get("from_col")
         to_col = spec.get("to_col")
         if not from_col or not to_col:
-            raise ValueError(
-                f"chain_lines.{cl_id} must specify 'from_col' and 'to_col'"
-            )
+            raise ValueError(f"chain_lines.{cl_id} must specify 'from_col' and 'to_col'")
         result[cl_id] = ChainLineConfig(
             event_line=str(event_line),
             from_col=str(from_col),
@@ -1054,5 +1206,12 @@ def _parse_chain_lines(
             anomaly_percentile=float(spec.get("anomaly_percentile", 95.0)),
             description=spec.get("description"),
             edge_dim_aggregations=spec.get("edge_dim_aggregations"),
+            timestamp_col=_opt_str(spec.get("timestamp_col")),
+            amount_col=_opt_str(spec.get("amount_col")),
+            category_col=_opt_str(spec.get("category_col")),
         )
     return result
+
+
+def _opt_str(value: Any) -> str | None:
+    return str(value) if value is not None else None

@@ -10,6 +10,7 @@ import logging
 
 import numpy as np
 import pytest
+
 from hypertopos.builder._stats import compute_stats
 
 

@@ -3,8 +3,9 @@
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
 """Tests for edge table navigator functions: find_counterparties fast path,
-find_geometric_path, discover_chains, entity_flow, contagion_score,
+find_geometric_path, extract_chains defaults, entity_flow, contagion_score,
 amount-weighted scoring, and degree_velocity."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -12,7 +13,7 @@ import pyarrow as pa
 import pytest
 
 from hypertopos.builder.builder import GDSBuilder, RelationSpec
-from hypertopos.navigation.navigator import GDSNavigationError, GDSNavigator
+from hypertopos.navigation.navigator import GDSNavigationError
 from hypertopos.sphere import HyperSphere
 
 
@@ -26,26 +27,32 @@ def tx_sphere(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("path_sphere")
     builder = GDSBuilder("path_test", str(tmp / "gds"))
 
-    accounts = pa.table({
-        "primary_key": [f"A{i:03d}" for i in range(20)],
-        "name": [f"Account {i}" for i in range(20)],
-    })
-    builder.add_line("accounts", accounts, key_col="primary_key",
-                     source_id="accounts", role="anchor")
+    accounts = pa.table(
+        {
+            "primary_key": [f"A{i:03d}" for i in range(20)],
+            "name": [f"Account {i}" for i in range(20)],
+        }
+    )
+    builder.add_line(
+        "accounts", accounts, key_col="primary_key", source_id="accounts", role="anchor"
+    )
 
     n_tx = 200
-    txns = pa.table({
-        "primary_key": [f"TX{i:05d}" for i in range(n_tx)],
-        "sender_id": [f"A{i % 20:03d}" for i in range(n_tx)],
-        "receiver_id": [f"A{(i + 3) % 20:03d}" for i in range(n_tx)],
-        "amount": [float(100 + i) for i in range(n_tx)],
-        "tx_date": pa.array(
-            [1_700_000_000.0 + i * 3600.0 for i in range(n_tx)],
-            type=pa.float64(),
-        ),
-    })
-    builder.add_line("transactions", txns, key_col="primary_key",
-                     source_id="transactions", role="event")
+    txns = pa.table(
+        {
+            "primary_key": [f"TX{i:05d}" for i in range(n_tx)],
+            "sender_id": [f"A{i % 20:03d}" for i in range(n_tx)],
+            "receiver_id": [f"A{(i + 3) % 20:03d}" for i in range(n_tx)],
+            "amount": [float(100 + i) for i in range(n_tx)],
+            "tx_date": pa.array(
+                [1_700_000_000.0 + i * 3600.0 for i in range(n_tx)],
+                type=pa.float64(),
+            ),
+        }
+    )
+    builder.add_line(
+        "transactions", txns, key_col="primary_key", source_id="transactions", role="event"
+    )
 
     builder.add_pattern(
         "tx_pattern",
@@ -85,7 +92,10 @@ class TestFindCounterpartiesEdgeTable:
     def test_fast_path_returns_counterparties(self, nav):
         """Edge table fast path should find counterparties for A000."""
         result = nav.find_counterparties(
-            "A000", "transactions", "sender_id", "receiver_id",
+            "A000",
+            "transactions",
+            "sender_id",
+            "receiver_id",
             pattern_id="tx_pattern",
         )
         assert result["primary_key"] == "A000"
@@ -94,7 +104,10 @@ class TestFindCounterpartiesEdgeTable:
     def test_includes_amount_sum_max(self, nav):
         """Fast path entries should include amount_sum and amount_max."""
         result = nav.find_counterparties(
-            "A000", "transactions", "sender_id", "receiver_id",
+            "A000",
+            "transactions",
+            "sender_id",
+            "receiver_id",
             pattern_id="tx_pattern",
         )
         for entry in result["outgoing"]:
@@ -106,7 +119,10 @@ class TestFindCounterpartiesEdgeTable:
     def test_incoming(self, nav):
         """Fast path should also find incoming counterparties."""
         result = nav.find_counterparties(
-            "A003", "transactions", "sender_id", "receiver_id",
+            "A003",
+            "transactions",
+            "sender_id",
+            "receiver_id",
             pattern_id="tx_pattern",
         )
         # A003 receives from A000 (i%20==0 sends to i+3%20==3)
@@ -115,7 +131,10 @@ class TestFindCounterpartiesEdgeTable:
     def test_fallback_no_edge_table(self, nav):
         """Without edge table (acct_pattern), should fall back to points scan."""
         result = nav.find_counterparties(
-            "A000", "transactions", "sender_id", "receiver_id",
+            "A000",
+            "transactions",
+            "sender_id",
+            "receiver_id",
             pattern_id=None,
         )
         # Falls back to points scan — no amount fields
@@ -126,12 +145,18 @@ class TestFindCounterpartiesEdgeTable:
     def test_timestamp_cutoff_empty_when_before_all_edges(self, nav):
         """Pre-fixture cutoff → edge-table fast path returns empty lists."""
         baseline = nav.find_counterparties(
-            "A000", "transactions", "sender_id", "receiver_id",
+            "A000",
+            "transactions",
+            "sender_id",
+            "receiver_id",
             pattern_id="tx_pattern",
         )
         assert baseline["summary"]["total_outgoing"] > 0
         cut = nav.find_counterparties(
-            "A000", "transactions", "sender_id", "receiver_id",
+            "A000",
+            "transactions",
+            "sender_id",
+            "receiver_id",
             pattern_id="tx_pattern",
             timestamp_cutoff=1_000_000_000.0,
         )
@@ -144,7 +169,10 @@ class TestFindCounterpartiesEdgeTable:
         """Cutoff cannot be honored on the points-scan fallback — must raise."""
         with pytest.raises(GDSNavigationError, match="edge-table fast path"):
             nav.find_counterparties(
-                "A000", "transactions", "sender_id", "receiver_id",
+                "A000",
+                "transactions",
+                "sender_id",
+                "receiver_id",
                 pattern_id="tx_pattern",
                 use_edge_table=False,
                 timestamp_cutoff=1_700_000_000.0,
@@ -153,8 +181,12 @@ class TestFindCounterpartiesEdgeTable:
     def test_use_edge_table_false(self, nav):
         """Explicit use_edge_table=False should force points scan."""
         result = nav.find_counterparties(
-            "A000", "transactions", "sender_id", "receiver_id",
-            pattern_id="tx_pattern", use_edge_table=False,
+            "A000",
+            "transactions",
+            "sender_id",
+            "receiver_id",
+            pattern_id="tx_pattern",
+            use_edge_table=False,
         )
         # Forced points scan — no amount fields
         assert result["summary"]["total_outgoing"] > 0
@@ -164,10 +196,88 @@ class TestFindCounterpartiesEdgeTable:
     def test_top_n_limits(self, nav):
         """top_n should cap the number of counterparties returned."""
         result = nav.find_counterparties(
-            "A000", "transactions", "sender_id", "receiver_id",
-            pattern_id="tx_pattern", top_n=1,
+            "A000",
+            "transactions",
+            "sender_id",
+            "receiver_id",
+            pattern_id="tx_pattern",
+            top_n=1,
         )
         assert len(result["outgoing"]) <= 1
+
+
+@pytest.fixture(scope="module")
+def tie_sphere(tmp_path_factory):
+    """X sends D twice, then C, A, B once each (insertion order C, A, B).
+
+    Amounts: C=10, A=10, B=50 — so insertion order, key order and amount
+    order all disagree inside the tx_count == 1 tie.
+    """
+    tmp = tmp_path_factory.mktemp("tie_sphere")
+    builder = GDSBuilder("tie_test", str(tmp / "gds"))
+    keys = ["X", "A", "B", "C", "D"]
+    builder.add_line(
+        "accounts",
+        pa.table({"primary_key": keys}),
+        key_col="primary_key",
+        source_id="accounts",
+        role="anchor",
+    )
+    receivers = ["D", "D", "C", "A", "B"]
+    amounts = [5.0, 5.0, 10.0, 10.0, 50.0]
+    n = len(receivers)
+    txns = pa.table(
+        {
+            "primary_key": [f"TX{i}" for i in range(n)],
+            "sender_id": ["X"] * n,
+            "receiver_id": receivers,
+            "amount": amounts,
+            "tx_date": pa.array([1_700_000_000.0 + i * 3600.0 for i in range(n)]),
+        }
+    )
+    builder.add_line(
+        "transactions", txns, key_col="primary_key", source_id="transactions", role="event"
+    )
+    builder.add_pattern(
+        "tx_pattern",
+        pattern_type="event",
+        entity_line="transactions",
+        relations=[
+            RelationSpec(line_id="accounts", fk_col="sender_id", direction="out"),
+            RelationSpec(line_id="accounts", fk_col="receiver_id", direction="in"),
+        ],
+    )
+    return builder.build()
+
+
+class TestFindCounterpartiesTieOrder:
+    """Ties on tx_count are broken deterministically, so a top_n cut inside
+    a tie always returns the same subset."""
+
+    def test_edge_table_ties_by_amount_then_key(self, tie_sphere):
+        nav = HyperSphere.open(tie_sphere).session("t").navigator()
+        assert nav._storage.has_edge_table("tx_pattern")
+        result = nav.find_counterparties(
+            "X", "transactions", "sender_id", "receiver_id", pattern_id="tx_pattern"
+        )
+        # D (2 tx) first, then the tx_count == 1 tie: B (amount 50), A, C (10 each)
+        assert [e["key"] for e in result["outgoing"]] == ["D", "B", "A", "C"]
+        cut = nav.find_counterparties(
+            "X", "transactions", "sender_id", "receiver_id", pattern_id="tx_pattern", top_n=3
+        )
+        assert [e["key"] for e in cut["outgoing"]] == ["D", "B", "A"]
+
+    def test_points_scan_ties_by_key(self, tie_sphere):
+        nav = HyperSphere.open(tie_sphere).session("t").navigator()
+        result = nav.find_counterparties(
+            "X", "transactions", "sender_id", "receiver_id", use_edge_table=False
+        )
+        # No amounts on the points scan: the tx_count == 1 tie is ordered by key
+        assert [e["key"] for e in result["outgoing"]] == ["D", "A", "B", "C"]
+        cut = nav.find_counterparties(
+            "X", "transactions", "sender_id", "receiver_id", use_edge_table=False, top_n=2
+        )
+        assert [e["key"] for e in cut["outgoing"]] == ["D", "A"]
 
 
 # ── entity_flow tests ───────────────────────────────────────
@@ -202,7 +312,9 @@ class TestEntityFlow:
         baseline = nav.entity_flow("A000", "tx_pattern")
         assert baseline["outgoing_total"] > 0 or baseline["incoming_total"] > 0
         cut = nav.entity_flow(
-            "A000", "tx_pattern", timestamp_cutoff=1_000_000_000.0,
+            "A000",
+            "tx_pattern",
+            timestamp_cutoff=1_000_000_000.0,
         )
         assert cut["outgoing_total"] == 0
         assert cut["incoming_total"] == 0
@@ -213,7 +325,9 @@ class TestEntityFlow:
         """Cutoff after all edges → identical to default."""
         baseline = nav.entity_flow("A000", "tx_pattern")
         future = nav.entity_flow(
-            "A000", "tx_pattern", timestamp_cutoff=9_999_999_999.0,
+            "A000",
+            "tx_pattern",
+            timestamp_cutoff=9_999_999_999.0,
         )
         assert future["outgoing_total"] == baseline["outgoing_total"]
         assert future["incoming_total"] == baseline["incoming_total"]
@@ -264,7 +378,9 @@ class TestContagionScore:
         baseline = nav.contagion_score("A000", "tx_pattern")
         assert baseline["total_counterparties"] > 0
         cutoff_result = nav.contagion_score(
-            "A000", "tx_pattern", timestamp_cutoff=1_000_000_000.0,
+            "A000",
+            "tx_pattern",
+            timestamp_cutoff=1_000_000_000.0,
         )
         assert cutoff_result["total_counterparties"] == 0
         assert cutoff_result["score"] == 0.0
@@ -273,7 +389,9 @@ class TestContagionScore:
         """Cutoff after all edges → identical to default (no cutoff)."""
         baseline = nav.contagion_score("A000", "tx_pattern")
         future = nav.contagion_score(
-            "A000", "tx_pattern", timestamp_cutoff=9_999_999_999.0,
+            "A000",
+            "tx_pattern",
+            timestamp_cutoff=9_999_999_999.0,
         )
         assert future["total_counterparties"] == baseline["total_counterparties"]
         assert future["score"] == baseline["score"]
@@ -281,7 +399,9 @@ class TestContagionScore:
     def test_batch_timestamp_cutoff_threaded(self, nav):
         """Batch must forward timestamp_cutoff to each per-entity call."""
         result = nav.contagion_score_batch(
-            ["A000", "A001"], "tx_pattern", timestamp_cutoff=1_000_000_000.0,
+            ["A000", "A001"],
+            "tx_pattern",
+            timestamp_cutoff=1_000_000_000.0,
         )
         for entry in result["results"]:
             assert entry["total_counterparties"] == 0
@@ -322,7 +442,9 @@ class TestDegreeVelocity:
     def test_timestamp_cutoff_pre_fixture_returns_no_edges_warning(self, nav):
         """Cutoff before any edge → warning path (same as no edges)."""
         result = nav.degree_velocity(
-            "A000", "tx_pattern", timestamp_cutoff=1_000_000_000.0,
+            "A000",
+            "tx_pattern",
+            timestamp_cutoff=1_000_000_000.0,
         )
         assert result["velocity_out"] is None
         assert result["velocity_in"] is None
@@ -408,7 +530,9 @@ class TestPropagateInfluence:
         assert low["summary"]["total_affected"] >= high["summary"]["total_affected"]
 
     def test_multiple_seeds(self, nav):
-        result = nav.propagate_influence(["A000", "A001"], "tx_pattern", max_depth=1, min_threshold=0.001)
+        result = nav.propagate_influence(
+            ["A000", "A001"], "tx_pattern", max_depth=1, min_threshold=0.001
+        )
         assert result["summary"]["total_affected"] > 0
 
     def test_has_anomaly_field(self, nav):
@@ -428,11 +552,14 @@ class TestPropagateInfluence:
     def test_timestamp_cutoff_blocks_expansion(self, nav):
         """Pre-fixture cutoff → BFS finds no neighbors."""
         baseline = nav.propagate_influence(
-            ["A000"], "tx_pattern", min_threshold=0.001,
+            ["A000"],
+            "tx_pattern",
+            min_threshold=0.001,
         )
         assert baseline["summary"]["total_affected"] > 0
         cut = nav.propagate_influence(
-            ["A000"], "tx_pattern",
+            ["A000"],
+            "tx_pattern",
             min_threshold=0.001,
             timestamp_cutoff=1_000_000_000.0,
         )
@@ -554,7 +681,10 @@ class TestFindGeometricPath:
     def test_two_hops(self, nav):
         """A000→A003→A006 should be found within depth 2."""
         result = nav.find_geometric_path(
-            "A000", "A006", "tx_pattern", max_depth=3,
+            "A000",
+            "A006",
+            "tx_pattern",
+            max_depth=3,
         )
         assert result["summary"]["paths_found"] >= 1
         assert any(p["hops"] <= 3 for p in result["paths"])
@@ -562,7 +692,10 @@ class TestFindGeometricPath:
     def test_no_path_disconnected(self, nav):
         """Asking for a nonexistent target yields empty paths."""
         result = nav.find_geometric_path(
-            "A000", "NONEXISTENT", "tx_pattern", max_depth=3,
+            "A000",
+            "NONEXISTENT",
+            "tx_pattern",
+            max_depth=3,
         )
         assert result["summary"]["paths_found"] == 0
         assert result["paths"] == []
@@ -570,7 +703,10 @@ class TestFindGeometricPath:
     def test_max_depth_limit(self, nav):
         """With depth=1, only direct neighbors are reachable."""
         result = nav.find_geometric_path(
-            "A000", "A006", "tx_pattern", max_depth=1,
+            "A000",
+            "A006",
+            "tx_pattern",
+            max_depth=1,
         )
         # A006 is 2 hops away, depth=1 shouldn't find it
         assert result["summary"]["paths_found"] == 0
@@ -579,7 +715,10 @@ class TestFindGeometricPath:
         """All four scoring modes should work without error."""
         for mode in ("geometric", "anomaly", "shortest", "amount"):
             result = nav.find_geometric_path(
-                "A000", "A003", "tx_pattern", scoring=mode,
+                "A000",
+                "A003",
+                "tx_pattern",
+                scoring=mode,
             )
             assert result["scoring"] == mode
             assert result["summary"]["paths_found"] >= 1
@@ -587,7 +726,10 @@ class TestFindGeometricPath:
     def test_amount_scoring_mode(self, nav):
         """Amount scoring should find paths and report correctly."""
         result = nav.find_geometric_path(
-            "A000", "A003", "tx_pattern", scoring="amount",
+            "A000",
+            "A003",
+            "tx_pattern",
+            scoring="amount",
         )
         assert result["scoring"] == "amount"
         assert result["summary"]["paths_found"] >= 1
@@ -610,7 +752,10 @@ class TestFindGeometricPath:
 
     def test_no_cycles_in_path(self, nav):
         result = nav.find_geometric_path(
-            "A000", "A009", "tx_pattern", max_depth=5,
+            "A000",
+            "A009",
+            "tx_pattern",
+            max_depth=5,
         )
         for p in result["paths"]:
             assert len(p["keys"]) == len(set(p["keys"]))
@@ -618,14 +763,20 @@ class TestFindGeometricPath:
     def test_beam_width_1(self, nav):
         """beam_width=1 still finds a path (greedy)."""
         result = nav.find_geometric_path(
-            "A000", "A003", "tx_pattern", beam_width=1,
+            "A000",
+            "A003",
+            "tx_pattern",
+            beam_width=1,
         )
         assert result["summary"]["paths_found"] >= 1
 
     def test_long_path_7_hops(self, nav):
         """A000→A001 is 7 hops in the +3 circular graph. Must be found."""
         result = nav.find_geometric_path(
-            "A000", "A001", "tx_pattern", max_depth=8,
+            "A000",
+            "A001",
+            "tx_pattern",
+            max_depth=8,
         )
         assert result["summary"]["paths_found"] >= 1
         best = result["paths"][0]
@@ -636,7 +787,11 @@ class TestFindGeometricPath:
     def test_beam_width_caps_output(self, nav):
         """beam_width should cap the number of returned paths."""
         result = nav.find_geometric_path(
-            "A000", "A009", "tx_pattern", max_depth=8, beam_width=2,
+            "A000",
+            "A009",
+            "tx_pattern",
+            max_depth=8,
+            beam_width=2,
         )
         assert len(result["paths"]) <= 2
 
@@ -646,116 +801,69 @@ class TestFindGeometricPath:
             nav.find_geometric_path("A000", "A003", "acct_pattern")
 
 
-# ── discover_chains tests ────────────────────────────────────
+class TestExtractChainsDefaults:
+    def test_columns_default_to_the_edge_table(self, nav):
+        result = nav.extract_chains("tx_pattern", seed_nodes=["A000"], min_hops=2, top_n=50)
+        assert result["total_chains"] > 0
+        assert all(c["keys"][0] == "A000" for c in result["chains"])
 
+    def test_time_column_defaults_to_the_pattern_timestamp(self, nav):
+        result = nav.extract_chains("tx_pattern", seed_nodes=["A000"], min_hops=2, top_n=50)
+        assert any(c["time_span_hours"] > 0 for c in result["chains"])
 
-class TestDiscoverChains:
-    def test_basic_discovery(self, nav):
-        result = nav.discover_chains(
-            "A000", "tx_pattern", min_hops=2, max_chains=50,
+    def test_explicit_columns_still_win(self, nav):
+        result = nav.extract_chains(
+            "tx_pattern", "sender_id", "receiver_id", seed_nodes=["A000"], min_hops=2
         )
-        assert result["summary"]["total"] > 0
-        for chain in result["chains"]:
-            assert chain["hop_count"] >= 2
-            assert chain["keys"][0] == "A000"
+        assert result["total_chains"] > 0
 
-    def test_temporal_ordering(self, nav):
-        """Chains should respect temporal order (timestamps increasing)."""
-        result = nav.discover_chains(
-            "A000", "tx_pattern", min_hops=2, max_chains=10,
+    def test_seeded_run_on_the_reachable_subset_matches_the_full_table(self, nav):
+        # Seeded runs cut the event table to what the seeds can reach before
+        # chain search; the chains must equal a search over the whole table.
+        from hypertopos.engine.chains import extract_chains as core
+
+        n_tx = 200
+        full = core(
+            from_keys=[f"A{i % 20:03d}" for i in range(n_tx)],
+            to_keys=[f"A{(i + 3) % 20:03d}" for i in range(n_tx)],
+            event_pks=[f"TX{i:05d}" for i in range(n_tx)],
+            timestamps=[1_700_000_000.0 + i * 3600.0 for i in range(n_tx)],
+            amounts=[float(100 + i) for i in range(n_tx)],
+            max_hops=4,
+            min_hops=2,
+            seed_nodes=["A000"],
         )
-        # All chains start from A000, so temporal ordering is implicit
-        assert result["summary"]["total"] > 0
-
-    def test_min_hops_filter(self, nav):
-        result = nav.discover_chains(
-            "A000", "tx_pattern", min_hops=3, max_chains=50,
+        subset = nav.extract_chains(
+            "tx_pattern",
+            "sender_id",
+            "receiver_id",
+            time_col="tx_date",
+            amount_col="amount",
+            seed_nodes=["A000"],
+            min_hops=2,
+            max_hops=4,
+            top_n=10**6,
         )
-        for chain in result["chains"]:
-            assert chain["hop_count"] >= 3
-
-    def test_max_chains_limit(self, nav):
-        result = nav.discover_chains(
-            "A000", "tx_pattern", min_hops=2, max_chains=5,
+        assert subset["total_chains"] > 0
+        assert sorted(tuple(c["event_keys"]) for c in subset["chains"]) == sorted(
+            tuple(c.event_keys) for c in full
         )
-        assert len(result["chains"]) <= 5
 
-    def test_geometric_score_present(self, nav):
-        result = nav.discover_chains(
-            "A000", "tx_pattern", min_hops=2, max_chains=10,
+    def test_seed_outside_the_graph_gives_no_misleading_hint(self, nav):
+        result = nav.extract_chains(
+            "tx_pattern", "sender_id", "receiver_id", seed_nodes=["NOT-A-NODE"], min_hops=2
         )
-        for chain in result["chains"]:
-            assert "geometric_score" in chain
+        assert result["total_chains"] == 0
+        assert "hint" not in result
 
-    def test_no_edge_table_raises(self, nav):
-        with pytest.raises(GDSNavigationError, match="no edge table"):
-            nav.discover_chains("A000", "acct_pattern")
 
-    def test_forward_direction(self, nav):
-        result = nav.discover_chains(
-            "A000", "tx_pattern", direction="forward",
-            min_hops=2, max_chains=20,
-        )
-        assert result["summary"]["total"] >= 0  # may be 0 if timestamps don't align
+def test_seeded_extraction_never_subsamples_events() -> None:
+    from hypertopos.engine.chains import extract_chains
 
-    @staticmethod
-    def _cyclic_nav(edges):
-        """A navigator whose adjacency is a hand-built temporal edge map
-        ``{key: [(target, ts, amount), ...]}``, with geometric scoring
-        neutralised so chain-shape logic is tested in isolation."""
-        from unittest.mock import MagicMock
-
-        adj = MagicMock()
-        adj.neighbors_out = MagicMock(
-            side_effect=lambda k: [
-                (t, ts, amt, f"e_{k}_{t}") for (t, ts, amt) in edges.get(k, [])
-            ]
-        )
-        adj.neighbors_in = MagicMock(side_effect=lambda k: [])
-        storage = MagicMock()
-        storage.has_edge_table = MagicMock(return_value=True)
-        storage.get_adjacency = MagicMock(return_value=adj)
-        nav = GDSNavigator(MagicMock(), storage, MagicMock(), MagicMock())
-        nav._resolve_anchor_pattern_for_scoring = lambda pid: pid
-        nav._prefetch_deltas = lambda keys, pat: None
-        nav._score_hop = lambda a, b, pat, mode, **kw: 0.0
-        return nav
-
-    def test_cyclic_chain_detected(self):
-        """Regression: a round trip A→B→C→A must surface as a cyclic chain.
-
-        The BFS seeds path=[start, neighbor] and a revisit guard blocks
-        re-appending any path member — including `start` — so the closing
-        hop back to the origin was silently dropped and is_cyclic was
-        structurally always False (summary.cyclic always 0). A funds-return
-        round trip is a core AML laundering typology; the fix emits the
-        closing hop as a terminal cyclic chain (mirroring the build-time
-        chain extractor)."""
-        nav = self._cyclic_nav({
-            "A": [("B", 1.0, 10.0)],
-            "B": [("C", 2.0, 10.0)],
-            "C": [("A", 3.0, 10.0)],
-        })
-        res = nav.discover_chains(
-            "A", "tx_pattern", time_window_hours=168,
-            max_hops=5, min_hops=2, direction="forward",
-        )
-        assert res["summary"]["cyclic"] >= 1
-        closed = [c for c in res["chains"] if c["is_cyclic"]]
-        assert closed, "expected at least one cyclic chain"
-        for c in closed:
-            assert c["keys"][0] == c["keys"][-1] == "A"
-
-    def test_acyclic_chain_not_flagged_cyclic(self):
-        """An open chain A→B→C must NOT be reported cyclic (no false positive
-        from the cycle-closing branch)."""
-        nav = self._cyclic_nav({
-            "A": [("B", 1.0, 10.0)],
-            "B": [("C", 2.0, 10.0)],
-        })
-        res = nav.discover_chains(
-            "A", "tx_pattern", time_window_hours=168,
-            max_hops=5, min_hops=2, direction="forward",
-        )
-        assert res["summary"]["cyclic"] == 0
-        assert all(not c["is_cyclic"] for c in res["chains"])
+    from_keys = ["S0", "S1"] + [f"N{i}" for i in range(1000)]
+    to_keys = ["S1", "S2"] + [f"M{i}" for i in range(1000)]
+    pks = [f"E{i}" for i in range(len(from_keys))]
+    result = extract_chains(
+        from_keys, to_keys, pks, sample_size=1, seed_nodes=["S0"], min_hops=2, max_hops=5
+    )
+    assert any(c.keys == ["S0", "S1", "S2"] for c in result)

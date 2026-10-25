@@ -7,11 +7,13 @@
 Geometry persists as a single ``geometry/<pid>/data.lance`` dataset; each
 calibration epoch is a Lance internal version pinned by an ``epoch_<N>`` tag.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
 
 import lance as _lance
+
 from hypertopos.builder import GDSBuilder, RelationSpec
 from hypertopos.sphere import HyperSphere
 
@@ -47,7 +49,10 @@ def _build_minimal_sphere(tmp_path: Path) -> tuple[str, str]:
         entity_line="orders",
         relations=[
             RelationSpec(
-                "customers", fk_col="cust_id", direction="in", required=True,
+                "customers",
+                fk_col="cust_id",
+                direction="in",
+                required=True,
             ),
         ],
     )
@@ -64,9 +69,7 @@ class TestNativeMvccGeometryLayout:
     def test_no_versioned_geometry_dir(self, tmp_path: Path) -> None:
         out, pid = _build_minimal_sphere(tmp_path)
         versioned = Path(out) / "geometry" / pid / "v=1"
-        assert not versioned.exists(), (
-            "geometry/<pid>/v=1 must not exist on a 3.0 sphere"
-        )
+        assert not versioned.exists(), "geometry/<pid>/v=1 must not exist on a 3.0 sphere"
 
     def test_epoch_1_tag_present_after_build(self, tmp_path: Path) -> None:
         out, pid = _build_minimal_sphere(tmp_path)
@@ -84,7 +87,8 @@ class TestNativeMvccGeometryLayout:
 
 class TestNativeMvccRecalibrateIsolation:
     def test_recalibrate_overwrites_in_place_no_versioned_dir(
-        self, tmp_path: Path,
+        self,
+        tmp_path: Path,
     ) -> None:
         out, pid = _build_minimal_sphere(tmp_path)
         sphere = HyperSphere.open(out)
@@ -99,7 +103,8 @@ class TestNativeMvccRecalibrateIsolation:
         session.close()
 
     def test_pre_recalibrate_session_isolated_after_recalibrate(
-        self, tmp_path: Path,
+        self,
+        tmp_path: Path,
     ) -> None:
         """Session opened before recalibrate sees the pre-recalibrate snapshot."""
         out, pid = _build_minimal_sphere(tmp_path)
@@ -109,7 +114,9 @@ class TestNativeMvccRecalibrateIsolation:
         pre = sphere.session("agent-pre")
         nav_pre = pre.navigator()
         pre_norms = nav_pre._storage.read_geometry(
-            pid, version, columns=["primary_key", "delta_norm"],
+            pid,
+            version,
+            columns=["primary_key", "delta_norm"],
         )["delta_norm"].to_pylist()
 
         recalib_session = sphere.session("agent-recalib")
@@ -117,7 +124,9 @@ class TestNativeMvccRecalibrateIsolation:
         recalib_session.close()
 
         same_norms_after = nav_pre._storage.read_geometry(
-            pid, version, columns=["primary_key", "delta_norm"],
+            pid,
+            version,
+            columns=["primary_key", "delta_norm"],
         )["delta_norm"].to_pylist()
 
         assert same_norms_after == pre_norms, (
@@ -127,7 +136,9 @@ class TestNativeMvccRecalibrateIsolation:
         post = sphere.session("agent-post")
         nav_post = post.navigator()
         post_norms = nav_post._storage.read_geometry(
-            pid, version, columns=["primary_key", "delta_norm"],
+            pid,
+            version,
+            columns=["primary_key", "delta_norm"],
         )["delta_norm"].to_pylist()
         # New session sees latest version (may differ from pre-recalibrate norms
         # only when the recalibration actually changes them; the test only

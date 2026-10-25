@@ -11,6 +11,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
+
 from hypertopos.builder.builder import (
     GDSBuilder,
     IncrementalUpdateResult,
@@ -233,25 +234,21 @@ def _build_agg_sphere(out_root):
             {"acct_id": "C", "name": "gamma"},
             {"acct_id": "D", "name": "delta"},
         ],
-        key_col="acct_id", source_id="t",
+        key_col="acct_id",
+        source_id="t",
     )
     b.add_line(
         "transactions",
         [
-            {"tx_id": "ek1", "from_acct": "A", "to_acct": "B",
-             "ts": 0.0,    "amount": 20000.0},
-            {"tx_id": "ek2", "from_acct": "B", "to_acct": "C",
-             "ts": 100.0,  "amount": 5000.0},
-            {"tx_id": "ek3", "from_acct": "C", "to_acct": "D",
-             "ts": 200.0,  "amount": 5000.0},
-            {"tx_id": "ek4", "from_acct": "A", "to_acct": "B",
-             "ts": 1000.0, "amount": 1000.0},
-            {"tx_id": "ek5", "from_acct": "C", "to_acct": "D",
-             "ts": 5000.0, "amount": 2000.0},
-            {"tx_id": "ek6", "from_acct": "D", "to_acct": "A",
-             "ts": 8000.0, "amount": 3000.0},
+            {"tx_id": "ek1", "from_acct": "A", "to_acct": "B", "ts": 0.0, "amount": 20000.0},
+            {"tx_id": "ek2", "from_acct": "B", "to_acct": "C", "ts": 100.0, "amount": 5000.0},
+            {"tx_id": "ek3", "from_acct": "C", "to_acct": "D", "ts": 200.0, "amount": 5000.0},
+            {"tx_id": "ek4", "from_acct": "A", "to_acct": "B", "ts": 1000.0, "amount": 1000.0},
+            {"tx_id": "ek5", "from_acct": "C", "to_acct": "D", "ts": 5000.0, "amount": 2000.0},
+            {"tx_id": "ek6", "from_acct": "D", "to_acct": "A", "ts": 8000.0, "amount": 3000.0},
         ],
-        key_col="tx_id", source_id="t",
+        key_col="tx_id",
+        source_id="t",
     )
     b.add_pattern(
         "tx_pattern",
@@ -259,12 +256,17 @@ def _build_agg_sphere(out_root):
         entity_line="transactions",
         relations=[
             RelationSpec(
-                "accounts", fk_col="from_acct", direction="in", required=True,
+                "accounts",
+                fk_col="from_acct",
+                direction="in",
+                required=True,
             ),
         ],
         edge_table=EdgeTableConfig(
-            from_col="from_acct", to_col="to_acct",
-            timestamp_col="ts", amount_col="amount",
+            from_col="from_acct",
+            to_col="to_acct",
+            timestamp_col="ts",
+            amount_col="amount",
         ),
         edge_dimensions=EdgeDimensionsConfig(dims={"pair_edge_count": {}}),
     )
@@ -319,34 +321,42 @@ def test_build_refuses_tracked_properties_with_edge_blocks(tmp_path):
             {"acct_id": "C", "name": "gamma"},
             {"acct_id": "D", "name": "delta"},
         ],
-        key_col="acct_id", source_id="t",
+        key_col="acct_id",
+        source_id="t",
     )
     b.add_line(
         "transactions",
         [
-            {"tx_id": f"ek{i}", "from_acct": "A", "to_acct": "B",
-             "ts": float(i), "amount": 100.0}
+            {"tx_id": f"ek{i}", "from_acct": "A", "to_acct": "B", "ts": float(i), "amount": 100.0}
             for i in range(6)
         ],
-        key_col="tx_id", source_id="t",
+        key_col="tx_id",
+        source_id="t",
     )
     b.add_pattern(
-        "tx_pattern", pattern_type="event", entity_line="transactions",
+        "tx_pattern",
+        pattern_type="event",
+        entity_line="transactions",
         relations=[
             RelationSpec("accounts", fk_col="from_acct", direction="in", required=True),
         ],
         edge_table=EdgeTableConfig(
-            from_col="from_acct", to_col="to_acct",
-            timestamp_col="ts", amount_col="amount",
+            from_col="from_acct",
+            to_col="to_acct",
+            timestamp_col="ts",
+            amount_col="amount",
         ),
         edge_dimensions=EdgeDimensionsConfig(dims={"pair_edge_count": {}}),
     )
     b.add_pattern(
-        "account_pattern", pattern_type="anchor", entity_line="accounts",
+        "account_pattern",
+        pattern_type="anchor",
+        entity_line="accounts",
         relations=[],
         tracked_properties=["name"],  # prop block ...
         edge_dim_aggregations=EdgeDimAggregationsConfig(  # ... + edge-agg block
-            from_event_pattern="tx_pattern", dims=("pair_edge_count",),
+            from_event_pattern="tx_pattern",
+            dims=("pair_edge_count",),
         ),
     )
     with pytest.raises(ValueError, match="tracked_properties"):
@@ -364,8 +374,7 @@ def test_incremental_update_edge_dim_aggregation_pattern(agg_sphere):
     pat_meta = _get_pattern_meta(agg_sphere, "account_pattern")
     expected_width = len(pat_meta["mu"])
     assert expected_width == 6, (
-        f"fixture sanity: expected 6-wide mu (1 derived + 5 aggs), "
-        f"got {expected_width}"
+        f"fixture sanity: expected 6-wide mu (1 derived + 5 aggs), got {expected_width}"
     )
     old_pop = pat_meta["population_size"]
 
@@ -382,14 +391,17 @@ def test_incremental_update_edge_dim_aggregation_pattern(agg_sphere):
             "pair_edge_count_std": pa.array([999.0], type=pa.float64()),
             "pair_edge_count_p95": pa.array([999.0], type=pa.float64()),
             "pair_edge_count_count_above_threshold": pa.array(
-                [999.0], type=pa.float64(),
+                [999.0],
+                type=pa.float64(),
             ),
         }
     )
 
     builder = GDSBuilder("test_inc_agg", agg_sphere)
     result = builder.incremental_update(
-        "account_pattern", changed_entities=new_accts, recalibrate="never",
+        "account_pattern",
+        changed_entities=new_accts,
+        recalibrate="never",
     )
 
     assert result.added == 1
@@ -412,7 +424,8 @@ def test_incremental_update_edge_dim_aggregation_pattern(agg_sphere):
     hs = HyperSphere.open(agg_sphere)
     nav = hs.session("inc-agg-test").navigator()
     polygons, _total, _emerging, _meta = nav.π5_attract_anomaly(
-        "account_pattern", top_n=1,
+        "account_pattern",
+        top_n=1,
     )
     surfaced = {p.primary_key for p in polygons}
     assert "NEW_ACCT" in surfaced, (
@@ -447,20 +460,21 @@ def test_incremental_update_triggers_reindex(agg_sphere, monkeypatch):
             "pair_edge_count_std": pa.array([0.0], type=pa.float64()),
             "pair_edge_count_p95": pa.array([1.0], type=pa.float64()),
             "pair_edge_count_count_above_threshold": pa.array(
-                [0.0], type=pa.float64(),
+                [0.0],
+                type=pa.float64(),
             ),
         }
     )
 
     builder = GDSBuilder("test_inc_agg", agg_sphere)
     builder.incremental_update(
-        "account_pattern", changed_entities=new_accts,
-        recalibrate="never", reindex=True,
+        "account_pattern",
+        changed_entities=new_accts,
+        recalibrate="never",
+        reindex=True,
     )
 
-    assert calls == [0.0], (
-        f"reindex=True must force a rebuild via threshold=0.0; got {calls}"
-    )
+    assert calls == [0.0], f"reindex=True must force a rebuild via threshold=0.0; got {calls}"
 
 
 def _build_anchor_sphere(out_root, n):
@@ -470,7 +484,8 @@ def _build_anchor_sphere(out_root, n):
     custs = pa.table(
         {
             "primary_key": pa.array(
-                [f"C{i}" for i in range(n)], type=pa.string(),
+                [f"C{i}" for i in range(n)],
+                type=pa.string(),
             ),
         }
     )
@@ -479,7 +494,8 @@ def _build_anchor_sphere(out_root, n):
     events = pa.table(
         {
             "primary_key": pa.array(
-                [f"E{i}" for i in range(n_events)], type=pa.string(),
+                [f"E{i}" for i in range(n_events)],
+                type=pa.string(),
             ),
             "cust_fk": pa.array(
                 [f"C{int(rng.integers(0, n))}" for _ in range(n_events)],
@@ -489,14 +505,26 @@ def _build_anchor_sphere(out_root, n):
     )
     b = GDSBuilder("test_inc_perf", str(out_root))
     b.add_line(
-        "customers", custs, key_col="primary_key",
-        source_id="t", role="anchor",
+        "customers",
+        custs,
+        key_col="primary_key",
+        source_id="t",
+        role="anchor",
     )
     b.add_line(
-        "events", events, key_col="primary_key", source_id="t", role="event",
+        "events",
+        events,
+        key_col="primary_key",
+        source_id="t",
+        role="event",
     )
     b.add_derived_dimension(
-        "customers", "events", "cust_fk", "count", None, "event_count",
+        "customers",
+        "events",
+        "cust_fk",
+        "count",
+        None,
+        "event_count",
         edge_max="auto",
     )
     b.add_pattern("cust_pattern", "anchor", "customers", relations=[])
@@ -535,10 +563,12 @@ def test_incremental_conformal_p_is_population_relative_not_batch_local(tmp_path
     sphere = _build_anchor_sphere(tmp_path / "gds_cp", 300)
 
     # Append ONE extreme outlier: event_count far above the population.
-    outlier = pa.table({
-        "primary_key": pa.array(["C_OUTLIER"], type=pa.string()),
-        "event_count": pa.array([99999.0], type=pa.float64()),
-    })
+    outlier = pa.table(
+        {
+            "primary_key": pa.array(["C_OUTLIER"], type=pa.string()),
+            "event_count": pa.array([99999.0], type=pa.float64()),
+        }
+    )
     b = GDSBuilder("test_inc_perf", sphere)
     b.incremental_update("cust_pattern", changed_entities=outlier, recalibrate="never")
 
@@ -555,14 +585,14 @@ def test_incremental_conformal_p_is_population_relative_not_batch_local(tmp_path
 
     # And it agrees with the population oracle on the full post-ingest set.
     from hypertopos.builder._stats import compute_conformal_p
+
     geo = GDSReader(sphere).read_geometry("cust_pattern", version=1)
     norms = geo["delta_norm"].to_numpy(zero_copy_only=False)
     keys = geo["primary_key"].to_pylist()
     oracle = compute_conformal_p(norms)
     idx = keys.index("C_OUTLIER")
     assert abs(cp - float(oracle[idx])) < 1e-3, (
-        f"stored conformal_p {cp} must match the full-population oracle "
-        f"{float(oracle[idx])}"
+        f"stored conformal_p {cp} must match the full-population oracle {float(oracle[idx])}"
     )
 
 
@@ -571,18 +601,23 @@ def test_recompute_rank_stats_matches_separate_recomputes(tmp_path):
     conformal_p as calling recompute_delta_rank_pct + recompute_conformal_p
     separately — at half the append-path scan/merge I/O. Corrupts both columns
     first so the recompute is observably doing work, not a no-op."""
-    import lance
     from pathlib import Path
+
+    import lance
 
     from hypertopos.storage.writer import GDSWriter
 
     sphere = _build_anchor_sphere(tmp_path / "gds_fuse", 300)
-    extra = pa.table({
-        "primary_key": pa.array([f"C_X{i}" for i in range(5)], type=pa.string()),
-        "event_count": pa.array([10.0, 50.0, 99999.0, 1.0, 500.0], type=pa.float64()),
-    })
+    extra = pa.table(
+        {
+            "primary_key": pa.array([f"C_X{i}" for i in range(5)], type=pa.string()),
+            "event_count": pa.array([10.0, 50.0, 99999.0, 1.0, 500.0], type=pa.float64()),
+        }
+    )
     GDSBuilder("test_inc_perf", sphere).incremental_update(
-        "cust_pattern", changed_entities=extra, recalibrate="never",
+        "cust_pattern",
+        changed_entities=extra,
+        recalibrate="never",
     )
 
     geo_path = str(Path(sphere) / "geometry" / "cust_pattern" / "data.lance")
@@ -590,20 +625,19 @@ def test_recompute_rank_stats_matches_separate_recomputes(tmp_path):
     sentinel = pa.array([-1.0] * len(pks), type=pa.float32())
 
     def _corrupt():
-        lance.dataset(geo_path).merge_insert(
-            "primary_key"
-        ).when_matched_update_all().execute(pa.table({
-            "primary_key": pks,
-            "delta_rank_pct": sentinel,
-            "conformal_p": sentinel,
-        }))
+        lance.dataset(geo_path).merge_insert("primary_key").when_matched_update_all().execute(
+            pa.table(
+                {
+                    "primary_key": pks,
+                    "delta_rank_pct": sentinel,
+                    "conformal_p": sentinel,
+                }
+            )
+        )
 
     def _read():
         geo = GDSReader(sphere).read_geometry("cust_pattern", version=1)
-        return {
-            r["primary_key"]: (r["delta_rank_pct"], r["conformal_p"])
-            for r in geo.to_pylist()
-        }
+        return {r["primary_key"]: (r["delta_rank_pct"], r["conformal_p"]) for r in geo.to_pylist()}
 
     writer = GDSWriter(str(sphere))
     _corrupt()
@@ -635,7 +669,8 @@ def test_incremental_recompute_ranks_false_defers_then_finalize(tmp_path):
         return pa.table(
             {
                 "primary_key": pa.array(
-                    [f"C{start + i}" for i in range(20)], type=pa.string(),
+                    [f"C{start + i}" for i in range(20)],
+                    type=pa.string(),
                 ),
                 "event_count": pa.array([9999.0] * 20, type=pa.float64()),
             }
@@ -647,12 +682,15 @@ def test_incremental_recompute_ranks_false_defers_then_finalize(tmp_path):
     b_def = GDSBuilder("test_inc_perf", deferred)
     for batch_start in (300, 320):
         b_ref.incremental_update(
-            "cust_pattern", changed_entities=_batch(batch_start),
+            "cust_pattern",
+            changed_entities=_batch(batch_start),
             recalibrate="never",
         )
         b_def.incremental_update(
-            "cust_pattern", changed_entities=_batch(batch_start),
-            recalibrate="never", recompute_ranks=False,
+            "cust_pattern",
+            changed_entities=_batch(batch_start),
+            recalibrate="never",
+            recompute_ranks=False,
         )
 
     # Mid-batch (deferred): C0's rank is stale — unchanged from the original
@@ -692,22 +730,24 @@ def test_incremental_update_rejects_grouped_pattern(tmp_path):
     sj["patterns"]["cust_pattern"]["group_by_property"] = "region"
     sj_path.write_text(_json.dumps(sj))
 
-    extra = pa.table({
-        "primary_key": pa.array(["C_NEW"], type=pa.string()),
-        "event_count": pa.array([5.0], type=pa.float64()),
-    })
+    extra = pa.table(
+        {
+            "primary_key": pa.array(["C_NEW"], type=pa.string()),
+            "event_count": pa.array([5.0], type=pa.float64()),
+        }
+    )
     with pytest.raises(ValueError, match="group_by_property"):
         GDSBuilder("test_inc_grouped", sphere).incremental_update(
-            "cust_pattern", changed_entities=extra, recalibrate="never",
+            "cust_pattern",
+            changed_entities=extra,
+            recalibrate="never",
         )
 
 
 def test_incremental_reindex_covers_all_rows_after_recompute(tmp_path):
-    """B-ordering regression: incremental_update(reindex=True) must leave the
-    IVF index covering ALL rows. recompute_delta_rank_pct's merge_insert
-    rewrites matched rows into new fragments — if reindex ran BEFORE the
-    recompute, the rebuilt index would cover zero current rows. This asserts
-    reindex runs AFTER recompute by checking num_rows_indexed == total."""
+    """incremental_update(reindex=True) must leave the IVF index covering ALL
+    rows, including the appended ones, after the rank recompute has run.
+    Checked via num_rows_indexed == total."""
     import lance
 
     sphere = _build_anchor_sphere(tmp_path / "gds_idx", 300)
@@ -715,15 +755,18 @@ def test_incremental_reindex_covers_all_rows_after_recompute(tmp_path):
     new_custs = pa.table(
         {
             "primary_key": pa.array(
-                [f"C{300 + i}" for i in range(40)], type=pa.string(),
+                [f"C{300 + i}" for i in range(40)],
+                type=pa.string(),
             ),
             "event_count": pa.array([50.0] * 40, type=pa.float64()),
         }
     )
     b = GDSBuilder("test_inc_perf", sphere)
     b.incremental_update(
-        "cust_pattern", changed_entities=new_custs,
-        recalibrate="never", reindex=True,
+        "cust_pattern",
+        changed_entities=new_custs,
+        recalibrate="never",
+        reindex=True,
     )
 
     lance_path = Path(sphere) / "geometry" / "cust_pattern" / "data.lance"
@@ -743,11 +786,10 @@ def test_incremental_reindex_covers_all_rows_after_recompute(tmp_path):
 
 
 def test_incremental_default_path_indexes_new_rows_after_recompute(tmp_path):
-    """Default path (reindex=False, recompute_ranks=True): the rank recompute's
-    merge_insert drops the vector index, so the subsequent threshold-gated
-    reindex sees 100% unindexed and rebuilds — leaving the index covering all
-    rows. Guards against a regression where the default path silently leaves
-    new rows outside the index (π10 would miss them)."""
+    """Default path (reindex=False, recompute_ranks=True): appending more than
+    10% of the population trips the threshold-gated reindex, leaving the index
+    covering all rows. Guards against a regression where the default path
+    silently leaves new rows outside the index (π10 would miss them)."""
     import lance
 
     sphere = _build_anchor_sphere(tmp_path / "gds_def_idx", 300)
@@ -756,14 +798,17 @@ def test_incremental_default_path_indexes_new_rows_after_recompute(tmp_path):
     new_custs = pa.table(
         {
             "primary_key": pa.array(
-                [f"C{300 + i}" for i in range(40)], type=pa.string(),
+                [f"C{300 + i}" for i in range(40)],
+                type=pa.string(),
             ),
             "event_count": pa.array([10.0] * 40, type=pa.float64()),
         }
     )
     b = GDSBuilder("test_inc_perf", sphere)
     b.incremental_update(
-        "cust_pattern", changed_entities=new_custs, recalibrate="never",
+        "cust_pattern",
+        changed_entities=new_custs,
+        recalibrate="never",
         # defaults: reindex=False, recompute_ranks=True
     )
     lance_path = Path(sphere) / "geometry" / "cust_pattern" / "data.lance"
@@ -789,51 +834,70 @@ def test_incremental_width_guard_rejects_dim_block_pattern(tmp_path):
     custs = pa.table(
         {
             "primary_key": pa.array(
-                [f"C{i}" for i in range(n)], type=pa.string(),
+                [f"C{i}" for i in range(n)],
+                type=pa.string(),
             ),
             "balance": pa.array(
-                np.linspace(0.0, 1000.0, n).tolist(), type=pa.float64(),
+                np.linspace(0.0, 1000.0, n).tolist(),
+                type=pa.float64(),
             ),
             "age_days": pa.array(
-                np.linspace(1.0, 500.0, n).tolist(), type=pa.float64(),
+                np.linspace(1.0, 500.0, n).tolist(),
+                type=pa.float64(),
             ),
         }
     )
     events = pa.table(
         {
             "primary_key": pa.array(
-                [f"E{i}" for i in range(n * 3)], type=pa.string(),
+                [f"E{i}" for i in range(n * 3)],
+                type=pa.string(),
             ),
             "cust_fk": pa.array(
-                [f"C{i % n}" for i in range(n * 3)], type=pa.string(),
+                [f"C{i % n}" for i in range(n * 3)],
+                type=pa.string(),
             ),
         }
     )
     out = str(tmp_path / "gds_block")
     b = GDSBuilder("test_inc_block", out)
     b.add_line(
-        "customers", custs, key_col="primary_key",
-        source_id="t", role="anchor",
+        "customers",
+        custs,
+        key_col="primary_key",
+        source_id="t",
+        role="anchor",
     )
     b.add_line(
-        "events", events, key_col="primary_key", source_id="t", role="event",
+        "events",
+        events,
+        key_col="primary_key",
+        source_id="t",
+        role="event",
     )
     b.add_derived_dimension(
-        "customers", "events", "cust_fk", "count", None, "event_count",
+        "customers",
+        "events",
+        "cust_fk",
+        "count",
+        None,
+        "event_count",
         edge_max="auto",
     )
     # 1 derived dim (reconstructable) + 2 metric-block dims (NOT
     # reconstructable by incremental_update) → mu is 3-wide.
     b.add_pattern(
-        "cust_pattern", "anchor", "customers", relations=[],
+        "cust_pattern",
+        "anchor",
+        "customers",
+        relations=[],
         metric_properties=["balance", "age_days"],
     )
     b.build()
 
     pat_meta = _get_pattern_meta(out, "cust_pattern")
     assert len(pat_meta["mu"]) == 3, (
-        f"fixture sanity: 1 derived + 2 metric-block dims; got "
-        f"{len(pat_meta['mu'])}"
+        f"fixture sanity: 1 derived + 2 metric-block dims; got {len(pat_meta['mu'])}"
     )
 
     new_custs = pa.table(
@@ -847,7 +911,9 @@ def test_incremental_width_guard_rejects_dim_block_pattern(tmp_path):
     builder = GDSBuilder("test_inc_block", out)
     with pytest.raises(ValueError, match="computed .* but the pattern mu"):
         builder.incremental_update(
-            "cust_pattern", changed_entities=new_custs, recalibrate="never",
+            "cust_pattern",
+            changed_entities=new_custs,
+            recalibrate="never",
         )
 
 
@@ -890,12 +956,15 @@ def test_compute_entity_geometry_raises_on_absent_edge_dim_agg_column():
     with no diagnostic. The guard now fails loud instead.
     """
     entity_table = pa.table({"primary_key": pa.array(["A"], type=pa.string())})
-    mu = np.array([50.0], dtype=np.float32)   # nonzero population mean
+    mu = np.array([50.0], dtype=np.float32)  # nonzero population mean
     sigma = np.array([10.0], dtype=np.float32)
 
     with pytest.raises(ValueError, match="declared value column"):
         compute_entity_geometry(
-            entity_table, mu, sigma, [],
+            entity_table,
+            mu,
+            sigma,
+            [],
             edge_dim_agg_labels=["amount_mean"],
         )
 
@@ -915,7 +984,108 @@ def test_compute_entity_geometry_absent_edge_dim_agg_would_corrupt_geometry():
         }
     )
     _d, norms, _s = compute_entity_geometry(
-        present, mu, sigma, [], edge_dim_agg_labels=["amount_mean"],
+        present,
+        mu,
+        sigma,
+        [],
+        edge_dim_agg_labels=["amount_mean"],
     )
     # Entity at the population mean is NOT anomalous: delta_norm ~ 0.
     assert float(norms[0]) == pytest.approx(0.0, abs=1e-6)
+
+
+# ── recalibrate="force" / "never" correctness ──────────────────────────────
+
+
+@pytest.fixture
+def sphere_for_recalibrate_force(base_sphere, tmp_path_factory):
+    return _copy_sphere(base_sphere, tmp_path_factory, "inc_recal_force")
+
+
+@pytest.fixture
+def sphere_for_recalibrate_never(base_sphere, tmp_path_factory):
+    return _copy_sphere(base_sphere, tmp_path_factory, "inc_recal_never")
+
+
+def test_incremental_force_recalibrate_updates_sphere_json(sphere_for_recalibrate_force):
+    """recalibrate='force' must recompute mu/sigma/theta and write them to
+    sphere.json — not just set result.recalibrated=True and leave stats stale.
+
+    Discriminator: ingest entities with event_count far above the population
+    mean. After force recalibration the mu in sphere.json must shift; with the
+    old (buggy) behaviour mu was unchanged.
+    """
+    sphere_path = sphere_for_recalibrate_force
+    old_meta = _get_pattern_meta(sphere_path)
+    old_mu = list(old_meta["mu"])
+    old_theta = list(old_meta["theta"])
+
+    # Extreme event_count values — original population averages ~5 events per
+    # customer, so 1000 pulls mu far away.
+    extreme = pa.table(
+        {
+            "primary_key": pa.array(
+                [f"C{200 + i}" for i in range(10)],
+                type=pa.string(),
+            ),
+            "event_count": pa.array([1000.0] * 10, type=pa.float64()),
+        }
+    )
+    builder = GDSBuilder("test_inc", sphere_path)
+    result = builder.incremental_update(
+        "cust_pattern",
+        changed_entities=extreme,
+        recalibrate="force",
+    )
+
+    assert result.recalibrated is True
+
+    new_meta = _get_pattern_meta(sphere_path)
+    new_mu = list(new_meta["mu"])
+    new_theta = list(new_meta["theta"])
+
+    # Full recalibration over 110 entities (100 original + 10 extreme) must
+    # shift mu and theta away from the original build values.
+    assert new_mu != old_mu, (
+        f"sphere.json mu must be updated after force recalibration (old={old_mu}, new={new_mu})"
+    )
+    assert new_theta != old_theta, (
+        "sphere.json theta must be updated after force recalibration "
+        f"(old={old_theta}, new={new_theta})"
+    )
+
+    # result.theta_norm must reflect the recalibrated value, not the pre-ingest one.
+    import math
+
+    expected_theta_norm = math.sqrt(sum(v**2 for v in new_theta))
+    assert abs(result.theta_norm - expected_theta_norm) < 1e-4, (
+        f"result.theta_norm {result.theta_norm} must match recomputed ‖theta‖ {expected_theta_norm}"
+    )
+
+
+def test_incremental_never_recalibrate_leaves_stats_unchanged(sphere_for_recalibrate_never):
+    """recalibrate='never' must not alter mu/sigma/theta in sphere.json and
+    must return result.recalibrated=False."""
+    sphere_path = sphere_for_recalibrate_never
+    old_meta = _get_pattern_meta(sphere_path)
+    old_mu = list(old_meta["mu"])
+    old_theta = list(old_meta["theta"])
+
+    new_custs = pa.table(
+        {
+            "primary_key": pa.array(["C300"], type=pa.string()),
+            "event_count": pa.array([5.0], type=pa.float64()),
+        }
+    )
+    builder = GDSBuilder("test_inc", sphere_path)
+    result = builder.incremental_update(
+        "cust_pattern",
+        changed_entities=new_custs,
+        recalibrate="never",
+    )
+
+    assert result.recalibrated is False
+
+    new_meta = _get_pattern_meta(sphere_path)
+    assert list(new_meta["mu"]) == old_mu, "mu must not change with recalibrate='never'"
+    assert list(new_meta["theta"]) == old_theta, "theta must not change with recalibrate='never'"

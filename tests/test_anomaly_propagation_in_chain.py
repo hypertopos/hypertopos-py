@@ -5,18 +5,17 @@ find_chains_with_coherent_anomaly. Uses the bundled AML HI-small sphere
 since it's the only sphere with a chain anchor + entity anchor with
 calibrated geometry.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
+
 from hypertopos import HyperSphere
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-AML_PATH = (
-    PROJECT_ROOT / "benchmark" / "ibm-aml" / "hi_small_sphere"
-    / "gds_aml_hi_small"
-)
+AML_PATH = PROJECT_ROOT / "benchmark" / "ibm-aml" / "hi_small_sphere" / "gds_aml_hi_small"
 
 
 def _aml_sphere_unavailable() -> bool:
@@ -24,13 +23,14 @@ def _aml_sphere_unavailable() -> bool:
     if not sphere_json.exists():
         return True
     import json
+
     raw = json.loads(sphere_json.read_text())
-    return raw.get("format_version") != "3.0"
+    return raw.get("format_version", "").split(".")[0] != "3"
 
 
 pytestmark = pytest.mark.skipif(
     _aml_sphere_unavailable(),
-    reason="AML HI-small sphere not built at format 3.0",
+    reason="AML HI-small sphere not built (format 3.x)",
 )
 
 
@@ -55,7 +55,9 @@ def known_anomalous_chain_id(aml_nav):
     assert out["chains"], "AML HI-small must have at least one coherent chain"
     line_ver = aml_nav._manifest.line_version("tx_chains") or 1
     pts = aml_nav._storage.read_points(
-        "tx_chains", line_ver, columns=["primary_key"],
+        "tx_chains",
+        line_ver,
+        columns=["primary_key"],
     )
     pks = pts["primary_key"].to_pylist()
     counts: dict[str, int] = {}
@@ -65,8 +67,7 @@ def known_anomalous_chain_id(aml_nav):
         if counts.get(c["chain_id"], 0) == 1:
             return c["chain_id"]
     pytest.skip(
-        "no flagged chain has a unique chain_id on this sphere "
-        "(chain extraction collision bug)",
+        "no flagged chain has a unique chain_id on this sphere (chain extraction collision bug)",
     )
 
 
@@ -76,7 +77,9 @@ def known_duplicate_chain_id(aml_nav):
     Used to verify the defensive raise."""
     line_ver = aml_nav._manifest.line_version("tx_chains") or 1
     pts = aml_nav._storage.read_points(
-        "tx_chains", line_ver, columns=["primary_key"],
+        "tx_chains",
+        line_ver,
+        columns=["primary_key"],
     )
     pks = pts["primary_key"].to_pylist()
     counts: dict[str, int] = {}
@@ -250,7 +253,9 @@ def test_chain_with_zero_anomalous_hops(aml_nav):
     flagged = {c["chain_id"] for c in sweep["chains"]}
     line_ver = aml_nav._manifest.line_version("tx_chains") or 1
     pts = aml_nav._storage.read_points(
-        "tx_chains", line_ver, columns=["primary_key", "chain_keys"],
+        "tx_chains",
+        line_ver,
+        columns=["primary_key", "chain_keys"],
     )
     pk_counts: dict[str, int] = {}
     for pk in pts["primary_key"].to_pylist():
@@ -290,7 +295,8 @@ def test_chain_with_zero_anomalous_hops(aml_nav):
 
 
 def test_propagation_complements_population_sweep(
-    aml_nav, known_anomalous_chain_id,
+    aml_nav,
+    known_anomalous_chain_id,
 ):
     """C2 inspector must surface the same anomalous run that C1 sweep
     flagged for the same chain — same primitive on the same data."""

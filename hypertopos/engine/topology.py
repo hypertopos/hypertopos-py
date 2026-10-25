@@ -13,11 +13,12 @@ required for ECDF-based calibration.
 Future PH primitives (M3 of patch 0.7.0) live in this module too if the
 regime-check gate ships them.
 """
+
 from __future__ import annotations
 
 import warnings
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import numpy as np
@@ -88,7 +89,9 @@ def _dtw_pair(seq_a: np.ndarray, seq_b: np.ndarray) -> float:
     for i in range(1, n + 1):
         for j in range(1, m + 1):
             dtw[i, j] = cost[i - 1, j - 1] + min(
-                dtw[i - 1, j], dtw[i, j - 1], dtw[i - 1, j - 1],
+                dtw[i - 1, j],
+                dtw[i, j - 1],
+                dtw[i - 1, j - 1],
             )
     return float(dtw[n, m])
 
@@ -120,7 +123,9 @@ def _median_trajectory(trajectories: list[np.ndarray]) -> np.ndarray:
         src_idx = np.linspace(0.0, traj.shape[0] - 1, target_len)
         for d in range(target_dim):
             resampled[i, :, d] = np.interp(
-                src_idx, np.arange(traj.shape[0]), traj[:, d].astype(np.float64),
+                src_idx,
+                np.arange(traj.shape[0]),
+                traj[:, d].astype(np.float64),
             )
     return np.median(resampled, axis=0)
 
@@ -191,7 +196,7 @@ def trajectory_continuous_score(
 
     median_traj = _median_trajectory([trajectories[k] for k in sample_keys])
     if median_traj.size == 0:
-        return {pk: 0.0 for pk in keys}
+        return dict.fromkeys(keys, 0.0)
 
     out: dict[str, float] = {}
     for pk, traj in trajectories.items():
@@ -206,7 +211,8 @@ def _delta_norm_series(traj: np.ndarray) -> np.ndarray:
     """Per-timestep L2 norm of a (T, D) trajectory of delta_snapshot vectors."""
     if traj.ndim != 2 or traj.shape[0] == 0:
         return np.zeros(0, dtype=np.float64)
-    return np.sqrt(np.einsum("ij,ij->i", traj, traj)).astype(np.float64)
+    norms: np.ndarray = np.sqrt(np.einsum("ij,ij->i", traj, traj)).astype(np.float64)
+    return norms
 
 
 def _safe_slope(values: np.ndarray) -> float:
@@ -307,9 +313,7 @@ def classify_trajectory(
 
     # DTW outlier threshold.
     dtw_arr = np.fromiter(dtw_scores.values(), dtype=np.float64, count=len(dtw_scores))
-    dtw_outlier_threshold = (
-        float(np.percentile(dtw_arr, 99)) if dtw_arr.size else float("inf")
-    )
+    dtw_outlier_threshold = float(np.percentile(dtw_arr, 99)) if dtw_arr.size else float("inf")
 
     out: list[dict[str, Any]] = []
     for pk in trajectories:
@@ -335,12 +339,14 @@ def classify_trajectory(
         if not np.isfinite(evidence):
             evidence = 0.0
 
-        out.append({
-            "primary_key": pk,
-            "dtw_distance": float(dtw),
-            "category": category,
-            "category_evidence": float(evidence),
-        })
+        out.append(
+            {
+                "primary_key": pk,
+                "dtw_distance": float(dtw),
+                "category": category,
+                "category_evidence": float(evidence),
+            }
+        )
     return out
 
 
@@ -426,10 +432,12 @@ def find_topological_anomalies(
     if not feature_cols:
         raise ValueError("geometry_table has no numeric feature columns")
 
-    coords = np.column_stack([
-        np.asarray(geometry_table[c].to_numpy(zero_copy_only=False), dtype=np.float64)
-        for c in feature_cols
-    ])
+    coords = np.column_stack(
+        [
+            np.asarray(geometry_table[c].to_numpy(zero_copy_only=False), dtype=np.float64)
+            for c in feature_cols
+        ]
+    )
 
     if coords.shape[1] > pca_dim:
         from sklearn.decomposition import PCA
@@ -448,7 +456,7 @@ def find_topological_anomalies(
     eps = 1e-12
     rows: list[tuple[int, float, float, float, int]] = []
     for i in sample_idx:
-        idx = nn.kneighbors(coords[i:i + 1], return_distance=False)[0]
+        idx = nn.kneighbors(coords[i : i + 1], return_distance=False)[0]
         neighborhood = coords[idx]
         try:
             diagrams = ripser(neighborhood, maxdim=homology_dim, thresh=np.inf)["dgms"]
@@ -486,7 +494,7 @@ def find_topological_anomalies(
     # Rank by h1_max_persistence (r[2]); empirical validation showed the
     # H_0-normalised topo_score (r[1]) dilutes discriminative signal.
     rows.sort(key=lambda r: r[2], reverse=True)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return [
         {
             "primary_key": pks[idx],
@@ -624,11 +632,12 @@ def find_topological_trajectory_anomalies(
 
         if not np.isfinite(total_persistence) or total_persistence < 0.0:
             total_persistence = 0.0
-        rows.append((pk, float(total_persistence), n_t, float(h1_total),
-                     dominant_birth, dominant_death))
+        rows.append(
+            (pk, float(total_persistence), n_t, float(h1_total), dominant_birth, dominant_death)
+        )
 
     rows.sort(key=lambda r: r[1], reverse=True)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return [
         {
             "primary_key": pk,

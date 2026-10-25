@@ -4,10 +4,11 @@ Covers: DimensionDecomposition + IntrinsicExtrinsicReport dataclasses,
 _compute_intrinsic_extrinsic_decomposition math helper, GDSNavigator.decompose_drift
 orchestration (auto-resolve, edge cases, error semantics).
 """
+
 from __future__ import annotations
 
 import dataclasses
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import numpy as np
 import pytest
@@ -53,8 +54,8 @@ def test_intrinsic_extrinsic_report_construction_and_frozen():
         v_from=1,
         v_to=2,
         schema_hash="a" * 64,
-        timestamp_from=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        timestamp_to=datetime(2026, 4, 1, tzinfo=timezone.utc),
+        timestamp_from=datetime(2026, 1, 1, tzinfo=UTC),
+        timestamp_to=datetime(2026, 4, 1, tzinfo=UTC),
         intrinsic_displacement=0.5,
         extrinsic_displacement=1.2,
         total_displacement=1.3,
@@ -102,13 +103,13 @@ def _make_fit(
         group_stats=None,
         gmm_components=None,
         edge_max=None,
-        computed_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc),
-        last_calibrated_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc),
+        computed_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=UTC),
+        last_calibrated_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=UTC),
     )
 
 
 def _ts(month: int) -> datetime:
-    return datetime(2026, month, 1, tzinfo=timezone.utc)
+    return datetime(2026, month, 1, tzinfo=UTC)
 
 
 def test_compute_decomposition_identical_shape_identical_calibration_returns_zero():
@@ -117,11 +118,17 @@ def test_compute_decomposition_identical_shape_identical_calibration_returns_zer
     fit = _make_fit(mu=[0.1, 0.2, 0.3], sigma=[0.05, 0.05, 0.05])
     shape = np.asarray([0.1, 0.2, 0.3], dtype=np.float32)
     report = _compute_intrinsic_extrinsic_decomposition(
-        shape_a=shape, shape_b=shape, fit_v1=fit, fit_v2=fit,
-        entity_key="E1", pattern_id="p",
-        timestamp_from=_ts(1), timestamp_to=_ts(2),
+        shape_a=shape,
+        shape_b=shape,
+        fit_v1=fit,
+        fit_v2=fit,
+        entity_key="E1",
+        pattern_id="p",
+        timestamp_from=_ts(1),
+        timestamp_to=_ts(2),
         dim_labels=["d0", "d1", "d2"],
-        top_n=10, verbose=False,
+        top_n=10,
+        verbose=False,
     )
     assert report.total_displacement == 0.0
     assert report.intrinsic_displacement == 0.0
@@ -137,10 +144,17 @@ def test_compute_decomposition_shape_changed_calibration_unchanged_is_all_intrin
     shape_a = np.asarray([0.0, 0.0], dtype=np.float32)
     shape_b = np.asarray([0.0, 0.5], dtype=np.float32)
     report = _compute_intrinsic_extrinsic_decomposition(
-        shape_a=shape_a, shape_b=shape_b, fit_v1=fit, fit_v2=fit,
-        entity_key="E1", pattern_id="p",
-        timestamp_from=_ts(1), timestamp_to=_ts(2),
-        dim_labels=None, top_n=2, verbose=False,
+        shape_a=shape_a,
+        shape_b=shape_b,
+        fit_v1=fit,
+        fit_v2=fit,
+        entity_key="E1",
+        pattern_id="p",
+        timestamp_from=_ts(1),
+        timestamp_to=_ts(2),
+        dim_labels=None,
+        top_n=2,
+        verbose=False,
     )
     assert report.intrinsic_displacement == pytest.approx(5.0, abs=1e-5)
     assert report.extrinsic_displacement == pytest.approx(0.0, abs=1e-5)
@@ -154,10 +168,17 @@ def test_compute_decomposition_shape_unchanged_calibration_changed_is_all_extrin
     fit_v2 = _make_fit(mu=[0.05, 0.0], sigma=[0.1, 0.1], calibration_epoch=2)
     shape = np.asarray([0.5, 0.0], dtype=np.float32)
     report = _compute_intrinsic_extrinsic_decomposition(
-        shape_a=shape, shape_b=shape, fit_v1=fit_v1, fit_v2=fit_v2,
-        entity_key="E1", pattern_id="p",
-        timestamp_from=_ts(1), timestamp_to=_ts(2),
-        dim_labels=None, top_n=2, verbose=False,
+        shape_a=shape,
+        shape_b=shape,
+        fit_v1=fit_v1,
+        fit_v2=fit_v2,
+        entity_key="E1",
+        pattern_id="p",
+        timestamp_from=_ts(1),
+        timestamp_to=_ts(2),
+        dim_labels=None,
+        top_n=2,
+        verbose=False,
     )
     assert report.intrinsic_displacement == pytest.approx(0.0, abs=1e-5)
     assert report.extrinsic_displacement == pytest.approx(0.5, abs=1e-5)
@@ -172,10 +193,17 @@ def test_compute_decomposition_mixed_split_correct_ratio():
     shape_a = np.asarray([0.0, 0.0], dtype=np.float32)
     shape_b = np.asarray([0.0, 0.1], dtype=np.float32)
     report = _compute_intrinsic_extrinsic_decomposition(
-        shape_a=shape_a, shape_b=shape_b, fit_v1=fit_v1, fit_v2=fit_v2,
-        entity_key="E1", pattern_id="p",
-        timestamp_from=_ts(1), timestamp_to=_ts(2),
-        dim_labels=["d0", "d1"], top_n=2, verbose=False,
+        shape_a=shape_a,
+        shape_b=shape_b,
+        fit_v1=fit_v1,
+        fit_v2=fit_v2,
+        entity_key="E1",
+        pattern_id="p",
+        timestamp_from=_ts(1),
+        timestamp_to=_ts(2),
+        dim_labels=["d0", "d1"],
+        top_n=2,
+        verbose=False,
     )
     assert report.intrinsic_displacement == pytest.approx(1.0, abs=1e-5)
     assert report.extrinsic_displacement == pytest.approx(1.0, abs=1e-5)
@@ -195,10 +223,17 @@ def test_compute_decomposition_sigma_safe_guard_on_degenerate_dim():
     shape_a = np.asarray([0.0, 0.0], dtype=np.float32)
     shape_b = np.asarray([0.0, 0.7], dtype=np.float32)
     report = _compute_intrinsic_extrinsic_decomposition(
-        shape_a=shape_a, shape_b=shape_b, fit_v1=fit_v1, fit_v2=fit_v2,
-        entity_key="E1", pattern_id="p",
-        timestamp_from=_ts(1), timestamp_to=_ts(2),
-        dim_labels=None, top_n=2, verbose=False,
+        shape_a=shape_a,
+        shape_b=shape_b,
+        fit_v1=fit_v1,
+        fit_v2=fit_v2,
+        entity_key="E1",
+        pattern_id="p",
+        timestamp_from=_ts(1),
+        timestamp_to=_ts(2),
+        dim_labels=None,
+        top_n=2,
+        verbose=False,
     )
     by_index = {d.dim_index: d for d in report.top_dimensions}
     assert np.isfinite(by_index[1].intrinsic)
@@ -213,10 +248,17 @@ def test_compute_decomposition_verbose_returns_full_table():
     shape_a = np.asarray([0.0] * 5, dtype=np.float32)
     shape_b = np.asarray([0.05] * 5, dtype=np.float32)
     report = _compute_intrinsic_extrinsic_decomposition(
-        shape_a=shape_a, shape_b=shape_b, fit_v1=fit, fit_v2=fit,
-        entity_key="E1", pattern_id="p",
-        timestamp_from=_ts(1), timestamp_to=_ts(2),
-        dim_labels=None, top_n=2, verbose=True,
+        shape_a=shape_a,
+        shape_b=shape_b,
+        fit_v1=fit,
+        fit_v2=fit,
+        entity_key="E1",
+        pattern_id="p",
+        timestamp_from=_ts(1),
+        timestamp_to=_ts(2),
+        dim_labels=None,
+        top_n=2,
+        verbose=True,
     )
     assert len(report.top_dimensions) == 2
     assert report.per_dimension is not None
@@ -230,10 +272,17 @@ def test_compute_decomposition_top_n_larger_than_d_returns_all():
     shape_a = np.asarray([0.0, 0.0], dtype=np.float32)
     shape_b = np.asarray([0.05, 0.05], dtype=np.float32)
     report = _compute_intrinsic_extrinsic_decomposition(
-        shape_a=shape_a, shape_b=shape_b, fit_v1=fit, fit_v2=fit,
-        entity_key="E1", pattern_id="p",
-        timestamp_from=_ts(1), timestamp_to=_ts(2),
-        dim_labels=None, top_n=99, verbose=False,
+        shape_a=shape_a,
+        shape_b=shape_b,
+        fit_v1=fit,
+        fit_v2=fit,
+        entity_key="E1",
+        pattern_id="p",
+        timestamp_from=_ts(1),
+        timestamp_to=_ts(2),
+        dim_labels=None,
+        top_n=99,
+        verbose=False,
     )
     assert len(report.top_dimensions) == 2
 
@@ -245,10 +294,17 @@ def test_compute_decomposition_dim_labels_propagate():
     shape_a = np.asarray([0.0, 0.0], dtype=np.float32)
     shape_b = np.asarray([0.05, 0.0], dtype=np.float32)
     report = _compute_intrinsic_extrinsic_decomposition(
-        shape_a=shape_a, shape_b=shape_b, fit_v1=fit, fit_v2=fit,
-        entity_key="E1", pattern_id="p",
-        timestamp_from=_ts(1), timestamp_to=_ts(2),
-        dim_labels=["amount", "tx_count"], top_n=2, verbose=False,
+        shape_a=shape_a,
+        shape_b=shape_b,
+        fit_v1=fit,
+        fit_v2=fit,
+        entity_key="E1",
+        pattern_id="p",
+        timestamp_from=_ts(1),
+        timestamp_to=_ts(2),
+        dim_labels=["amount", "tx_count"],
+        top_n=2,
+        verbose=False,
     )
     by_index = {d.dim_index: d for d in report.top_dimensions}
     assert by_index[0].dim_label == "amount"
@@ -264,10 +320,17 @@ def test_compute_decomposition_dim_labels_none_uses_index_only():
     shape_a = np.asarray([0.0, 0.0], dtype=np.float32)
     shape_b = np.asarray([0.05, 0.0], dtype=np.float32)
     report = _compute_intrinsic_extrinsic_decomposition(
-        shape_a=shape_a, shape_b=shape_b, fit_v1=fit, fit_v2=fit,
-        entity_key="E1", pattern_id="p",
-        timestamp_from=_ts(1), timestamp_to=_ts(2),
-        dim_labels=None, top_n=2, verbose=False,
+        shape_a=shape_a,
+        shape_b=shape_b,
+        fit_v1=fit,
+        fit_v2=fit,
+        entity_key="E1",
+        pattern_id="p",
+        timestamp_from=_ts(1),
+        timestamp_to=_ts(2),
+        dim_labels=None,
+        top_n=2,
+        verbose=False,
     )
     for d in report.top_dimensions:
         assert d.dim_label is None
@@ -300,10 +363,12 @@ def _build_temporal_table(rows: list[dict]):
             "shape_snapshot": pa.array([r["shape_snapshot"] for r in rows]),
             "pattern_ver": pa.array([r.get("pattern_ver", 1) for r in rows], type=pa.int32()),
             "changed_property": pa.array(
-                [r.get("changed_property") for r in rows], type=pa.string(),
+                [r.get("changed_property") for r in rows],
+                type=pa.string(),
             ),
             "changed_line_id": pa.array(
-                [r.get("changed_line_id") for r in rows], type=pa.string(),
+                [r.get("changed_line_id") for r in rows],
+                type=pa.string(),
             ),
         }
     )
@@ -321,9 +386,9 @@ def _make_reader_mock(
 
     reader = MagicMock()
     reader.list_calibration_versions.return_value = versions
-    reader.read_calibration_fit.side_effect = (
-        lambda pattern_id, version=None: fits[version if version is not None else versions[-1]]
-    )
+    reader.read_calibration_fit.side_effect = lambda pattern_id, version=None: fits[
+        version if version is not None else versions[-1]
+    ]
     reader.read_temporal.return_value = _build_temporal_table(temporal_rows)
 
     sphere = MagicMock()
@@ -349,9 +414,14 @@ def test_decompose_drift_explicit_versions_and_timestamps():
     )
     nav = _make_navigator_with_mocks(reader)
     report = nav.decompose_drift(
-        entity_key="E1", pattern_id="p", v_from=1, v_to=2,
-        timestamp_from=_ts(1), timestamp_to=_ts(2),
-        top_n=2, verbose=False,
+        entity_key="E1",
+        pattern_id="p",
+        v_from=1,
+        v_to=2,
+        timestamp_from=_ts(1),
+        timestamp_to=_ts(2),
+        top_n=2,
+        verbose=False,
     )
     assert report.entity_key == "E1"
     assert report.v_from == 1
@@ -501,8 +571,10 @@ def test_decompose_drift_window_filter_slices_outside_range():
     )
     nav = _make_navigator_with_mocks(reader)
     report = nav.decompose_drift(
-        entity_key="E1", pattern_id="p",
-        timestamp_from=_ts(2), timestamp_to=_ts(3),
+        entity_key="E1",
+        pattern_id="p",
+        timestamp_from=_ts(2),
+        timestamp_to=_ts(3),
     )
     assert report.timestamp_from == _ts(2)
     assert report.timestamp_to == _ts(3)

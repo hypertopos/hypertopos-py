@@ -17,9 +17,9 @@ Compact enough to build in <50 ms, large enough to give every chain
 primitive a non-trivial input shape. Live alongside the AML HI-small
 fixture in conftest as an opt-in session fixture.
 """
+
 from __future__ import annotations
 
-import contextlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -50,18 +50,18 @@ ACCOUNT_DELTAS = {
 
 # Chain shape — 12 chains exercising different topologies.
 CHAINS = {
-    "CH-001": ["A1", "A2", "A3", "A4"],          # full cascade (n=4)
-    "CH-002": ["A1", "A2", "B1"],                  # partial cascade (anom prefix)
-    "CH-003": ["B1", "B2", "B3"],                  # clean chain
-    "CH-004": ["A1", "B1", "A2"],                  # interleaved
-    "CH-005": ["A1", "A2"],                         # short cascade (n=2)
-    "CH-006": ["A3", "A4", "A1"],                  # different cascade ordering
-    "CH-007": ["A2", "B2"],                         # boundary 1+1
-    "CH-008": ["A1", "A1"],                         # self-loop
-    "CH-009": ["A1", "A2", "B1", "A3", "A4"],   # reset-then-resume
-    "CH-010": ["B3", "B4"],                         # clean short
-    "CH-011": ["A1", "A2", "A3", "A4", "B4"],   # cascade then clean exit
-    "CH-012": ["B1", "A1", "A2", "A3"],           # clean-then-cascade
+    "CH-001": ["A1", "A2", "A3", "A4"],  # full cascade (n=4)
+    "CH-002": ["A1", "A2", "B1"],  # partial cascade (anom prefix)
+    "CH-003": ["B1", "B2", "B3"],  # clean chain
+    "CH-004": ["A1", "B1", "A2"],  # interleaved
+    "CH-005": ["A1", "A2"],  # short cascade (n=2)
+    "CH-006": ["A3", "A4", "A1"],  # different cascade ordering
+    "CH-007": ["A2", "B2"],  # boundary 1+1
+    "CH-008": ["A1", "A1"],  # self-loop
+    "CH-009": ["A1", "A2", "B1", "A3", "A4"],  # reset-then-resume
+    "CH-010": ["B3", "B4"],  # clean short
+    "CH-011": ["A1", "A2", "A3", "A4", "B4"],  # cascade then clean exit
+    "CH-012": ["B1", "A1", "A2", "A3"],  # clean-then-cascade
 }
 
 # Chain pattern level — 2 dims (synthetic chain features).
@@ -82,7 +82,9 @@ def _attach_per_dim_columns(table: pa.Table, list_size: int) -> pa.Table:
     fixed_type = pa.list_(pa.float32(), list_size)
     fixed_delta = delta_col.cast(fixed_type)
     table = table.set_column(
-        table.schema.get_field_index("delta"), "delta", fixed_delta,
+        table.schema.get_field_index("delta"),
+        "delta",
+        fixed_delta,
     )
     flat = fixed_delta.combine_chunks().values.to_numpy(zero_copy_only=False)
     matrix = flat.reshape(-1, list_size)
@@ -208,10 +210,7 @@ def generate_chains_points() -> None:
     pks = list(CHAINS.keys())
     keys_csv = [",".join(CHAINS[pk]) for pk in pks]
     hop_counts = [len(CHAINS[pk]) - 1 for pk in pks]
-    is_cyclic = [
-        len(CHAINS[pk]) >= 2 and CHAINS[pk][0] == CHAINS[pk][-1]
-        for pk in pks
-    ]
+    is_cyclic = [len(CHAINS[pk]) >= 2 and CHAINS[pk][0] == CHAINS[pk][-1] for pk in pks]
     n = len(pks)
     table = pa.table(
         {
@@ -300,7 +299,11 @@ def _build_geometry_table(
 def generate_account_geometry() -> None:
     pks = list(ACCOUNT_DELTAS.keys())
     table = _build_geometry_table(
-        pks, ACCOUNT_DELTAS, ACCOUNT_MU, ACCOUNT_SIGMA, ACCOUNT_THETA,
+        pks,
+        ACCOUNT_DELTAS,
+        ACCOUNT_MU,
+        ACCOUNT_SIGMA,
+        ACCOUNT_THETA,
         pattern_name="account_pattern",
     )
     geo_path = BASE / "geometry" / "account_pattern" / "data.lance"
@@ -335,7 +338,11 @@ def generate_chain_geometry() -> None:
         chain_deltas[pk] = [float(n_hops), float(n_hops) * 0.5 + 0.5]
 
     table = _build_geometry_table(
-        pks, chain_deltas, CHAIN_MU, CHAIN_SIGMA, CHAIN_THETA,
+        pks,
+        chain_deltas,
+        CHAIN_MU,
+        CHAIN_SIGMA,
+        CHAIN_THETA,
         pattern_name="chain_pattern",
     )
     geo_path = BASE / "geometry" / "chain_pattern" / "data.lance"

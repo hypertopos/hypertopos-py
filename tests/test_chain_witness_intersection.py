@@ -9,11 +9,13 @@ throughout (mirrors `test_investigate_entity.py`) because the synthetic
 fixture's hand-injected geometry skips the polygon-build path that
 `explain_anomaly` needs.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
+
 from hypertopos import HyperSphere
 
 FIXTURES = Path(__file__).parent / "fixtures" / "gds" / "synthetic_chain_sphere"
@@ -79,6 +81,7 @@ def _make_fake_explain(witness_map: dict[str, list[str] | None]):
     """Build a fake explain_anomaly that returns engineered top_dimensions
     or raises ValueError for None entries.
     """
+
     def fake(primary_key: str, pattern_id: str) -> dict:
         result = witness_map.get(primary_key, "missing")
         if result == "missing":
@@ -89,11 +92,9 @@ def _make_fake_explain(witness_map: dict[str, list[str] | None]):
             "severity": "high",
             "delta_norm": 99.0,
             "theta_norm": 5.0,
-            "top_dimensions": [
-                {"dim": i, "label": lbl, "delta": 1.0, "contribution_pct": 50.0}
-                for i, lbl in enumerate(result)
-            ],
+            "top_dimensions": [{"dim": lbl, "delta": 1.0, "pct_of_total": 0.5} for lbl in result],
         }
+
     return fake
 
 
@@ -102,12 +103,14 @@ def test_coordinated_chain_returns_intersection(synthetic_nav, monkeypatch):
     `risk_score`. Intersection must surface risk_score and
     mean_pairwise_witness_jaccard >= min_jaccard => coordinated True.
     """
-    fake = _make_fake_explain({
-        "A1": ["risk_score", "diversity", "regularity"],
-        "A2": ["risk_score", "diversity", "regularity"],
-        "A3": ["risk_score", "diversity", "regularity"],
-        "A4": ["risk_score", "diversity", "regularity"],
-    })
+    fake = _make_fake_explain(
+        {
+            "A1": ["risk_score", "diversity", "regularity"],
+            "A2": ["risk_score", "diversity", "regularity"],
+            "A3": ["risk_score", "diversity", "regularity"],
+            "A4": ["risk_score", "diversity", "regularity"],
+        }
+    )
     monkeypatch.setattr(synthetic_nav, "explain_anomaly", fake)
     out = synthetic_nav.chain_witness_intersection(
         "CH-001",
@@ -151,12 +154,14 @@ def test_self_loop_chain_dedupes_members_and_raises(synthetic_nav, monkeypatch):
 
 def test_deterministic_output_ordering(synthetic_nav, monkeypatch):
     """Same input twice — identical output (alphabetical sort verified)."""
-    fake = _make_fake_explain({
-        "A1": ["zeta", "alpha", "mu"],
-        "A2": ["zeta", "alpha", "nu"],
-        "A3": ["zeta", "alpha", "xi"],
-        "A4": ["zeta", "alpha", "omicron"],
-    })
+    fake = _make_fake_explain(
+        {
+            "A1": ["zeta", "alpha", "mu"],
+            "A2": ["zeta", "alpha", "nu"],
+            "A3": ["zeta", "alpha", "xi"],
+            "A4": ["zeta", "alpha", "omicron"],
+        }
+    )
     monkeypatch.setattr(synthetic_nav, "explain_anomaly", fake)
     out1 = synthetic_nav.chain_witness_intersection(
         "CH-001",
@@ -180,17 +185,20 @@ def test_deterministic_output_ordering(synthetic_nav, monkeypatch):
 
 
 def test_disjoint_witness_sets_returns_empty_intersection(
-    synthetic_nav, monkeypatch,
+    synthetic_nav,
+    monkeypatch,
 ):
     """4 members with totally disjoint witness sets — intersection empty,
     pairwise jaccard 0, coordinated False.
     """
-    fake = _make_fake_explain({
-        "A1": ["a", "b"],
-        "A2": ["c", "d"],
-        "A3": ["e", "f"],
-        "A4": ["g", "h"],
-    })
+    fake = _make_fake_explain(
+        {
+            "A1": ["a", "b"],
+            "A2": ["c", "d"],
+            "A3": ["e", "f"],
+            "A4": ["g", "h"],
+        }
+    )
     monkeypatch.setattr(synthetic_nav, "explain_anomaly", fake)
     out = synthetic_nav.chain_witness_intersection(
         "CH-001",
@@ -210,12 +218,14 @@ def test_partial_overlap_yields_expected_jaccard(synthetic_nav, monkeypatch):
     """4 members each with top-5: every pair shares dims 'x','y' out of 5 unique
     each → pairwise jaccard = 2/8 = 0.25. Intersection = {x,y}.
     """
-    fake = _make_fake_explain({
-        "A1": ["x", "y", "a", "b", "c"],
-        "A2": ["x", "y", "d", "e", "f"],
-        "A3": ["x", "y", "g", "h", "i"],
-        "A4": ["x", "y", "j", "k", "l"],
-    })
+    fake = _make_fake_explain(
+        {
+            "A1": ["x", "y", "a", "b", "c"],
+            "A2": ["x", "y", "d", "e", "f"],
+            "A3": ["x", "y", "g", "h", "i"],
+            "A4": ["x", "y", "j", "k", "l"],
+        }
+    )
     monkeypatch.setattr(synthetic_nav, "explain_anomaly", fake)
     out = synthetic_nav.chain_witness_intersection(
         "CH-001",
@@ -232,12 +242,14 @@ def test_skipped_member_handling(synthetic_nav, monkeypatch):
     """When one member's explain_anomaly raises, n_members_skipped reflects it
     and jaccard is computed over the remaining members.
     """
-    fake = _make_fake_explain({
-        "A1": ["alpha", "beta"],
-        "A2": ["alpha", "beta"],
-        "A3": None,  # forced raise
-        "A4": ["alpha", "beta"],
-    })
+    fake = _make_fake_explain(
+        {
+            "A1": ["alpha", "beta"],
+            "A2": ["alpha", "beta"],
+            "A3": None,  # forced raise
+            "A4": ["alpha", "beta"],
+        }
+    )
     monkeypatch.setattr(synthetic_nav, "explain_anomaly", fake)
     out = synthetic_nav.chain_witness_intersection(
         "CH-001",
@@ -265,6 +277,7 @@ def test_empty_top_dims_produces_zero_jaccard(synthetic_nav, monkeypatch):
     the function must not crash and pairwise jaccard must be 0.0
     (never NaN — sanitisation path).
     """
+
     def fake_empty(primary_key: str, pattern_id: str) -> dict:
         return {
             "severity": "normal",
@@ -272,6 +285,7 @@ def test_empty_top_dims_produces_zero_jaccard(synthetic_nav, monkeypatch):
             "theta_norm": 5.0,
             # no top_dimensions key — handled by .get with default
         }
+
     monkeypatch.setattr(synthetic_nav, "explain_anomaly", fake_empty)
     out = synthetic_nav.chain_witness_intersection(
         "CH-001",
@@ -287,16 +301,42 @@ def test_empty_top_dims_produces_zero_jaccard(synthetic_nav, monkeypatch):
     assert out["coordinated"] is False
 
 
+def test_members_without_witness_dims_do_not_dilute_jaccard(synthetic_nav, monkeypatch):
+    """Two anomalous members share their mechanism; two normal members carry
+    no witness dims. The normal members must not pull the agreement to 0."""
+    fake = _make_fake_explain(
+        {
+            "A1": ["alpha", "beta"],
+            "A2": ["alpha", "beta"],
+            "A3": [],
+            "A4": [],
+        }
+    )
+    monkeypatch.setattr(synthetic_nav, "explain_anomaly", fake)
+    out = synthetic_nav.chain_witness_intersection(
+        "CH-001",
+        chain_pattern="chain_pattern",
+        member_pattern="account_pattern",
+    )
+    assert out["n_members_explained"] == 4
+    assert out["n_members_without_witness"] == 2
+    assert out["intersected_witness_dims"] == ["alpha", "beta"]
+    assert out["mean_pairwise_witness_jaccard"] == 1.0
+    assert out["coordinated"] is True
+
+
 def test_top_k_witness_truncates(synthetic_nav, monkeypatch):
     """top_k_witness=2 must truncate each member's witness list, leaving
     only the first 2 dims for intersection.
     """
-    fake = _make_fake_explain({
-        "A1": ["x", "y", "rare1"],
-        "A2": ["x", "y", "rare2"],
-        "A3": ["x", "y", "rare3"],
-        "A4": ["x", "y", "rare4"],
-    })
+    fake = _make_fake_explain(
+        {
+            "A1": ["x", "y", "rare1"],
+            "A2": ["x", "y", "rare2"],
+            "A3": ["x", "y", "rare3"],
+            "A4": ["x", "y", "rare4"],
+        }
+    )
     monkeypatch.setattr(synthetic_nav, "explain_anomaly", fake)
     out = synthetic_nav.chain_witness_intersection(
         "CH-001",
@@ -311,17 +351,20 @@ def test_top_k_witness_truncates(synthetic_nav, monkeypatch):
 
 
 def test_min_jaccard_threshold_controls_coordinated_flag(
-    synthetic_nav, monkeypatch,
+    synthetic_nav,
+    monkeypatch,
 ):
     """Two members sharing exactly half their witness set (jaccard ~ 0.33) —
     flips coordinated True/False depending on min_jaccard.
     """
-    fake = _make_fake_explain({
-        "A1": ["x", "y"],
-        "A2": ["x", "z"],
-        "A3": ["x", "w"],
-        "A4": ["x", "v"],
-    })
+    fake = _make_fake_explain(
+        {
+            "A1": ["x", "y"],
+            "A2": ["x", "z"],
+            "A3": ["x", "w"],
+            "A4": ["x", "v"],
+        }
+    )
     monkeypatch.setattr(synthetic_nav, "explain_anomaly", fake)
     out_strict = synthetic_nav.chain_witness_intersection(
         "CH-001",
@@ -338,7 +381,4 @@ def test_min_jaccard_threshold_controls_coordinated_flag(
     )
     assert out_loose["coordinated"] is True
     # Same jaccard regardless of threshold
-    assert (
-        out_strict["mean_pairwise_witness_jaccard"]
-        == out_loose["mean_pairwise_witness_jaccard"]
-    )
+    assert out_strict["mean_pairwise_witness_jaccard"] == out_loose["mean_pairwise_witness_jaccard"]

@@ -37,13 +37,13 @@ Synthetic pattern setup (used across most tests):
         new_delta_norm = sqrt(4 + 1 + 1) = sqrt(6) ≈ 2.4494897
         drop_pct = (3.7416574 - 2.4494897) / 3.7416574 ≈ 34.5347%
 """
+
 from __future__ import annotations
 
 import math
 
 import numpy as np
 import pytest
-
 
 # ── Shared synthetic fixture ────────────────────────────────────────────────
 
@@ -68,10 +68,7 @@ def _edges(specs: list[tuple[str, str, str, str]]) -> list[dict]:
 
 def _relations(specs: list[tuple[str, str]]) -> list[dict]:
     """Build relation defs: (line_id, direction)."""
-    return [
-        {"line_id": line, "direction": direction}
-        for line, direction in specs
-    ]
+    return [{"line_id": line, "direction": direction} for line, direction in specs]
 
 
 # ── Tests ──────────────────────────────────────────────────────────────────
@@ -82,12 +79,14 @@ def test_relations_counterfactual_hand_computed():
     from hypertopos.engine.counterfactual import simulate_edge_removal_naive
 
     relations = _relations([("A", "out"), ("B", "in"), ("C", "out")])
-    edges = _edges([
-        ("E1", "X", "out", "A"),
-        ("E2", "Y", "out", "A"),
-        ("E3", "Z", "in", "B"),
-        ("E4", "W", "out", "B"),  # mismatched direction → no contribution
-    ])
+    edges = _edges(
+        [
+            ("E1", "X", "out", "A"),
+            ("E2", "Y", "out", "A"),
+            ("E3", "Z", "in", "B"),
+            ("E4", "W", "out", "B"),  # mismatched direction → no contribution
+        ]
+    )
 
     result = simulate_edge_removal_naive(
         shape=_SHAPE.copy(),
@@ -166,12 +165,14 @@ def test_edge_ids_filter():
     from hypertopos.engine.counterfactual import simulate_edge_removal_naive
 
     relations = _relations([("A", "out"), ("B", "in"), ("C", "out")])
-    edges = _edges([
-        ("E1", "X", "out", "A"),
-        ("E2", "Y", "out", "A"),
-        ("E3", "Z", "in", "B"),
-        ("E4", "W", "out", "B"),
-    ])
+    edges = _edges(
+        [
+            ("E1", "X", "out", "A"),
+            ("E2", "Y", "out", "A"),
+            ("E3", "Z", "in", "B"),
+            ("E4", "W", "out", "B"),
+        ]
+    )
 
     result = simulate_edge_removal_naive(
         shape=_SHAPE.copy(),
@@ -196,11 +197,13 @@ def test_top_n_truncates_after_ranking():
     from hypertopos.engine.counterfactual import simulate_edge_removal_naive
 
     relations = _relations([("A", "out"), ("B", "in"), ("C", "out")])
-    edges = _edges([
-        ("E1", "X", "out", "A"),
-        ("E2", "Y", "out", "A"),
-        ("E3", "Z", "in", "B"),
-    ])
+    edges = _edges(
+        [
+            ("E1", "X", "out", "A"),
+            ("E2", "Y", "out", "A"),
+            ("E3", "Z", "in", "B"),
+        ]
+    )
 
     result = simulate_edge_removal_naive(
         shape=_SHAPE.copy(),
@@ -256,6 +259,7 @@ def test_v1_mean_aggregation_hand_computed():
     from hypertopos.engine.counterfactual import (
         simulate_edge_removal_with_aggregations,
     )
+
     edges = [
         {"edge_id": "ev1", "partner_key": "X", "direction": "out", "line_id": "L"},
         {"edge_id": "ev2", "partner_key": "Y", "direction": "out", "line_id": "L"},
@@ -292,6 +296,7 @@ def test_v1_max_aggregation_rescan():
     from hypertopos.engine.counterfactual import (
         simulate_edge_removal_with_aggregations,
     )
+
     edges = [
         {"edge_id": "e1", "partner_key": "A", "direction": "out", "line_id": "L"},
         {"edge_id": "e2", "partner_key": "B", "direction": "out", "line_id": "L"},
@@ -330,6 +335,7 @@ def test_v1_std_aggregation_rescan():
     from hypertopos.engine.counterfactual import (
         simulate_edge_removal_with_aggregations,
     )
+
     edges = [
         {"edge_id": f"e{i}", "partner_key": f"P{i}", "direction": "out", "line_id": "L"}
         for i in range(1, 6)
@@ -359,6 +365,7 @@ def test_v1_count_above_threshold_held_constant():
     from hypertopos.engine.counterfactual import (
         simulate_edge_removal_with_aggregations,
     )
+
     edges = [
         {"edge_id": "e1", "partner_key": "A", "direction": "out", "line_id": "L"},
     ]
@@ -408,6 +415,7 @@ def test_v1_combined_relations_and_aggregations():
     from hypertopos.engine.counterfactual import (
         simulate_edge_removal_with_aggregations,
     )
+
     relations = [
         {"line_id": "A", "direction": "out"},
         {"line_id": "B", "direction": "out"},
@@ -436,9 +444,7 @@ def test_v1_combined_relations_and_aggregations():
     )
     assert len(result) == 1
     expected_new_delta_norm = math.sqrt(1.0 + 1.0 + 2.25)
-    expected_drop_pct = (
-        (math.sqrt(14.0) - expected_new_delta_norm) / math.sqrt(14.0) * 100
-    )
+    expected_drop_pct = (math.sqrt(14.0) - expected_new_delta_norm) / math.sqrt(14.0) * 100
     assert result[0]["delta_norm_after"] == pytest.approx(expected_new_delta_norm, abs=1e-4)
     assert result[0]["drop_pct"] == pytest.approx(expected_drop_pct, abs=0.01)
 
@@ -486,6 +492,7 @@ def test_v1_count_above_threshold_with_threshold():
     from hypertopos.engine.counterfactual import (
         simulate_edge_removal_with_aggregations,
     )
+
     edges = [
         {"edge_id": "e1", "partner_key": "A", "direction": "out", "line_id": "L"},
         {"edge_id": "e2", "partner_key": "B", "direction": "out", "line_id": "L"},
@@ -537,6 +544,7 @@ def test_v1_threshold_missing_keeps_count_above_in_skipped():
     from hypertopos.engine.counterfactual import (
         simulate_edge_removal_with_aggregations,
     )
+
     edges = [
         {"edge_id": "e1", "partner_key": "A", "direction": "out", "line_id": "L"},
     ]
@@ -568,8 +576,8 @@ def test_v1_threshold_missing_keeps_count_above_in_skipped():
         relations=[],
         edge_agg_dim_offset=0,
         edge_agg_specs=[
-            ("pair_count", "mean"),                    # supported
-            ("pair_count", "count_above_threshold"),   # unsupported (no thr)
+            ("pair_count", "mean"),  # supported
+            ("pair_count", "count_above_threshold"),  # unsupported (no thr)
         ],
         event_source_values={"e1": {"pair_count": 50.0}},
         candidate_edge_ids=None,
@@ -578,7 +586,7 @@ def test_v1_threshold_missing_keeps_count_above_in_skipped():
     )
     assert len(result2) == 1
     assert 0 not in result2[0]["dimensions_skipped"]  # mean is simulated
-    assert 1 in result2[0]["dimensions_skipped"]      # count_above skipped
+    assert 1 in result2[0]["dimensions_skipped"]  # count_above skipped
 
 
 # ── Phase 1.A: per-counterparty rollup ──────────────────────────────────────
@@ -600,19 +608,14 @@ def test_counterparty_rollup_aggregates_by_partner():
     from hypertopos.engine.counterfactual import (
         aggregate_edge_removals_by_counterparty,
     )
+
     per_edge = [
-        {"edge_id": "e1", "edge_partner_key": "X", "drop_pct": 5.0,
-         "dominant_dim_label": "rel_A"},
-        {"edge_id": "e2", "edge_partner_key": "X", "drop_pct": 3.0,
-         "dominant_dim_label": "rel_A"},
-        {"edge_id": "e3", "edge_partner_key": "X", "drop_pct": -2.0,
-         "dominant_dim_label": "rel_B"},
-        {"edge_id": "e4", "edge_partner_key": "Y", "drop_pct": 10.0,
-         "dominant_dim_label": "rel_A"},
-        {"edge_id": "e5", "edge_partner_key": "Y", "drop_pct": 4.0,
-         "dominant_dim_label": "rel_C"},
-        {"edge_id": "e6", "edge_partner_key": "Z", "drop_pct": 1.0,
-         "dominant_dim_label": "rel_A"},
+        {"edge_id": "e1", "edge_partner_key": "X", "drop_pct": 5.0, "dominant_dim_label": "rel_A"},
+        {"edge_id": "e2", "edge_partner_key": "X", "drop_pct": 3.0, "dominant_dim_label": "rel_A"},
+        {"edge_id": "e3", "edge_partner_key": "X", "drop_pct": -2.0, "dominant_dim_label": "rel_B"},
+        {"edge_id": "e4", "edge_partner_key": "Y", "drop_pct": 10.0, "dominant_dim_label": "rel_A"},
+        {"edge_id": "e5", "edge_partner_key": "Y", "drop_pct": 4.0, "dominant_dim_label": "rel_C"},
+        {"edge_id": "e6", "edge_partner_key": "Z", "drop_pct": 1.0, "dominant_dim_label": "rel_A"},
     ]
     result = aggregate_edge_removals_by_counterparty(per_edge, top_n=10)
     assert len(result) == 3
@@ -642,9 +645,14 @@ def test_counterparty_rollup_top_n_truncates():
     from hypertopos.engine.counterfactual import (
         aggregate_edge_removals_by_counterparty,
     )
+
     per_edge = [
-        {"edge_id": f"e{i}", "edge_partner_key": f"P{i}",
-         "drop_pct": float(10 - i), "dominant_dim_label": "rel_A"}
+        {
+            "edge_id": f"e{i}",
+            "edge_partner_key": f"P{i}",
+            "drop_pct": float(10 - i),
+            "dominant_dim_label": "rel_A",
+        }
         for i in range(5)
     ]
     result = aggregate_edge_removals_by_counterparty(per_edge, top_n=2)
@@ -658,11 +666,15 @@ def test_counterparty_rollup_dominant_dim_is_per_partner_max():
     from hypertopos.engine.counterfactual import (
         aggregate_edge_removals_by_counterparty,
     )
+
     per_edge = [
-        {"edge_id": "e1", "edge_partner_key": "X", "drop_pct": 3.0,
-         "dominant_dim_label": "rel_A"},
-        {"edge_id": "e2", "edge_partner_key": "X", "drop_pct": -8.0,
-         "dominant_dim_label": "rel_B"},  # max-abs for X
+        {"edge_id": "e1", "edge_partner_key": "X", "drop_pct": 3.0, "dominant_dim_label": "rel_A"},
+        {
+            "edge_id": "e2",
+            "edge_partner_key": "X",
+            "drop_pct": -8.0,
+            "dominant_dim_label": "rel_B",
+        },  # max-abs for X
     ]
     result = aggregate_edge_removals_by_counterparty(per_edge, top_n=5)
     assert len(result) == 1
@@ -674,11 +686,10 @@ def test_counterparty_rollup_handles_missing_partner():
     from hypertopos.engine.counterfactual import (
         aggregate_edge_removals_by_counterparty,
     )
+
     per_edge = [
-        {"edge_id": "e1", "edge_partner_key": None, "drop_pct": 2.0,
-         "dominant_dim_label": "rel_A"},
-        {"edge_id": "e2", "edge_partner_key": "X", "drop_pct": 1.0,
-         "dominant_dim_label": "rel_A"},
+        {"edge_id": "e1", "edge_partner_key": None, "drop_pct": 2.0, "dominant_dim_label": "rel_A"},
+        {"edge_id": "e2", "edge_partner_key": "X", "drop_pct": 1.0, "dominant_dim_label": "rel_A"},
     ]
     result = aggregate_edge_removals_by_counterparty(per_edge, top_n=5)
     assert len(result) == 2
@@ -692,11 +703,20 @@ def test_counterparty_rollup_dedup_same_edge_both_directions():
     from hypertopos.engine.counterfactual import (
         aggregate_edge_removals_by_counterparty,
     )
+
     per_edge = [
-        {"edge_id": "TX-001", "edge_partner_key": "X", "drop_pct": 5.0,
-         "dominant_dim_label": "rel_A"},
-        {"edge_id": "TX-001", "edge_partner_key": "X", "drop_pct": 5.0,
-         "dominant_dim_label": "rel_A"},  # duplicate
+        {
+            "edge_id": "TX-001",
+            "edge_partner_key": "X",
+            "drop_pct": 5.0,
+            "dominant_dim_label": "rel_A",
+        },
+        {
+            "edge_id": "TX-001",
+            "edge_partner_key": "X",
+            "drop_pct": 5.0,
+            "dominant_dim_label": "rel_A",
+        },  # duplicate
     ]
     result = aggregate_edge_removals_by_counterparty(per_edge, top_n=5)
     assert len(result) == 1
@@ -720,6 +740,7 @@ def test_ecdf_pvalue_upper_tail_basic():
     from hypertopos.engine.counterfactual import (
         ecdf_pvalue_upper_tail,
     )
+
     pop_sorted = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
     assert ecdf_pvalue_upper_tail(5.0, pop_sorted) == pytest.approx(0.20)
     assert ecdf_pvalue_upper_tail(3.0, pop_sorted) == pytest.approx(0.60)
@@ -735,8 +756,18 @@ def test_ecdf_pvalue_handles_ties_correctly():
     Population [1, 2, 3, 3, 3, 5] (N=6). v=3 → 4 values ≥ 3 → p = 4/6 ≈ 0.667.
     """
     from hypertopos.engine.counterfactual import ecdf_pvalue_upper_tail
+
     pop_sorted = np.array([1.0, 2.0, 3.0, 3.0, 3.0, 5.0])
     assert ecdf_pvalue_upper_tail(3.0, pop_sorted) == pytest.approx(4.0 / 6.0)
+
+
+def test_ecdf_pvalue_missing_value_is_not_significant():
+    """A NaN observation carries no evidence: p = 1, not the most extreme 1/(N+1)."""
+    from hypertopos.engine.counterfactual import ecdf_pvalue_upper_tail
+
+    pop_sorted = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+    assert ecdf_pvalue_upper_tail(float("nan"), pop_sorted) == 1.0
+    assert ecdf_pvalue_upper_tail(float("inf"), pop_sorted) == pytest.approx(1.0 / 6.0)
 
 
 def test_compute_per_edge_pvalues_picks_min_across_dims():
@@ -758,6 +789,7 @@ def test_compute_per_edge_pvalues_picks_min_across_dims():
     from hypertopos.engine.counterfactual import (
         compute_per_edge_source_value_pvalues,
     )
+
     pop_ecdfs = {
         "dim_X": np.arange(100, dtype=np.float64),
         "dim_Y": np.arange(10, dtype=np.float64),
@@ -798,10 +830,10 @@ def test_compute_per_edge_pvalues_missing_source_value_handled():
     from hypertopos.engine.counterfactual import (
         compute_per_edge_source_value_pvalues,
     )
+
     pop_ecdfs = {"dim_X": np.arange(100, dtype=np.float64)}
     edges = [
-        {"edge_id": "e_missing", "partner_key": "A",
-         "direction": "out", "line_id": "L"},
+        {"edge_id": "e_missing", "partner_key": "A", "direction": "out", "line_id": "L"},
     ]
     result = compute_per_edge_source_value_pvalues(
         edges=edges,
@@ -831,6 +863,7 @@ def test_simulate_joint_edge_removal_two_edges_hand_computed():
         drop_pct ≈ 53.71%
     """
     from hypertopos.engine.counterfactual import simulate_joint_edge_removal
+
     relations = [
         {"line_id": "A", "direction": "out"},
         {"line_id": "B", "direction": "in"},
@@ -839,7 +872,7 @@ def test_simulate_joint_edge_removal_two_edges_hand_computed():
     edges = [
         {"edge_id": "E1", "partner_key": "X", "direction": "out", "line_id": "A"},
         {"edge_id": "E2", "partner_key": "Y", "direction": "out", "line_id": "A"},
-        {"edge_id": "E3", "partner_key": "Z", "direction": "in",  "line_id": "B"},
+        {"edge_id": "E3", "partner_key": "Z", "direction": "in", "line_id": "B"},
         {"edge_id": "E4", "partner_key": "W", "direction": "out", "line_id": "B"},
     ]
     shape = np.array([4.0, 3.0, 1.0], dtype=np.float32)
@@ -849,7 +882,10 @@ def test_simulate_joint_edge_removal_two_edges_hand_computed():
 
     # {E1, E2}
     res_12 = simulate_joint_edge_removal(
-        shape=shape, mu=mu, sigma_diag=sigma_diag, delta_norm=delta_norm,
+        shape=shape,
+        mu=mu,
+        sigma_diag=sigma_diag,
+        delta_norm=delta_norm,
         edges_to_remove=[edges[0], edges[1]],
         all_edges=edges,
         relations=relations,
@@ -866,7 +902,10 @@ def test_simulate_joint_edge_removal_two_edges_hand_computed():
 
     # {E1, E3}
     res_13 = simulate_joint_edge_removal(
-        shape=shape, mu=mu, sigma_diag=sigma_diag, delta_norm=delta_norm,
+        shape=shape,
+        mu=mu,
+        sigma_diag=sigma_diag,
+        delta_norm=delta_norm,
         edges_to_remove=[edges[0], edges[2]],
         all_edges=edges,
         relations=relations,
@@ -896,6 +935,7 @@ def test_simulate_joint_edge_removal_with_aggregation_rescan():
         drop_pct = (3.1623 - 1.4142) / 3.1623 ≈ 55.28%
     """
     from hypertopos.engine.counterfactual import simulate_joint_edge_removal
+
     relations = [{"line_id": "L", "direction": "out"}]
     edges = [
         {"edge_id": "E1", "partner_key": "X", "direction": "out", "line_id": "L"},
@@ -940,6 +980,7 @@ def test_select_minimal_joint_removal_greedy_terminates_at_target():
     Verify: termination + selected sequence is valid + achieved >= target.
     """
     from hypertopos.engine.counterfactual import select_minimal_joint_removal
+
     relations = [
         {"line_id": "A", "direction": "out"},
         {"line_id": "B", "direction": "out"},
@@ -948,10 +989,14 @@ def test_select_minimal_joint_removal_greedy_terminates_at_target():
     edges = []
     for line in ("A", "B", "C"):
         for i in range(2):
-            edges.append({
-                "edge_id": f"{line}{i}", "partner_key": f"P_{line}{i}",
-                "direction": "out", "line_id": line,
-            })
+            edges.append(
+                {
+                    "edge_id": f"{line}{i}",
+                    "partner_key": f"P_{line}{i}",
+                    "direction": "out",
+                    "line_id": line,
+                }
+            )
     result = select_minimal_joint_removal(
         shape=np.array([4.0, 4.0, 4.0], dtype=np.float32),
         mu=np.array([0.0, 0.0, 0.0], dtype=np.float32),
@@ -972,10 +1017,7 @@ def test_select_minimal_joint_removal_greedy_terminates_at_target():
     # Selected sequence is monotone in |joint_drop_pct|: each step adds
     # absolute magnitude (direction-agnostic selection).
     seq_abs_drops = [s["abs_joint_drop_pct"] for s in result["selection_sequence"]]
-    assert all(
-        seq_abs_drops[i] <= seq_abs_drops[i + 1]
-        for i in range(len(seq_abs_drops) - 1)
-    )
+    assert all(seq_abs_drops[i] <= seq_abs_drops[i + 1] for i in range(len(seq_abs_drops) - 1))
     # All selected edges are distinct.
     assert len(set(result["selected_edge_ids"])) == len(result["selected_edge_ids"])
 
@@ -984,6 +1026,7 @@ def test_select_minimal_joint_removal_target_unreachable_caps_at_k_max():
     """When target_drop_pct cannot be reached within k_max, return what
     we have with target_reached=False."""
     from hypertopos.engine.counterfactual import select_minimal_joint_removal
+
     # Single edge that can contribute at most ~12% — target 50% unreachable.
     relations = [{"line_id": "A", "direction": "out"}]
     edges = [
@@ -1025,16 +1068,16 @@ def test_compute_per_edge_pvalues_breaks_uniform_drop_pct_ties():
     from hypertopos.engine.counterfactual import (
         compute_per_edge_source_value_pvalues,
     )
+
     pop_ecdfs = {"pair_count": np.arange(100, dtype=np.float64)}
     edges = [
-        {"edge_id": f"e_{label}", "partner_key": label,
-         "direction": "out", "line_id": "L"}
+        {"edge_id": f"e_{label}", "partner_key": label, "direction": "out", "line_id": "L"}
         for label in ("high", "mid", "low")
     ]
     event_source_values = {
         "e_high": {"pair_count": 95.0},
-        "e_mid":  {"pair_count": 50.0},
-        "e_low":  {"pair_count":  5.0},
+        "e_mid": {"pair_count": 50.0},
+        "e_low": {"pair_count": 5.0},
     }
     result = compute_per_edge_source_value_pvalues(
         edges=edges,

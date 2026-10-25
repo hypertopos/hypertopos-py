@@ -1,6 +1,8 @@
 import importlib.util
-import pytest
+import os
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT_PATH = REPO_ROOT / "benchmark" / "ibm-aml" / "profile_motif_perf.py"
@@ -12,12 +14,17 @@ def _sphere_unavailable() -> bool:
     if not sphere_json.exists():
         return True
     import json
-    return json.loads(sphere_json.read_text()).get("format_version") != "3.0"
+
+    return json.loads(sphere_json.read_text()).get("format_version", "").split(".")[0] != "3"
 
 
 @pytest.mark.skipif(
     _sphere_unavailable(),
-    reason="AML HI-Small sphere not present at format 3.0",
+    reason="AML HI-Small sphere not present (format 3.x)",
+)
+@pytest.mark.skipif(
+    os.environ.get("HYPERTOPOS_RUN_PROFILE_SMOKE") != "1",
+    reason="runs the full profiling script (minutes); set HYPERTOPOS_RUN_PROFILE_SMOKE=1",
 )
 def test_profile_script_produces_output(tmp_path, monkeypatch):
     """Integration smoke: cProfile script runs end-to-end and writes output."""

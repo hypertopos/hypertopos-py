@@ -13,6 +13,7 @@ foundation:
 - A3: ``GDSEngine.decompose_displacement`` + per-pattern
   ``intrinsic_displacement_mean`` / ``extrinsic_displacement_mean``.
 """
+
 from __future__ import annotations
 
 import json
@@ -24,19 +25,21 @@ from unittest.mock import MagicMock
 import numpy as np
 import pyarrow as pa
 import pytest
+
 from hypertopos.builder import GDSBuilder, RelationSpec
 from hypertopos.cli.schema import LabelAuditConfig
 from hypertopos.engine.geometry import GDSEngine
 from hypertopos.navigation.navigator import GDSNavigator
 from hypertopos.storage.reader import GDSReader
 
-
 # ─────────────────────────────────────────────────────────────────────
 # A1 — per-dim AUROC field on audit_pattern_dims
 # ─────────────────────────────────────────────────────────────────────
 
 
-def _make_dim_cal(mu_pos: float, sigma_pos: float, mu_neg: float, sigma_neg: float, direction: float) -> SimpleNamespace:
+def _make_dim_cal(
+    mu_pos: float, sigma_pos: float, mu_neg: float, sigma_neg: float, direction: float
+) -> SimpleNamespace:
     return SimpleNamespace(
         mu_pos=mu_pos,
         sigma_pos=sigma_pos,
@@ -49,13 +52,16 @@ def _make_dim_cal(mu_pos: float, sigma_pos: float, mu_neg: float, sigma_neg: flo
 def _gaussian_auroc(mu_pos: float, sigma_pos: float, mu_neg: float, sigma_neg: float) -> float:
     """Closed-form Phi((mu_pos - mu_neg) / sqrt(sigma_pos^2 + sigma_neg^2))."""
     from scipy.special import ndtr
-    sum_sq = sigma_pos ** 2 + sigma_neg ** 2
+
+    sum_sq = sigma_pos**2 + sigma_neg**2
     if sum_sq <= 0.0:
         return 0.5
     return float(ndtr((mu_pos - mu_neg) / math.sqrt(sum_sq)))
 
 
-def _call_audit_pattern_dims(pattern: object, *, pattern_id: str = "synth_pat", top_k: int = 10) -> dict:
+def _call_audit_pattern_dims(
+    pattern: object, *, pattern_id: str = "synth_pat", top_k: int = 10
+) -> dict:
     """Invoke audit_pattern_dims against an in-memory pattern stand-in."""
     import hypertopos_mcp.tools.observability  # noqa: F401 — register tool
     from hypertopos_mcp.server import _state
@@ -101,9 +107,9 @@ def test_a1_auroc_per_dim_matches_closed_form_three_dims():
     """
     dim_labels = ["dim_a", "dim_b", "dim_c"]
     tuples = [
-        (2.0, 0.5, 0.0, 0.5),    # strong separation, small spread
-        (1.0, 1.0, 0.0, 1.5),    # moderate separation, asymmetric spread
-        (0.1, 2.0, 0.0, 2.0),    # weak separation, large spread
+        (2.0, 0.5, 0.0, 0.5),  # strong separation, small spread
+        (1.0, 1.0, 0.0, 1.5),  # moderate separation, asymmetric spread
+        (0.1, 2.0, 0.0, 2.0),  # weak separation, large spread
     ]
     lac = {
         label: _make_dim_cal(mp, sp, mn, sn, direction=0.5)
@@ -130,9 +136,7 @@ def test_a1_auroc_per_dim_matches_closed_form_three_dims():
     for label, (mp, sp, mn, sn) in zip(dim_labels, tuples, strict=True):
         expected = _gaussian_auroc(mp, sp, mn, sn)
         got = by_label[label]["auroc_per_dim"]
-        assert got == pytest.approx(expected, abs=1e-6), (
-            f"{label}: got {got}, expected {expected}"
-        )
+        assert got == pytest.approx(expected, abs=1e-6), f"{label}: got {got}, expected {expected}"
 
 
 def test_a1_auroc_per_dim_degenerate_zero_sigmas():
@@ -178,7 +182,11 @@ def _pattern_with_signed_percentiles(
     return SimpleNamespace(
         pattern_id=pattern_id,
         signed_percentiles={
-            "p1": p1, "p5": p5, "p50": p50, "p95": p95, "p99": p99,
+            "p1": p1,
+            "p5": p5,
+            "p50": p50,
+            "p95": p95,
+            "p99": p99,
         },
         label_aware_n_pos=n_pos,
     )
@@ -187,7 +195,12 @@ def _pattern_with_signed_percentiles(
 def test_a2_signed_tail_concentration_fires_above_threshold():
     """Ratio 100 (p99=100, p50=1) with n_pos >> 30 → warning fires."""
     pat = _pattern_with_signed_percentiles(
-        p1=-1.0, p5=-0.5, p50=1.0, p95=10.0, p99=100.0, n_pos=120,
+        p1=-1.0,
+        p5=-0.5,
+        p50=1.0,
+        p95=10.0,
+        p99=100.0,
+        n_pos=120,
     )
     w = GDSNavigator._compute_signed_tail_concentration_warning(pat)
     assert w is not None
@@ -200,7 +213,12 @@ def test_a2_signed_tail_concentration_fires_above_threshold():
 def test_a2_signed_tail_concentration_does_not_fire_below_threshold():
     """Ratio 10 (p99=10, p50=1) — under threshold (50), no warning."""
     pat = _pattern_with_signed_percentiles(
-        p1=-1.0, p5=-0.5, p50=1.0, p95=5.0, p99=10.0, n_pos=120,
+        p1=-1.0,
+        p5=-0.5,
+        p50=1.0,
+        p95=5.0,
+        p99=10.0,
+        n_pos=120,
     )
     w = GDSNavigator._compute_signed_tail_concentration_warning(pat)
     assert w is None
@@ -209,7 +227,12 @@ def test_a2_signed_tail_concentration_does_not_fire_below_threshold():
 def test_a2_signed_tail_concentration_suppressed_when_n_pos_low():
     """n_pos < 30 — warning suppressed even when ratio crosses 50."""
     pat = _pattern_with_signed_percentiles(
-        p1=-1.0, p5=-0.5, p50=1.0, p95=10.0, p99=100.0, n_pos=10,
+        p1=-1.0,
+        p5=-0.5,
+        p50=1.0,
+        p95=10.0,
+        p99=100.0,
+        n_pos=10,
     )
     w = GDSNavigator._compute_signed_tail_concentration_warning(pat)
     assert w is None
@@ -267,8 +290,7 @@ def test_a3_decompose_displacement_preservation_identity():
         identity_lhs = r["intrinsic"] ** 2 + r["extrinsic"] ** 2
         identity_rhs = float(np.dot(d, d))
         assert identity_lhs == pytest.approx(identity_rhs, abs=1e-6), (
-            f"identity violated: lhs={identity_lhs} rhs={identity_rhs} "
-            f"d={d}, ld={ld}"
+            f"identity violated: lhs={identity_lhs} rhs={identity_rhs} d={d}, ld={ld}"
         )
 
 
@@ -324,22 +346,31 @@ def _build_two_class_sphere_for_round_trip(
     noise_score = rng.normal(0.0, 1.0, n).astype(np.float32)
 
     pks = [f"T-{i:04d}" for i in range(n)]
-    tx = pa.table({
-        "tx_id": pks,
-        "account_id": ["A-shared"] * n,
-        "sep_score": sep_score,
-        "noise_score": noise_score,
-        "label": labels_pyarr,
-    })
+    tx = pa.table(
+        {
+            "tx_id": pks,
+            "account_id": ["A-shared"] * n,
+            "sep_score": sep_score,
+            "noise_score": noise_score,
+            "label": labels_pyarr,
+        }
+    )
     accounts = pa.table({"account_id": ["A-shared"]})
 
     out_path = tmp_path / out_dir_name
     b = GDSBuilder("two_class_round_trip", str(out_path))
     b.add_line(
-        "accounts", accounts, key_col="account_id", source_id="test",
+        "accounts",
+        accounts,
+        key_col="account_id",
+        source_id="test",
     )
     b.add_line(
-        "tx", tx, key_col="tx_id", source_id="test", role="event",
+        "tx",
+        tx,
+        key_col="tx_id",
+        source_id="test",
+        role="event",
     )
     b.add_pattern(
         "tx_pattern",
@@ -347,8 +378,10 @@ def _build_two_class_sphere_for_round_trip(
         entity_line="tx",
         relations=[
             RelationSpec(
-                line_id="accounts", fk_col="account_id",
-                direction="in", required=True,
+                line_id="accounts",
+                fk_col="account_id",
+                direction="in",
+                required=True,
             ),
         ],
         anomaly_percentile=95.0,
@@ -400,7 +433,8 @@ def test_dim_quality_warnings_returns_list_with_signed_percentiles(tmp_path):
     (typo / shape mismatch would surface here rather than at MCP smoke).
     """
     out = _build_two_class_sphere_for_round_trip(
-        tmp_path, out_dir_name="gds_cluster_a_warnings_wiring",
+        tmp_path,
+        out_dir_name="gds_cluster_a_warnings_wiring",
     )
     pat = GDSReader(out).read_sphere().patterns["tx_pattern"]
     assert pat.signed_percentiles is not None
@@ -414,7 +448,8 @@ def test_audit_pattern_dims_surfaces_decomposition_means(tmp_path):
     intrinsic/extrinsic displacement means in the top-level response.
     """
     out = _build_two_class_sphere_for_round_trip(
-        tmp_path, out_dir_name="gds_cluster_a_audit_e2e",
+        tmp_path,
+        out_dir_name="gds_cluster_a_audit_e2e",
     )
     sphere = GDSReader(out).read_sphere()
     pat = sphere.patterns["tx_pattern"]
@@ -424,10 +459,12 @@ def test_audit_pattern_dims_surfaces_decomposition_means(tmp_path):
     assert parsed["intrinsic_displacement_mean"] is not None
     assert parsed["extrinsic_displacement_mean"] is not None
     assert parsed["intrinsic_displacement_mean"] == pytest.approx(
-        pat.intrinsic_displacement_mean, abs=1e-6,
+        pat.intrinsic_displacement_mean,
+        abs=1e-6,
     )
     assert parsed["extrinsic_displacement_mean"] == pytest.approx(
-        pat.extrinsic_displacement_mean, abs=1e-6,
+        pat.extrinsic_displacement_mean,
+        abs=1e-6,
     )
     # Per-row auroc_per_dim populated when label-aware fired.
     for row in parsed["dims"]:

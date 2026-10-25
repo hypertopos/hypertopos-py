@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 
 import numpy as np
 import pytest
+
 from hypertopos.model.manifest import Contract, Manifest
 from hypertopos.model.objects import Edge, Point, Polygon, Solid, SolidSlice
 from hypertopos.model.sphere import (
@@ -469,6 +470,7 @@ def test_pattern_prop_columns_default_empty():
     import datetime
 
     import numpy as np
+
     from hypertopos.model.sphere import Pattern, RelationDef
 
     pattern = Pattern(
@@ -492,6 +494,7 @@ def test_pattern_delta_dim_includes_prop_columns():
     import datetime
 
     import numpy as np
+
     from hypertopos.model.sphere import Pattern, RelationDef
 
     pattern = Pattern(
@@ -518,6 +521,7 @@ def test_pattern_dim_index_prop_column():
     import datetime
 
     import numpy as np
+
     from hypertopos.model.sphere import Pattern, RelationDef
 
     pattern = Pattern(
@@ -542,6 +546,7 @@ def test_pattern_dim_index_unknown_lists_prop_columns():
     import datetime
 
     import numpy as np
+
     from hypertopos.model.sphere import Pattern, RelationDef
 
     pattern = Pattern(
@@ -573,6 +578,7 @@ def test_pattern_dim_index_covers_edge_dim_aggregations():
     import datetime
 
     import numpy as np
+
     from hypertopos.model.sphere import (
         EdgeDimAggregationsRef,
         EventDimDef,
@@ -983,7 +989,14 @@ def test_pattern_dim_percentiles_default_none():
 
 def test_pattern_dim_percentiles_stored():
     percentiles = {
-        "avg_late_days": {"min": 0.0, "p25": 20.0, "p50": 26.0, "p75": 32.0, "p99": 50.0, "max": 322.0},
+        "avg_late_days": {
+            "min": 0.0,
+            "p25": 20.0,
+            "p50": 26.0,
+            "p75": 32.0,
+            "p99": 50.0,
+            "max": 322.0,
+        },
     }
     pattern = Pattern(
         pattern_id="p",

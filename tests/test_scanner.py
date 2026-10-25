@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import numpy as np
 import pyarrow as pa
+import pytest
+
 from hypertopos.builder.builder import GDSBuilder, RelationSpec
 from hypertopos.engine.chains import Chain
 from hypertopos.navigation.scanner import PassiveScanner
@@ -35,7 +37,9 @@ def _make_scanner_fixture(tmp_path, n=50, seed=42):
         )
 
     b = GDSBuilder("scan_test", str(tmp_path / "gds"))
-    b.add_line("accounts", accounts, key_col="account_id", source_id="accounts", entity_type="account")
+    b.add_line(
+        "accounts", accounts, key_col="account_id", source_id="accounts", entity_type="account"
+    )
     b.add_line("transactions", txs, key_col="tx_id", source_id="transactions", role="event")
 
     b.add_derived_dimension(
@@ -179,6 +183,30 @@ class TestPassiveScannerScoring:
         scanner.add_source("acct", "account_pattern", key_type="direct")
         result = scanner.scan("accounts", top_n=3)
         assert len(result.hits) <= 3
+        sess.__exit__(None, None, None)
+
+    def test_every_source_reports_its_weighted_contribution(self, tmp_path):
+        scanner, sess = _make_scanner_fixture(tmp_path)
+        scanner.add_source("acct", "account_pattern", key_type="direct")
+        scanner.add_source("pairs", "pair_pattern", key_type="composite")
+        result = scanner.scan("accounts", scoring="weighted", threshold=0)
+        pair_hits = [h.sources["pairs"] for h in result.hits if "pairs" in h.sources]
+        assert pair_hits, "fixture must flag composite hits"
+        for sh in pair_hits:
+            assert sh.anomaly_intensity == pytest.approx(sh.anomalous_count / sh.related_count)
+        for hit in result.hits:
+            total = sum(sh.anomaly_intensity for sh in hit.sources.values())
+            assert hit.weighted_score == pytest.approx(round(total, 4))
+        sess.__exit__(None, None, None)
+
+    def test_total_flagged_counts_hits_beyond_top_n(self, tmp_path):
+        scanner, sess = _make_scanner_fixture(tmp_path)
+        scanner.add_source("acct", "account_pattern", key_type="direct")
+        everything = scanner.scan("accounts", threshold=1)
+        assert everything.total_flagged >= 2, "fixture must flag at least two entities"
+        result = scanner.scan("accounts", threshold=1, top_n=1)
+        assert len(result.hits) == 1
+        assert result.total_flagged == everything.total_flagged
         sess.__exit__(None, None, None)
 
     def test_empty_sources_returns_empty(self, tmp_path):
@@ -394,8 +422,7 @@ def _make_sibling_fixture(tmp_path, n=50, seed=42):
     accounts = [{"account_id": f"A{i:04d}", "entity_type": "Individual"} for i in range(n)]
     # Sibling line: same keys, different perspective
     accounts_stress = [
-        {"account_id": f"A{i:04d}", "stress_score": float(rng.uniform(0, 100))}
-        for i in range(n)
+        {"account_id": f"A{i:04d}", "stress_score": float(rng.uniform(0, 100))} for i in range(n)
     ]
 
     txs = []
@@ -414,12 +441,22 @@ def _make_sibling_fixture(tmp_path, n=50, seed=42):
         )
 
     b = GDSBuilder("sibling_test", str(tmp_path / "gds"))
-    b.add_line("accounts", accounts, key_col="account_id", source_id="acct_src", entity_type="account")
-    b.add_line("accounts_stress", accounts_stress, key_col="account_id", source_id="acct_src", entity_type="account")
+    b.add_line(
+        "accounts", accounts, key_col="account_id", source_id="acct_src", entity_type="account"
+    )
+    b.add_line(
+        "accounts_stress",
+        accounts_stress,
+        key_col="account_id",
+        source_id="acct_src",
+        entity_type="account",
+    )
     b.add_line("transactions", txs, key_col="tx_id", source_id="transactions", role="event")
 
     b.add_derived_dimension("accounts", "transactions", "from_account", "count", None, "tx_out")
-    b.add_derived_dimension("accounts_stress", "transactions", "from_account", "count", None, "tx_out")
+    b.add_derived_dimension(
+        "accounts_stress", "transactions", "from_account", "count", None, "tx_out"
+    )
 
     b.add_pattern("account_pattern", "anchor", "accounts", relations=[])
     b.add_pattern("account_stress_pattern", "anchor", "accounts_stress", relations=[])
@@ -553,26 +590,32 @@ def _make_graph_scanner_fixture(tmp_path):
     """Build sphere with accounts + transactions + edge table for graph source tests."""
     builder = GDSBuilder("graph_test", str(tmp_path / "gds"))
 
-    accounts = pa.table({
-        "primary_key": [f"A{i:03d}" for i in range(20)],
-        "name": [f"Account {i}" for i in range(20)],
-    })
-    builder.add_line("accounts", accounts, key_col="primary_key",
-                     source_id="accounts", role="anchor")
+    accounts = pa.table(
+        {
+            "primary_key": [f"A{i:03d}" for i in range(20)],
+            "name": [f"Account {i}" for i in range(20)],
+        }
+    )
+    builder.add_line(
+        "accounts", accounts, key_col="primary_key", source_id="accounts", role="anchor"
+    )
 
     n_tx = 200
-    txns = pa.table({
-        "primary_key": [f"TX{i:05d}" for i in range(n_tx)],
-        "sender_id": [f"A{i % 20:03d}" for i in range(n_tx)],
-        "receiver_id": [f"A{(i + 3) % 20:03d}" for i in range(n_tx)],
-        "amount": [float(100 + i) for i in range(n_tx)],
-        "tx_date": pa.array(
-            [1_700_000_000.0 + i * 3600.0 for i in range(n_tx)],
-            type=pa.float64(),
-        ),
-    })
-    builder.add_line("transactions", txns, key_col="primary_key",
-                     source_id="transactions", role="event")
+    txns = pa.table(
+        {
+            "primary_key": [f"TX{i:05d}" for i in range(n_tx)],
+            "sender_id": [f"A{i % 20:03d}" for i in range(n_tx)],
+            "receiver_id": [f"A{(i + 3) % 20:03d}" for i in range(n_tx)],
+            "amount": [float(100 + i) for i in range(n_tx)],
+            "tx_date": pa.array(
+                [1_700_000_000.0 + i * 3600.0 for i in range(n_tx)],
+                type=pa.float64(),
+            ),
+        }
+    )
+    builder.add_line(
+        "transactions", txns, key_col="primary_key", source_id="transactions", role="event"
+    )
 
     builder.add_pattern(
         "tx_pattern",
@@ -664,15 +707,11 @@ class TestGraphContagionSource:
         from pathlib import Path
 
         scanner, sess = _make_graph_scanner_fixture(tmp_path)
-        cs_path = (
-            Path(sess._reader._base) / "_gds_meta" / "contagion_stats"
-            / "tx_pattern.lance"
-        )
-        assert cs_path.exists(), (
-            f"contagion_stats file missing for tx_pattern at {cs_path}"
-        )
+        cs_path = Path(sess._reader._base) / "_gds_meta" / "contagion_stats" / "tx_pattern.lance"
+        assert cs_path.exists(), f"contagion_stats file missing for tx_pattern at {cs_path}"
         # Schema sanity
         import lance
+
         ds = lance.dataset(str(cs_path))
         names = ds.schema.names
         assert "primary_key" in names
@@ -686,14 +725,11 @@ class TestGraphContagionSource:
         """A sphere built without precomputed contagion stats produces zero
         graph-source hits — there is no edge-table-replay fallback in 0.3.0,
         spheres must be rebuilt to get graph contagion."""
-        from pathlib import Path
         import shutil
+        from pathlib import Path
 
         scanner, sess = _make_graph_scanner_fixture(tmp_path)
-        cs_path = (
-            Path(sess._reader._base) / "_gds_meta" / "contagion_stats"
-            / "tx_pattern.lance"
-        )
+        cs_path = Path(sess._reader._base) / "_gds_meta" / "contagion_stats" / "tx_pattern.lance"
         shutil.rmtree(cs_path)
         assert not sess._reader.has_contagion_stats("tx_pattern")
         scanner.add_graph_source("graph", "tx_pattern", contagion_threshold=0.0)
@@ -730,7 +766,9 @@ def _make_chain_pattern_fixture(tmp_path, n=50, seed=42):
         )
 
     b = GDSBuilder("chain_rc_test", str(tmp_path / "gds"))
-    b.add_line("accounts", accounts, key_col="account_id", source_id="accounts", entity_type="account")
+    b.add_line(
+        "accounts", accounts, key_col="account_id", source_id="accounts", entity_type="account"
+    )
     b.add_line("transactions", txs, key_col="tx_id", source_id="transactions", role="event")
     b.add_derived_dimension("accounts", "transactions", "from_account", "count", None, "tx_out")
     b.add_derived_dimension("accounts", "transactions", "to_account", "count", None, "tx_in")
@@ -808,11 +846,7 @@ class TestRelatedCountEntitySpecific:
 
         # Verify entity-specificity: with 20 chains / 50 accounts, most accounts
         # appear in only 1-2 chains, so related_count should be < 20 for most hits
-        chain_hits = [
-            hit.sources["chains"]
-            for hit in result.hits
-            if "chains" in hit.sources
-        ]
+        chain_hits = [hit.sources["chains"] for hit in result.hits if "chains" in hit.sources]
         if chain_hits and total_chains > 1:
             assert any(h.related_count < total_chains for h in chain_hits), (
                 f"All chain hits have related_count == {total_chains} (total), "
@@ -839,7 +873,8 @@ class TestRelatedCountEntitySpecific:
                 continue
             src_hit = hit.sources["pairs"]
             assert src_hit.related_count <= total_composites, (
-                f"related_count {src_hit.related_count} exceeds total composite count {total_composites}"
+                f"related_count {src_hit.related_count} exceeds "
+                f"total composite count {total_composites}"
             )
             assert src_hit.related_count >= src_hit.anomalous_count, (
                 f"related_count {src_hit.related_count} < anomalous_count {src_hit.anomalous_count}"
@@ -847,11 +882,7 @@ class TestRelatedCountEntitySpecific:
 
         # Verify entity-specificity: with n=50 accounts and ~250 pairs (n*5 txs),
         # most accounts appear in far fewer pairs than the total
-        pair_hits = [
-            hit.sources["pairs"]
-            for hit in result.hits
-            if "pairs" in hit.sources
-        ]
+        pair_hits = [hit.sources["pairs"] for hit in result.hits if "pairs" in hit.sources]
         if pair_hits and total_composites > 1:
             assert any(h.related_count < total_composites for h in pair_hits), (
                 f"All composite hits have related_count == {total_composites} (total), "

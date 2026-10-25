@@ -3,6 +3,7 @@
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
 """Per-hop edge_potentials field on Chain.to_dict()."""
+
 from __future__ import annotations
 
 import json

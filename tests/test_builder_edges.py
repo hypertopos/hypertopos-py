@@ -3,12 +3,12 @@
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
 """Tests for builder edge table emission."""
+
 from __future__ import annotations
 
 import json
 
 import pyarrow as pa
-import pytest
 
 from hypertopos.builder.builder import (
     EdgeTableConfig,
@@ -23,25 +23,31 @@ def _build_tx_sphere(tmp_path, *, edge_table_cfg=None):
     """Build a minimal sphere with accounts + transactions (from/to structure)."""
     builder = GDSBuilder("test_sphere", str(tmp_path / "gds"))
 
-    accounts = pa.table({
-        "primary_key": [f"A{i:03d}" for i in range(20)],
-        "name": [f"Account {i}" for i in range(20)],
-    })
-    builder.add_line("accounts", accounts, key_col="primary_key",
-                     source_id="accounts", role="anchor")
+    accounts = pa.table(
+        {
+            "primary_key": [f"A{i:03d}" for i in range(20)],
+            "name": [f"Account {i}" for i in range(20)],
+        }
+    )
+    builder.add_line(
+        "accounts", accounts, key_col="primary_key", source_id="accounts", role="anchor"
+    )
 
-    txns = pa.table({
-        "primary_key": [f"TX{i:05d}" for i in range(200)],
-        "sender_id": [f"A{i % 20:03d}" for i in range(200)],
-        "receiver_id": [f"A{(i + 3) % 20:03d}" for i in range(200)],
-        "amount": [float(i * 10) for i in range(200)],
-        "tx_date": pa.array(
-            [1_700_000_000.0 + i * 3600.0 for i in range(200)],
-            type=pa.float64(),
-        ),
-    })
-    builder.add_line("transactions", txns, key_col="primary_key",
-                     source_id="transactions", role="event")
+    txns = pa.table(
+        {
+            "primary_key": [f"TX{i:05d}" for i in range(200)],
+            "sender_id": [f"A{i % 20:03d}" for i in range(200)],
+            "receiver_id": [f"A{(i + 3) % 20:03d}" for i in range(200)],
+            "amount": [float(i * 10) for i in range(200)],
+            "tx_date": pa.array(
+                [1_700_000_000.0 + i * 3600.0 for i in range(200)],
+                type=pa.float64(),
+            ),
+        }
+    )
+    builder.add_line(
+        "transactions", txns, key_col="primary_key", source_id="transactions", role="event"
+    )
 
     builder.add_pattern(
         "tx_pattern",
@@ -113,10 +119,8 @@ class TestEdgeEmission:
 
 class TestSphereJsonMetadata:
     def test_has_edge_table_in_sphere_json(self, tmp_path):
-        path = _build_tx_sphere(tmp_path)
-        sphere_json = json.loads(
-            (tmp_path / "gds" / "_gds_meta" / "sphere.json").read_text()
-        )
+        _build_tx_sphere(tmp_path)
+        sphere_json = json.loads((tmp_path / "gds" / "_gds_meta" / "sphere.json").read_text())
         pat = sphere_json["patterns"]["tx_pattern"]
         assert pat.get("has_edge_table") is True
         assert "edge_table" in pat
@@ -128,12 +132,15 @@ class TestAnchorPatternNoEdges:
     def test_anchor_pattern_skips_edge_table(self, tmp_path):
         """Anchor patterns without from/to structure don't emit edge table."""
         builder = GDSBuilder("test_sphere", str(tmp_path / "gds"))
-        customers = pa.table({
-            "primary_key": [f"C{i:03d}" for i in range(50)],
-            "region": ["east", "west"] * 25,
-        })
-        builder.add_line("customers", customers, key_col="primary_key",
-                         source_id="customers", role="anchor")
+        customers = pa.table(
+            {
+                "primary_key": [f"C{i:03d}" for i in range(50)],
+                "region": ["east", "west"] * 25,
+            }
+        )
+        builder.add_line(
+            "customers", customers, key_col="primary_key", source_id="customers", role="anchor"
+        )
         builder.add_pattern(
             "cust_pattern",
             pattern_type="anchor",

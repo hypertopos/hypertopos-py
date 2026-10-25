@@ -20,6 +20,7 @@ Does NOT change sphere format. Does NOT bake labels into the pattern.
 Caller supplies labels at audit time; output is a per-dim score table
 + a recommended mask for downstream filtered scoring.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -44,9 +45,14 @@ def _auroc_unsafe(scores: np.ndarray, labels: np.ndarray) -> float:
     """Compute AUROC via the rank-based identity:
         AUROC = (sum_rank_positives - n_pos*(n_pos+1)/2) / (n_pos * n_neg)
 
-    Avoids sklearn dependency on the engine layer. Returns 0.5 when one
-    class is missing or when all scores are tied.
+    Avoids sklearn dependency on the engine layer. Entities with a
+    non-finite score are left out (argsort would rank NaN highest).
+    Returns 0.5 when one class is missing or when all scores are tied.
     """
+    finite = np.isfinite(scores)
+    if not finite.all():
+        scores = scores[finite]
+        labels = labels[finite]
     n = labels.size
     if n == 0:
         return 0.5
@@ -110,8 +116,7 @@ def compute_per_dim_label_auroc(
         raise ValueError(f"deltas must be 2-D, got shape {deltas.shape}")
     if labels.shape != (deltas.shape[0],):
         raise ValueError(
-            f"labels shape mismatch: {labels.shape} vs "
-            f"({deltas.shape[0]},)",
+            f"labels shape mismatch: {labels.shape} vs ({deltas.shape[0]},)",
         )
     n_dims = deltas.shape[1]
     if dim_labels is None:
@@ -141,12 +146,14 @@ def compute_per_dim_label_auroc(
         else:
             cls = "neutral"
             n_neutral += 1
-        per_dim.append({
-            "idx": i,
-            "label": dim_labels[i],
-            "auroc": a,
-            "classification": cls,
-        })
+        per_dim.append(
+            {
+                "idx": i,
+                "label": dim_labels[i],
+                "auroc": a,
+                "classification": cls,
+            }
+        )
     return {
         "per_dim": per_dim,
         "n_signal": n_signal,
@@ -175,7 +182,8 @@ def filter_delta_norm(
     keep = np.asarray(list(keep_idx), dtype=np.intp)
     if keep.size == 0:
         return np.zeros(deltas.shape[0], dtype=np.float64)
-    return np.linalg.norm(deltas[:, keep], axis=1)
+    norms: np.ndarray = np.linalg.norm(deltas[:, keep], axis=1)
+    return norms
 
 
 def fit_lda_direction(
@@ -222,8 +230,7 @@ def fit_lda_direction(
         raise ValueError(f"deltas must be 2-D, got shape {deltas.shape}")
     if labels.shape != (deltas.shape[0],):
         raise ValueError(
-            f"labels shape mismatch: {labels.shape} vs "
-            f"({deltas.shape[0]},)",
+            f"labels shape mismatch: {labels.shape} vs ({deltas.shape[0]},)",
         )
     unique_labels = np.unique(labels)
     if not np.all(np.isin(unique_labels, [0, 1])):
@@ -239,8 +246,7 @@ def fit_lda_direction(
     n_normal = int(mask_normal.sum())
     if n_anom == 0 or n_normal == 0:
         raise ValueError(
-            f"both classes must be present: n_anom={n_anom}, "
-            f"n_normal={n_normal}",
+            f"both classes must be present: n_anom={n_anom}, n_normal={n_normal}",
         )
     if n_anom < 2 or n_normal < 2:
         raise ValueError(

@@ -3,6 +3,7 @@
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
 """Tests for π5_attract_anomaly fdr_resolution + fdr_temporal_resolution wiring."""
+
 from __future__ import annotations
 
 import re
@@ -14,6 +15,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
+
 from hypertopos.model.manifest import Contract, Manifest
 from hypertopos.model.sphere import (
     FDRHierarchyLevel,
@@ -45,7 +47,8 @@ def _make_pattern_with_hierarchy(spatial: bool, temporal: bool) -> Pattern:
         ),
         fdr_temporal_hierarchy=(
             [FDRTemporalLevel(level="quarter", slice_dimension="temporal_bucket")]
-            if temporal else []
+            if temporal
+            else []
         ),
     )
 
@@ -120,8 +123,16 @@ class _MockStorage:
     def count_geometry_rows(self, *a, **kw):
         return 0  # force in-process path
 
-    def read_geometry(self, pattern_id, version, primary_key=None,
-                      filters=None, point_keys=None, columns=None, filter=None):
+    def read_geometry(
+        self,
+        pattern_id,
+        version,
+        primary_key=None,
+        filters=None,
+        point_keys=None,
+        columns=None,
+        filter=None,
+    ):
         table = self._geometry
         if filter is not None:
             f = str(filter)
@@ -143,8 +154,11 @@ class _MockStorage:
 def _nav_with(pattern: Pattern, geometry: pa.Table) -> GDSNavigator:
     storage = _MockStorage(pattern, geometry)
     manifest = Manifest(
-        manifest_id="m1", agent_id="t", snapshot_time=_DT,
-        status="active", line_versions={"line_a": 1},
+        manifest_id="m1",
+        agent_id="t",
+        snapshot_time=_DT,
+        status="active",
+        line_versions={"line_a": 1},
         pattern_versions={"p_x": 1},
     )
     contract = Contract(manifest_id="m1", pattern_ids=["p_x"])
@@ -164,7 +178,10 @@ class TestReliabilityFlagsAttachedByNavigator:
         pat = _make_pattern_with_hierarchy(spatial=True, temporal=False)
         nav = _nav_with(pat, _make_geometry_table())
         polys, _t, _e, _m = nav.π5_attract_anomaly(
-            "p_x", top_n=10, fdr_alpha=0.05, fdr_resolution="bank",
+            "p_x",
+            top_n=10,
+            fdr_alpha=0.05,
+            fdr_resolution="bank",
         )
         assert len(polys) > 0
         for poly in polys:
@@ -189,8 +206,12 @@ class TestFDRResolutionSpatial:
         pat = _make_pattern_with_hierarchy(spatial=True, temporal=False)
         nav = _nav_with(pat, _make_geometry_table())
         polys, total_found, _emerging, _meta = nav.π5_attract_anomaly(
-            "p_x", top_n=30, fdr_alpha=0.05, fdr_resolution="bank",
-            p_value_method="chi2", fdr_method="storey",
+            "p_x",
+            top_n=30,
+            fdr_alpha=0.05,
+            fdr_resolution="bank",
+            p_value_method="chi2",
+            fdr_method="storey",
         )
         # Every survivor must come from anomaly-enriched bank B1
         assert len(polys) > 0
@@ -204,7 +225,10 @@ class TestFDRResolutionSpatial:
         nav = _nav_with(pat, _make_geometry_table())
         with pytest.raises(ValueError, match="fdr_resolution"):
             nav.π5_attract_anomaly(
-                "p_x", top_n=10, fdr_alpha=0.05, fdr_resolution="not_a_level",
+                "p_x",
+                top_n=10,
+                fdr_alpha=0.05,
+                fdr_resolution="not_a_level",
             )
 
     def test_resolution_without_alpha_raises(self):
@@ -212,7 +236,9 @@ class TestFDRResolutionSpatial:
         nav = _nav_with(pat, _make_geometry_table())
         with pytest.raises(ValueError, match="fdr_alpha"):
             nav.π5_attract_anomaly(
-                "p_x", top_n=10, fdr_resolution="bank",
+                "p_x",
+                top_n=10,
+                fdr_resolution="bank",
             )
 
 
@@ -221,11 +247,13 @@ class TestFDRResolutionIntersection:
         pat = _make_pattern_with_hierarchy(spatial=True, temporal=True)
         nav = _nav_with(pat, _make_geometry_table(temporal=True))
         polys, _total, _emerging, _meta = nav.π5_attract_anomaly(
-            "p_x", top_n=50,
+            "p_x",
+            top_n=50,
             fdr_alpha=0.05,
             fdr_resolution="bank",
             fdr_temporal_resolution="quarter",
-            p_value_method="chi2", fdr_method="storey",
+            p_value_method="chi2",
+            fdr_method="storey",
         )
         # B1 is in Q1 + all anomalous -> intersection should keep B1-* only
         assert len(polys) > 0
@@ -237,7 +265,9 @@ class TestFDRResolutionIntersection:
         nav = _nav_with(pat, _make_geometry_table(temporal=True))
         with pytest.raises(ValueError, match="fdr_temporal_resolution"):
             nav.π5_attract_anomaly(
-                "p_x", top_n=10, fdr_alpha=0.05,
+                "p_x",
+                top_n=10,
+                fdr_alpha=0.05,
                 fdr_temporal_resolution="not_a_level",
             )
 
@@ -245,9 +275,13 @@ class TestFDRResolutionIntersection:
         pat = _make_pattern_with_hierarchy(spatial=True, temporal=True)
         nav = _nav_with(pat, _make_geometry_table(temporal=True))
         polys, *_ = nav.π5_attract_anomaly(
-            "p_x", top_n=30, fdr_alpha=0.05,
-            fdr_resolution="bank", fdr_temporal_resolution="quarter",
-            p_value_method="chi2", fdr_method="storey",
+            "p_x",
+            top_n=30,
+            fdr_alpha=0.05,
+            fdr_resolution="bank",
+            fdr_temporal_resolution="quarter",
+            p_value_method="chi2",
+            fdr_method="storey",
         )
         assert polys
         p = polys[0]
@@ -262,10 +296,13 @@ class TestFDRResolutionIntersection:
         # First call: no gate -> baseline
         baseline, _t, _e, _m = nav.π5_attract_anomaly("p_x", top_n=30)
         baseline_keys = {p.primary_key for p in baseline}
-        # Second call: with gate (auto-upgrades rank+bh -> chi2+storey
-        # silently when fdr_resolution is set on entity axis)
+        # Second call: with gate (implicit fdr_method resolves to storey
+        # when fdr_resolution is set on entity axis)
         gated, _t, _e, _m = nav.π5_attract_anomaly(
-            "p_x", top_n=30, fdr_alpha=0.05, fdr_resolution="bank",
+            "p_x",
+            top_n=30,
+            fdr_alpha=0.05,
+            fdr_resolution="bank",
         )
         gated_keys = {p.primary_key for p in gated}
         assert gated_keys.issubset(baseline_keys)
@@ -273,21 +310,22 @@ class TestFDRResolutionIntersection:
 
 class TestFDRResolutionDefaultsAutoUpgrade:
     """When fdr_resolution / fdr_temporal_resolution is set on the
-    entity axis, p_value_method='rank' + fdr_method='bh' (the documented
-    defaults) silently upgrade to chi2 + storey because the rank+bh
-    combo is degenerate (uniform p-values, BH rejects nothing). Explicit
-    non-default values are not overridden. per_dim / both axes don't
-    use entity-axis FDR, so no upgrade happens there.
+    entity axis and fdr_method is left implicit, it resolves to 'storey'
+    (entity-level p-values are always chi2). Explicit values are not
+    overridden. per_dim / both axes don't use entity-axis FDR, so no
+    upgrade happens there.
     """
 
-    def test_rank_bh_with_spatial_resolution_keeps_entities(self):
-        """Pre-upgrade rank+bh combo returned zero meaningful survivors on
-        AML scale because BH rejected nothing. After auto-upgrade to
-        chi2+storey under the hood, the call returns non-empty top-K."""
+    def test_default_fdr_with_spatial_resolution_keeps_entities(self):
+        """With implicit fdr_method the call resolves to chi2+storey and
+        returns a non-empty top-K."""
         pat = _make_pattern_with_hierarchy(spatial=True, temporal=False)
         nav = _nav_with(pat, _make_geometry_table())
         polys, _t, _e, _m = nav.π5_attract_anomaly(
-            "p_x", top_n=10, fdr_alpha=0.05, fdr_resolution="bank",
+            "p_x",
+            top_n=10,
+            fdr_alpha=0.05,
+            fdr_resolution="bank",
         )
         assert len(polys) > 0
         # And every survivor must come from the anomaly-enriched bank
@@ -298,18 +336,25 @@ class TestFDRResolutionDefaultsAutoUpgrade:
         """No combo should emit a warning — auto-upgrade replaces warning."""
         pat = _make_pattern_with_hierarchy(spatial=True, temporal=False)
         nav = _nav_with(pat, _make_geometry_table())
-        # rank+bh (would have warned before)
+        # implicit fdr_method
         with warnings.catch_warnings():
             warnings.simplefilter("error", UserWarning)
             nav.π5_attract_anomaly(
-                "p_x", top_n=10, fdr_alpha=0.05, fdr_resolution="bank",
+                "p_x",
+                top_n=10,
+                fdr_alpha=0.05,
+                fdr_resolution="bank",
             )
         # explicit chi2+storey
         with warnings.catch_warnings():
             warnings.simplefilter("error", UserWarning)
             nav.π5_attract_anomaly(
-                "p_x", top_n=10, fdr_alpha=0.05, fdr_resolution="bank",
-                p_value_method="chi2", fdr_method="storey",
+                "p_x",
+                top_n=10,
+                fdr_alpha=0.05,
+                fdr_resolution="bank",
+                p_value_method="chi2",
+                fdr_method="storey",
             )
         # no resolution at all
         with warnings.catch_warnings():
@@ -319,7 +364,10 @@ class TestFDRResolutionDefaultsAutoUpgrade:
         with warnings.catch_warnings():
             warnings.simplefilter("error", UserWarning)
             nav.π5_attract_anomaly(
-                "p_x", top_n=10, fdr_alpha=0.05, fdr_resolution="bank",
+                "p_x",
+                top_n=10,
+                fdr_alpha=0.05,
+                fdr_resolution="bank",
                 fdr_axis="per_dim",
             )
 
@@ -330,36 +378,17 @@ class TestFDRResolutionDefaultsAutoUpgrade:
         pat = _make_pattern_with_hierarchy(spatial=True, temporal=False)
         nav = _nav_with(pat, _make_geometry_table())
         polys_explicit, *_ = nav.π5_attract_anomaly(
-            "p_x", top_n=10, fdr_alpha=0.05, fdr_resolution="bank",
-            p_value_method="chi2", fdr_method="storey",
+            "p_x",
+            top_n=10,
+            fdr_alpha=0.05,
+            fdr_resolution="bank",
+            p_value_method="chi2",
+            fdr_method="storey",
         )
         polys_auto, *_ = nav.π5_attract_anomaly(
-            "p_x", top_n=10, fdr_alpha=0.05, fdr_resolution="bank",
+            "p_x",
+            top_n=10,
+            fdr_alpha=0.05,
+            fdr_resolution="bank",
         )
-        assert {p.primary_key for p in polys_explicit} == {
-            p.primary_key for p in polys_auto
-        }
-
-    def test_explicit_rank_is_not_overridden(self):
-        """A caller who explicitly passes p_value_method='rank' wants the
-        rank-uniform p-values (e.g. for pre-upgrade reproduction, migration
-        validation, benchmarking the degenerate path on purpose). The
-        sentinel-None pattern must keep that escape hatch — explicit 'rank'
-        bypasses the auto-upgrade and produces different (zero-survivor on
-        this fixture) output than the upgraded path."""
-        pat = _make_pattern_with_hierarchy(spatial=True, temporal=False)
-        nav = _nav_with(pat, _make_geometry_table())
-        polys_rank, *_ = nav.π5_attract_anomaly(
-            "p_x", top_n=10, fdr_alpha=0.05, fdr_resolution="bank",
-            p_value_method="rank", fdr_method="bh",
-        )
-        polys_auto, *_ = nav.π5_attract_anomaly(
-            "p_x", top_n=10, fdr_alpha=0.05, fdr_resolution="bank",
-        )
-        # Auto-upgrade returns survivors with real chi2 ranking inside the
-        # surviving cells; explicit rank+bh hands the entity-level FDR a
-        # uniform p-value distribution where BH at alpha=0.05 cannot
-        # reject — so the survivor sets must differ.
-        assert {p.primary_key for p in polys_rank} != {
-            p.primary_key for p in polys_auto
-        }
+        assert {p.primary_key for p in polys_explicit} == {p.primary_key for p in polys_auto}

@@ -6,7 +6,10 @@
 
 Pure NumPy + scipy.special. No state. No I/O. Closed-form per-batch operations.
 """
+
 from __future__ import annotations
+
+from typing import Any
 
 import numpy as np
 import pyarrow as pa
@@ -18,7 +21,6 @@ from scipy.stats import hypergeom
 __all__ = [
     "benjamini_hochberg",
     "cell_p_values_from_anomaly_indicator",
-    "empirical_p_values_from_rank",
     "fdr_multi_resolution",
     "fdr_per_dimension",
     "parametric_p_values_chi2",
@@ -27,28 +29,6 @@ __all__ = [
     "storey_pi0",
     "storey_q_values",
 ]
-
-
-def empirical_p_values_from_rank(
-    delta_rank_pct: NDArray[np.float64],
-) -> NDArray[np.float64]:
-    """Convert delta rank percentile (0-100 or 0-1) into empirical-null p-values.
-
-    delta_rank_pct[i] is the entity's position in the population sorted by
-    delta_norm ascending --- 100 (or 1.0) is the most extreme entity.
-    p-value = 1 - rank_pct/100 (if input > 1, assume 0-100 scale).
-
-    Returns: 1-D array of p-values in (0, 1].
-    """
-    p = np.asarray(delta_rank_pct, dtype=np.float64)
-    # Auto-detect scale: if max > 1, assume 0-100 range
-    if p.size > 0 and np.max(p) > 1.0:
-        p = p / 100.0
-    p = 1.0 - p
-    # clip into (eps, 1) — use a fixed floor (not 1/N) because
-    # delta_rank_pct is computed against the FULL population, so
-    # the input array may be a small top-N subset with very small p-values.
-    return np.clip(p, 1e-10, 1.0)
 
 
 def parametric_p_values_chi2(
@@ -60,8 +40,8 @@ def parametric_p_values_chi2(
     If delta_i ~ N(0, 1) iid across df dimensions (the population-relative
     construction), then ||delta||² ~ χ²(df) and the upper-tail survival
     function gives per-entity p-values that concentrate near 0 for genuine
-    alternatives — unlike the rank-based p-values, which are uniform by
-    construction and carry no null/alternative signal for the Storey estimator.
+    alternatives — unlike p-values derived from population rank, which are
+    uniform by construction and carry no null/alternative signal.
 
     Returns: p-values in (0, 1], clipped to [1e-10, 1].
     """
@@ -70,27 +50,48 @@ def parametric_p_values_chi2(
     chi2 = np.asarray(delta_norms, dtype=np.float64) ** 2
     # gammaincc(df/2, x/2) == 1 - F_χ²(df, x) (upper-tail survival function)
     p = gammaincc(df / 2.0, chi2 / 2.0)
-    return np.clip(p, 1e-10, 1.0)
+    # A NaN delta_norm carries no evidence against the null.
+    p = np.where(np.isnan(p), 1.0, p)
+    clipped: NDArray[np.float64] = np.clip(p, 1e-10, 1.0)
+    return clipped
 
 
 def q_values_from_p_values(
     p_values: NDArray[np.float64],
+    *,
+    n_tests: int | None = None,
+    rank_offset: int = 0,
 ) -> NDArray[np.float64]:
     """Compute BH q-value for each input p-value.
 
     q-value of entity i = minimum FDR alpha at which i would be rejected.
     Implementation: right-to-left running minimum of (p_(j) * m / j).
 
+    ``n_tests`` is m, the size of the tested family; default = len(p_values).
+    Pass it when ``p_values`` is a subset of the family (e.g. the top-n most
+    extreme entities). ``rank_offset`` is the number of family members with
+    smaller p-values that are not in the subset (e.g. a pagination offset);
+    ranks then start at ``rank_offset + 1``. When the subset is exactly the
+    family's smallest p-values (shifted by ``rank_offset``) the result equals
+    BH on the full family for those entries; for any other subset it is
+    conservative (never smaller than the full-family q-value).
+
     Returns: 1-D array of q-values in [0, 1] aligned with input order.
     """
     p_values = np.asarray(p_values, dtype=np.float64)
+    # A non-finite p-value carries no evidence: rank it as p = 1 so one bad
+    # value cannot propagate NaN through the running minimum to every q.
+    p_values = np.where(np.isfinite(p_values), p_values, 1.0)
     n = p_values.shape[0]
     if n == 0:
         return np.empty(0, dtype=np.float64)
+    m = n if n_tests is None else int(n_tests)
+    if m < n + rank_offset:
+        raise ValueError(f"n_tests={m} is smaller than len(p_values)+rank_offset={n + rank_offset}")
     order = np.argsort(p_values, kind="stable")
     sorted_p = p_values[order]
-    ranks = np.arange(1, n + 1, dtype=np.float64)
-    raw_q_sorted = sorted_p * n / ranks
+    ranks = np.arange(rank_offset + 1, rank_offset + n + 1, dtype=np.float64)
+    raw_q_sorted = sorted_p * m / ranks
     # right-to-left cumulative min keeps q monotonic
     q_sorted = np.minimum.accumulate(raw_q_sorted[::-1])[::-1]
     q_sorted = np.clip(q_sorted, 0.0, 1.0)
@@ -119,13 +120,21 @@ def storey_pi0(
 def storey_q_values(
     p_values: NDArray[np.float64],
     lam: float = 0.5,
+    *,
+    n_tests: int | None = None,
+    rank_offset: int = 0,
+    pi0: float | None = None,
 ) -> NDArray[np.float64]:
+    """Storey q-values. π̂₀ is estimated from ``p_values`` only when they are
+    the whole family; for a subset (``n_tests`` larger than the input) pass a
+    family-level ``pi0`` — without one π₀ = 1 (plain BH, conservative)."""
     p = np.asarray(p_values, dtype=np.float64)
     n = p.shape[0]
     if n == 0:
         return np.empty(0, dtype=np.float64)
-    q_bh = q_values_from_p_values(p)
-    pi0 = storey_pi0(p, lam=lam)
+    q_bh = q_values_from_p_values(p, n_tests=n_tests, rank_offset=rank_offset)
+    if pi0 is None:
+        pi0 = storey_pi0(p, lam=lam) if n_tests is None or n_tests == n else 1.0
     return np.clip(pi0 * q_bh, 0.0, 1.0)
 
 
@@ -154,7 +163,8 @@ def per_dim_p_values_chi2_univariate(
     """
     chi2 = np.asarray(deltas, dtype=np.float64) ** 2
     p = gammaincc(0.5, chi2 / 2.0)
-    return np.clip(p, 1e-10, 1.0)
+    clipped: NDArray[np.float64] = np.clip(p, 1e-10, 1.0)
+    return clipped
 
 
 def fdr_per_dimension(
@@ -162,8 +172,12 @@ def fdr_per_dimension(
     *,
     alpha: float = 0.05,
     method: str = "bh",
+    n_tests: int | None = None,
 ) -> tuple[NDArray[np.bool_], NDArray[np.float64]]:
     """Apply BH or Storey FDR INDEPENDENTLY per column (per dim).
+
+    ``n_tests``: family size per dim when the rows are a subset of the tested
+    entities (conservative; Storey then uses π₀ = 1).
 
     Unlike a flat FDR over all ``n_entities * n_dims`` p-values (which
     would inflate every dim's threshold when one dim drives many
@@ -200,8 +214,9 @@ def fdr_per_dimension(
     for d in range(n_dims):
         col = p[:, d]
         q_col = (
-            q_values_from_p_values(col) if method == "bh"
-            else storey_q_values(col)
+            q_values_from_p_values(col, n_tests=n_tests)
+            if method == "bh"
+            else storey_q_values(col, n_tests=n_tests)
         )
         q_values[:, d] = q_col
     rejected = q_values <= alpha
@@ -212,11 +227,19 @@ def benjamini_hochberg(
     p_values: NDArray[np.float64],
     alpha: float,
     method: str = "bh",
+    *,
+    n_tests: int | None = None,
+    rank_offset: int = 0,
+    pi0: float | None = None,
 ) -> tuple[NDArray[np.bool_], NDArray[np.float64]]:
     """Apply BH-family FDR procedure at level alpha.
 
     method: "bh" (default) — Benjamini-Hochberg, assumes π₀ = 1.
             "storey" — BH scaled by Storey π̂₀, recovers power when π₀ < 1.
+
+    ``n_tests`` / ``rank_offset`` / ``pi0``: see :func:`q_values_from_p_values`
+    and :func:`storey_q_values` — required for correct control when
+    ``p_values`` is a subset (e.g. a top-n page) of the tested family.
 
     Guarantees: E[FDR | rejected] <= alpha
         - under independence or PRDS for method="bh"
@@ -230,7 +253,11 @@ def benjamini_hochberg(
     n = p_values.shape[0]
     if n == 0:
         return np.empty(0, dtype=np.bool_), np.empty(0, dtype=np.float64)
-    q_values = q_values_from_p_values(p_values) if method == "bh" else storey_q_values(p_values)
+    q_values = (
+        q_values_from_p_values(p_values, n_tests=n_tests, rank_offset=rank_offset)
+        if method == "bh"
+        else storey_q_values(p_values, n_tests=n_tests, rank_offset=rank_offset, pi0=pi0)
+    )
     rejected = q_values <= alpha
     return rejected, q_values
 
@@ -241,7 +268,7 @@ def cell_p_values_from_anomaly_indicator(
     hierarchy_dims: list[str] | None = None,
     temporal_dim: str | None = None,
     anomaly_col: str = "is_anomaly",
-) -> dict[tuple, float]:
+) -> dict[tuple[Any, ...], float]:
     """Per-cell Fisher exact 2x2 upper-tail p-value on anomaly indicator.
 
     Cell = unique tuple of (hierarchy_dims values..., temporal_dim value).
@@ -281,8 +308,7 @@ def cell_p_values_from_anomaly_indicator(
     """
     if anomaly_col not in geometry.schema.names:
         raise ValueError(
-            f"anomaly_col {anomaly_col!r} not in geometry columns "
-            f"{geometry.schema.names!r}",
+            f"anomaly_col {anomaly_col!r} not in geometry columns {geometry.schema.names!r}",
         )
     cell_dims: list[str] = list(hierarchy_dims or [])
     if temporal_dim is not None:
@@ -312,7 +338,8 @@ def cell_p_values_from_anomaly_indicator(
     n_arr = np.asarray(grouped["__anomaly_int___count"].to_pylist(), dtype=np.int64)
     k_raw = grouped["__anomaly_int___sum"].to_pylist()
     k_arr = np.asarray(
-        [0 if v is None else int(v) for v in k_raw], dtype=np.int64,
+        [0 if v is None else int(v) for v in k_raw],
+        dtype=np.int64,
     )
     cell_value_cols = [grouped[d].to_pylist() for d in cell_dims]
 
@@ -325,11 +352,14 @@ def cell_p_values_from_anomaly_indicator(
         real_mask = n_arr != n_total
         if real_mask.any():
             p_arr[real_mask] = hypergeom.sf(
-                k_arr[real_mask] - 1, n_total, k_total, n_arr[real_mask],
+                k_arr[real_mask] - 1,
+                n_total,
+                k_total,
+                n_arr[real_mask],
             )
     p_arr = np.clip(p_arr, 1e-10, 1.0)
 
-    result: dict[tuple, float] = {}
+    result: dict[tuple[Any, ...], float] = {}
     for i in range(grouped.num_rows):
         cell_tuple = tuple(cell_value_cols[j][i] for j in range(len(cell_dims)))
         result[cell_tuple] = float(p_arr[i])
@@ -337,13 +367,13 @@ def cell_p_values_from_anomaly_indicator(
 
 
 def _aggregate_min_p_at_level_spatial(
-    cell_p_values: dict[tuple, float],
+    cell_p_values: dict[tuple[Any, ...], float],
     *,
     spatial_prefix_len: int,
     spatial_n: int,
-) -> dict[tuple, float]:
+) -> dict[tuple[Any, ...], float]:
     """Tippett min-p on spatial prefix only (ignores temporal portion)."""
-    out: dict[tuple, float] = {}
+    out: dict[tuple[Any, ...], float] = {}
     for cell, p in cell_p_values.items():
         parent = cell[:spatial_prefix_len]
         if parent not in out or p < out[parent]:
@@ -352,26 +382,26 @@ def _aggregate_min_p_at_level_spatial(
 
 
 def _aggregate_min_p_at_level_temporal(
-    cell_p_values: dict[tuple, float],
+    cell_p_values: dict[tuple[Any, ...], float],
     *,
     spatial_n: int,
     temporal_prefix_len: int,
-) -> dict[tuple, float]:
+) -> dict[tuple[Any, ...], float]:
     """Tippett min-p on temporal prefix only (ignores spatial portion)."""
-    out: dict[tuple, float] = {}
+    out: dict[tuple[Any, ...], float] = {}
     for cell, p in cell_p_values.items():
-        temp_parent = cell[spatial_n:spatial_n + temporal_prefix_len]
+        temp_parent = cell[spatial_n : spatial_n + temporal_prefix_len]
         if temp_parent not in out or p < out[temp_parent]:
             out[temp_parent] = p
     return out
 
 
 def _apply_fdr_at_level(
-    parent_p_values: dict[tuple, float],
+    parent_p_values: dict[tuple[Any, ...], float],
     *,
     method: str,
     alpha: float,
-) -> tuple[dict[tuple, float], set[tuple]]:
+) -> tuple[dict[tuple[Any, ...], float], set[tuple[Any, ...]]]:
     """BH or Storey FDR on a flat parent-cell p-value dict.
 
     Returns (q_values_by_parent, parents_surviving_at_alpha).
@@ -387,13 +417,13 @@ def _apply_fdr_at_level(
 
 
 def fdr_multi_resolution(
-    cell_p_values: dict[tuple, float],
+    cell_p_values: dict[tuple[Any, ...], float],
     *,
     hierarchy: list[str] | None = None,
     temporal_levels: list[str] | None = None,
     method: str = "storey",
     alpha: float = 0.05,
-) -> tuple[dict[tuple, float], set[tuple]]:
+) -> tuple[dict[tuple[Any, ...], float], set[tuple[Any, ...]]]:
     """Per-level BH/Storey FDR over a cell-tuple lattice.
 
     Cell-tuple layout: ``cell = (*hierarchy_values, *temporal_values)`` where
@@ -455,17 +485,21 @@ def fdr_multi_resolution(
             )
 
     # Track per-cell max q across levels and whether cell survived every level
-    cell_max_q: dict[tuple, float] = dict.fromkeys(cell_p_values, 0.0)
-    cell_survives: dict[tuple, bool] = dict.fromkeys(cell_p_values, True)
+    cell_max_q: dict[tuple[Any, ...], float] = dict.fromkeys(cell_p_values, 0.0)
+    cell_survives: dict[tuple[Any, ...], bool] = dict.fromkeys(cell_p_values, True)
 
     # Walk spatial levels root -> leaf
     for level_idx in range(spatial_n):
         prefix_len = level_idx + 1
         parent_p = _aggregate_min_p_at_level_spatial(
-            cell_p_values, spatial_prefix_len=prefix_len, spatial_n=spatial_n,
+            cell_p_values,
+            spatial_prefix_len=prefix_len,
+            spatial_n=spatial_n,
         )
         q_map, surviving = _apply_fdr_at_level(
-            parent_p, method=method, alpha=alpha,
+            parent_p,
+            method=method,
+            alpha=alpha,
         )
         for cell in cell_p_values:
             parent = cell[:prefix_len]
@@ -484,10 +518,12 @@ def fdr_multi_resolution(
             temporal_prefix_len=prefix_len,
         )
         q_map, surviving = _apply_fdr_at_level(
-            parent_p, method=method, alpha=alpha,
+            parent_p,
+            method=method,
+            alpha=alpha,
         )
         for cell in cell_p_values:
-            parent = cell[spatial_n:spatial_n + prefix_len]
+            parent = cell[spatial_n : spatial_n + prefix_len]
             q = q_map.get(parent, 1.0)
             if q > cell_max_q[cell]:
                 cell_max_q[cell] = q

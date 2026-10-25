@@ -3,6 +3,7 @@
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
 """Unit + integration tests for trace_root_cause."""
+
 from __future__ import annotations
 
 from dataclasses import asdict
@@ -103,6 +104,7 @@ class TestTraceRootCauseUnit:
                 "primary_key": pk,
                 "pattern_id": pid,
             }
+
         monkeypatch.setattr(GDSNavigator, "explain_anomaly", fake_explain)
         result = nav_mock.trace_root_cause("whatever", "test_pattern")
         assert result["hop_count"] == 1
@@ -124,6 +126,7 @@ class TestTraceRootCauseUnit:
                 "pattern_id": pid,
                 "delta_norm": 6.3,
             }
+
         monkeypatch.setattr(GDSNavigator, "explain_anomaly", fake_explain)
         result = nav_mock.trace_root_cause("ACC-1", "test_pattern", max_depth=0)
         assert result["hop_count"] == 1
@@ -156,8 +159,10 @@ class TestTraceRootCauseUnit:
         monkeypatch.setattr(GDSNavigator, "π7_attract_hub", fake_hub)
 
         result = nav_mock.trace_root_cause(
-            "ACC-1", "test_pattern",
-            max_depth=1, max_branches=2,
+            "ACC-1",
+            "test_pattern",
+            max_depth=1,
+            max_branches=2,
         )
         assert len(result["root"]["children"]) <= 2
         assert result["branches_explored"] <= 2
@@ -165,7 +170,8 @@ class TestTraceRootCauseUnit:
     def _stub_graph_companion(self, monkeypatch, graph_pid: str = "graph_pid"):
         """Make _resolve_edge_pattern_for_anchor return a truthy graph pid for unit tests."""
         monkeypatch.setattr(
-            GDSNavigator, "_resolve_edge_pattern_for_anchor",
+            GDSNavigator,
+            "_resolve_edge_pattern_for_anchor",
             lambda self, pid: graph_pid,
         )
 
@@ -225,6 +231,7 @@ class TestTraceRootCauseUnit:
 
     def test_unknown_pattern_raises(self, nav_mock):
         from hypertopos.navigation.navigator import GDSNavigationError
+
         with pytest.raises(GDSNavigationError):
             nav_mock.trace_root_cause("ACC-1", "does_not_exist")
 
@@ -255,7 +262,8 @@ class TestTraceRootCauseRecursion:
 
     def _stub_graph_companion(self, monkeypatch, graph_pid: str = "graph_pid"):
         monkeypatch.setattr(
-            GDSNavigator, "_resolve_edge_pattern_for_anchor",
+            GDSNavigator,
+            "_resolve_edge_pattern_for_anchor",
             lambda self, pid: graph_pid,
         )
 
@@ -276,9 +284,12 @@ class TestTraceRootCauseRecursion:
 
         def fake_counterparties(self, pk, line_id, from_col, to_col, **kw):
             if pk == "ACC-ROOT":
-                return {"incoming": [], "outgoing": [
-                    {"primary_key": "ACC-CP", "is_anomaly": True, "delta_norm": 4.1},
-                ]}
+                return {
+                    "incoming": [],
+                    "outgoing": [
+                        {"primary_key": "ACC-CP", "is_anomaly": True, "delta_norm": 4.1},
+                    ],
+                }
             return {"outgoing": [], "incoming": []}
 
         def fake_contagion(self, pk, pid, **kw):
@@ -306,7 +317,8 @@ class TestTraceRootCauseRecursion:
         must be called with the COMPANION pid, not the anchor pid."""
         nav = self._make_nav_with_relations()
         monkeypatch.setattr(
-            GDSNavigator, "_resolve_edge_pattern_for_anchor",
+            GDSNavigator,
+            "_resolve_edge_pattern_for_anchor",
             lambda self, pid: "event_companion",
         )
 
@@ -317,7 +329,9 @@ class TestTraceRootCauseRecursion:
             return {
                 "severity": "critical",
                 "top_dimensions": [{"label": "amount_std", "z_score": 4.2, "contribution": 0.7}],
-                "primary_key": pk, "pattern_id": pid, "delta_norm": 6.3,
+                "primary_key": pk,
+                "pattern_id": pid,
+                "delta_norm": 6.3,
             }
 
         def fake_contagion(self, pk, pid, **kw):
@@ -345,7 +359,8 @@ class TestTraceRootCauseRecursion:
         contagion_score and find_counterparties are not called at all."""
         nav = self._make_nav_with_relations()
         monkeypatch.setattr(
-            GDSNavigator, "_resolve_edge_pattern_for_anchor",
+            GDSNavigator,
+            "_resolve_edge_pattern_for_anchor",
             lambda self, pid: None,
         )
 
@@ -356,7 +371,9 @@ class TestTraceRootCauseRecursion:
             return {
                 "severity": "critical",
                 "top_dimensions": [{"label": "x", "z_score": 5.0, "contribution": 0.8}],
-                "primary_key": pk, "pattern_id": pid, "delta_norm": 6.0,
+                "primary_key": pk,
+                "pattern_id": pid,
+                "delta_norm": 6.0,
             }
 
         def tracking_contagion(self, pk, pid, **kw):
@@ -438,12 +455,18 @@ class TestTraceRootCauseRecursion:
         def fake_counterparties(self, pk, line_id, from_col, to_col, **kw):
             # A → B, then B → A: the second hop must NOT recurse.
             if pk == "ACC-ROOT":
-                return {"incoming": [], "outgoing": [
-                    {"primary_key": "ACC-B", "is_anomaly": True, "delta_rank_pct": 99.5},
-                ]}
-            return {"incoming": [], "outgoing": [
-                {"primary_key": "ACC-ROOT", "is_anomaly": True, "delta_rank_pct": 99.5},
-            ]}
+                return {
+                    "incoming": [],
+                    "outgoing": [
+                        {"primary_key": "ACC-B", "is_anomaly": True, "delta_rank_pct": 99.5},
+                    ],
+                }
+            return {
+                "incoming": [],
+                "outgoing": [
+                    {"primary_key": "ACC-ROOT", "is_anomaly": True, "delta_rank_pct": 99.5},
+                ],
+            }
 
         def fake_contagion(self, pk, pid, **kw):
             return {"score": 0.0, "total_counterparties": 0}
@@ -490,7 +513,8 @@ class TestTraceRootCauseQualityFixes:
 
     def _stub_companion(self, monkeypatch, pid: str = "graph_pid"):
         monkeypatch.setattr(
-            GDSNavigator, "_resolve_edge_pattern_for_anchor",
+            GDSNavigator,
+            "_resolve_edge_pattern_for_anchor",
             lambda self, p: pid,
         )
         monkeypatch.setattr(GDSNavigator, "_resolve_version", lambda self, p: 1)
@@ -505,27 +529,43 @@ class TestTraceRootCauseQualityFixes:
         nav = self._make_nav()
         self._stub_companion(monkeypatch)
 
-        monkeypatch.setattr(GDSNavigator, "explain_anomaly", lambda self, pk, pid: {
-            "severity": "critical",
-            "top_dimensions": [{"label": "amount_std"}],
-            "delta_norm": 5.0, "conformal_p": 1e-5,
-        })
-        monkeypatch.setattr(GDSNavigator, "contagion_score", lambda self, pk, pid, **kw: {
-            "score": 0.0, "total_counterparties": 0,
-        })
+        monkeypatch.setattr(
+            GDSNavigator,
+            "explain_anomaly",
+            lambda self, pk, pid: {
+                "severity": "critical",
+                "top_dimensions": [{"label": "amount_std"}],
+                "delta_norm": 5.0,
+                "conformal_p": 1e-5,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "contagion_score",
+            lambda self, pk, pid, **kw: {
+                "score": 0.0,
+                "total_counterparties": 0,
+            },
+        )
         monkeypatch.setattr(GDSNavigator, "π7_attract_hub", lambda self, pid, top_n=10, **kw: [])
 
         # HIGH_VOL is the high-volume BUT NOT anomalous cp; LOW_VOL_ANOM is the tail-end
         # of the volume list but flagged anomalous. Previous code picked HIGH_VOL_ANOM
         # only if it happened to be in top-by-volume; the fix sorts by is_anomaly first.
-        monkeypatch.setattr(GDSNavigator, "find_counterparties",
+        monkeypatch.setattr(
+            GDSNavigator,
+            "find_counterparties",
             lambda self, pk, line_id, from_col, to_col, **kw: {
                 "incoming": [],
                 "outgoing": [
                     {"primary_key": "HIGH_VOL", "is_anomaly": False, "delta_rank_pct": 50.0},
                     {"primary_key": "HIGHER_VOL", "is_anomaly": False, "delta_rank_pct": 60.0},
                     {"primary_key": "LOW_VOL_ANOM", "is_anomaly": True, "delta_rank_pct": 99.5},
-                    {"primary_key": "LOW_VOL_ANOM_WEAK", "is_anomaly": True, "delta_rank_pct": 90.0},
+                    {
+                        "primary_key": "LOW_VOL_ANOM_WEAK",
+                        "is_anomaly": True,
+                        "delta_rank_pct": 90.0,
+                    },
                 ],
             },
         )
@@ -541,15 +581,28 @@ class TestTraceRootCauseQualityFixes:
         nav = self._make_nav()
         self._stub_companion(monkeypatch)
 
-        monkeypatch.setattr(GDSNavigator, "explain_anomaly", lambda self, pk, pid: {
-            "severity": "critical",
-            "top_dimensions": [{"label": "x"}],
-            "delta_norm": 5.0, "conformal_p": 1e-5,
-        })
-        monkeypatch.setattr(GDSNavigator, "contagion_score", lambda self, pk, pid, **kw: {
-            "score": 0.35, "total_counterparties": 5, "anomalous_counterparties": 2,
-        })
-        monkeypatch.setattr(GDSNavigator, "find_counterparties",
+        monkeypatch.setattr(
+            GDSNavigator,
+            "explain_anomaly",
+            lambda self, pk, pid: {
+                "severity": "critical",
+                "top_dimensions": [{"label": "x"}],
+                "delta_norm": 5.0,
+                "conformal_p": 1e-5,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "contagion_score",
+            lambda self, pk, pid, **kw: {
+                "score": 0.35,
+                "total_counterparties": 5,
+                "anomalous_counterparties": 2,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "find_counterparties",
             lambda self, pk, line_id, from_col, to_col, **kw: {
                 "incoming": [],
                 "outgoing": [
@@ -576,19 +629,34 @@ class TestTraceRootCauseQualityFixes:
         nav = self._make_nav()
         self._stub_companion(monkeypatch)
 
-        monkeypatch.setattr(GDSNavigator, "explain_anomaly", lambda self, pk, pid: {
-            "severity": "extreme",
-            "top_dimensions": [{"label": "x"}],
-            "delta_norm": 5.0, "conformal_p": 1e-5,
-        })
+        monkeypatch.setattr(
+            GDSNavigator,
+            "explain_anomaly",
+            lambda self, pk, pid: {
+                "severity": "extreme",
+                "top_dimensions": [{"label": "x"}],
+                "delta_norm": 5.0,
+                "conformal_p": 1e-5,
+            },
+        )
         # contagion 0.8 → critical (new scale); previously was "high"
-        monkeypatch.setattr(GDSNavigator, "contagion_score", lambda self, pk, pid, **kw: {
-            "score": 0.8, "total_counterparties": 10, "anomalous_counterparties": 8,
-        })
-        monkeypatch.setattr(GDSNavigator, "find_counterparties",
+        monkeypatch.setattr(
+            GDSNavigator,
+            "contagion_score",
+            lambda self, pk, pid, **kw: {
+                "score": 0.8,
+                "total_counterparties": 10,
+                "anomalous_counterparties": 8,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "find_counterparties",
             lambda self, pk, line_id, from_col, to_col, **kw: {"outgoing": [], "incoming": []},
         )
-        monkeypatch.setattr(GDSNavigator, "π7_attract_hub",
+        monkeypatch.setattr(
+            GDSNavigator,
+            "π7_attract_hub",
             lambda self, pid, top_n=10, **kw: [("ACC-1", 5, 0.5)],
         )
 
@@ -607,17 +675,30 @@ class TestTraceRootCauseQualityFixes:
         nav = self._make_nav()
         self._stub_companion(monkeypatch)
 
-        monkeypatch.setattr(GDSNavigator, "explain_anomaly", lambda self, pk, pid: {
-            "severity": "extreme",
-            "top_dimensions": [{"label": "x"}],
-            "delta_norm": 5.0, "conformal_p": 1e-5,
-        })
+        monkeypatch.setattr(
+            GDSNavigator,
+            "explain_anomaly",
+            lambda self, pk, pid: {
+                "severity": "extreme",
+                "top_dimensions": [{"label": "x"}],
+                "delta_norm": 5.0,
+                "conformal_p": 1e-5,
+            },
+        )
         # Weak contagion (low) + anomalous cp (extreme) + hub (extreme)
         # max_branches=2: must keep the TWO extreme ones, drop the low one.
-        monkeypatch.setattr(GDSNavigator, "contagion_score", lambda self, pk, pid, **kw: {
-            "score": 0.15, "total_counterparties": 10, "anomalous_counterparties": 1,
-        })
-        monkeypatch.setattr(GDSNavigator, "find_counterparties",
+        monkeypatch.setattr(
+            GDSNavigator,
+            "contagion_score",
+            lambda self, pk, pid, **kw: {
+                "score": 0.15,
+                "total_counterparties": 10,
+                "anomalous_counterparties": 1,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "find_counterparties",
             lambda self, pk, line_id, from_col, to_col, **kw: {
                 "incoming": [],
                 "outgoing": [
@@ -625,7 +706,9 @@ class TestTraceRootCauseQualityFixes:
                 ],
             },
         )
-        monkeypatch.setattr(GDSNavigator, "π7_attract_hub",
+        monkeypatch.setattr(
+            GDSNavigator,
+            "π7_attract_hub",
             lambda self, pid, top_n=10, **kw: [("ACC-1", 99, 0.99)],
         )
 
@@ -642,15 +725,28 @@ class TestTraceRootCauseQualityFixes:
         nav = self._make_nav()
         self._stub_companion(monkeypatch)
 
-        monkeypatch.setattr(GDSNavigator, "explain_anomaly", lambda self, pk, pid: {
-            "severity": "extreme",
-            "top_dimensions": [{"label": "x"}],
-            "delta_norm": 5.0, "conformal_p": 1e-5,
-        })
-        monkeypatch.setattr(GDSNavigator, "contagion_score", lambda self, pk, pid, **kw: {
-            "score": 0.9, "total_counterparties": 10, "anomalous_counterparties": 9,
-        })
-        monkeypatch.setattr(GDSNavigator, "find_counterparties",
+        monkeypatch.setattr(
+            GDSNavigator,
+            "explain_anomaly",
+            lambda self, pk, pid: {
+                "severity": "extreme",
+                "top_dimensions": [{"label": "x"}],
+                "delta_norm": 5.0,
+                "conformal_p": 1e-5,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "contagion_score",
+            lambda self, pk, pid, **kw: {
+                "score": 0.9,
+                "total_counterparties": 10,
+                "anomalous_counterparties": 9,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "find_counterparties",
             lambda self, pk, line_id, from_col, to_col, **kw: {"outgoing": [], "incoming": []},
         )
         monkeypatch.setattr(GDSNavigator, "π7_attract_hub", lambda self, pid, top_n=10, **kw: [])
@@ -664,15 +760,28 @@ class TestTraceRootCauseQualityFixes:
         nav = self._make_nav()
         self._stub_companion(monkeypatch)
 
-        monkeypatch.setattr(GDSNavigator, "explain_anomaly", lambda self, pk, pid: {
-            "severity": "extreme",
-            "top_dimensions": [{"label": "x"}],
-            "delta_norm": 5.0, "conformal_p": 1e-5,
-        })
-        monkeypatch.setattr(GDSNavigator, "contagion_score", lambda self, pk, pid, **kw: {
-            "score": 0.05, "total_counterparties": 20, "anomalous_counterparties": 1,
-        })
-        monkeypatch.setattr(GDSNavigator, "find_counterparties",
+        monkeypatch.setattr(
+            GDSNavigator,
+            "explain_anomaly",
+            lambda self, pk, pid: {
+                "severity": "extreme",
+                "top_dimensions": [{"label": "x"}],
+                "delta_norm": 5.0,
+                "conformal_p": 1e-5,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "contagion_score",
+            lambda self, pk, pid, **kw: {
+                "score": 0.05,
+                "total_counterparties": 20,
+                "anomalous_counterparties": 1,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "find_counterparties",
             lambda self, pk, line_id, from_col, to_col, **kw: {"outgoing": [], "incoming": []},
         )
         monkeypatch.setattr(GDSNavigator, "π7_attract_hub", lambda self, pid, top_n=10, **kw: [])
@@ -684,8 +793,10 @@ class TestTraceRootCauseQualityFixes:
 
         # Lower the threshold → branch fires
         result2 = nav.trace_root_cause(
-            "ACC-1", "test_pattern",
-            max_depth=1, contagion_min_threshold=0.01,
+            "ACC-1",
+            "test_pattern",
+            max_depth=1,
+            contagion_min_threshold=0.01,
         )
         roles2 = {c["role"] for c in result2["root"]["children"]}
         assert "neighbor_contamination" in roles2
@@ -699,19 +810,32 @@ class TestTraceRootCauseQualityFixes:
         sphere = nav._storage.read_sphere()
         sphere.patterns["test_pattern"].population_size = 100_000
 
-        monkeypatch.setattr(GDSNavigator, "explain_anomaly", lambda self, pk, pid: {
-            "severity": "extreme",
-            "top_dimensions": [{"label": "x"}],
-            "delta_norm": 5.0, "conformal_p": 1e-5,
-        })
-        monkeypatch.setattr(GDSNavigator, "contagion_score", lambda self, pk, pid, **kw: {
-            "score": 0.0, "total_counterparties": 0,
-        })
-        monkeypatch.setattr(GDSNavigator, "find_counterparties",
+        monkeypatch.setattr(
+            GDSNavigator,
+            "explain_anomaly",
+            lambda self, pk, pid: {
+                "severity": "extreme",
+                "top_dimensions": [{"label": "x"}],
+                "delta_norm": 5.0,
+                "conformal_p": 1e-5,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "contagion_score",
+            lambda self, pk, pid, **kw: {
+                "score": 0.0,
+                "total_counterparties": 0,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "find_counterparties",
             lambda self, pk, line_id, from_col, to_col, **kw: {"outgoing": [], "incoming": []},
         )
 
         hub_calls = []
+
         def tracking_hub(self, pid, top_n=10, **kw):
             hub_calls.append(pid)
             return [("ACC-1", 99, 0.99)]
@@ -726,7 +850,10 @@ class TestTraceRootCauseQualityFixes:
 
         # Raise the limit — hub branch fires
         result2 = nav.trace_root_cause(
-            "ACC-1", "test_pattern", max_depth=1, hub_pop_limit=200_000,
+            "ACC-1",
+            "test_pattern",
+            max_depth=1,
+            hub_pop_limit=200_000,
         )
         roles2 = {c["role"] for c in result2["root"]["children"]}
         assert "hub" in roles2
@@ -737,23 +864,38 @@ class TestTraceRootCauseQualityFixes:
         nav = self._make_nav()
         self._stub_companion(monkeypatch)
 
-        monkeypatch.setattr(GDSNavigator, "explain_anomaly", lambda self, pk, pid: {
-            "severity": "extreme",
-            "top_dimensions": [{"label": "x"}],
-            "delta_norm": 5.0, "conformal_p": 1e-5,
-        })
-        monkeypatch.setattr(GDSNavigator, "contagion_score", lambda self, pk, pid, **kw: {
-            "score": 0.0, "total_counterparties": 0,
-        })
+        monkeypatch.setattr(
+            GDSNavigator,
+            "explain_anomaly",
+            lambda self, pk, pid: {
+                "severity": "extreme",
+                "top_dimensions": [{"label": "x"}],
+                "delta_norm": 5.0,
+                "conformal_p": 1e-5,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "contagion_score",
+            lambda self, pk, pid, **kw: {
+                "score": 0.0,
+                "total_counterparties": 0,
+            },
+        )
 
         chain_depth = {"n": 0}
+
         def fake_counterparties(self, pk, line_id, from_col, to_col, **kw):
             chain_depth["n"] += 1
             # Each cp points to a unique new entity, so recursion would continue until depth cap
             return {
                 "incoming": [],
                 "outgoing": [
-                    {"primary_key": f"ACC-CHAIN-{chain_depth['n']}", "is_anomaly": True, "delta_rank_pct": 99.9},
+                    {
+                        "primary_key": f"ACC-CHAIN-{chain_depth['n']}",
+                        "is_anomaly": True,
+                        "delta_rank_pct": 99.9,
+                    },
                 ],
             }
 
@@ -761,8 +903,11 @@ class TestTraceRootCauseQualityFixes:
         monkeypatch.setattr(GDSNavigator, "π7_attract_hub", lambda self, pid, top_n=10, **kw: [])
 
         result = nav.trace_root_cause(
-            "ACC-ROOT", "test_pattern",
-            max_depth=20, max_branches=1, max_total_nodes=3,
+            "ACC-ROOT",
+            "test_pattern",
+            max_depth=20,
+            max_branches=1,
+            max_total_nodes=3,
         )
         # Cap enforced: no more than 3 nodes expanded
         assert result["hop_count"] <= 3
@@ -774,30 +919,50 @@ class TestTraceRootCauseQualityFixes:
 
         calls = {"resolve_companion": 0, "resolve_version": 0, "hub": 0}
 
-        monkeypatch.setattr(GDSNavigator, "_resolve_edge_pattern_for_anchor",
-            lambda self, p: (calls.__setitem__("resolve_companion", calls["resolve_companion"] + 1) or "graph_pid"),
+        monkeypatch.setattr(
+            GDSNavigator,
+            "_resolve_edge_pattern_for_anchor",
+            lambda self, p: (
+                calls.__setitem__("resolve_companion", calls["resolve_companion"] + 1)
+                or "graph_pid"
+            ),
         )
 
         version_holder = {"v": 7}
+
         def version_fn(self, p):
             calls["resolve_version"] += 1
             return version_holder["v"]
+
         monkeypatch.setattr(GDSNavigator, "_resolve_version", version_fn)
 
         def hub_fn(self, pid, top_n=10, **kw):
             calls["hub"] += 1
             return [("ACC-1", 5, 0.5)]
+
         monkeypatch.setattr(GDSNavigator, "π7_attract_hub", hub_fn)
 
-        monkeypatch.setattr(GDSNavigator, "explain_anomaly", lambda self, pk, pid: {
-            "severity": "extreme",
-            "top_dimensions": [{"label": "x"}],
-            "delta_norm": 5.0, "conformal_p": 1e-5,
-        })
-        monkeypatch.setattr(GDSNavigator, "contagion_score", lambda self, pk, pid, **kw: {
-            "score": 0.0, "total_counterparties": 0,
-        })
-        monkeypatch.setattr(GDSNavigator, "find_counterparties",
+        monkeypatch.setattr(
+            GDSNavigator,
+            "explain_anomaly",
+            lambda self, pk, pid: {
+                "severity": "extreme",
+                "top_dimensions": [{"label": "x"}],
+                "delta_norm": 5.0,
+                "conformal_p": 1e-5,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "contagion_score",
+            lambda self, pk, pid, **kw: {
+                "score": 0.0,
+                "total_counterparties": 0,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "find_counterparties",
             lambda self, pk, line_id, from_col, to_col, **kw: {"outgoing": [], "incoming": []},
         )
 
@@ -819,15 +984,27 @@ class TestTraceRootCauseQualityFixes:
         nav = self._make_nav()
         self._stub_companion(monkeypatch)
 
-        monkeypatch.setattr(GDSNavigator, "explain_anomaly", lambda self, pk, pid: {
-            "severity": "medium",  # legacy scale
-            "top_dimensions": [{"label": "x"}],
-            "delta_norm": 5.0, "conformal_p": 1e-5,
-        })
-        monkeypatch.setattr(GDSNavigator, "contagion_score", lambda self, pk, pid, **kw: {
-            "score": 0.0, "total_counterparties": 0,
-        })
-        monkeypatch.setattr(GDSNavigator, "find_counterparties",
+        monkeypatch.setattr(
+            GDSNavigator,
+            "explain_anomaly",
+            lambda self, pk, pid: {
+                "severity": "medium",  # legacy scale
+                "top_dimensions": [{"label": "x"}],
+                "delta_norm": 5.0,
+                "conformal_p": 1e-5,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "contagion_score",
+            lambda self, pk, pid, **kw: {
+                "score": 0.0,
+                "total_counterparties": 0,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "find_counterparties",
             lambda self, pk, line_id, from_col, to_col, **kw: {"outgoing": [], "incoming": []},
         )
         monkeypatch.setattr(GDSNavigator, "π7_attract_hub", lambda self, pid, top_n=10, **kw: [])
@@ -840,15 +1017,27 @@ class TestTraceRootCauseQualityFixes:
         nav = self._make_nav()
         self._stub_companion(monkeypatch)
 
-        monkeypatch.setattr(GDSNavigator, "explain_anomaly", lambda self, pk, pid: {
-            "severity": "extreme",
-            "top_dimensions": [{"label": "x"}],
-            "delta_norm": 5.0, "conformal_p": 1e-5,
-        })
-        monkeypatch.setattr(GDSNavigator, "contagion_score", lambda self, pk, pid, **kw: {
-            "score": 0.0, "total_counterparties": 0,
-        })
-        monkeypatch.setattr(GDSNavigator, "find_counterparties",
+        monkeypatch.setattr(
+            GDSNavigator,
+            "explain_anomaly",
+            lambda self, pk, pid: {
+                "severity": "extreme",
+                "top_dimensions": [{"label": "x"}],
+                "delta_norm": 5.0,
+                "conformal_p": 1e-5,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "contagion_score",
+            lambda self, pk, pid, **kw: {
+                "score": 0.0,
+                "total_counterparties": 0,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "find_counterparties",
             lambda self, pk, line_id, from_col, to_col, **kw: {
                 "outgoing": [
                     {"primary_key": "ANOM1", "is_anomaly": True, "delta_rank_pct": 99.9},
@@ -861,8 +1050,11 @@ class TestTraceRootCauseQualityFixes:
         monkeypatch.setattr(GDSNavigator, "π7_attract_hub", lambda self, pid, top_n=10, **kw: [])
 
         result = nav.trace_root_cause(
-            "ACC-1", "test_pattern",
-            max_depth=2, max_branches=5, edge_counterparty_top_n=2,
+            "ACC-1",
+            "test_pattern",
+            max_depth=2,
+            max_branches=5,
+            edge_counterparty_top_n=2,
         )
         edge_cps = [c for c in result["root"]["children"] if c["role"] == "edge_counterparty"]
         assert len(edge_cps) == 2
@@ -875,21 +1067,37 @@ class TestTraceRootCauseQualityFixes:
         nav = self._make_nav()
         self._stub_companion(monkeypatch)
 
-        monkeypatch.setattr(GDSNavigator, "explain_anomaly", lambda self, pk, pid: {
-            "severity": "extreme",
-            "top_dimensions": [{"label": "x"}],
-            "delta_norm": 5.0, "conformal_p": 1e-5,
-        })
-        monkeypatch.setattr(GDSNavigator, "contagion_score", lambda self, pk, pid, **kw: {
-            "score": 0.0, "total_counterparties": 0,
-        })
-        monkeypatch.setattr(GDSNavigator, "find_counterparties",
-            lambda self, pk, line_id, from_col, to_col, **kw: {
-                "outgoing": [
-                    {"primary_key": "ANOM1", "is_anomaly": True, "delta_rank_pct": 99.5},
-                ],
-                "incoming": [],
-            } if pk == "ACC-1" else {"outgoing": [], "incoming": []},
+        monkeypatch.setattr(
+            GDSNavigator,
+            "explain_anomaly",
+            lambda self, pk, pid: {
+                "severity": "extreme",
+                "top_dimensions": [{"label": "x"}],
+                "delta_norm": 5.0,
+                "conformal_p": 1e-5,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "contagion_score",
+            lambda self, pk, pid, **kw: {
+                "score": 0.0,
+                "total_counterparties": 0,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "find_counterparties",
+            lambda self, pk, line_id, from_col, to_col, **kw: (
+                {
+                    "outgoing": [
+                        {"primary_key": "ANOM1", "is_anomaly": True, "delta_rank_pct": 99.5},
+                    ],
+                    "incoming": [],
+                }
+                if pk == "ACC-1"
+                else {"outgoing": [], "incoming": []}
+            ),
         )
         monkeypatch.setattr(GDSNavigator, "π7_attract_hub", lambda self, pid, top_n=10, **kw: [])
 
@@ -917,16 +1125,24 @@ class TestTraceRootCauseQualityFixes:
             cps_calls.append(pk)
             # ACC-1 → ACC-2, ACC-2 has no further anomalous cps
             if pk == "ACC-1":
-                return {"outgoing": [
-                    {"primary_key": "ACC-2", "is_anomaly": True, "delta_rank_pct": 99.0},
-                ], "incoming": []}
+                return {
+                    "outgoing": [
+                        {"primary_key": "ACC-2", "is_anomaly": True, "delta_rank_pct": 99.0},
+                    ],
+                    "incoming": [],
+                }
             return {"outgoing": [], "incoming": []}
 
-        monkeypatch.setattr(GDSNavigator, "explain_anomaly", lambda self, pk, pid: {
-            "severity": "extreme",
-            "top_dimensions": [{"label": "x"}],
-            "delta_norm": 5.0, "conformal_p": 1e-5,
-        })
+        monkeypatch.setattr(
+            GDSNavigator,
+            "explain_anomaly",
+            lambda self, pk, pid: {
+                "severity": "extreme",
+                "top_dimensions": [{"label": "x"}],
+                "delta_norm": 5.0,
+                "conformal_p": 1e-5,
+            },
+        )
         monkeypatch.setattr(GDSNavigator, "contagion_score", fake_contagion)
         monkeypatch.setattr(GDSNavigator, "find_counterparties", fake_cps)
         monkeypatch.setattr(GDSNavigator, "π7_attract_hub", lambda self, pid, top_n=10, **kw: [])
@@ -942,15 +1158,23 @@ class TestTraceRootCauseQualityFixes:
     def test_branches_enabled_rejects_invalid_values(self, monkeypatch):
         """Typos in branches_enabled must error loudly, not silently disable everything."""
         from hypertopos.navigation.navigator import GDSNavigationError
+
         nav = self._make_nav()
         self._stub_companion(monkeypatch)
-        monkeypatch.setattr(GDSNavigator, "explain_anomaly", lambda self, pk, pid: {
-            "severity": "extreme", "top_dimensions": [{"label": "x"}],
-            "delta_norm": 5.0, "conformal_p": 1e-5,
-        })
+        monkeypatch.setattr(
+            GDSNavigator,
+            "explain_anomaly",
+            lambda self, pk, pid: {
+                "severity": "extreme",
+                "top_dimensions": [{"label": "x"}],
+                "delta_norm": 5.0,
+                "conformal_p": 1e-5,
+            },
+        )
         with pytest.raises(GDSNavigationError, match="invalid values"):
             nav.trace_root_cause(
-                "ACC-1", "test_pattern",
+                "ACC-1",
+                "test_pattern",
                 branches_enabled=["kubelek", "hub"],
             )
 
@@ -958,16 +1182,30 @@ class TestTraceRootCauseQualityFixes:
         """revisits_root carries the list of cp keys that equal the root, not just a bool."""
         nav = self._make_nav()
         self._stub_companion(monkeypatch)
-        monkeypatch.setattr(GDSNavigator, "explain_anomaly", lambda self, pk, pid: {
-            "severity": "extreme", "top_dimensions": [{"label": "x"}],
-            "delta_norm": 5.0, "conformal_p": 1e-5,
-        })
+        monkeypatch.setattr(
+            GDSNavigator,
+            "explain_anomaly",
+            lambda self, pk, pid: {
+                "severity": "extreme",
+                "top_dimensions": [{"label": "x"}],
+                "delta_norm": 5.0,
+                "conformal_p": 1e-5,
+            },
+        )
         # When tracing ACC-1, its contagion_score reports ACC-1 itself as one of the
         # anomalous counterparties (self-loop clique indicator).
-        monkeypatch.setattr(GDSNavigator, "contagion_score", lambda self, pk, pid, **kw: {
-            "score": 0.5, "total_counterparties": 4, "anomalous_counterparties": 2,
-        })
-        monkeypatch.setattr(GDSNavigator, "find_counterparties",
+        monkeypatch.setattr(
+            GDSNavigator,
+            "contagion_score",
+            lambda self, pk, pid, **kw: {
+                "score": 0.5,
+                "total_counterparties": 4,
+                "anomalous_counterparties": 2,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "find_counterparties",
             lambda self, pk, line_id, from_col, to_col, **kw: {
                 "outgoing": [
                     {"primary_key": "ACC-1", "is_anomaly": True, "delta_rank_pct": 99.0},
@@ -996,19 +1234,33 @@ class TestTraceRootCauseQualityFixes:
         on ACC-B surfaces ACC-A via `previously_seen_as_cp_of`."""
         nav = self._make_nav()
         self._stub_companion(monkeypatch)
-        monkeypatch.setattr(GDSNavigator, "explain_anomaly", lambda self, pk, pid: {
-            "severity": "extreme", "top_dimensions": [{"label": "x"}],
-            "delta_norm": 5.0, "conformal_p": 1e-5,
-        })
-        monkeypatch.setattr(GDSNavigator, "contagion_score", lambda self, pk, pid, **kw: {
-            "score": 0.5, "total_counterparties": 4, "anomalous_counterparties": 1,
-        })
+        monkeypatch.setattr(
+            GDSNavigator,
+            "explain_anomaly",
+            lambda self, pk, pid: {
+                "severity": "extreme",
+                "top_dimensions": [{"label": "x"}],
+                "delta_norm": 5.0,
+                "conformal_p": 1e-5,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "contagion_score",
+            lambda self, pk, pid, **kw: {
+                "score": 0.5,
+                "total_counterparties": 4,
+                "anomalous_counterparties": 1,
+            },
+        )
 
         def cps_fn(self, pk, line_id, from_col, to_col, **kw):
             # ACC-A's cps include ACC-B as anomalous
             if pk == "ACC-A":
                 return {
-                    "outgoing": [{"primary_key": "ACC-B", "is_anomaly": True, "delta_rank_pct": 99.0}],
+                    "outgoing": [
+                        {"primary_key": "ACC-B", "is_anomaly": True, "delta_rank_pct": 99.0}
+                    ],
                     "incoming": [],
                 }
             # ACC-B's cps are NOT anomalous — isolated
@@ -1032,14 +1284,27 @@ class TestTraceRootCauseQualityFixes:
         """When contagion cache exceeds _LRU_MAX, oldest entries are evicted."""
         nav = self._make_nav()
         self._stub_companion(monkeypatch)
-        monkeypatch.setattr(GDSNavigator, "explain_anomaly", lambda self, pk, pid: {
-            "severity": "extreme", "top_dimensions": [{"label": "x"}],
-            "delta_norm": 5.0, "conformal_p": 1e-5,
-        })
-        monkeypatch.setattr(GDSNavigator, "contagion_score", lambda self, pk, pid, **kw: {
-            "score": 0.0, "total_counterparties": 0,
-        })
-        monkeypatch.setattr(GDSNavigator, "find_counterparties",
+        monkeypatch.setattr(
+            GDSNavigator,
+            "explain_anomaly",
+            lambda self, pk, pid: {
+                "severity": "extreme",
+                "top_dimensions": [{"label": "x"}],
+                "delta_norm": 5.0,
+                "conformal_p": 1e-5,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "contagion_score",
+            lambda self, pk, pid, **kw: {
+                "score": 0.0,
+                "total_counterparties": 0,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "find_counterparties",
             lambda self, pk, line_id, from_col, to_col, **kw: {"outgoing": [], "incoming": []},
         )
         monkeypatch.setattr(GDSNavigator, "π7_attract_hub", lambda self, pid, top_n=10, **kw: [])
@@ -1071,8 +1336,7 @@ class TestTraceRootCauseQualityFixes:
             # skip-on-failure would silently erode: a fixture refactor could make
             # this test no-op without anyone noticing. Assert the preconditions.
             anchor_pids = [
-                pid for pid, pat in sphere.patterns.items()
-                if pat.pattern_type == "anchor"
+                pid for pid, pat in sphere.patterns.items() if pat.pattern_type == "anchor"
             ]
             assert anchor_pids, (
                 "Fixture regression: sales_sphere has no anchor pattern. "
@@ -1092,7 +1356,9 @@ class TestTraceRootCauseQualityFixes:
             if anomalies:
                 first = anomalies[0]
                 # π5_attract_anomaly may return Polygon objects or (key, score) tuples
-                pk = getattr(first, "primary_key", None) or (first[0] if isinstance(first, tuple) else None)
+                pk = getattr(first, "primary_key", None) or (
+                    first[0] if isinstance(first, tuple) else None
+                )
             if pk is None:
                 # Fallback: first entity from the anchor line.
                 home_line = sphere.entity_line(pid)
@@ -1101,7 +1367,9 @@ class TestTraceRootCauseQualityFixes:
                 )
                 version = nav._resolve_version(pid)
                 geo = session._reader.read_geometry(
-                    pid, version, columns=["primary_key"],
+                    pid,
+                    version,
+                    columns=["primary_key"],
                 )
                 assert geo.num_rows > 0, (
                     f"Fixture regression: pattern '{pid}' has zero entities in geometry."
@@ -1111,7 +1379,11 @@ class TestTraceRootCauseQualityFixes:
             # Smoke: the call must not raise, must return all wrapper keys.
             result = nav.trace_root_cause(pk, pid, max_depth=2, max_branches=3)
             assert set(result.keys()) == {
-                "root", "summary", "hop_count", "branches_explored", "truncated",
+                "root",
+                "summary",
+                "hop_count",
+                "branches_explored",
+                "truncated",
             }
             assert result["root"]["entity_key"] == pk
             assert result["root"]["role"] == "root"
@@ -1133,28 +1405,50 @@ class TestTraceRootCauseQualityFixes:
         """edge_counterparty branch evidence includes edge_potential sub-dict."""
         nav = self._make_nav()
         self._stub_companion(monkeypatch)
-        monkeypatch.setattr(GDSNavigator, "explain_anomaly", lambda self, pk, pid: {
-            "severity": "extreme",
-            "top_dimensions": [{"label": "amount_out_std"}],
-            "delta_norm": 5.0, "conformal_p": 1e-5,
-        })
-        monkeypatch.setattr(GDSNavigator, "contagion_score", lambda self, pk, pid, **kw: {
-            "score": 0.0, "total_counterparties": 0,
-        })
-        monkeypatch.setattr(GDSNavigator, "find_counterparties",
-            lambda self, pk, line_id, from_col, to_col, **kw: {
-                "outgoing": [
-                    {"primary_key": "ANOM_CP", "is_anomaly": True, "delta_rank_pct": 99.5},
-                ],
-                "incoming": [],
-            } if pk == "ACC-1" else {"outgoing": [], "incoming": []},
+        monkeypatch.setattr(
+            GDSNavigator,
+            "explain_anomaly",
+            lambda self, pk, pid: {
+                "severity": "extreme",
+                "top_dimensions": [{"label": "amount_out_std"}],
+                "delta_norm": 5.0,
+                "conformal_p": 1e-5,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "contagion_score",
+            lambda self, pk, pid, **kw: {
+                "score": 0.0,
+                "total_counterparties": 0,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "find_counterparties",
+            lambda self, pk, line_id, from_col, to_col, **kw: (
+                {
+                    "outgoing": [
+                        {"primary_key": "ANOM_CP", "is_anomaly": True, "delta_rank_pct": 99.5},
+                    ],
+                    "incoming": [],
+                }
+                if pk == "ACC-1"
+                else {"outgoing": [], "incoming": []}
+            ),
         )
         monkeypatch.setattr(GDSNavigator, "π7_attract_hub", lambda self, pid, top_n=10, **kw: [])
-        monkeypatch.setattr(GDSNavigator, "edge_potential",
+        monkeypatch.setattr(
+            GDSNavigator,
+            "edge_potential",
             lambda self, fk, tk, pid, **kw: {
-                "score": 12.5, "delta_distance": 5.0,
-                "pair_tx_count": 1, "effective_weight": 1.0,
-                "from_key": fk, "to_key": tk, "pattern_id": pid,
+                "score": 12.5,
+                "delta_distance": 5.0,
+                "pair_tx_count": 1,
+                "effective_weight": 1.0,
+                "from_key": fk,
+                "to_key": tk,
+                "pattern_id": pid,
                 "interpretation": "stub",
             },
         )
@@ -1171,30 +1465,53 @@ class TestTraceRootCauseQualityFixes:
         """edge_counterparty evidence gets motif_potential block when cycle_2 exists seed<->cp."""
         nav = self._make_nav()
         self._stub_companion(monkeypatch)
-        monkeypatch.setattr(GDSNavigator, "explain_anomaly", lambda self, pk, pid: {
-            "severity": "extreme",
-            "top_dimensions": [{"label": "amount_out_std"}],
-            "delta_norm": 5.0, "conformal_p": 1e-5,
-        })
-        monkeypatch.setattr(GDSNavigator, "contagion_score", lambda self, pk, pid, **kw: {
-            "score": 0.0, "total_counterparties": 0,
-        })
-        monkeypatch.setattr(GDSNavigator, "find_counterparties",
-            lambda self, pk, line_id, from_col, to_col, **kw: {
-                "outgoing": [
-                    {"primary_key": "ANOM_CP", "is_anomaly": True, "delta_rank_pct": 99.5},
-                ],
-                "incoming": [],
-            } if pk == "ACC-1" else {"outgoing": [], "incoming": []},
-        )
-        monkeypatch.setattr(GDSNavigator, "π7_attract_hub", lambda self, pid, top_n=10, **kw: [])
-        monkeypatch.setattr(GDSNavigator, "edge_potential",
-            lambda self, fk, tk, pid, **kw: {
-                "score": 8.0, "delta_distance": 4.0,
-                "pair_tx_count": 1, "effective_weight": 1.0,
-                "from_key": fk, "to_key": tk, "pattern_id": pid,
+        monkeypatch.setattr(
+            GDSNavigator,
+            "explain_anomaly",
+            lambda self, pk, pid: {
+                "severity": "extreme",
+                "top_dimensions": [{"label": "amount_out_std"}],
+                "delta_norm": 5.0,
+                "conformal_p": 1e-5,
             },
         )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "contagion_score",
+            lambda self, pk, pid, **kw: {
+                "score": 0.0,
+                "total_counterparties": 0,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "find_counterparties",
+            lambda self, pk, line_id, from_col, to_col, **kw: (
+                {
+                    "outgoing": [
+                        {"primary_key": "ANOM_CP", "is_anomaly": True, "delta_rank_pct": 99.5},
+                    ],
+                    "incoming": [],
+                }
+                if pk == "ACC-1"
+                else {"outgoing": [], "incoming": []}
+            ),
+        )
+        monkeypatch.setattr(GDSNavigator, "π7_attract_hub", lambda self, pid, top_n=10, **kw: [])
+        monkeypatch.setattr(
+            GDSNavigator,
+            "edge_potential",
+            lambda self, fk, tk, pid, **kw: {
+                "score": 8.0,
+                "delta_distance": 4.0,
+                "pair_tx_count": 1,
+                "effective_weight": 1.0,
+                "from_key": fk,
+                "to_key": tk,
+                "pattern_id": pid,
+            },
+        )
+
         # Stub score_motif to return a cycle_2 for (ACC-1, ANOM_CP) pair.
         def _stub_score_motif(self, entity_key, motif_type, pattern_id, time_window_hours=None):
             if motif_type == "cycle_2" and entity_key == "ACC-1":
@@ -1205,11 +1522,14 @@ class TestTraceRootCauseQualityFixes:
                     "counterparty": "ANOM_CP",
                     "ring": ["ACC-1", "ANOM_CP"],
                     "score": 64.0,
+                    "log_score": 4.158883,
+                    "score_clamped": False,
                     "edges": [("ACC-1", "ANOM_CP"), ("ANOM_CP", "ACC-1")],
                     "time_window_hours": 24,
                     "pattern_id": pattern_id,
                 }
             return {"found": False, "score": 0.0, "motif_type": motif_type}
+
         monkeypatch.setattr(GDSNavigator, "score_motif", _stub_score_motif)
 
         result = nav.trace_root_cause("ACC-1", "test_pattern", max_depth=2)
@@ -1220,38 +1540,68 @@ class TestTraceRootCauseQualityFixes:
         assert ev["motif_potential"]["motif_type"] == "cycle_2"
         assert ev["motif_potential"]["score"] == 64.0
         assert ev["motif_potential"]["counterparty"] == "ANOM_CP"
+        # A clamped score (past the float range) is only readable with these.
+        assert ev["motif_potential"]["log_score"] == 4.158883
+        assert ev["motif_potential"]["score_clamped"] is False
+        assert "_rank" not in ev["motif_potential"]
 
     def test_edge_counterparty_no_motif_when_none_found(self, monkeypatch):
         """motif_potential key absent when no motif matches the cp — trace never breaks."""
         nav = self._make_nav()
         self._stub_companion(monkeypatch)
-        monkeypatch.setattr(GDSNavigator, "explain_anomaly", lambda self, pk, pid: {
-            "severity": "extreme",
-            "top_dimensions": [{"label": "x"}],
-            "delta_norm": 5.0, "conformal_p": 1e-5,
-        })
-        monkeypatch.setattr(GDSNavigator, "contagion_score", lambda self, pk, pid, **kw: {
-            "score": 0.0, "total_counterparties": 0,
-        })
-        monkeypatch.setattr(GDSNavigator, "find_counterparties",
-            lambda self, pk, line_id, from_col, to_col, **kw: {
-                "outgoing": [
-                    {"primary_key": "X", "is_anomaly": True, "delta_rank_pct": 99.0},
-                ],
-                "incoming": [],
-            } if pk == "ACC-1" else {"outgoing": [], "incoming": []},
-        )
-        monkeypatch.setattr(GDSNavigator, "π7_attract_hub", lambda self, pid, top_n=10, **kw: [])
-        monkeypatch.setattr(GDSNavigator, "edge_potential",
-            lambda self, fk, tk, pid, **kw: {
-                "score": 1.0, "delta_distance": 1.0,
-                "pair_tx_count": 1, "effective_weight": 1.0,
-                "from_key": fk, "to_key": tk, "pattern_id": pid,
+        monkeypatch.setattr(
+            GDSNavigator,
+            "explain_anomaly",
+            lambda self, pk, pid: {
+                "severity": "extreme",
+                "top_dimensions": [{"label": "x"}],
+                "delta_norm": 5.0,
+                "conformal_p": 1e-5,
             },
         )
-        monkeypatch.setattr(GDSNavigator, "score_motif",
+        monkeypatch.setattr(
+            GDSNavigator,
+            "contagion_score",
+            lambda self, pk, pid, **kw: {
+                "score": 0.0,
+                "total_counterparties": 0,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "find_counterparties",
+            lambda self, pk, line_id, from_col, to_col, **kw: (
+                {
+                    "outgoing": [
+                        {"primary_key": "X", "is_anomaly": True, "delta_rank_pct": 99.0},
+                    ],
+                    "incoming": [],
+                }
+                if pk == "ACC-1"
+                else {"outgoing": [], "incoming": []}
+            ),
+        )
+        monkeypatch.setattr(GDSNavigator, "π7_attract_hub", lambda self, pid, top_n=10, **kw: [])
+        monkeypatch.setattr(
+            GDSNavigator,
+            "edge_potential",
+            lambda self, fk, tk, pid, **kw: {
+                "score": 1.0,
+                "delta_distance": 1.0,
+                "pair_tx_count": 1,
+                "effective_weight": 1.0,
+                "from_key": fk,
+                "to_key": tk,
+                "pattern_id": pid,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "score_motif",
             lambda self, entity_key, motif_type, pattern_id, time_window_hours=None: {
-                "found": False, "score": 0.0, "motif_type": motif_type,
+                "found": False,
+                "score": 0.0,
+                "motif_type": motif_type,
             },
         )
         result = nav.trace_root_cause("ACC-1", "test_pattern", max_depth=2)
@@ -1265,15 +1615,27 @@ class TestTraceRootCauseQualityFixes:
         nav = self._make_nav()
         self._stub_companion(monkeypatch)
 
-        monkeypatch.setattr(GDSNavigator, "explain_anomaly", lambda self, pk, pid: {
-            "severity": "extreme",
-            "top_dimensions": [{"label": "x"}],
-            "delta_norm": 5.0, "conformal_p": 1e-5,
-        })
-        monkeypatch.setattr(GDSNavigator, "contagion_score", lambda self, pk, pid, **kw: {
-            "score": 0.0, "total_counterparties": 0,
-        })
-        monkeypatch.setattr(GDSNavigator, "find_counterparties",
+        monkeypatch.setattr(
+            GDSNavigator,
+            "explain_anomaly",
+            lambda self, pk, pid: {
+                "severity": "extreme",
+                "top_dimensions": [{"label": "x"}],
+                "delta_norm": 5.0,
+                "conformal_p": 1e-5,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "contagion_score",
+            lambda self, pk, pid, **kw: {
+                "score": 0.0,
+                "total_counterparties": 0,
+            },
+        )
+        monkeypatch.setattr(
+            GDSNavigator,
+            "find_counterparties",
             lambda self, pk, line_id, from_col, to_col, **kw: {"outgoing": [], "incoming": []},
         )
         monkeypatch.setattr(GDSNavigator, "π7_attract_hub", lambda self, pid, top_n=10, **kw: [])

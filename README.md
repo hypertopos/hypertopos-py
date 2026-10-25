@@ -1,6 +1,6 @@
 # hypertopos
 
-> A behavioral feature layer for graph and temporal data — turning behavior into coordinates, trajectories, and explanations.
+> Business data as geometry that AI agents navigate — the core engine.
 
 [![Test](https://github.com/hypertopos/hypertopos-py/actions/workflows/test.yml/badge.svg)](https://github.com/hypertopos/hypertopos-py/actions/workflows/test.yml)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
@@ -9,107 +9,324 @@
 [![PyArrow](https://img.shields.io/badge/format-PyArrow-red.svg)](https://arrow.apache.org/docs/python/)
 [![Lance](https://img.shields.io/badge/storage-Lance-blueviolet.svg)](https://github.com/lance-format/lance)
 [![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io)
-[![Version](https://img.shields.io/badge/version-0.8.1-%235500FF.svg)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.9.0-%235500FF.svg)](pyproject.toml)
 
-hypertopos is not a database, and not a machine learning model. It is a layer that turns relational data into a coordinate system where every entity gets a position derived from its relationships and the population around it.
+Describe your tables in a YAML file, run `hypertopos build`, and every entity gets a position relative to its own population — so "out of place", "similar", "drifting" and "different between groups" become distances you read instead of queries you write.
 
-```
-typical:    data → features → feature store → ML → decision
-hypertopos: data → representation (hypertopos) → ML / decision
-```
+- **No model, no labels.** The threshold θ is a percentile of the population's own distances; nothing is trained and nothing has to be annotated.
+- **Explanations in the data's own columns.** `explain_anomaly` splits an anomaly into each dimension's share of the distance; the shares sum to 100%.
+- **One snapshot per reader, what-if on a branch.** A session keeps its answers while data keeps arriving; a recalibration or trial ingest runs on a copy-free branch, gets compared with main, then is promoted or deleted.
+
+<p align="center">
+  <img src="docs/images/demo-find-anomalies.svg" width="900"
+       alt="An agent ranks anomalies with find_anomalies and explains the top one with explain_anomaly; the entity sits outside the θ ring.">
+</p>
+<p align="center"><sub><i>Distance from the centre is the real <code>delta_norm</code>; θ comes from the population.</i></sub></p>
+
+hypertopos is not a database, and not a machine learning model. It is a layer that turns relational data into a coordinate system where every entity gets a position derived from its relationships and the population around it. It complements SQL: the database answers *which rows match*; hypertopos answers *which entities are out of place, how that is changing, and why*.
+
+This package is the core engine of a three-package family:
+
+| Package | Role |
+|---|---|
+| **hypertopos** (this package) | Builds the sphere from YAML, computes the geometry, serves snapshot sessions and copy-free branches to Python code and the CLI |
+| [hypertopos-mcp](https://github.com/hypertopos/hypertopos-mcp) | The agent interface — an MCP server over the same core, over stdio or local HTTP, with responses shaped for an agent's context window |
+| [hypertopos-skills](https://github.com/hypertopos/hypertopos-skills) | Investigation workflows that give an agent judgement about which tool to reach for, and when |
+
+**Get started** (two minutes). Needs Python 3.12+ and two CSV files — one per entity type:
 
 ```bash
-pip install hypertopos
+pip install hypertopos                                     # the engine and the `hypertopos` command
+hypertopos validate --config sphere.yaml                   # check the YAML and every source file, nothing written
+hypertopos build --config sphere.yaml --output my_sphere   # compute μ, σ, θ and every entity's position
+hypertopos info my_sphere                                  # what got built
 ```
 
-![hypertopos overview](docs/images/hypertopos-overview.svg)
+`sphere.yaml` names the sources, the entity lines and which column links an event to its anchor:
+
+```yaml
+version: "0.1.0"
+sphere_id: my_sphere
+
+sources:
+  customers:
+    path: customers.csv
+  orders:
+    path: orders.csv
+
+lines:
+  customers:
+    source: customers
+    key: customer_id
+    role: anchor
+  orders:
+    source: orders
+    key: order_id
+    role: event
+
+patterns:
+  order_pattern:
+    type: event
+    entity_line: orders
+    relations:
+      - line: customers
+        direction: in
+        key_on_entity: customer_id
+    event_dimensions:
+      - column: amount
+```
+
+Then, from Python:
+
+```python
+from hypertopos import HyperSphere
+
+hs = HyperSphere.open("my_sphere")
+with hs.session("analyst") as session:
+    nav = session.navigator()
+
+    polygons, total, _, _ = nav.π5_attract_anomaly("order_pattern", top_n=5)
+    print(f"{total} anomalous orders")
+    for p in polygons:
+        print(p.primary_key, round(p.delta_norm, 2))
+
+    top = polygons[0].primary_key
+    for d in nav.explain_anomaly(top, "order_pattern")["top_dimensions"]:
+        print(d["dim"], f"{d['pct_of_total']:.0%}")
+```
+
+That's it. You get a sphere — the built, navigable geometry of one dataset, stored as Lance datasets under one directory:
+
+```
+my_sphere/
+├── _gds_meta/
+│   ├── sphere.json            # population statistics (μ, σ, θ) per pattern — read first on every open
+│   ├── calibration/           # the current fit per pattern
+│   ├── calibration_history/   # one epoch per build or recalibrate
+│   └── branches/              # what-if branches, empty until you create one
+├── points/customers/          # entity data per line (Lance)
+├── points/orders/
+└── geometry/order_pattern/    # delta vectors, delta_norm, edges per pattern (Lance)
+```
+
+> [!TIP]
+> Run `validate` before every `build`. It parses the YAML and checks that every source file exists without writing anything; `build` fails late on the same problems after loading the data.
+
+> [!NOTE]
+> Paths under `sources:` resolve relative to the YAML file, not to your shell. On Windows, `python -m hypertopos.cli.main …` works wherever the `hypertopos` script is not on `PATH`.
+
+## See it in action
+
+Real output from the YAML above on a 40-customer, 313-order CSV pair (three orders carry amounts an order of magnitude above the rest):
+
+```text
+$ hypertopos validate --config sphere.yaml
+Valid: my_sphere (2 sources, 2 lines, 1 patterns, 0 composite lines, 0 temporal configs)
+
+$ hypertopos build --config sphere.yaml --output my_sphere
+Built: my_sphere
+
+$ hypertopos info my_sphere
+Sphere: my_sphere
+Path:   …/my_sphere
+
+Lines (2):
+  customers                       role=anchor    rows=40  cols=3
+  orders                          role=event     rows=313  cols=4
+
+Patterns (1):
+  order_pattern                   type=event     entity=orders  dims=2
+
+Total disk size: 104.3 KB
+```
+
+The Python snippet above, on that sphere:
+
+```text
+16 anomalous orders
+ORD-0311 8.46
+ORD-0312 8.46
+ORD-0313 8.46
+ORD-0053 1.75
+ORD-0020 1.71
+amount 100%
+```
+
+`delta_norm` is the order's distance from the population centre, measured in σ; the three planted orders sit at 8.46 while the next one is at 1.75. `explain_anomaly` attributes the whole distance to `amount` — the only event dimension in this sphere — as a share of `delta_norm²`.
+
+<p align="center">
+  <img src="docs/images/demo-drift-solid.svg" width="900"
+       alt="find_drifting_entities ranks drift; get_solid replays the top entity's slices back inside θ.">
+</p>
+<p align="center"><sub><i>With a temporal configuration, every entity also keeps a history of positions; each slice's distance is its real <code>delta_norm_snapshot</code>.</i></sub></p>
 
 ## How it works
 
-You describe your data in YAML — entity types, sources, relationships. hypertopos computes population statistics and produces a sphere: pre-computed geometry stored in Apache Arrow format.
+![hypertopos overview](docs/images/hypertopos-overview.svg)
 
-Agents (or Python code) open the sphere and navigate it using twelve primitives that cover movement, clustering, anomaly detection, population comparison, and temporal analysis. Each step is stateful — where you are determines what you see next.
+**Build.** `hypertopos build` reads the sources named in the YAML, computes the population statistics every coordinate is measured against (μ, σ and the threshold θ per dimension — the calibration), and writes the sphere: points, delta vectors, edges and temporal history as Lance datasets. Later batches are ingested into the same sphere with `hypertopos sphere ingest` or `GDSBuilder.incremental_update`, without a full rebuild.
 
-For the full picture: [Introduction](docs/introduction.md) · [Core Concepts](docs/concepts.md) · [Quick Start](docs/quickstart.md)
+**Navigate.** A session opens on the sphere and moves through it with twelve navigation primitives (π1–π12): walking along a line of entities, jumping across a relationship, diving into an entity's history, and the attractors — π5 `attract_anomaly`, boundary, hub, cluster, drift, trajectory, population comparison and regime change. Each step is stateful: where you are determines what you see next. Opening a sphere reads a few kilobytes of metadata; everything else is loaded as navigation requires it.
+
+**Stay consistent.** A session reads one consistent snapshot of the sphere — the state current when it opened. Ingests and recalibrations by other processes do not change its answers mid-investigation. A session sees its own `recalibrate` immediately, and every recalibration records a calibration epoch exactly as a rebuild does, so `compare_calibrations` can show what moved between any two fits.
+
+> [!IMPORTANT]
+> A session does not see new data until you ask for it. `session.is_stale()` returns a `SnapshotStatus` whose `stale` flag says a newer state exists; `session.refresh()` moves the session to it. Nothing refreshes on its own.
+
+**Try things on a branch.** A sphere branch is a what-if workspace created without copying data; writes on a branch never touch main.
+
+![Sessions and branches](docs/images/sessions-and-branches.svg)
+
+*Sessions never change under you; branches never touch main.*
+
+Continuing inside the `with` block of the snippet above — recalibrate on a branch without the top anomaly in the baseline, compare, then keep or drop the result:
+
+```python
+    result = session.recalibrate("order_pattern", branch="trial", exclude_keys=[top])
+    print(result["n_excluded"], result["old_theta_norm"], result["new_theta_norm"])
+
+    diff = nav.compare_branches("order_pattern", "trial")
+    print(diff.flipped_in, diff.flipped_out, round(diff.jaccard, 2))
+
+print(hs.promote_branch("trial"))   # replay the branch's recalibrations and ingests on main, then delete it
+# hs.delete_branch("trial")         # or discard it; main is unchanged
+```
+
+Real output on the sphere above:
+
+```text
+1 1.2203 1.3675
+1 0 0.94
+PromoteReport(name='trial', recipes_replayed=1, versions_before={'order_pattern': 7}, versions_after={'order_pattern': 10})
+```
+
+One entity was excluded from the fit, θ moved from 1.22 to 1.37, one order became anomalous on the branch (`flipped_in`), none stopped being anomalous, and the two anomaly sets overlap at 0.94 Jaccard. `exclude_keys` fits the population statistics without those entities while still scoring every entity. Promoting replays the branch's recipes on main and verifies that the replayed fit matches.
+
+> [!TIP]
+> Always pass `branch=` together with `exclude_keys`. Without it the recalibration lands on main, and the only way back is another recalibration.
+
+> [!WARNING]
+> `promote_branch` is refused when main has moved since the branch was created — compare, then recreate the branch from the current main. `delete_branch` and `promote_branch` are also refused while an open session reads the branch; close those sessions first.
+
+The same workflow is available from the CLI (`hypertopos sphere branch`, `hypertopos sphere ingest --branch`) and to agents through the [MCP server](https://github.com/hypertopos/hypertopos-mcp).
+
+For the full picture: [Introduction](docs/introduction.md) · [Core Concepts](docs/concepts.md) · [Architecture](docs/architecture.md)
+
+## Common commands
+
+```bash
+hypertopos validate --config sphere.yaml                        # parse the YAML, check every source file; writes nothing
+hypertopos build --config sphere.yaml --output my_sphere        # full build; --force overwrites an existing directory
+hypertopos build --config sphere.yaml --output my_sphere \
+    --no-temporal --no-chains --no-edges                        # skip stages for a fast iteration build
+hypertopos info my_sphere                                       # lines, patterns, disk size
+
+hypertopos sphere health my_sphere --exit-code-on-critical      # CI gate: ok / warning / critical, exit 2 on a HIGH alert
+hypertopos sphere validate my_sphere --strict                   # structural check; --strict turns calibration warnings into errors
+hypertopos sphere diff old_sphere my_sphere --json              # pattern inventory and calibration drift between two builds
+
+hypertopos sphere ingest my_sphere --points new_orders.csv --pattern order_pattern            # append new or changed entities, no rebuild
+hypertopos sphere ingest my_sphere --points new_orders.csv --pattern order_pattern --branch trial   # same, on a branch only
+hypertopos sphere ingest my_sphere --points new_orders.csv --pattern order_pattern --finalize       # last batch: global ranks + index rebuild
+
+hypertopos sphere branch list my_sphere                         # what exists, with recipe counts and staleness
+hypertopos sphere branch create my_sphere trial --purpose "recalibrate without top anomaly"
+hypertopos sphere branch promote my_sphere trial                # replay the branch's recipes on main, then delete it
+hypertopos sphere branch delete my_sphere trial                 # discard it; main is unchanged
+```
+
+Every `hypertopos sphere …` subcommand takes `--json` for machine-readable output. See the [full command reference](#full-command-reference) below.
+
+> [!NOTE]
+> An `edges/` adjacency table is only written for event patterns with two or more relations to the same anchor line (sender and receiver accounts, for example). It powers graph traversal — paths, flows, contagion — and `--no-edges` skips it.
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `error: output directory 'my_sphere' already exists. Use --force to overwrite.` | Add `--force`, or build into a new directory. |
+| `error: output directory '…' has branches ['trial']; delete them first (--force does not delete branches).` | `hypertopos sphere branch delete` (or `promote`) every branch, then build. |
+| Creating a branch on Windows fails with a message about the 260-character path limit | Branch files live under `<dataset>/tree/<branch>/`, which can push paths past Windows' limit. Move the sphere to a shorter directory, use a shorter branch name, or enable long paths in Windows (`LongPathsEnabled`). |
+| `Validation errors:` / `Source 'orders': file not found: …` | Source paths resolve relative to the YAML file's directory, not the shell's. |
+| `error: not a sphere directory (no _gds_meta/sphere.json): …` | Point `info` and `sphere …` at the directory that contains `_gds_meta/sphere.json`. |
+| `sphere validate` prints `dim_quality warning (non_normal_dim) on dim 'amount'` | Advisory: a gaussian-declared dimension with a heavy tail. Declare a `kind` or transform the column; `--strict` turns it into a failure for CI. |
+| `sphere validate` prints `dim_quality warning (dominant_dim_mass)` | One dimension carries most of the tail variance — the pattern is effectively a one-dimension detector. Add independent dimensions or split the column. |
+| A session keeps returning the same answers after an ingest | Sessions are pinned to a snapshot. `session.is_stale()`, then `session.refresh()`. |
+| `promote_branch` refused: main moved since the branch was created | `compare_branches` to see what differs, then delete the branch and create it again from the current main. |
+| `delete_branch` / `promote_branch` refused: a session reads the branch | Close every session opened with `branch=` first. |
+| Lance warns `KMeans: more than 10% of clusters are empty` during build | The dataset is too small for a meaningful vector index; the warning is informational and the build is complete. |
 
 ## What's different
 
-Each capability below emerges from treating entities as points in a shared, population-calibrated space.
+Every capability below comes from one decision: an entity is a point in a space calibrated on its own population. The same coordinate answers anomaly, similarity, drift and group questions, so the answers stay comparable and explainable in the data's own dimensions.
 
-| Capability | What it does | Compared to | Since |
-|---|---|---|---|
-| Population-relative coordinates | `delta = (shape - mu) / sigma` — one coordinate for anomaly, clustering, drift | node2vec/GNN: latent dims, retraining on shift | `0.1.0` |
-| Self-calibrating threshold | `theta = percentile(norms, 95)` — no tuning, no labels | PyOD: choose contamination rate | `0.1.0` |
-| Named dimension attribution | `explain_anomaly` → `loan_count: +3.2σ (42%)`. Sums to 100% | SHAP/LIME: approximate, model-dependent | `0.1.0` |
-| Temporal deformation | Append-only delta log. Displacement, path length, directionality | Time-series DBs: metric values, not trajectories | `0.1.0` |
-| Stateful navigation | 12 typed primitives. Position type constrains valid ops | SQL/GraphQL: stateless queries | `0.1.0` |
-| Cross-sphere comparison | `\|\|delta\|\|` is dimensionless — 4.2σ means the same in any domain | Requires shared features or joint embeddings | `0.1.0` |
-| Counterfactual simulation | `simulate_edges` recomputes delta against fixed baseline | Causal inference: explicit DAG required | `0.1.0` |
-| Regime change detection | Per-bucket centroids, self-calibrating shift threshold | Evidently/NannyML: model prediction drift | `0.1.0` |
-| Graph contagion | Mean `\|\|delta\|\|` of neighbors. Cohen's d vs control group | PageRank: topology, not behavioral propagation | `0.2.0` |
-| Witness cohort | Similar deltas, NOT connected. Validates pattern vs one-off | k-NN on features (includes neighbors) | `0.2.1` |
-| FDR-controlled detection | Benjamini-Hochberg on rank p-values. Per-entity q-values | BH not combined with geometric detection | `0.3.1` |
-| Diverse anomaly selection | Facility location covers distinct anomaly regions | Top-N returns redundant extremes | `0.3.1` |
-| Distribution-aware scoring | Per-dim Bregman divergence (gaussian/poisson/bernoulli). Additive | PyOD/sklearn: uniform metric across all features | `0.4.0` |
-| Anomaly confidence | Bootstrap `anomaly_confidence: 0-1`. `min_confidence` filter | No equivalent — binary verdict, no stability signal | `0.4.0` |
-| Graph algorithm dimensions | PageRank, betweenness, community, clustering as geometry dims | Separate graph DB + manual joins | `0.4.1` |
-| Adaptive false-discovery-rate | Storey π₀ estimator + χ² parametric p-values recover BH power loss | BH without adaptive π₀ overcorrects on null-heavy populations | `0.5.0` |
-| Drift direction | `gradient_alignment` + `drift_direction ∈ {normalizing, deteriorating, neutral}` | Drift magnitude only — no toward/away-from-centre signal | `0.5.0` |
-| One-call root cause | `trace_root_cause` returns bounded evidence DAG — witness, edge-counterparty, contamination, hub | Manual chain of `explain_anomaly → find_counterparties → contagion_score → π7 hub` | `0.5.0` |
-| Geometric edge potential | `\|\|delta_from − delta_to\|\| × (1/pair_tx_count)` — per-edge layering signature | Node-level `delta_norm` misses one-off transactions between divergent accounts | `0.5.0` |
-| Structural motif scoring | Product of `edge_potential` across closed-vocab motifs (fan_out, cycle_2, cycle_3, structuring) | Graph DB motif matching has no geometric rarity score | `0.5.0` |
-| Extended motif catalog | `fan_in` (sink-centric concentrator) and `chain_k` (open directed chain, 3 ≤ k ≤ 8) extend the motif vocabulary; window-filter correctness fix on fan_out/cycle_2/cycle_3 | Prior motifs silently ignored declared `time_window_hours` in production | `0.5.1` |
-| Bipartite motif catalog | `split_recombine` (diamond scatter-gather S → k intermediaries → D, forward/backward seed anchoring) and `bipartite_burst` (complete K_{k,m} bipartite subgraph in tight window) cover scatter-gather smurfing, parallel layering, and coordinated-burst atoms | Closed-vocabulary atomic queries — no manual graph inversion or per-side enumeration glue | `0.5.2` |
-| Multi-epoch calibration audit | `compare_calibrations(v_from, v_to)` — per-dim μ/σ/θ drift between two retained calibration epochs of one pattern | Drift detectors compare model predictions; nothing compares the underlying coordinate system itself | `0.6.0` |
-| Intrinsic vs extrinsic drift decomposition | `decompose_drift` splits an entity's geometric drift into its own movement vs population recalibration; `intrinsic_fraction ∈ [0, 1]` | Drift magnitude alone — population shift and entity behaviour change confound | `0.6.0` |
-| Hidden-influencer matrix | `find_calibration_influencers` — 4-cell classification (`hidden` / `distorter` / `standard_anomaly` / `normal`) via exact leave-one-out impact on calibration | SHAP / counterfactual: explain a prediction, not the coordinate system itself | `0.6.0` |
-| Cross-pattern temporal lead-lag | `find_lead_lag(pattern_a, pattern_b)` — cross-correlates differenced population-centroid drift; peak lag, Bonferroni-adjusted significance, per-dim FDR matrix | Granger causality on raw metrics — not on population-relative geometry | `0.6.0` |
-| Anomaly by absence | `find_density_gaps` — joint-density gaps under independence null with BH-corrected q-values; surfaces under-populated cells in named delta-space ranges | Outlier detection finds extremes; gap detection finds *missing* combinations | `0.6.0` |
-| Declarative motif API | `find_motif_by_hops(pattern_id, hops, *, seed_keys)` — caller passes per-hop `HopPredicate`s (amount / time-delta / direction / edge-dim filters); navigator walks chains of length 1..8 with optional total-span cap (`time_window_hours`) | Closed-vocab motif registry — no escape hatch for ad-hoc structural shapes | `0.6.0` |
-| Anchor-pattern aggregation of edge-derived dims | Anchor patterns declare `edge_dim_aggregations:` to bake per-edge sidecar signals (`pair_edge_count`, `find_motif_structuring`, …) into per-anchor `_mean` / `_max` columns; surfaces in every anchor primitive (`find_anomalies`, `explain_anomaly`, `find_clusters`) | Hand-rolled SQL roll-up + manual feature engineering | `0.6.1` |
-| Richer hop predicates | `HopPredicate.amount_ratio_to_prev` (decreasing-chain ratio) and `require_anomalous_entity` (filter chains routing through calibrated-anomalous nodes) extend the declarative motif API | Closed-vocab motif library has fixed amount thresholds and no anomaly-routing filter | `0.6.1` |
-| Event-aware motif scoring | `find_motif_by_hops(score=True)` ranks motifs by the product of event-aware `edge_potential` across edges (uses both the anchor companion's per-entity geometry and the event pattern's per-transaction polygons); distinct transactions between the same accounts produce distinct scores | Pure node-pair scoring collapses ranks when motifs share a node sequence | `0.6.1` |
-| Chain-anchor aggregation | Chain anchor patterns auto-emitted from `chain_lines:` declare `edge_dim_aggregations:` to bake per-event sidecar signals into per-chain `_mean` / `_max` columns; closes the third `anchor_kind` after `single` and `pair` | Per-chain manual aggregation outside the geometry, or no chain-level edge-dim summary at all | `0.6.2` |
-| Expanded `edge_dim_aggregations:` surface | Three additional canonical aggregates per source dim (`_std`, `_p95`, `_count_above_threshold` with population p95 cutoff persisted in calibration epoch JSON); k>2 composite anchor support (tripartite and beyond); per-source-dim subset selector — `dims:` accepts list (sugar = all five aggregates) or mapping `{dim: [agg, …]}` (per-dim subset); cross-epoch `edge_dim_threshold_drift` surface on `compare_calibrations` | Manual rebuild + re-engineering whenever the aggregate vocabulary or the per-anchor breadth changes | `0.6.3` |
-| Chain-coherent investigative loop | Four primitives compose into a complete chain investigation: `find_chains_with_coherent_anomaly` (population sweep — chains where consecutive entity-anchor positions are individually anomalous on the same dominant delta dim), `anomaly_propagation_in_chain` (per-chain hop-by-hop trace), `classify_chain_typology` (five-axis label: shape / peak_position / position_in_chain / extension_signals / dominant_top_dim), `extend_chain` (boundary-extension suggester via the chain reverse index) | Manual SQL over chain pattern + ad-hoc Python scoring + no per-chain typology label | `0.6.4` |
-| Anomaly-anchored seed prune for motifs | `find_motif_by_hops(anomaly_seed_filter=True)` intersects the BFS starting frontier with the anomaly subset of the resolved anchor companion (replaces "all keys" frontier when `seed_keys=None`, intersects with explicit list otherwise); result dict carries `seed_filter_summary` (`{requested, anomaly, filtered}`) | Manual pre-filter on every call, no built-in convergence on anomaly-anchored seeds | `0.6.4` |
-| Cross-bank and structuring chain features | Chain anchor patterns gain two derived columns — `cross_bank_count` (distinct banks the chain transits, textbook jurisdictional layering signal) and `amount_monotone_decreasing` (boolean, true when amounts strictly decrease at every hop, textbook structuring pattern). Auto-populated when the event line declares `from_bank` / `to_bank` columns; surfaces in `find_anomalies(<chain_pattern>)`, the chain-coherent loop, and `classify_chain_typology` `dominant_top_dim`. Effect gated on next chain pattern rebuild | Hand-rolled per-chain rollup post-extraction, no chain-level structuring detector | `0.6.5` |
-| Strict-prefix chain subsumption | `extract_chains` post-merge dedup gains a strict ordered prefix pass — chains whose entity sequence is a strict prefix of another chain's are dropped, since the longer chain investigates every entity the shorter one does plus more | Three near-duplicate chain rows in the points table for what is effectively one investigative finding | `0.6.5` |
-| Theta sensitivity diagnostic | Calibration epochs gain a `theta_sensitivity` field — per-percentile sweep of the anomaly threshold at p90..p99 with `theta_mean`, `anomaly_count_mean`, and `anomaly_rate` per percentile. New `theta_sensitivity(pattern_id)` MCP tool plus `sphere_overview` summary block surface a stable band (longest contiguous range where adjacent-pair theta ratio stays below 1.30) and cliff list (boundaries where the ratio is 1.50 or higher, signalling heavy-tail regions). Lets investigators see at a glance whether the chosen `anomaly_percentile` sits in a smooth zone or near a recalibration cliff. Glues onto the builder's existing population sort — zero new I/O cost in the build path | Manual percentile sweep + custom analytics to characterise threshold sensitivity per pattern | `0.6.6` |
-| Per-dim runtime weights on `find_anomalies` | `dimension_weights={dim: float}` scales each dim's contribution to the rank score before computing `delta_norm`; default `1.0` for missing dims, `0.0` silences a dim. Wires stratified correlation-gate verdicts (NOISE / DIRECTION-INCONSISTENT / VOLUME-MEDIATED / ROBUST) into runtime ranking — discount or silence per-dim signals that fail confounder-controlled gates | Gate verdicts only inform CHANGELOG / skill cheatsheet narrative; no runtime knob to discount NOISE-classified dims when scoring | `0.6.7` |
-| Chain-coherent triage + one-shot R9 orchestrator + SAR narrative | Three composable additions close the chain investigation→SAR pipeline: `chain_investigation_summary` (population-level triage — `coherent_run_rate`, `cross_pattern_overlap.jaccard`, `recommended_min_hops`); `investigate_chain` (one-shot orchestrator running trace + typology + shape + extension forward + extension backward server-side, returns SAR-ready summary); `generate_sar_rationale` (template-based composition of a 3-5 paragraph SAR-ready narrative from R9 evidence with structured `evidence_anchors` per claim, no LLM call) | Manual chain of four MCP round-trips per investigation, manual SAR narrative drafting from a blank page | `0.6.7` |
-| Dim-quality warnings on `sphere_overview` | `dim_quality_warnings[]` block surfaces two silent build-time failure modes that break z-score / `delta_norm` semantics: `dead_dim` (sigma_diag below 1e-10, z-score undefined) and `sparse_dim` (median == 0 with rare nonzero, gaussian assumption wrong). Each warning carries `type`, `dim_label`, `reason`, and concrete `advice`. Computed sub-millisecond from cached pattern state | Both classes silently broke the delta vector with no agent-visible signal, requiring calibration-log archaeology to discover | `0.6.7` |
-| External-chain ingestion as anchor lines | New cookbook + schema convention documenting how chains discovered outside hypertopos (SAR typology engines, ERP supply-chain workflows, EHR clinical pathways, customer-journey platforms) ingest as anchor lines. Optional `chain_keys` column (comma-joined member primary_keys in chain order) unlocks the full chain-coherent investigative loop on externally-curated chains — same primitives, no code change | Build-time `chain_lines:` BFS extraction was the only documented path; external chain identifiers had no documented ingestion route | `0.6.7` |
-| Chain-level coordinated-witness diagnosis | `chain_witness_intersection(chain_id, chain_pattern, member_pattern)` — intersect the top witness dims of a chain's members; `coordinated=True` when the mean pairwise Jaccard clears the threshold, indicating a single anomaly mechanism behind the structural object | Per-member `explain_anomaly` read manually plus hand-rolled set intersection — no chain-level diagnosis | `0.7.1` |
-| Per-position chain drift trajectory | `chain_drift_trajectory(chain_id, chain_pattern, member_pattern, n_windows=4)` — per-member regime (`normalizing` / `deteriorating` / `neutral`) over time-bucketed `delta_norm`, rolled up to a chain-level regime + drift score; spots chains whose members jointly drift toward anomaly before any single hop crosses the threshold | Per-member `get_solid()` reads with manual windowing and slope fitting; no chain-level drift score | `0.7.1` |
-| Counterfactual: dimension override | `simulate_dimension_change(primary_key, pattern_id, line_id, set_dimension)` — what-if recomputation of `delta_norm` under hypothetical raw shape-vector values for one or more dimensions; reports the before/after norms, the anomaly-flag flip, and the new top witness dims. Companion to `simulate_edge_removal` for non-edge dimensions | Manual reconstruction of `shape = delta * sigma + mu`, point-edit, and norm recompute against the right cholesky path | `0.7.1` |
-| Multi-hypothesis anomaly explainer | `find_diverse_explanations(primary_key, pattern_id, n_hypotheses=3)` — K strict-disjoint dim sets explaining the anomaly via greedy selection over per-dim Bregman contributions (each dim in at most one hypothesis); graceful degradation when an entity is single-dim driven; `validate=True` opt-in counterfactual confirmation | Single explanation from `explain_anomaly` only — investigator manually picks "what else could explain this" from the full dim ranking | `0.7.0` |
-| Declarative compliance rules + violations query | `Pattern.conformance_rules` (AST predicate language in `sphere.yaml`) + `find_conformance_violations(pattern_id, rule_id, severity_min, top_n)` — builder evaluates rules vectorized at build time, sidecar Lance dataset persists violations, query primitive returns ranked violations with sub-second filter pushdown | Manual SQL ad-hoc on entity table + bespoke compliance scripts; no integration with anomaly geometry | `0.7.0` |
-| Incremental ingest | `GDSBuilder.incremental_update` adds, modifies, and deletes entities on an existing sphere without a full rebuild; new entities are immediately visible to anomaly search; `reindex=True` rebuilds the ANN vector index, and `recompute_ranks=False` + `GDSBuilder.finalize_incremental` batch the percentile recompute across many small appends. Works on the existing sphere format — no migration | Full rebuild from source on every new batch of entities | `0.8.0` |
-| Agent-correctness reports | Five composer tools synthesise a verdict an agent can act on: `assess_anomaly_certainty` (calibrated certainty + rationale), `consensus_classification` (multi-detector agreement), `calibration_drift_report` (cross-epoch drift verdict), `diverse_explanations` (multi-cause robustness verdict), `theta_sensitivity_report` (recalibration-safety verdict) | Manual stitching of several lower-level tool calls plus bespoke interpretation logic | `0.8.0` |
-| Vector-index health observability | `audit_pattern_dims` returns a `vector_index_health` block (index presence, indexed/unindexed row counts, staleness flag, reindex recommendation) and `check_alerts` emits a `stale_vector_index` alert, so an agent knows whether recently-added entities are covered by the ANN index before relying on trajectory tools | No agent-visible signal that the ANN index lagged behind incrementally-added rows | `0.8.0` |
-| Cloud-ops CLI | `hypertopos sphere health` (composes population summary + geometric checks into an `ok`/`warning`/`critical` status with `--exit-code-on-critical` for CI gates and `--json` output), `hypertopos sphere validate [--strict] [--json]` (structural integrity check), and `hypertopos sphere diff [--json]` (pattern-inventory + calibration drift between two built spheres) | Hand-rolled validation scripts and no built-in CI deploy gate | `0.8.0` |
+### A coordinate system that calibrates itself
+
+| Capability | What it does | Instead of |
+|---|---|---|
+| Population-relative coordinates | `delta = (shape − μ) / σ` per dimension; one vector serves anomaly, clustering, drift and comparison | Learned embeddings with latent dimensions that need retraining when the data shifts |
+| Self-calibrating threshold | θ is a percentile of the population's own `delta_norm` — per group when a pattern declares `group_by_property` | Choosing a contamination rate or a hand-tuned cut-off |
+| Distribution-aware dimensions | Each dimension declares a kind (gaussian, poisson, bernoulli); `sphere_overview` flags dead, sparse, non-normal and dominant dimensions with concrete advice | One metric for every feature, and silent garbage when a feature breaks its assumption |
+| Calibration epochs | Every build and `recalibrate` records an epoch; `compare_calibrations` shows per-dimension μ / σ / θ drift, `theta_sensitivity` shows whether θ sits near a cliff | No record of how the coordinate system itself moved |
+| Hidden influencers | `find_calibration_influencers` measures each entity's leave-one-out impact on the calibration and names the ones that distort it | Explaining predictions while the baseline itself is contaminated |
+
+### Explanations and confidence
+
+| Capability | What it does | Instead of |
+|---|---|---|
+| Named attribution | `explain_anomaly` ranks real dimensions by their share of `delta_norm²`; shares sum to 100% | SHAP / LIME approximations over a trained model |
+| Alternative hypotheses | `find_diverse_explanations` returns disjoint dimension sets that each explain the anomaly | One explanation and a manual search for "what else could it be" |
+| Error-controlled detection | Benjamini-Hochberg or Storey FDR on χ² p-values, per entity or per dimension; bootstrap `anomaly_confidence` with a `min_confidence` filter | A ranked list with no statement about false discoveries or stability |
+| Verdicts an agent can act on | `assess_anomaly_certainty`, `consensus_classification`, `calibration_drift_report`, `theta_sensitivity_report` return a verdict with its rationale | Stitching several low-level calls and interpreting them by hand |
+| Anomaly by absence | `find_density_gaps` finds combinations that are missing from the population; `find_conformance_violations` checks declared rules | Outlier detection, which only sees extremes that exist |
+
+### Time
+
+| Capability | What it does | Instead of |
+|---|---|---|
+| Entity trajectories | Each entity keeps a history of its position; `find_drifting_entities` ranks displacement and says whether it moves toward or away from normal | Metric time series with no notion of position or direction |
+| Drift you can attribute | `decompose_drift` splits drift into the entity's own movement and the population's recalibration | Drift magnitude, where a moving baseline and a changing entity look the same |
+| Population shifts | `find_regime_changes` and `compare_time_windows` detect when the population itself changed; `find_lead_lag` finds which pattern moves first | Model-prediction drift monitors |
+
+### Graphs, chains and motifs
+
+| Capability | What it does | Instead of |
+|---|---|---|
+| Graph structure as geometry | PageRank, betweenness, community and clustering become dimensions; `edge_dim_aggregations` bake per-edge signals into each entity's position | A separate graph database joined by hand |
+| Propagation with a control group | `contagion_score` and `propagate_influence` compare connected neighbourhoods against a control; `find_witness_cohort` finds similar but unconnected entities that confirm a pattern | PageRank-style topology with no behavioural baseline |
+| One-call root cause | `trace_root_cause` returns a bounded evidence graph: witnesses, counterparties, contamination, hubs | Four or more manual calls |
+| Scored edges and motifs | `score_edge` scores one relationship; `find_high_potential_motifs` scores fan-out, fan-in, cycles, structuring, split-recombine and bipartite bursts; `find_motif_by_hops` takes any hop sequence | Subgraph queries that match shapes but cannot rank them by rarity |
+| Chain investigation | `find_chains_with_coherent_anomaly` finds chains whose consecutive members are anomalous in the same way; `investigate_chain` and `chain_full_loop_summary` return a verdict with its evidence; `generate_sar_rationale` drafts the narrative. Chains found by other systems load as anchor lines | Per-chain SQL and a blank page for the report |
+
+### What-if
+
+| Capability | What it does | Instead of |
+|---|---|---|
+| Counterfactuals | `simulate_edge_removal` and `simulate_dimension_change` recompute an entity against the fixed calibration with an edge removed or a value overridden | An explicit causal model, or rebuilding to find out |
+| Branches | A copy-free branch takes a recalibration without suspected influencers (`exclude_keys`) or a trial ingest; `compare_branches` lists who flips in or out of anomaly; promote replays the change onto main, delete discards it | Copying the sphere, rerunning, and diffing by hand |
+
+### Running it
+
+| Capability | What it does | Instead of |
+|---|---|---|
+| Snapshot sessions | Every session reads one consistent snapshot while builds, ingests and recalibrations land; `is_stale()` and `refresh()` move it on | Pausing ingestion, or two reads of the same question that disagree |
+| Incremental ingest | `incremental_update` adds, changes and removes entities without a full rebuild | Rebuilding from source for every batch |
+| Operations CLI | `hypertopos sphere health`, `validate` and `diff` give CI gates and drift between two builds; vector-index health is reported before trajectory tools rely on it | Hand-rolled validation scripts |
+| An agent surface | The MCP server runs over stdio or HTTP with a session per agent and compact, strict-JSON responses sized for a context window | Wrapping a database in ad-hoc tools |
 
 ### What changes in practice
 
-The same problems look different when graph, time, and statistics are unified:
-
 | Problem | Typical approach | With hypertopos |
 |---|---|---|
-| Detect anomalies | Train model, engineer features, choose contamination rate, retrain on shift | `hypertopos build` from YAML, `find_anomalies()` — threshold auto-calibrated from population |
-| Explain an anomaly | SHAP on trained model — feature importance for latent dimensions | `explain_anomaly(entity)` — ranked real dimensions: `loan_count: +3.2 sigma (42%)` |
-| Compare across domains | Align schemas, build shared features, normalize units | Compare `\|\|delta\|\|` directly — 4.2 sigma means the same in any sphere |
-| Track behavioral drift | Export to time-series DB, build dashboard, set manual thresholds | `attract_drift(window)` — displacement, path length, directionality per entity |
-| Validate anomaly is real | Manual investigation, ask domain expert | `find_witness_cohort(entity)` — similar non-connected entities confirming the pattern |
-| Understand propagation | PageRank, manual path tracing, cross-table joins | `propagate_influence(source)` — Cohen's d between connected vs control group |
-| Trust an anomaly verdict | Re-run with different thresholds, manual sensitivity analysis | `find_anomalies(min_confidence=0.8)` — only entities stable under population perturbation |
-| Understand why anomalous | SHAP on black-box model, approximate feature importance | `explain_anomaly` — per-dimension Bregman contribution with distribution kind, sums to 100% |
-| Root-cause an anomaly | Manual chain: explain → counterparties → contagion → hub check, 4+ tool calls | `trace_root_cause(entity)` — single call returns bounded DAG of evidence |
-| Detect relationship layering | Custom rule engine or manual rare-pair SQL queries | `edge_potential(A, B)` — per-edge score combining endpoint distance and pair rarity |
-| Match AML typology patterns | Graph DB subgraph queries + separate risk scoring | `find_motif(type="structuring", …)` — structural pattern + geometric rarity product |
-| Match ad-hoc structural chains | Custom subgraph queries per shape, no built-in scoring | `find_motif_by_hops(hops=[HopPredicate(...)])` — declarative per-hop predicates (amount, time, direction, edge-dim, ratio-to-prev, anomaly filter) with event-aware geometric scoring on the same call |
-| Account-level transaction layering recall | Hand-rolled SQL roll-ups of per-edge signals into account features | `edge_dim_aggregations:` on the anchor pattern bakes per-edge structuring / pair-recurrence / chain-depth signals into anchor geometry — read off `find_anomalies` like any other dim |
-| Direction of behavioural drift | Drift magnitude alone — no toward/away-from-centre signal | `attract_drift` returns `drift_direction ∈ {normalizing, deteriorating, neutral}` |
+| Find what is unusual | Engineer features, train a model, pick a contamination rate, retrain on shift | Build from YAML, call `find_anomalies` — θ comes from the population |
+| Say why it is unusual | Feature importance from a model you have to trust | `explain_anomaly` — real dimensions, shares that sum to 100%; `find_diverse_explanations` for alternatives |
+| Know it is not a fluke | Rerun with other thresholds, ask a domain expert | `find_witness_cohort` for unconnected look-alikes, `min_confidence` for stability, FDR for the whole list |
+| Find the cause | Explain, then counterparties, then contagion, then hubs | `trace_root_cause` in one call |
+| Catch layering and typologies | Rule engines and rare-pair SQL | `score_edge`, `find_high_potential_motifs`, `find_motif_by_hops`, and chain investigation with a verdict |
+| See behaviour change | Export to a time-series database and set manual alerts | `find_drifting_entities` with direction; `decompose_drift` to separate entity from baseline |
+| Compare across datasets | Align schemas and units | Compare `delta_norm` directly — it is measured in σ in every sphere |
+| Change the baseline safely | Copy production, rerun, diff by hand | `recalibrate(..., branch="trial", exclude_keys=[...])`, `compare_branches`, then promote or delete |
+| Read while data arrives | Pause ingestion or accept inconsistent reads | Snapshot sessions with `is_stale()` / `refresh()` |
 
 ## Benchmarks
 
@@ -125,17 +342,52 @@ Benchmark scripts and data preparation are included. Results are reproducible. N
 
 Full results: [Benchmarks](docs/benchmarks.md)
 
+## Full command reference
+
+<details>
+<summary><b>CLI</b> (click to expand)</summary>
+
+| Command | What it does |
+|---|---|
+| `hypertopos validate --config FILE` | Parse the YAML and check every source file without building |
+| `hypertopos build --config FILE [--output DIR] [--force] [--verbose] [--no-temporal] [--no-chains] [--no-edges] [--label-aware-calibration]` | Build the sphere. `--output` overrides the YAML's output directory; `--force` overwrites an existing one (never one that has branches); the `--no-*` flags skip stages; `--label-aware-calibration` is a no-op unless the YAML declares a `label_audit` block |
+| `hypertopos info DIR` | Lines, patterns and disk size of a built sphere |
+| `hypertopos sphere health DIR [--json] [--exit-code-on-critical]` | Health status `ok` / `warning` / `critical` with alert counts; exit 2 on critical when asked |
+| `hypertopos sphere validate DIR [--strict] [--json]` | Structural integrity check; `--strict` promotes calibration and dimension-quality warnings to errors |
+| `hypertopos sphere diff OLD NEW [--json]` | Pattern inventory and calibration drift between two built spheres |
+| `hypertopos sphere ingest DIR --points FILE [--pattern ID] [--recalibrate auto\|force\|never] [--reindex] [--finalize] [--branch NAME] [--json]` | Append a table of new or changed entities (`.arrow`, `.parquet`, `.csv`, `.csv.gz` with a `primary_key` column) to a pattern; `--pattern` is optional when the sphere has exactly one |
+| `hypertopos sphere branch {list,create,delete,promote} DIR [NAME] [--purpose TEXT] [--json]` | Manage sphere branches |
+
+</details>
+
+<details>
+<summary><b>Python API map</b> (click to expand)</summary>
+
+| Object | Entry points |
+|---|---|
+| `HyperSphere` | `open(path, branch=None)`, `session(agent_id, branch=None)`, `create_branch(name, purpose=…)`, `branches()`, `delete_branch(name)`, `promote_branch(name)` → `PromoteReport` |
+| `HyperSession` | `navigator()`, `sphere()`, `is_stale()` → `SnapshotStatus`, `refresh()`, `recalibrate(pattern_id, branch=…, exclude_keys=…)`, `close()`; usable as a context manager |
+| `GDSNavigator` | The twelve primitives (`π1_walk_line` … `π12_attract_regime_change`), `explain_anomaly(primary_key, pattern_id)`, `compare_branches(pattern_id, branch, other=None, top_n=20)` → `BranchDiffReport`, and the analysis, chain, motif and calibration methods listed in the [API Reference](docs/api-reference.md) |
+| `GDSBuilder` | Programmatic build and `incremental_update` — the engine behind `hypertopos build` and `hypertopos sphere ingest` |
+
+</details>
+
+See [Configuration](docs/configuration.md) for the YAML reference and [Container Deployment](docs/container-deployment.md) for running these as one-shot jobs.
+
 ## Documentation
 
 | | |
 |---|---|
 | [Introduction](docs/introduction.md) | The idea and where it stands |
-| [Quick Start](docs/quickstart.md) | Install, build, navigate |
-| [Core Concepts](docs/concepts.md) | Mathematical foundation |
+| [Quick Start](docs/quickstart.md) | Install, build, navigate from Python, try a branch, connect an agent |
+| [Core Concepts](docs/concepts.md) | Mathematical foundation, objects, calibration epochs, snapshots and branches |
+| [Architecture](docs/architecture.md) | Package layers, snapshot sessions, sphere branches, the MCP layer |
 | [Configuration](docs/configuration.md) | Sphere builder YAML reference |
 | [API Reference](docs/api-reference.md) | Python API |
-| [Data Format](docs/data-format.md) | On-disk storage format |
-| [Architecture](docs/architecture.md) | Package layers and design |
+| [Data Format](docs/data-format.md) | On-disk storage format, including branches |
+| [External Chains as Anchor Lines](docs/external-chains-as-anchor-line.md) | Ingest chains found by other systems and investigate them with the same primitives |
+| [Container Deployment](docs/container-deployment.md) | Run the CLI as one-shot container jobs |
+| [Benchmarks](docs/benchmarks.md) | Validation results — banking, AML, transportation |
 
 ## Status
 

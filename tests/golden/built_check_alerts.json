@@ -1,0 +1,7 @@
+{
+  "alerts": [],
+  "limitations": [
+    "coverage_gap and theta_ceiling checks require a full geometry scan \u2014 use detect_data_quality_issues() for the complete diagnostic"
+  ],
+  "patterns_checked": 2
+}

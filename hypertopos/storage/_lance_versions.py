@@ -9,6 +9,7 @@ dataset where each calibration epoch lands as a new internal Lance version
 tagged ``epoch_<N>``. This module concentrates the epoch <-> Lance-version
 mapping; callers read or write epochs through this surface only.
 """
+
 from __future__ import annotations
 
 import lance as _lance

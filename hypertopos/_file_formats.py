@@ -10,6 +10,7 @@ trailing extension, except for the legitimate ``.gz``-compound form
 preserving a ``<ext>.gz`` compound, so ``q1.2024.parquet`` → ``.parquet`` and
 ``q1.2024.csv.gz`` → ``.csv.gz``.
 """
+
 from __future__ import annotations
 
 from pathlib import Path

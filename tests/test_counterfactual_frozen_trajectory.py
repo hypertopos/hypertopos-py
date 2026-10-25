@@ -14,6 +14,7 @@ default ``delta_norm_snapshot`` trajectory looks anomalous, while the
 frozen-trajectory ``delta_norm_frozen_pop`` collapses to zero for every slice
 — the canonical "is it real movement or population drift?" signal.
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -21,6 +22,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pyarrow as pa
+
 from hypertopos.engine.counterfactual import (
     recompute_delta_norm_against_frozen,
 )
@@ -52,9 +54,7 @@ def _make_pattern(mu: np.ndarray, sigma_diag: np.ndarray) -> Pattern:
     )
 
 
-def _make_engine(
-    pattern: Pattern, shape_per_slice: list[np.ndarray]
-) -> tuple[GDSEngine, Manifest]:
+def _make_engine(pattern: Pattern, shape_per_slice: list[np.ndarray]) -> tuple[GDSEngine, Manifest]:
     now = datetime(2024, 6, 1, tzinfo=UTC)
     timestamps = [
         datetime(2024, 1, 1, tzinfo=UTC),
@@ -64,7 +64,8 @@ def _make_engine(
     temporal_table = pa.table(
         {
             "slice_index": pa.array(
-                list(range(len(shape_per_slice))), type=pa.int64(),
+                list(range(len(shape_per_slice))),
+                type=pa.int64(),
             ),
             "timestamp": pa.array(
                 timestamps[: len(shape_per_slice)],
@@ -209,7 +210,9 @@ def test_frozen_path_diverges_from_current_pop_when_entity_moves():
     np.testing.assert_allclose(solid.slices[1].delta_norm_frozen_pop, 1.0, rtol=1e-5)
     # Slice 2 raw delta from slice-0 reference: [1.0, 2.0] / [1, 1] → norm sqrt(5)
     np.testing.assert_allclose(
-        solid.slices[2].delta_norm_frozen_pop, float(np.sqrt(5.0)), rtol=1e-5,
+        solid.slices[2].delta_norm_frozen_pop,
+        float(np.sqrt(5.0)),
+        rtol=1e-5,
     )
 
     # The default ``delta_norm_snapshot`` trajectory uses the current pattern
@@ -228,7 +231,9 @@ def test_recompute_delta_norm_against_frozen_helper():
     sigma = np.array([1.0, 3.0], dtype=np.float32)
     # delta = [(2-1)/1, (4-1)/3] = [1, 1] → norm sqrt(2)
     result = recompute_delta_norm_against_frozen(
-        shape=shape, mu_frozen=mu_frozen, sigma=sigma,
+        shape=shape,
+        mu_frozen=mu_frozen,
+        sigma=sigma,
     )
     np.testing.assert_allclose(result, float(np.sqrt(2.0)), rtol=1e-5)
 
@@ -240,7 +245,9 @@ def test_recompute_delta_norm_handles_sigma_dead_dims():
     sigma = np.array([1.0, 0.0], dtype=np.float32)  # second dim is dead
     # Only first dim contributes: (2-1)/1 = 1 → norm 1.0
     result = recompute_delta_norm_against_frozen(
-        shape=shape, mu_frozen=mu_frozen, sigma=sigma,
+        shape=shape,
+        mu_frozen=mu_frozen,
+        sigma=sigma,
     )
     np.testing.assert_allclose(result, 1.0, rtol=1e-5)
 
@@ -274,5 +281,7 @@ def test_serializer_round_trips_delta_norm_frozen_pop():
     assert serialised_frozen_first.get("delta_norm_frozen_pop") == 0.0
     # Slice 1 raw delta from slice-0 raw shape [1,1]: [0, 2] / [1,1] → norm 2.0
     np.testing.assert_allclose(
-        serialised_frozen_second["delta_norm_frozen_pop"], 2.0, rtol=1e-5,
+        serialised_frozen_second["delta_norm_frozen_pop"],
+        2.0,
+        rtol=1e-5,
     )

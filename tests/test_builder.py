@@ -6,6 +6,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+
 from hypertopos.builder import GDSBuilder, RelationSpec
 
 
@@ -16,14 +17,21 @@ def test_builder_init(tmp_path):
 
 def test_add_line_registers(tmp_path):
     b = GDSBuilder("s", str(tmp_path / "gds"))
-    b.add_line("customers", [{"customer_id": "C-1", "name": "Acme"}], key_col="customer_id", source_id="test")
+    b.add_line(
+        "customers",
+        [{"customer_id": "C-1", "name": "Acme"}],
+        key_col="customer_id",
+        source_id="test",
+    )
     assert "customers" in b._lines
 
 
 def test_add_pattern_registers(tmp_path):
     b = GDSBuilder("s", str(tmp_path / "gds"))
     b.add_line("customers", [{"customer_id": "C-1"}], key_col="customer_id", source_id="test")
-    b.add_line("orders", [{"order_id": "O-1", "customer_id": "C-1"}], key_col="order_id", source_id="test")
+    b.add_line(
+        "orders", [{"order_id": "O-1", "customer_id": "C-1"}], key_col="order_id", source_id="test"
+    )
     b.add_pattern(
         "order_pattern",
         pattern_type="event",
@@ -35,7 +43,12 @@ def test_add_pattern_registers(tmp_path):
 
 def test_add_line_normalizes_key_col(tmp_path):
     b = GDSBuilder("s", str(tmp_path / "gds"))
-    b.add_line("customers", [{"customer_id": "C-1", "name": "Acme"}], key_col="customer_id", source_id="test")
+    b.add_line(
+        "customers",
+        [{"customer_id": "C-1", "name": "Acme"}],
+        key_col="customer_id",
+        source_id="test",
+    )
     tbl = b._lines["customers"].table
     assert "primary_key" in tbl.schema.names
     assert "version" in tbl.schema.names
@@ -169,6 +182,7 @@ def test_geometry_has_edges_struct_not_json(tmp_path):
     """Geometry table uses native Arrow struct for edges, not JSON string."""
     import lance
     import pyarrow as pa
+
     from hypertopos.builder.builder import GDSBuilder, RelationSpec
 
     builder = GDSBuilder("s", str(tmp_path / "gds"))
@@ -638,10 +652,7 @@ def test_builder_prop_columns_full_coverage_string(tmp_path):
     b = GDSBuilder("s", str(tmp_path / "gds"))
     b.add_line(
         "customers",
-        [
-            {"cid": f"C-{i}", "seg_id": "SEG-A", "nation": "FRANCE"}
-            for i in range(10)
-        ],
+        [{"cid": f"C-{i}", "seg_id": "SEG-A", "nation": "FRANCE"} for i in range(10)],
         key_col="cid",
         source_id="test",
     )
@@ -668,10 +679,7 @@ def test_builder_prop_columns_full_coverage_boolean(tmp_path):
     b = GDSBuilder("s", str(tmp_path / "gds"))
     b.add_line(
         "customers",
-        [
-            {"cid": f"C-{i}", "seg_id": "SEG-A", "active": True}
-            for i in range(10)
-        ],
+        [{"cid": f"C-{i}", "seg_id": "SEG-A", "active": True} for i in range(10)],
         key_col="cid",
         source_id="test",
     )
@@ -780,7 +788,9 @@ def test_mixed_edge_max_raises(tmp_path):
     import pytest
 
     b = GDSBuilder("s", str(tmp_path / "gds"))
-    b.add_line("customers", [{"cid": "C-1", "cnt": 2, "seg_id": "S-1"}], key_col="cid", source_id="test")
+    b.add_line(
+        "customers", [{"cid": "C-1", "cnt": 2, "seg_id": "S-1"}], key_col="cid", source_id="test"
+    )
     b.add_line("segments", [{"sid": "S-1"}], key_col="sid", source_id="test")
     b.add_pattern(
         "cp",
@@ -927,13 +937,16 @@ def test_delta_rank_pct_consistent_after_two_builds(tmp_path):
     from datetime import UTC, datetime
 
     import lance
+
     from hypertopos.builder.builder import GEOMETRY_EVENT_SCHEMA
     from hypertopos.storage.writer import GDSWriter
 
     # Build a sphere where entities have varied delta_norms:
     # 8 entries have customer FK (shape≈[1,1] → low delta), 2 have no FK (shape≈[1,0] → higher).
     b1 = GDSBuilder("s", str(tmp_path / "gds"))
-    b1.add_line("customers", [{"cid": f"C-{i:03d}"} for i in range(10)], key_col="cid", source_id="test")
+    b1.add_line(
+        "customers", [{"cid": f"C-{i:03d}"} for i in range(10)], key_col="cid", source_id="test"
+    )
     b1.add_line(
         "gl_entries",
         [{"doc": f"D-{i:03d}", "cust_id": f"C-{i:03d}"} for i in range(8)]
@@ -1307,8 +1320,9 @@ def test_streaming_stats_match_full_population(tmp_path, monkeypatch):
     import json
     from pathlib import Path
 
-    import hypertopos.builder.builder as builder_mod
     import lance
+
+    import hypertopos.builder.builder as builder_mod
 
     # Path A: streaming (chunk_size=100, so 500 entities triggers streaming)
     monkeypatch.setattr(builder_mod, "GEOMETRY_CHUNK_SIZE", 100)
@@ -1380,8 +1394,9 @@ def test_streaming_stats_with_dim_weights(tmp_path, monkeypatch):
     import json
     from pathlib import Path
 
-    import hypertopos.builder.builder as builder_mod
     import lance
+
+    import hypertopos.builder.builder as builder_mod
 
     n_entities = 500
 
@@ -1535,7 +1550,10 @@ def test_dimension_weights_kurtosis_alias(tmp_path, monkeypatch):
 
     assert w_kurt_s is not None, "kurtosis must produce dimension_weights in streaming path"
     np.testing.assert_allclose(
-        w_kurt, w_kurt_s, atol=1e-4, rtol=1e-4,
+        w_kurt,
+        w_kurt_s,
+        atol=1e-4,
+        rtol=1e-4,
         err_msg="kurtosis weights: streaming vs non-streaming mismatch",
     )
 
@@ -1555,8 +1573,9 @@ def test_streaming_with_tracked_properties(tmp_path, monkeypatch):
     import json
     from pathlib import Path
 
-    import hypertopos.builder.builder as builder_mod
     import lance
+
+    import hypertopos.builder.builder as builder_mod
 
     n_entities = 500
 
@@ -1661,7 +1680,12 @@ def test_streaming_complex_mode_falls_back_to_chunked(tmp_path, monkeypatch):
         for i in range(500)
     ]
     b.add_line("gl", gl, key_col="doc", source_id="test", role="event")
-    b.add_line("customers", [{"cust_id": f"C-{i:04d}"} for i in range(50)], key_col="cust_id", source_id="test")
+    b.add_line(
+        "customers",
+        [{"cust_id": f"C-{i:04d}"} for i in range(50)],
+        key_col="cust_id",
+        source_id="test",
+    )
     b.add_pattern(
         "gp",
         pattern_type="event",
@@ -1706,17 +1730,22 @@ def test_heteroscedasticity_diagnostic_persisted_when_group_by_property(tmp_path
     ):
         for _ in range(100):
             event_count = max(0, int(rng.normal(mean_count, std_count)))
-            customers.append({
-                "cust_id": f"C-{cust_id:04d}",
-                "region": region_label,
-                "event_count": event_count,
-            })
+            customers.append(
+                {
+                    "cust_id": f"C-{cust_id:04d}",
+                    "region": region_label,
+                    "event_count": event_count,
+                }
+            )
             cust_id += 1
 
     out_path = tmp_path / "gds_het"
     b = GDSBuilder("het_test", str(out_path))
     b.add_line(
-        "customers", customers, key_col="cust_id", source_id="test",
+        "customers",
+        customers,
+        key_col="cust_id",
+        source_id="test",
     )
     b.add_pattern(
         "cust_pat",
@@ -1724,8 +1753,10 @@ def test_heteroscedasticity_diagnostic_persisted_when_group_by_property(tmp_path
         entity_line="customers",
         relations=[
             RelationSpec(
-                "customers", fk_col="event_count",
-                direction="in", edge_max=100,
+                "customers",
+                fk_col="event_count",
+                direction="in",
+                edge_max=100,
             ),
         ],
         group_by_property="region",
@@ -1765,8 +1796,7 @@ def test_heteroscedasticity_diagnostic_persisted_when_group_by_property(tmp_path
     entries = nav.sphere_overview()
     pat_entry = next(e for e in entries if e["pattern_id"] == "cust_pat")
     het = [
-        w for w in pat_entry.get("dim_quality_warnings", [])
-        if w["type"] == "heteroscedasticity"
+        w for w in pat_entry.get("dim_quality_warnings", []) if w["type"] == "heteroscedasticity"
     ]
     assert len(het) == 1, (
         "heteroscedasticity warning missing from sphere_overview — the "
@@ -1850,9 +1880,7 @@ def test_source_id_persisted_in_sphere_json(tmp_path):
     )
     b.build()
 
-    sphere_json = json.loads(
-        (tmp_path / "gds" / "_gds_meta" / "sphere.json").read_text()
-    )
+    sphere_json = json.loads((tmp_path / "gds" / "_gds_meta" / "sphere.json").read_text())
     lines = sphere_json["lines"]
     assert lines["accounts"]["source_id"] == "accounts"
     assert lines["accounts_stress"]["source_id"] == "accounts"
@@ -1933,6 +1961,7 @@ def test_geometry_writes_null_confidence_when_bootstrap_skipped(tmp_path):
     """When bootstrap is not run, anomaly_confidence column must be all-null (not 0.0)."""
     import lance
     import pyarrow as pa
+
     from hypertopos.builder.builder import GDSBuilder, RelationSpec
 
     builder = GDSBuilder("s", str(tmp_path / "gds"))
@@ -1966,3 +1995,23 @@ def test_geometry_writes_null_confidence_when_bootstrap_skipped(tmp_path):
         assert confidence_col[i].as_py() is None, (
             f"Row {i}: expected null anomaly_confidence, got {confidence_col[i].as_py()}"
         )
+
+
+def test_streaming_geometry_is_written_once_without_compaction(tmp_path, monkeypatch):
+    """Chunked geometry goes out in one streamed write: no compaction, one fragment."""
+    from pathlib import Path
+
+    import lance
+    from lance.dataset import DatasetOptimizer
+
+    import hypertopos.builder.builder as builder_mod
+
+    def no_compaction(*_args, **_kwargs):
+        raise AssertionError("geometry chunks must not need a compaction pass")
+
+    monkeypatch.setattr(builder_mod, "GEOMETRY_CHUNK_SIZE", 100)
+    monkeypatch.setattr(DatasetOptimizer, "compact_files", no_compaction)
+    out = _make_streaming_builder(tmp_path, n_entities=500, suffix="_once").build()
+    ds = lance.dataset(str(Path(out) / "geometry" / "gl_pattern" / "data.lance"))
+    assert ds.count_rows() == 500
+    assert len(ds.get_fragments()) == 1

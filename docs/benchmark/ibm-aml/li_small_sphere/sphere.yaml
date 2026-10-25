@@ -141,7 +141,6 @@ patterns:
         edge_max: 1
     relations: auto
     anomaly_percentile: 95
-    use_mahalanobis: true
     tracked_properties: [bank_id, entity_type]
     group_by_property: entity_type
 

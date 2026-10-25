@@ -3,10 +3,10 @@
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
 """Tests for Welford rolling z-score."""
+
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from hypertopos.builder.builder import GDSBuilder
 
@@ -62,9 +62,15 @@ class TestWelfordRollingZ:
 
     def test_large_input(self):
         n_anchor, n_buckets, D = 1000, 200, 16
-        tensor = np.random.default_rng(7).uniform(
-            0, 1, (n_anchor, n_buckets, D),
-        ).astype(np.float32)
+        tensor = (
+            np.random.default_rng(7)
+            .uniform(
+                0,
+                1,
+                (n_anchor, n_buckets, D),
+            )
+            .astype(np.float32)
+        )
         result = GDSBuilder._compute_max_rolling_z(tensor, n_anchor, n_buckets)
         assert result.shape == (n_anchor,)
         assert np.all(np.isfinite(result))

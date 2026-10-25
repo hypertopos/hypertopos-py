@@ -13,6 +13,7 @@ a ``manifest.json`` carrying ``rule_set_hash`` for change detection.
 No ``eval()`` — the predicate language is intentionally minimal and the
 compiler walks the AST recursively.
 """
+
 from __future__ import annotations
 
 import json
@@ -20,7 +21,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import lance as _lance  # type: ignore[import-untyped]
 import pyarrow as pa
 import pyarrow.compute as pc
 
@@ -28,6 +28,7 @@ from hypertopos.model.sphere import (
     ConformancePredicate,
     Pattern,
 )
+from hypertopos.storage.writer import _write_lance
 
 # Comparison ops → PyArrow compute functions on (field, value) pairs.
 _BINARY_COMPARISONS: dict[str, str] = {
@@ -119,8 +120,7 @@ def evaluate_conformance_rules(
         return _VIOLATIONS_SCHEMA.empty_table()
     if "primary_key" not in points_table.column_names:
         raise ValueError(
-            "evaluate_conformance_rules requires a 'primary_key' column on "
-            "the points table",
+            "evaluate_conformance_rules requires a 'primary_key' column on the points table",
         )
 
     chunks: list[pa.Table] = []
@@ -153,17 +153,13 @@ def conformance_dir(base_path: Path, pattern_id: str) -> Path:
     ``_gds_meta/conformance/violations/{pattern_id}/`` — version subdirs
     (``v={N}.lance``) and ``manifest.json`` live underneath.
     """
-    return (
-        base_path
-        / "_gds_meta"
-        / "conformance"
-        / "violations"
-        / pattern_id
-    )
+    return base_path / "_gds_meta" / "conformance" / "violations" / pattern_id
 
 
 def conformance_dataset_path(
-    base_path: Path, pattern_id: str, version: int,
+    base_path: Path,
+    pattern_id: str,
+    version: int,
 ) -> Path:
     """Return the Lance dataset path for a pattern's violations at a given
     geometry version.
@@ -196,7 +192,7 @@ def write_conformance_sidecar(
         violations_table = violations_table.cast(_VIOLATIONS_SCHEMA)
 
     dataset_path = conformance_dataset_path(base_path, pattern_id, version)
-    _lance.write_dataset(violations_table, str(dataset_path), mode="overwrite")
+    _write_lance(violations_table, str(dataset_path), mode="overwrite")
 
     manifest = {
         "version": version,

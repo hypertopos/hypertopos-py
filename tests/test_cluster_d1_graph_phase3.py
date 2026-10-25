@@ -15,6 +15,7 @@ PageRank: H >> any S_i (star center accumulates incoming mass)
 Connected components: {H, S1, S2, S3, S4} = one component; {D, E} = second.
 Louvain: at least 2 communities (one per component).
 """
+
 from __future__ import annotations
 
 from unittest.mock import patch
@@ -39,7 +40,11 @@ def _make_adj(edges: list[tuple[str, str]]) -> AdjacencyIndex:
     amounts = [1.0] * len(edges)
     event_keys = [f"E-{i}" for i in range(len(edges))]
     return AdjacencyIndex.from_edge_lists(
-        from_keys, to_keys, timestamps, amounts, event_keys,
+        from_keys,
+        to_keys,
+        timestamps,
+        amounts,
+        event_keys,
     )
 
 
@@ -47,8 +52,11 @@ def _make_adj(edges: list[tuple[str, str]]) -> AdjacencyIndex:
 def engineered_graph() -> AdjacencyIndex:
     """Star (H ← S1..S4) + isolated edge (D--E). Seven nodes, two components."""
     edges = [
-        ("S1", "H"), ("S2", "H"), ("S3", "H"), ("S4", "H"),  # star, edges INTO H
-        ("D", "E"),                                            # isolated component
+        ("S1", "H"),
+        ("S2", "H"),
+        ("S3", "H"),
+        ("S4", "H"),  # star, edges INTO H
+        ("D", "E"),  # isolated component
     ]
     return _make_adj(edges)
 
@@ -66,8 +74,7 @@ class TestPageRank:
         assert pr["H"] > 0
         for leaf in ["S1", "S2", "S3", "S4"]:
             assert pr["H"] >= 3.0 * pr[leaf], (
-                f"hub PR={pr['H']:.4f} should be >= 3x leaf {leaf} "
-                f"PR={pr[leaf]:.4f}"
+                f"hub PR={pr['H']:.4f} should be >= 3x leaf {leaf} PR={pr[leaf]:.4f}"
             )
 
     def test_sums_to_one(self, engineered_graph: AdjacencyIndex) -> None:
@@ -138,7 +145,8 @@ class TestConnectedComponents:
 
 class TestLouvainCommunity:
     def test_two_components_at_least_two_communities(
-        self, engineered_graph: AdjacencyIndex,
+        self,
+        engineered_graph: AdjacencyIndex,
     ) -> None:
         """Disconnected components are guaranteed separate communities."""
         com = compute_louvain_community(engineered_graph)
@@ -162,7 +170,8 @@ class TestLouvainCommunity:
         )
 
     def test_fallback_to_networkx_when_igraph_missing(
-        self, engineered_graph: AdjacencyIndex,
+        self,
+        engineered_graph: AdjacencyIndex,
     ) -> None:
         """When igraph import fails, the helper should still return results via NetworkX."""
         # Verify NetworkX is available before running this fallback test
@@ -172,6 +181,7 @@ class TestLouvainCommunity:
             pytest.skip("networkx not installed; cannot exercise fallback")
 
         import builtins
+
         real_import = builtins.__import__
 
         def fake_import(name: str, *args: object, **kwargs: object) -> object:
@@ -190,10 +200,12 @@ class TestLouvainCommunity:
         assert com["H"] != com["D"]
 
     def test_no_backend_returns_empty(
-        self, engineered_graph: AdjacencyIndex,
+        self,
+        engineered_graph: AdjacencyIndex,
     ) -> None:
         """When neither igraph nor networkx is importable, return {} (no hard failure)."""
         import builtins
+
         real_import = builtins.__import__
 
         def fake_import(name: str, *args: object, **kwargs: object) -> object:
@@ -204,9 +216,7 @@ class TestLouvainCommunity:
         with patch("builtins.__import__", side_effect=fake_import):
             com = compute_louvain_community(engineered_graph)
 
-        assert com == {}, (
-            "with no backend, should return empty dict (caller handles null per-node)"
-        )
+        assert com == {}, "with no backend, should return empty dict (caller handles null per-node)"
 
 
 class TestComputeFromAdjacency:
@@ -223,7 +233,8 @@ class TestComputeFromAdjacency:
         assert len(set(results["connected_component"].values())) == 2
 
     def test_unknown_feature_silently_ignored(
-        self, engineered_graph: AdjacencyIndex,
+        self,
+        engineered_graph: AdjacencyIndex,
     ) -> None:
         results = compute_from_adjacency(engineered_graph, {"pagerank", "no_such_thing"})
         assert "pagerank" in results
@@ -242,23 +253,34 @@ class TestBuildIntegrationRoundtrip:
 
         # Seven-node engineered graph: star + isolated edge
         accounts = pa.table({"primary_key": ["H", "S1", "S2", "S3", "S4", "D", "E"]})
-        transfers = pa.table({
-            "primary_key": [f"T{i}" for i in range(5)],
-            "src": ["S1", "S2", "S3", "S4", "D"],
-            "dst": ["H", "H", "H", "H", "E"],
-        })
+        transfers = pa.table(
+            {
+                "primary_key": [f"T{i}" for i in range(5)],
+                "src": ["S1", "S2", "S3", "S4", "D"],
+                "dst": ["H", "H", "H", "H", "E"],
+            }
+        )
 
         builder = GDSBuilder("graph_phase3", str(tmp_path / "sphere"))
         builder.add_line(
-            "transfers", transfers, key_col="primary_key",
-            source_id="test", role="event",
+            "transfers",
+            transfers,
+            key_col="primary_key",
+            source_id="test",
+            role="event",
         )
         builder.add_line(
-            "accounts", accounts, key_col="primary_key",
-            source_id="test", role="anchor",
+            "accounts",
+            accounts,
+            key_col="primary_key",
+            source_id="test",
+            role="anchor",
         )
         builder.add_graph_features(
-            "accounts", "transfers", "src", "dst",
+            "accounts",
+            "transfers",
+            "src",
+            "dst",
             features=["pagerank", "community_id", "connected_component"],
         )
         builder.add_pattern("account_pattern", "anchor", "accounts", relations=[])
@@ -307,6 +329,7 @@ class TestBuildIntegrationRoundtrip:
 def test_wall_clock_engineered_subsecond(engineered_graph: AdjacencyIndex) -> None:
     """Sanity floor: all three algorithms on 7-node engineered graph < 1 second."""
     import time
+
     t0 = time.perf_counter()
     _ = compute_pagerank(engineered_graph)
     _ = compute_connected_components(engineered_graph)

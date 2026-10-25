@@ -6,11 +6,11 @@ Reuses prepare_accounts and filters to has_loan == 'yes'.
 Purpose: isolated population for loan stress pattern where mu/sigma
 are calibrated to loan-holders, not the full 4,500-account population.
 """
+
 from __future__ import annotations
 
 import pyarrow as pa
 import pyarrow.compute as pc
-
 from prepare_accounts import prepare as prepare_all_accounts
 
 

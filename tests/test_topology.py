@@ -3,6 +3,7 @@
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
 """Tests for engine/topology.trajectory_continuous_score."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -78,10 +79,7 @@ class TestTrajectoryContinuousScore:
     def test_sample_size_caps_population(self):
         rng = np.random.default_rng(0)
         traj_len = 4
-        trajectories = {
-            f"E{i}": rng.normal(0.0, 1.0, (traj_len, 2)).tolist()
-            for i in range(20)
-        }
+        trajectories = {f"E{i}": rng.normal(0.0, 1.0, (traj_len, 2)).tolist() for i in range(20)}
         tbl = _make_solid_table(trajectories)
         scores = trajectory_continuous_score(tbl, sample_size=5)
         # All entities receive a score (sample is for median estimation only)
@@ -89,9 +87,7 @@ class TestTrajectoryContinuousScore:
 
     def test_no_nan_or_inf(self):
         rng = np.random.default_rng(7)
-        trajectories = {
-            f"E{i}": rng.normal(0.0, 1.0, (3, 2)).tolist() for i in range(8)
-        }
+        trajectories = {f"E{i}": rng.normal(0.0, 1.0, (3, 2)).tolist() for i in range(8)}
         tbl = _make_solid_table(trajectories)
         scores = trajectory_continuous_score(tbl)
         for s in scores.values():

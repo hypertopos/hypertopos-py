@@ -3,6 +3,7 @@
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
 """Tests for compute_graph_features_temporal — single-pass graph features."""
+
 import numpy as np
 import pyarrow as pa
 
@@ -17,10 +18,12 @@ def _make_event_table(n_events: int, n_anchors: int, n_buckets: int):
     from_keys = rng.choice([f"A{i}" for i in range(n_anchors)], size=n_events)
     to_keys = rng.choice([f"A{i}" for i in range(n_anchors)], size=n_events)
     buckets = rng.integers(0, n_buckets, size=n_events)
-    table = pa.table({
-        "from_key": pa.array(from_keys),
-        "to_key": pa.array(to_keys),
-    })
+    table = pa.table(
+        {
+            "from_key": pa.array(from_keys),
+            "to_key": pa.array(to_keys),
+        }
+    )
     return table, buckets
 
 
@@ -38,7 +41,11 @@ def test_temporal_graph_features_match_per_window():
         indices = np.where(mask)[0]
         filtered = table.take(pa.array(indices, type=pa.int64()))
         results = compute_graph_features(
-            filtered, anchor_keys, "from_key", "to_key", features,
+            filtered,
+            anchor_keys,
+            "from_key",
+            "to_key",
+            features,
         )
         for f_idx, feat in enumerate(features):
             if feat in results:
@@ -46,17 +53,25 @@ def test_temporal_graph_features_match_per_window():
                 expected[:, b, f_idx] = values
 
     actual = compute_graph_features_temporal(
-        table, anchor_keys, "from_key", "to_key", features, buckets, n_buckets,
+        table,
+        anchor_keys,
+        "from_key",
+        "to_key",
+        features,
+        buckets,
+        n_buckets,
     )
     np.testing.assert_array_almost_equal(actual, expected, decimal=5)
 
 
 def test_temporal_graph_features_with_nulls():
     """Null from/to values should be filtered the same way."""
-    table = pa.table({
-        "from_key": pa.array(["A0", None, "A1", "A0", None]),
-        "to_key": pa.array(["A1", "A0", None, "A1", None]),
-    })
+    table = pa.table(
+        {
+            "from_key": pa.array(["A0", None, "A1", "A0", None]),
+            "to_key": pa.array(["A1", "A0", None, "A1", None]),
+        }
+    )
     anchor_keys = pa.array(["A0", "A1"])
     buckets = np.array([0, 0, 0, 1, 1])
     features = ["in_degree", "out_degree"]
@@ -68,7 +83,11 @@ def test_temporal_graph_features_with_nulls():
         indices = np.where(mask)[0]
         filtered = table.take(pa.array(indices, type=pa.int64()))
         results = compute_graph_features(
-            filtered, anchor_keys, "from_key", "to_key", features,
+            filtered,
+            anchor_keys,
+            "from_key",
+            "to_key",
+            features,
         )
         for f_idx, feat in enumerate(features):
             if feat in results:
@@ -76,24 +95,38 @@ def test_temporal_graph_features_with_nulls():
                 expected[:, b, f_idx] = values
 
     actual = compute_graph_features_temporal(
-        table, anchor_keys, "from_key", "to_key", features, buckets, 2,
+        table,
+        anchor_keys,
+        "from_key",
+        "to_key",
+        features,
+        buckets,
+        2,
     )
     np.testing.assert_array_almost_equal(actual, expected, decimal=5)
 
 
 def test_temporal_graph_features_empty_bucket():
     """Buckets with no events should remain zero."""
-    table = pa.table({
-        "from_key": pa.array(["A0", "A1"]),
-        "to_key": pa.array(["A1", "A0"]),
-    })
+    table = pa.table(
+        {
+            "from_key": pa.array(["A0", "A1"]),
+            "to_key": pa.array(["A1", "A0"]),
+        }
+    )
     anchor_keys = pa.array(["A0", "A1"])
     # All events in bucket 0, bucket 1 is empty
     buckets = np.array([0, 0])
     features = ["in_degree", "out_degree"]
 
     actual = compute_graph_features_temporal(
-        table, anchor_keys, "from_key", "to_key", features, buckets, 2,
+        table,
+        anchor_keys,
+        "from_key",
+        "to_key",
+        features,
+        buckets,
+        2,
     )
     # Bucket 1 should be all zeros
     np.testing.assert_array_equal(actual[:, 1, :], 0.0)
@@ -116,7 +149,11 @@ def test_temporal_graph_features_reciprocity():
         indices = np.where(mask)[0]
         filtered = table.take(pa.array(indices, type=pa.int64()))
         results = compute_graph_features(
-            filtered, anchor_keys, "from_key", "to_key", features,
+            filtered,
+            anchor_keys,
+            "from_key",
+            "to_key",
+            features,
         )
         for f_idx, feat in enumerate(features):
             if feat in results:
@@ -124,7 +161,13 @@ def test_temporal_graph_features_reciprocity():
                 expected[:, b, f_idx] = values
 
     actual = compute_graph_features_temporal(
-        table, anchor_keys, "from_key", "to_key", features, buckets, n_buckets,
+        table,
+        anchor_keys,
+        "from_key",
+        "to_key",
+        features,
+        buckets,
+        n_buckets,
     )
     np.testing.assert_array_almost_equal(actual, expected, decimal=5)
 
@@ -144,7 +187,11 @@ def test_temporal_graph_features_counterpart_overlap():
         indices = np.where(mask)[0]
         filtered = table.take(pa.array(indices, type=pa.int64()))
         results = compute_graph_features(
-            filtered, anchor_keys, "from_key", "to_key", features,
+            filtered,
+            anchor_keys,
+            "from_key",
+            "to_key",
+            features,
         )
         for f_idx, feat in enumerate(features):
             if feat in results:
@@ -152,7 +199,13 @@ def test_temporal_graph_features_counterpart_overlap():
                 expected[:, b, f_idx] = values
 
     actual = compute_graph_features_temporal(
-        table, anchor_keys, "from_key", "to_key", features, buckets, n_buckets,
+        table,
+        anchor_keys,
+        "from_key",
+        "to_key",
+        features,
+        buckets,
+        n_buckets,
     )
     np.testing.assert_array_almost_equal(actual, expected, decimal=5)
 
@@ -172,7 +225,11 @@ def test_temporal_graph_features_all_four():
         indices = np.where(mask)[0]
         filtered = table.take(pa.array(indices, type=pa.int64()))
         results = compute_graph_features(
-            filtered, anchor_keys, "from_key", "to_key", features,
+            filtered,
+            anchor_keys,
+            "from_key",
+            "to_key",
+            features,
         )
         for f_idx, feat in enumerate(features):
             if feat in results:
@@ -180,7 +237,13 @@ def test_temporal_graph_features_all_four():
                 expected[:, b, f_idx] = values
 
     actual = compute_graph_features_temporal(
-        table, anchor_keys, "from_key", "to_key", features, buckets, n_buckets,
+        table,
+        anchor_keys,
+        "from_key",
+        "to_key",
+        features,
+        buckets,
+        n_buckets,
     )
     np.testing.assert_array_almost_equal(actual, expected, decimal=5)
 
@@ -192,10 +255,12 @@ def test_temporal_graph_features_non_anchor_entities():
     but never appear as result rows.
     """
     # Anchors: A0, A1. Non-anchor: X0, X1 (appear in edges only)
-    table = pa.table({
-        "from_key": pa.array(["A0", "A0", "X0", "A1", "X1"]),
-        "to_key":   pa.array(["X0", "A1", "A0", "A0", "A1"]),
-    })
+    table = pa.table(
+        {
+            "from_key": pa.array(["A0", "A0", "X0", "A1", "X1"]),
+            "to_key": pa.array(["X0", "A1", "A0", "A0", "A1"]),
+        }
+    )
     anchor_keys = pa.array(["A0", "A1"])
     buckets = np.array([0, 0, 0, 0, 0])
     features = ["reciprocity", "counterpart_overlap"]
@@ -203,7 +268,11 @@ def test_temporal_graph_features_non_anchor_entities():
     expected = np.zeros((2, 1, 2), dtype=np.float32)
     filtered = table  # single bucket
     results = compute_graph_features(
-        filtered, anchor_keys, "from_key", "to_key", features,
+        filtered,
+        anchor_keys,
+        "from_key",
+        "to_key",
+        features,
     )
     for f_idx, feat in enumerate(features):
         if feat in results:
@@ -211,17 +280,25 @@ def test_temporal_graph_features_non_anchor_entities():
             expected[:, 0, f_idx] = values
 
     actual = compute_graph_features_temporal(
-        table, anchor_keys, "from_key", "to_key", features, buckets, 1,
+        table,
+        anchor_keys,
+        "from_key",
+        "to_key",
+        features,
+        buckets,
+        1,
     )
     np.testing.assert_array_almost_equal(actual, expected, decimal=5)
 
 
 def test_temporal_graph_features_single_entity_self_loop():
     """Self-loops (A0→A0) should be handled without errors."""
-    table = pa.table({
-        "from_key": pa.array(["A0", "A0", "A0"]),
-        "to_key":   pa.array(["A0", "A1", "A0"]),
-    })
+    table = pa.table(
+        {
+            "from_key": pa.array(["A0", "A0", "A0"]),
+            "to_key": pa.array(["A0", "A1", "A0"]),
+        }
+    )
     anchor_keys = pa.array(["A0", "A1"])
     buckets = np.array([0, 0, 1])
     features = ["reciprocity", "counterpart_overlap"]
@@ -232,7 +309,11 @@ def test_temporal_graph_features_single_entity_self_loop():
         indices = np.where(mask)[0]
         filtered = table.take(pa.array(indices, type=pa.int64()))
         results = compute_graph_features(
-            filtered, anchor_keys, "from_key", "to_key", features,
+            filtered,
+            anchor_keys,
+            "from_key",
+            "to_key",
+            features,
         )
         for f_idx, feat in enumerate(features):
             if feat in results:
@@ -240,7 +321,13 @@ def test_temporal_graph_features_single_entity_self_loop():
                 expected[:, b, f_idx] = values
 
     actual = compute_graph_features_temporal(
-        table, anchor_keys, "from_key", "to_key", features, buckets, 2,
+        table,
+        anchor_keys,
+        "from_key",
+        "to_key",
+        features,
+        buckets,
+        2,
     )
     np.testing.assert_array_almost_equal(actual, expected, decimal=5)
 
@@ -260,7 +347,11 @@ def test_temporal_graph_features_many_buckets():
         indices = np.where(mask)[0]
         filtered = table.take(pa.array(indices, type=pa.int64()))
         results = compute_graph_features(
-            filtered, anchor_keys, "from_key", "to_key", features,
+            filtered,
+            anchor_keys,
+            "from_key",
+            "to_key",
+            features,
         )
         for f_idx, feat in enumerate(features):
             if feat in results:
@@ -268,7 +359,13 @@ def test_temporal_graph_features_many_buckets():
                 expected[:, b, f_idx] = values
 
     actual = compute_graph_features_temporal(
-        table, anchor_keys, "from_key", "to_key", features, buckets, n_buckets,
+        table,
+        anchor_keys,
+        "from_key",
+        "to_key",
+        features,
+        buckets,
+        n_buckets,
     )
     np.testing.assert_array_almost_equal(actual, expected, decimal=5)
 
@@ -276,16 +373,24 @@ def test_temporal_graph_features_many_buckets():
 def test_temporal_overlap_no_bidirectional_edges():
     """When all edges are unidirectional, overlap should be 0."""
     # A0→A1, A1→A2, A2→A0 — no bidirectional pairs
-    table = pa.table({
-        "from_key": pa.array(["A0", "A1", "A2"]),
-        "to_key":   pa.array(["A1", "A2", "A0"]),
-    })
+    table = pa.table(
+        {
+            "from_key": pa.array(["A0", "A1", "A2"]),
+            "to_key": pa.array(["A1", "A2", "A0"]),
+        }
+    )
     anchor_keys = pa.array(["A0", "A1", "A2"])
     buckets = np.array([0, 0, 0])
     features = ["counterpart_overlap"]
 
     actual = compute_graph_features_temporal(
-        table, anchor_keys, "from_key", "to_key", features, buckets, 1,
+        table,
+        anchor_keys,
+        "from_key",
+        "to_key",
+        features,
+        buckets,
+        1,
     )
     np.testing.assert_array_equal(actual[:, 0, 0], 0.0)
 
@@ -293,16 +398,24 @@ def test_temporal_overlap_no_bidirectional_edges():
 def test_temporal_overlap_full_bidirectional():
     """When all edges are bidirectional, overlap should be 1.0."""
     # A0↔A1 — full bidirectionality
-    table = pa.table({
-        "from_key": pa.array(["A0", "A1"]),
-        "to_key":   pa.array(["A1", "A0"]),
-    })
+    table = pa.table(
+        {
+            "from_key": pa.array(["A0", "A1"]),
+            "to_key": pa.array(["A1", "A0"]),
+        }
+    )
     anchor_keys = pa.array(["A0", "A1"])
     buckets = np.array([0, 0])
     features = ["counterpart_overlap"]
 
     actual = compute_graph_features_temporal(
-        table, anchor_keys, "from_key", "to_key", features, buckets, 1,
+        table,
+        anchor_keys,
+        "from_key",
+        "to_key",
+        features,
+        buckets,
+        1,
     )
     # A0: out={A1}, in={A1}, bidir={A1} → 1/(1+1-1)=1.0
     # A1: out={A0}, in={A0}, bidir={A0} → 1/(1+1-1)=1.0
@@ -311,18 +424,30 @@ def test_temporal_overlap_full_bidirectional():
 
 # --- Graph algorithm features (static) ---
 
+
 def test_static_graph_algo_features():
     """New graph algorithm features produce non-zero results."""
-    table = pa.table({
-        "from_key": pa.array(["A0", "A1", "A2", "A0", "A1"]),
-        "to_key": pa.array(["A1", "A2", "A0", "A2", "A0"]),
-    })
+    table = pa.table(
+        {
+            "from_key": pa.array(["A0", "A1", "A2", "A0", "A1"]),
+            "to_key": pa.array(["A1", "A2", "A0", "A2", "A0"]),
+        }
+    )
     anchor_keys = pa.array(["A0", "A1", "A2"])
-    features = ["pagerank", "connected_component", "clustering_coefficient",
-                 "community", "betweenness"]
+    features = [
+        "pagerank",
+        "connected_component",
+        "clustering_coefficient",
+        "community",
+        "betweenness",
+    ]
 
     results = compute_graph_features(
-        table, anchor_keys, "from_key", "to_key", features,
+        table,
+        anchor_keys,
+        "from_key",
+        "to_key",
+        features,
     )
     assert set(results.keys()) == set(features)
 
@@ -355,7 +480,13 @@ def test_temporal_graph_algo_features_static_only():
     features = ["pagerank", "betweenness"]
 
     actual = compute_graph_features_temporal(
-        table, anchor_keys, "from_key", "to_key", features, buckets, n_buckets,
+        table,
+        anchor_keys,
+        "from_key",
+        "to_key",
+        features,
+        buckets,
+        n_buckets,
     )
     assert actual.shape == (n_anchors, n_buckets, len(features))
     # Static-only features produce zeros in temporal mode (by design)

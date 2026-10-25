@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
+
 from hypertopos.model.objects import SolidSlice
 from hypertopos.sphere import HyperSphere
 from hypertopos.storage.writer import GDSWriter
@@ -155,6 +156,7 @@ def test_parse_alias_cutting_plane_validates_dim(tmp_path):
     import json
 
     import pytest
+
     from hypertopos.storage.reader import GDSReader
 
     sphere_json = {

@@ -1,0 +1,270 @@
+{
+  "CH-001": {
+    "propagation": {
+      "anchor_pattern_id": "account_pattern",
+      "chain_id": "CH-001",
+      "hops": [
+        {
+          "delta_norm": 45.0444,
+          "delta_rank_pct": 75.0,
+          "hop_idx": 0,
+          "is_anomaly": true,
+          "primary_key": "A1",
+          "top_dim": "dim_0"
+        },
+        {
+          "delta_norm": 55.0454,
+          "delta_rank_pct": 100.0,
+          "hop_idx": 1,
+          "is_anomaly": true,
+          "primary_key": "A2",
+          "top_dim": "dim_0"
+        },
+        {
+          "delta_norm": 40.1995,
+          "delta_rank_pct": 62.5,
+          "hop_idx": 2,
+          "is_anomaly": true,
+          "primary_key": "A3",
+          "top_dim": "dim_0"
+        },
+        {
+          "delta_norm": 50.0999,
+          "delta_rank_pct": 87.5,
+          "hop_idx": 3,
+          "is_anomaly": true,
+          "primary_key": "A4",
+          "top_dim": "dim_0"
+        }
+      ],
+      "pattern_id": "chain_pattern",
+      "summary": {
+        "dominant_top_dim": "dim_0",
+        "max_run_length_same_top_dim": 4,
+        "n_anomalous": 4,
+        "n_hops": 4
+      }
+    },
+    "typology": {
+      "anchor_pattern_id": "account_pattern",
+      "chain_id": "CH-001",
+      "pattern_id": "chain_pattern",
+      "typology": {
+        "breakpoint_rank_bucket": "no-breakpoint",
+        "dominant_top_dim": "dim_0",
+        "extension_signals": {
+          "backward": false,
+          "forward": false
+        },
+        "peak_position": "early",
+        "position_in_chain": "full-chain",
+        "pre_run_rank_bucket": "no-pre-run",
+        "run_length": 4,
+        "run_start_idx": 0,
+        "run_top_dim": "dim_0",
+        "shape": "peak-in-middle"
+      }
+    }
+  },
+  "CH-002": {
+    "propagation": {
+      "anchor_pattern_id": "account_pattern",
+      "chain_id": "CH-002",
+      "hops": [
+        {
+          "delta_norm": 45.0444,
+          "delta_rank_pct": 75.0,
+          "hop_idx": 0,
+          "is_anomaly": true,
+          "primary_key": "A1",
+          "top_dim": "dim_0"
+        },
+        {
+          "delta_norm": 55.0454,
+          "delta_rank_pct": 100.0,
+          "hop_idx": 1,
+          "is_anomaly": true,
+          "primary_key": "A2",
+          "top_dim": "dim_0"
+        },
+        {
+          "delta_norm": 3.7417,
+          "delta_rank_pct": 50.0,
+          "hop_idx": 2,
+          "is_anomaly": false,
+          "primary_key": "B1",
+          "top_dim": null
+        }
+      ],
+      "pattern_id": "chain_pattern",
+      "summary": {
+        "dominant_top_dim": "dim_0",
+        "max_run_length_same_top_dim": 2,
+        "n_anomalous": 2,
+        "n_hops": 3
+      }
+    },
+    "typology": {
+      "anchor_pattern_id": "account_pattern",
+      "chain_id": "CH-002",
+      "pattern_id": "chain_pattern",
+      "typology": {
+        "breakpoint_rank_bucket": "median",
+        "dominant_top_dim": "dim_0",
+        "extension_signals": {
+          "backward": false,
+          "forward": false
+        },
+        "peak_position": "at-end",
+        "position_in_chain": "leading",
+        "pre_run_rank_bucket": "no-pre-run",
+        "run_length": 2,
+        "run_start_idx": 0,
+        "run_top_dim": "dim_0",
+        "shape": "monotone-rising"
+      }
+    }
+  },
+  "CH-009": {
+    "propagation": {
+      "anchor_pattern_id": "account_pattern",
+      "chain_id": "CH-009",
+      "hops": [
+        {
+          "delta_norm": 45.0444,
+          "delta_rank_pct": 75.0,
+          "hop_idx": 0,
+          "is_anomaly": true,
+          "primary_key": "A1",
+          "top_dim": "dim_0"
+        },
+        {
+          "delta_norm": 55.0454,
+          "delta_rank_pct": 100.0,
+          "hop_idx": 1,
+          "is_anomaly": true,
+          "primary_key": "A2",
+          "top_dim": "dim_0"
+        },
+        {
+          "delta_norm": 3.7417,
+          "delta_rank_pct": 50.0,
+          "hop_idx": 2,
+          "is_anomaly": false,
+          "primary_key": "B1",
+          "top_dim": null
+        },
+        {
+          "delta_norm": 40.1995,
+          "delta_rank_pct": 62.5,
+          "hop_idx": 3,
+          "is_anomaly": true,
+          "primary_key": "A3",
+          "top_dim": "dim_0"
+        },
+        {
+          "delta_norm": 50.0999,
+          "delta_rank_pct": 87.5,
+          "hop_idx": 4,
+          "is_anomaly": true,
+          "primary_key": "A4",
+          "top_dim": "dim_0"
+        }
+      ],
+      "pattern_id": "chain_pattern",
+      "summary": {
+        "dominant_top_dim": "dim_0",
+        "max_run_length_same_top_dim": 2,
+        "n_anomalous": 4,
+        "n_hops": 5
+      }
+    },
+    "typology": {
+      "anchor_pattern_id": "account_pattern",
+      "chain_id": "CH-009",
+      "pattern_id": "chain_pattern",
+      "typology": {
+        "breakpoint_rank_bucket": "median",
+        "dominant_top_dim": "dim_0",
+        "extension_signals": {
+          "backward": false,
+          "forward": false
+        },
+        "peak_position": "at-end",
+        "position_in_chain": "leading",
+        "pre_run_rank_bucket": "no-pre-run",
+        "run_length": 2,
+        "run_start_idx": 0,
+        "run_top_dim": "dim_0",
+        "shape": "monotone-rising"
+      }
+    }
+  },
+  "CH-012": {
+    "propagation": {
+      "anchor_pattern_id": "account_pattern",
+      "chain_id": "CH-012",
+      "hops": [
+        {
+          "delta_norm": 3.7417,
+          "delta_rank_pct": 50.0,
+          "hop_idx": 0,
+          "is_anomaly": false,
+          "primary_key": "B1",
+          "top_dim": null
+        },
+        {
+          "delta_norm": 45.0444,
+          "delta_rank_pct": 75.0,
+          "hop_idx": 1,
+          "is_anomaly": true,
+          "primary_key": "A1",
+          "top_dim": "dim_0"
+        },
+        {
+          "delta_norm": 55.0454,
+          "delta_rank_pct": 100.0,
+          "hop_idx": 2,
+          "is_anomaly": true,
+          "primary_key": "A2",
+          "top_dim": "dim_0"
+        },
+        {
+          "delta_norm": 40.1995,
+          "delta_rank_pct": 62.5,
+          "hop_idx": 3,
+          "is_anomaly": true,
+          "primary_key": "A3",
+          "top_dim": "dim_0"
+        }
+      ],
+      "pattern_id": "chain_pattern",
+      "summary": {
+        "dominant_top_dim": "dim_0",
+        "max_run_length_same_top_dim": 3,
+        "n_anomalous": 3,
+        "n_hops": 4
+      }
+    },
+    "typology": {
+      "anchor_pattern_id": "account_pattern",
+      "chain_id": "CH-012",
+      "pattern_id": "chain_pattern",
+      "typology": {
+        "breakpoint_rank_bucket": "no-breakpoint",
+        "dominant_top_dim": "dim_0",
+        "extension_signals": {
+          "backward": false,
+          "forward": false
+        },
+        "peak_position": "middle",
+        "position_in_chain": "terminal",
+        "pre_run_rank_bucket": "median",
+        "run_length": 3,
+        "run_start_idx": 1,
+        "run_top_dim": "dim_0",
+        "shape": "peak-in-middle"
+      }
+    }
+  }
+}

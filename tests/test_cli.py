@@ -10,8 +10,11 @@ import sys
 import textwrap
 from contextlib import redirect_stderr
 from dataclasses import dataclass
+from pathlib import Path
 
-from hypertopos.cli import main as cli_main
+import pytest
+
+from hypertopos.cli.main import main as cli_main
 
 
 @dataclass
@@ -54,13 +57,22 @@ def test_cli_build_missing_mapping(monkeypatch):
     assert result.returncode != 0
 
 
-def test_cli_build_creates_sphere(tmp_path):
-    (tmp_path / "items.csv").write_text("item_id,name\nI-1,Widget\nI-2,Gadget\nI-3,Foo\n")
-    yaml_file = tmp_path / "mapping.yaml"
+@pytest.fixture(scope="module")
+def default_build(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    """One real subprocess ``build`` (YAML ``output_path``, no override).
+
+    Read-only for its consumers: they only inspect the exit code, stdout and
+    the written sphere, so a single build serves the whole module.
+    """
+    workdir = tmp_path_factory.mktemp("cli_default_build")
+    (workdir / "items.csv").write_text("item_id,name\nI-1,Widget\nI-2,Gadget\nI-3,Foo\n")
+    yaml_file = workdir / "mapping.yaml"
     yaml_file.write_text(
         textwrap.dedent(f"""\
         sphere_id: cli_test
-        output_path: {tmp_path / "gds_cli"}
+        output_path: {workdir / "gds_cli"}
         lines:
           items:
             source: items.csv
@@ -68,9 +80,13 @@ def test_cli_build_creates_sphere(tmp_path):
         patterns: {{}}
     """)
     )
-    result = _run_cli(["build", "--mapping", str(yaml_file)])
+    return _run_cli(["build", "--mapping", str(yaml_file)]), workdir
+
+
+def test_cli_build_creates_sphere(default_build):
+    result, workdir = default_build
     assert result.returncode == 0, f"CLI failed:\n{result.stderr}"
-    assert (tmp_path / "gds_cli" / "_gds_meta" / "sphere.json").exists()
+    assert (workdir / "gds_cli" / "_gds_meta" / "sphere.json").exists()
 
 
 def test_cli_build_output_override(tmp_path):
@@ -110,20 +126,64 @@ def test_cli_build_invalid_yaml(tmp_path, monkeypatch):
     assert "error:" in result.stderr.lower()
 
 
-def test_cli_build_prints_output_path(tmp_path):
-    (tmp_path / "data.csv").write_text("id\nX-1\nX-2\n")
-    yaml_file = tmp_path / "mapping.yaml"
-    yaml_file.write_text(
-        textwrap.dedent(f"""\
-        sphere_id: print_test
-        output_path: {tmp_path / "gds_print"}
-        lines:
-          data:
-            source: data.csv
-            key_col: id
-        patterns: {{}}
-    """)
-    )
-    result = _run_cli(["build", "--mapping", str(yaml_file)])
+def test_cli_build_prints_output_path(default_build):
+    result, _ = default_build
     assert result.returncode == 0
-    assert "gds_print" in result.stdout
+    assert "gds_cli" in result.stdout
+
+
+def test_add_derived_group_resolves_anchor_fk_from_pattern_relations():
+    """The derived-dimension YAML path resolves the anchor FK from the
+    ``from_pattern`` relations and always threads the sphere config through."""
+    from unittest.mock import MagicMock
+
+    from hypertopos.cli.build import _add_derived_group
+    from hypertopos.cli.schema import (
+        DerivedDimGroup,
+        FeatureSpec,
+        PatternConfig,
+        RelationConfig,
+        SphereConfig,
+    )
+
+    anchor = PatternConfig(type="anchor", entity_line="accounts")
+    event = PatternConfig(
+        type="event",
+        entity_line="tx",
+        relations=[RelationConfig(line="accounts", key_on_entity="from_acct")],
+    )
+    cfg = SphereConfig(
+        sphere_id="s",
+        patterns={"account_pattern": anchor, "tx_pattern": event},
+    )
+    group = DerivedDimGroup(
+        from_pattern="tx_pattern",
+        features=[FeatureSpec(dimension_name="tx_count", metric="count")],
+    )
+    builder = MagicMock()
+
+    _add_derived_group(builder, "account_pattern", group, anchor, cfg)
+
+    kwargs = builder.add_derived_dimension.call_args.kwargs
+    assert kwargs["event_line"] == "tx"
+    assert kwargs["anchor_fk"] == "from_acct"
+
+
+def test_add_one_feature_requires_sphere_config():
+    """Omitting the sphere config is a call error, not a late crash while
+    resolving the anchor FK."""
+    from unittest.mock import MagicMock
+
+    from hypertopos.cli.build import _add_one_feature
+    from hypertopos.cli.schema import FeatureSpec, PatternConfig
+
+    with pytest.raises(TypeError):
+        _add_one_feature(  # type: ignore[call-arg]
+            MagicMock(),
+            "account_pattern",
+            FeatureSpec(dimension_name="tx_count", metric="count"),
+            PatternConfig(type="anchor", entity_line="accounts"),
+            "tx",
+            None,
+            from_pattern="tx_pattern",
+        )

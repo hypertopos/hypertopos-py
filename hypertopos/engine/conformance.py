@@ -13,13 +13,15 @@ primitive.
 Bail-guard: the sidecar directory's existence is a cheap O(1) filesystem
 check; we never open the Lance dataset when the sidecar is absent.
 """
+
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import lance as _lance  # type: ignore[import-untyped]
+if TYPE_CHECKING:
+    from hypertopos.storage.reader import GDSReader
 
 # Severity ordering — keep in sync with ``ConformanceRule.severity`` Literal.
 _SEVERITY_RANK: dict[str, int] = {
@@ -31,13 +33,7 @@ _SEVERITY_RANK: dict[str, int] = {
 
 
 def _sidecar_dir(base_path: Path, pattern_id: str) -> Path:
-    return (
-        base_path
-        / "_gds_meta"
-        / "conformance"
-        / "violations"
-        / pattern_id
-    )
+    return base_path / "_gds_meta" / "conformance" / "violations" / pattern_id
 
 
 def _dataset_path(base_path: Path, pattern_id: str, version: int) -> Path:
@@ -48,10 +44,12 @@ def _read_manifest(base_path: Path, pattern_id: str) -> dict[str, Any] | None:
     manifest_path = _sidecar_dir(base_path, pattern_id) / "manifest.json"
     if not manifest_path.exists():
         return None
-    return json.loads(manifest_path.read_text())
+    manifest: dict[str, Any] = json.loads(manifest_path.read_text())
+    return manifest
 
 
 def read_violations(
+    reader: GDSReader,
     base_path: Path,
     pattern_id: str,
     version: int,
@@ -74,8 +72,7 @@ def read_violations(
     """
     if severity_min not in _SEVERITY_RANK:
         raise ValueError(
-            f"severity_min must be one of {list(_SEVERITY_RANK)!r}; "
-            f"got {severity_min!r}",
+            f"severity_min must be one of {list(_SEVERITY_RANK)!r}; got {severity_min!r}",
         )
 
     # ── Bail-guard: cheap metadata check first. ─────────────────────────
@@ -83,7 +80,8 @@ def read_violations(
     if not side_dir.exists():
         return ([], None)
 
-    manifest = _read_manifest(base_path, pattern_id)
+    # The manifest is metadata: a branch reader reads the branch's copy.
+    manifest = _read_manifest(reader.meta_root, pattern_id)
 
     ds_path = _dataset_path(base_path, pattern_id, version)
     if not ds_path.exists():
@@ -93,7 +91,7 @@ def read_violations(
         # observability.
         return ([], manifest)
 
-    ds = _lance.dataset(str(ds_path))
+    ds = reader.dataset(ds_path)
     columns = ["primary_key", "rule_id", "severity"]
 
     # Lance ``to_table`` supports ``filter`` pushdown via a SQL fragment

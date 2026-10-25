@@ -5,6 +5,7 @@ embedded at origin + Gaussian background mean=5 (≈17σ away on dim-0). For a
 loop member, k=30 NN ≈ all 30 loop points (cycle visible in H_1). For a bg
 member, k=30 NN = bg blob (no H_1). Top-n is dominated by loop members.
 """
+
 from __future__ import annotations
 
 import numpy as np
@@ -16,7 +17,10 @@ pytest.importorskip("sklearn")
 
 
 def _embedded_loop_with_bg(
-    n_loop: int = 30, n_bg: int = 1970, dim: int = 10, seed: int = 0,
+    n_loop: int = 30,
+    n_bg: int = 1970,
+    dim: int = 10,
+    seed: int = 0,
 ) -> tuple[np.ndarray, list[str]]:
     """Loop members prefixed 'L' with LARGE cycle radius 3.0 → high h1_max;
     background prefixed 'B' as a tight Gaussian blob (std=0.3) far away → low h1_max.
@@ -59,7 +63,11 @@ def test_embedded_loop_dominates_top_n():
     tbl = _to_geometry_table(coords, pks)
 
     result = find_topological_anomalies(
-        tbl, top_n=30, sample_size=1500, k_neighbors=30, pca_dim=10,
+        tbl,
+        top_n=30,
+        sample_size=1500,
+        k_neighbors=30,
+        pca_dim=10,
     )
 
     top_pks = {r["primary_key"] for r in result}
@@ -85,7 +93,10 @@ def test_advisory_warning_for_small_n():
     tbl = _to_geometry_table(_gaussian_cloud(1500))
     with pytest.warns(UserWarning, match="PH reliability"):
         find_topological_anomalies(
-            tbl, top_n=10, sample_size=1500, k_neighbors=20,
+            tbl,
+            top_n=10,
+            sample_size=1500,
+            k_neighbors=20,
         )
 
 
@@ -103,7 +114,10 @@ def test_non_numeric_columns_filtered_silently():
     tbl = pa.table(cols)
 
     result = find_topological_anomalies(
-        tbl, top_n=10, sample_size=1500, k_neighbors=20,
+        tbl,
+        top_n=10,
+        sample_size=1500,
+        k_neighbors=20,
     )
     assert len(result) == 10
     assert all(np.isfinite(r["topo_score"]) for r in result)
@@ -116,14 +130,21 @@ def test_return_shape_and_fields():
     tbl = _to_geometry_table(coords, pks)
 
     result = find_topological_anomalies(
-        tbl, top_n=10, sample_size=1500, k_neighbors=20,
+        tbl,
+        top_n=10,
+        sample_size=1500,
+        k_neighbors=20,
     )
 
     assert isinstance(result, list)
     assert len(result) == 10
     required = {
-        "primary_key", "topo_score", "h1_max_persistence",
-        "h0_mean_death", "n_h1_features", "computed_at",
+        "primary_key",
+        "topo_score",
+        "h1_max_persistence",
+        "h0_mean_death",
+        "n_h1_features",
+        "computed_at",
     }
     for row in result:
         assert required.issubset(row.keys()), f"missing fields: {required - row.keys()}"

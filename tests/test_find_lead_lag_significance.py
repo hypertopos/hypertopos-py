@@ -1,8 +1,8 @@
 """Null-distribution calibration for M5 find_lead_lag significance machinery."""
+
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 
 def test_population_significance_null_calibration():
@@ -32,9 +32,7 @@ def test_population_significance_null_calibration():
             n_significant += 1
     fraction = n_significant / n_trials
     # Bonferroni is conservative — observed FPR should not exceed 0.07
-    assert fraction <= 0.07, (
-        f"observed FPR {fraction:.3f} exceeds nominal 0.05 by too much"
-    )
+    assert fraction <= 0.07, f"observed FPR {fraction:.3f} exceeds nominal 0.05 by too much"
 
 
 def test_per_dim_fdr_calibration_under_global_null():
@@ -54,9 +52,13 @@ def test_per_dim_fdr_calibration_under_global_null():
         mu_pop_a = rng.normal(size=(n_epochs, D_a))
         mu_pop_b = rng.normal(size=(n_epochs, D_b))
         pairs, _, _ = _compute_per_dim_lead_lag(
-            mu_pop_a, mu_pop_b,
-            max_lag=4, fdr_alpha=alpha, fdr_method="bh",
-            dim_labels_a=None, dim_labels_b=None,
+            mu_pop_a,
+            mu_pop_b,
+            max_lag=4,
+            fdr_alpha=alpha,
+            fdr_method="bh",
+            dim_labels_a=None,
+            dim_labels_b=None,
         )
         n_sig = sum(1 for p in pairs if p.is_significant)
         any_rejection.append(1.0 if n_sig > 0 else 0.0)
@@ -64,9 +66,7 @@ def test_per_dim_fdr_calibration_under_global_null():
     # With Bonferroni-over-lags + BH over pairs, false-rejection should be
     # comfortably under nominal alpha. Allow a generous margin (0.20) for
     # MC noise on 50 runs.
-    assert rate <= 0.20, (
-        f"BH false-rejection rate under H0 = {rate:.3f} too high"
-    )
+    assert rate <= 0.20, f"BH false-rejection rate under H0 = {rate:.3f} too high"
 
 
 def test_storey_recovers_power_on_rich_signal():
@@ -94,14 +94,22 @@ def test_storey_recovers_power_on_rich_signal():
     mu_pop_b[:2, 1] = rng.normal(size=2)
 
     pairs_bh, _, _ = _compute_per_dim_lead_lag(
-        mu_pop_a, mu_pop_b,
-        max_lag=5, fdr_alpha=0.05, fdr_method="bh",
-        dim_labels_a=None, dim_labels_b=None,
+        mu_pop_a,
+        mu_pop_b,
+        max_lag=5,
+        fdr_alpha=0.05,
+        fdr_method="bh",
+        dim_labels_a=None,
+        dim_labels_b=None,
     )
     pairs_storey, _, _ = _compute_per_dim_lead_lag(
-        mu_pop_a, mu_pop_b,
-        max_lag=5, fdr_alpha=0.05, fdr_method="storey",
-        dim_labels_a=None, dim_labels_b=None,
+        mu_pop_a,
+        mu_pop_b,
+        max_lag=5,
+        fdr_alpha=0.05,
+        fdr_method="storey",
+        dim_labels_a=None,
+        dim_labels_b=None,
     )
     n_sig_bh = sum(1 for p in pairs_bh if p.is_significant)
     n_sig_storey = sum(1 for p in pairs_storey if p.is_significant)

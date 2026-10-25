@@ -4,10 +4,8 @@
 # See LICENSE.md in the repository root for full terms.
 """Tests for chain extraction engine."""
 
-import concurrent.futures
-from concurrent.futures.process import BrokenProcessPool
-
 import pytest
+
 from hypertopos.engine.chains import extract_chains
 
 
@@ -215,23 +213,16 @@ class TestExtractChains:
             for j, seq_j in enumerate(key_seqs):
                 if i == j:
                     continue
-                if (len(seq_i) < len(seq_j)
-                        and seq_j[:len(seq_i)] == seq_i):
+                if len(seq_i) < len(seq_j) and seq_j[: len(seq_i)] == seq_i:
                     raise AssertionError(
                         f"chain {i} {seq_i} is a strict prefix of "
                         f"chain {j} {seq_j} — dedup missed it",
                     )
 
-    def test_chain_ids_unique_across_workers(self):
-        """Regression — multi-worker extraction must produce unique
-        chain_ids in the merged output. Previously each worker's local
-        len(chains) counter restarted from 0 and merged chains had
-        repeated primary_keys (~ n_workers-fold duplication), breaking
-        downstream point-table reads keyed by chain_id."""
-        # Build a graph dense enough to span multiple workers and produce
-        # several chains per seed. ProcessPoolExecutor activates when
-        # there are enough seeds to chunk; a 50-seed fan-out scenario
-        # reliably triggers the parallel path on a multi-CPU host.
+    def test_chain_ids_unique(self):
+        """Extraction must produce unique chain_ids: downstream point-table
+        reads are keyed by chain_id."""
+        # 50 seeds, several chains per seed.
         from_keys: list[str] = []
         to_keys: list[str] = []
         event_pks: list[str] = []
@@ -250,8 +241,7 @@ class TestExtractChains:
         )
         ids = [c.chain_id for c in chains]
         assert len(ids) == len(set(ids)), (
-            f"chain_ids are not unique: {len(ids) - len(set(ids))} "
-            f"duplicates in {len(ids)} chains"
+            f"chain_ids are not unique: {len(ids) - len(set(ids))} duplicates in {len(ids)} chains"
         )
 
     def test_cycle_detection(self):
@@ -372,33 +362,6 @@ class TestExtractChains:
         )
         assert len(chains_sampled) <= len(chains_all)
         assert len(chains_sampled) <= 10
-
-    def test_parallel_falls_back_on_broken_process_pool(self, monkeypatch):
-        """BrokenProcessPool during startup falls back to serial BFS."""
-
-        class BrokenExecutor:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def __enter__(self):
-                raise BrokenProcessPool("boom")
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-        monkeypatch.setattr(concurrent.futures, "ProcessPoolExecutor", BrokenExecutor)
-
-        from_keys = [f"A{i}" for i in range(400)] + [f"B{i}" for i in range(400)]
-        to_keys = [f"B{i}" for i in range(400)] + [f"C{i}" for i in range(400)]
-        event_pks = [f"TX-{i}" for i in range(800)]
-
-        chains = extract_chains(
-            from_keys=from_keys,
-            to_keys=to_keys,
-            event_pks=event_pks,
-            min_hops=2,
-        )
-        assert len(chains) == 400
 
     def test_dedup_chains(self):
         """Same event set doesn't produce duplicate chains."""
@@ -595,57 +558,8 @@ class TestExtractChains:
 
 
 class TestParallelBFS:
-    def test_parallel_produces_same_chains_as_serial(self):
-        """Parallel BFS (>400 seeds) produces equivalent chains to serial."""
-        # Build a graph with 500+ unique starting nodes
-        n = 600
-        from_keys = [f"N-{i:04d}" for i in range(n)]
-        to_keys = [f"N-{(i + 1) % n:04d}" for i in range(n)]
-        event_pks = [f"TX-{i:06d}" for i in range(n)]
-
-        serial = extract_chains(
-            from_keys=from_keys,
-            to_keys=to_keys,
-            event_pks=event_pks,
-            min_hops=2,
-            max_chains=1000,
-        )
-        # Should produce chains (ring graph → every node is a seed)
-        assert len(serial) > 0
-        # All chains have hop_count >= 2
-        assert all(c.hop_count >= 2 for c in serial)
-
-    def test_parallel_falls_back_when_process_pool_unavailable(self, monkeypatch):
-        """Parallel BFS falls back to serial when process pools cannot start."""
-        import concurrent.futures
-
-        n = 600
-        from_keys = [f"N-{i:04d}" for i in range(n)]
-        to_keys = [f"N-{(i + 1) % n:04d}" for i in range(n)]
-        event_pks = [f"TX-{i:06d}" for i in range(n)]
-
-        def raise_permission_error(*args, **kwargs):
-            raise PermissionError("mocked process pool failure")
-
-        monkeypatch.setattr(
-            concurrent.futures,
-            "ProcessPoolExecutor",
-            raise_permission_error,
-        )
-
-        chains = extract_chains(
-            from_keys=from_keys,
-            to_keys=to_keys,
-            event_pks=event_pks,
-            min_hops=2,
-            max_chains=1000,
-        )
-
-        assert len(chains) > 0
-        assert all(c.hop_count >= 2 for c in chains)
-
-    def test_parallel_dedup_across_workers(self):
-        """Post-merge dedup removes duplicates found by different workers."""
+    def test_no_duplicate_event_sets_on_dense_graph(self):
+        """Seeds that reach the same chain do not emit it twice."""
         # Dense graph: many seeds find the same chains
         n = 500
         from_keys = [f"N-{i % 50:03d}" for i in range(n)]
@@ -662,3 +576,52 @@ class TestParallelBFS:
         # Verify no duplicate event_keys sets
         sigs = [frozenset(c.event_keys) for c in chains]
         assert len(sigs) == len(set(sigs))
+
+
+def test_chain_to_dict_lists_distinct_categories_in_sorted_order() -> None:
+    from hypertopos.engine.chains import Chain
+
+    chain = Chain(
+        chain_id="CHAIN-000000",
+        keys=["A", "B", "C", "D"],
+        event_keys=["e1", "e2", "e3"],
+        hop_count=3,
+        is_cyclic=False,
+        time_span_hours=1.0,
+        categories=["PLN", "EUR", "PLN"],
+        amounts=[3.0, 2.0, 1.0],
+        amount_decay=1 / 3,
+    )
+    assert chain.to_dict()["categories"] == ["EUR", "PLN"]
+
+
+def test_extract_chains_restores_the_garbage_collector_state() -> None:
+    import gc
+
+    from hypertopos.engine.chains import extract_chains
+
+    args = (["A", "B"], ["B", "A"], ["e1", "e2"], [0.0, 10.0])
+    try:
+        gc.enable()
+        extract_chains(*args)
+        assert gc.isenabled()
+        gc.disable()
+        extract_chains(*args)
+        assert not gc.isenabled()
+    finally:
+        gc.enable()
+
+
+def test_dedup_cap_overflow_is_reported(monkeypatch):
+    """When the dedup set fills up, later duplicate chains are no longer
+    removed; that must be visible, not silent."""
+    import hypertopos.engine.chains as chains_mod
+
+    monkeypatch.setattr(chains_mod, "_DEDUP_CAP", 1)
+    with pytest.warns(UserWarning, match="chain dedup stopped"):
+        extract_chains(
+            from_keys=["A", "B", "C"],
+            to_keys=["B", "C", "D"],
+            event_pks=["TX-1", "TX-2", "TX-3"],
+            min_hops=2,
+        )

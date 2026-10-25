@@ -7,6 +7,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import numpy as np
+
 from hypertopos.model.objects import Polygon
 from hypertopos.storage.cache import GDSCache
 

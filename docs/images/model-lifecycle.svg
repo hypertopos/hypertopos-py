@@ -1,110 +1,58 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 400" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#0a0e27"/>
-      <stop offset="100%" stop-color="#1a1a3e"/>
-    </linearGradient>
-  </defs>
-
-  <rect width="900" height="400" fill="url(#bg)" rx="12"/>
-
-  <text x="450" y="32" fill="#ccd6f6" font-size="13" font-weight="600" text-anchor="middle" letter-spacing="2">MODEL OBJECT LIFECYCLE</text>
-
-  <!-- ===== Row 1: Line → Point → Polygon → Solid ===== -->
-
-  <!-- Line -->
-  <g transform="translate(30, 65)">
-    <rect x="0" y="0" width="145" height="70" rx="10" fill="#0f2040" stroke="#22d3ee" stroke-width="1.5"/>
-    <text x="72" y="30" fill="#22d3ee" font-size="17" font-weight="700" text-anchor="middle">Line</text>
-    <text x="72" y="50" fill="#ccd6f6" font-size="11" text-anchor="middle">entity collection</text>
-  </g>
-
-  <!-- Arrow: contains -->
-  <g>
-    <line x1="185" y1="100" x2="250" y2="100" stroke="#60a5fa" stroke-width="2"/>
-    <polygon points="250,-5 260,0 250,5" transform="translate(0,100)" fill="#60a5fa"/>
-    <text x="220" y="92" fill="#60a5fa" font-size="10" font-weight="600" text-anchor="middle">contains</text>
-  </g>
-
-  <!-- Point -->
-  <g transform="translate(270, 65)">
-    <rect x="0" y="0" width="145" height="70" rx="10" fill="#1a1a3e" stroke="#8892b0" stroke-width="1.5"/>
-    <text x="72" y="30" fill="#ccd6f6" font-size="17" font-weight="700" text-anchor="middle">Point</text>
-    <text x="72" y="50" fill="#ccd6f6" font-size="11" text-anchor="middle">single entity</text>
-  </g>
-
-  <!-- Arrow: build geometry -->
-  <g>
-    <line x1="425" y1="100" x2="490" y2="100" stroke="#60a5fa" stroke-width="2"/>
-    <polygon points="490,-5 500,0 490,5" transform="translate(0,100)" fill="#60a5fa"/>
-    <text x="460" y="92" fill="#60a5fa" font-size="10" font-weight="600" text-anchor="middle">build geometry</text>
-  </g>
-
-  <!-- Polygon -->
-  <g transform="translate(510, 55)">
-    <rect x="0" y="0" width="165" height="90" rx="12" fill="#0f2040" stroke="#3b82f6" stroke-width="2"/>
-    <text x="82" y="28" fill="#60a5fa" font-size="18" font-weight="700" text-anchor="middle">Polygon</text>
-    <text x="82" y="48" fill="#93c5fd" font-size="11" text-anchor="middle">shape + edges + delta</text>
-    <line x1="18" y1="56" x2="147" y2="56" stroke="#1e3a5f" stroke-width="0.5"/>
-    <text x="82" y="74" fill="#ccd6f6" font-size="11" text-anchor="middle">δ = (s − μ) ⊘ σ</text>
-  </g>
-
-  <!-- Arrow: over time -->
-  <g>
-    <line x1="685" y1="100" x2="740" y2="100" stroke="#a78bfa" stroke-width="2"/>
-    <polygon points="740,-5 750,0 740,5" transform="translate(0,100)" fill="#a78bfa"/>
-    <text x="715" y="92" fill="#a78bfa" font-size="10" font-weight="600" text-anchor="middle">over time</text>
-  </g>
-
-  <!-- Solid -->
-  <g transform="translate(760, 55)">
-    <rect x="6" y="-4" width="113" height="82" rx="10" fill="none" stroke="#a78bfa" stroke-width="0.4" opacity="0.2"/>
-    <rect x="3" y="-2" width="119" height="86" rx="10" fill="none" stroke="#a78bfa" stroke-width="0.3" opacity="0.15"/>
-    <rect x="0" y="0" width="125" height="90" rx="12" fill="#1a0028" stroke="#a78bfa" stroke-width="2"/>
-    <text x="62" y="28" fill="#a78bfa" font-size="18" font-weight="700" text-anchor="middle">Solid</text>
-    <text x="62" y="48" fill="#c4b5fd" font-size="11" text-anchor="middle">temporal stack</text>
-    <line x1="15" y1="56" x2="110" y2="56" stroke="#2a0050" stroke-width="0.5"/>
-    <text x="62" y="74" fill="#ccd6f6" font-size="11" text-anchor="middle">τ = (δ₁, ..., δₜ)</text>
-  </g>
-
-  <!-- ===== Row 2: Edge, Pattern, Alias ===== -->
-
-  <!-- Edge -->
-  <g transform="translate(30, 240)">
-    <rect x="0" y="0" width="145" height="65" rx="8" fill="#1a1a3e" stroke="#8892b0" stroke-width="1"/>
-    <text x="72" y="26" fill="#ccd6f6" font-size="15" font-weight="600" text-anchor="middle">Edge</text>
-    <text x="72" y="46" fill="#8892b0" font-size="10" text-anchor="middle">line · key · direction</text>
-  </g>
-  <line x1="105" y1="240" x2="560" y2="150" stroke="#8892b0" stroke-width="1" stroke-dasharray="5,3" opacity="0.3"/>
-  <text x="90" y="232" fill="#8892b0" font-size="10" font-weight="600">part of polygon</text>
-
-  <!-- Pattern -->
-  <g transform="translate(270, 230)">
-    <rect x="0" y="0" width="200" height="80" rx="10" fill="#001a0a" stroke="#2ed573" stroke-width="1.5"/>
-    <text x="100" y="28" fill="#2ed573" font-size="17" font-weight="700" text-anchor="middle">Pattern</text>
-    <text x="100" y="48" fill="#6ee7b7" font-size="11" text-anchor="middle">μ, σ, θ population stats</text>
-    <text x="100" y="66" fill="#ccd6f6" font-size="10" text-anchor="middle">calibrates the geometry</text>
-  </g>
-
-  <!-- Dashed arrow Pattern → Polygon -->
-  <g>
-    <line x1="445" y1="230" x2="555" y2="150" stroke="#2ed573" stroke-width="1.5" stroke-dasharray="6,4"/>
-    <polygon points="552,153 560,145 558,157" fill="#2ed573"/>
-    <text x="515" y="198" fill="#2ed573" font-size="10" font-weight="600">calibrates</text>
-  </g>
-
-  <!-- Alias -->
-  <g transform="translate(565, 230)">
-    <rect x="0" y="0" width="200" height="80" rx="10" fill="#1a1000" stroke="#fbbf24" stroke-width="1.5"/>
-    <text x="100" y="28" fill="#fbbf24" font-size="17" font-weight="700" text-anchor="middle">Alias</text>
-    <text x="100" y="48" fill="#fcd34d" font-size="11" text-anchor="middle">cutting plane filter</text>
-    <text x="100" y="66" fill="#ccd6f6" font-size="10" text-anchor="middle">w · δ ≥ b</text>
-  </g>
-
-  <!-- Dashed arrow Alias → Pattern -->
-  <g>
-    <line x1="565" y1="270" x2="475" y2="270" stroke="#fbbf24" stroke-width="1.5" stroke-dasharray="6,4"/>
-    <polygon points="478,266 470,270 478,274" fill="#fbbf24"/>
-    <text x="520" y="262" fill="#fbbf24" font-size="10" font-weight="600">filters</text>
-  </g>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 340" font-family="'Segoe UI', system-ui, -apple-system, sans-serif" role="img" aria-labelledby="mlc-title mlc-desc">
+<title id="mlc-title">Model object lifecycle</title>
+<desc id="mlc-desc">A line contains points; building geometry turns a point into a polygon with δ = (s − μ) ⊘ σ; polygons stacked over time form a solid. Edges are part of a polygon, the pattern's μ, σ, θ calibrate it, and an alias filters the pattern with a cutting plane w · δ ≥ b.</desc>
+<defs>
+<linearGradient id="mlc-bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#0a0e27"/><stop offset="100%" stop-color="#1a1a3e"/></linearGradient>
+<radialGradient id="mlc-glow"><stop offset="0%" stop-color="#4808FC" stop-opacity="0.55"/><stop offset="100%" stop-color="#4808FC" stop-opacity="0"/></radialGradient>
+</defs>
+<rect width="900" height="340" rx="14" fill="url(#mlc-bg)" stroke="#230C7C" stroke-width="1.5"/>
+<text x="450" y="32" font-size="11" fill="#FFFFFF" fill-opacity="0.55" font-weight="600" text-anchor="middle" letter-spacing="2">MODEL OBJECT LIFECYCLE</text>
+<rect x="30" y="65" width="145" height="70" rx="12" fill="#0f2040" stroke="#230C7C" stroke-width="1.2"/>
+<text x="102.5" y="93" font-size="17" fill="#FFFFFF" font-weight="700" text-anchor="middle">Line</text>
+<text x="102.5" y="113" font-size="11" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">entity collection</text>
+<rect x="270" y="65" width="145" height="70" rx="12" fill="#0f2040" stroke="#230C7C" stroke-width="1.2"/>
+<text x="342.5" y="93" font-size="17" fill="#FFFFFF" font-weight="700" text-anchor="middle">Point</text>
+<text x="342.5" y="113" font-size="11" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">single entity</text>
+<rect x="510" y="55" width="165" height="90" rx="12" fill="#0f2040" stroke="#6D39FD" stroke-width="2"/>
+<text x="592.5" y="83" font-size="18" fill="#DACEFE" font-weight="700" text-anchor="middle">Polygon</text>
+<text x="592.5" y="103" font-size="11" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">shape + edges + delta</text>
+<line x1="526" y1="111" x2="659" y2="111" stroke="#230C7C" stroke-width="1"/>
+<text x="592.5" y="129" font-size="11" fill="#FFFFFF" fill-opacity="0.85" text-anchor="middle">δ = (s − μ) ⊘ σ</text>
+<rect x="766" y="51" width="119" height="86" rx="10" fill="none" stroke="#230C7C" stroke-width="0.8" stroke-opacity="0.6"/>
+<rect x="763" y="53" width="122" height="88" rx="11" fill="none" stroke="#230C7C" stroke-width="0.8" stroke-opacity="0.8"/>
+<rect x="760" y="55" width="125" height="90" rx="12" fill="#0f2040" stroke="#230C7C" stroke-width="1.2"/>
+<text x="822.5" y="83" font-size="18" fill="#FFFFFF" font-weight="700" text-anchor="middle">Solid</text>
+<text x="822.5" y="103" font-size="11" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">temporal stack</text>
+<line x1="776" y1="111" x2="869" y2="111" stroke="#230C7C" stroke-width="1"/>
+<text x="822.5" y="129" font-size="11" fill="#FFFFFF" fill-opacity="0.85" text-anchor="middle">τ = (δ₁, …, δₜ)</text>
+<line x1="183" y1="100" x2="256.4" y2="100" stroke="#885EFD" stroke-width="1.5"/>
+<polygon points="262,100 255,96.15 255,103.85" fill="#885EFD"/>
+<text x="222" y="92" font-size="10" fill="#A484FE" font-weight="600" text-anchor="middle" font-style="italic">contains</text>
+<line x1="423" y1="100" x2="496.4" y2="100" stroke="#885EFD" stroke-width="1.5"/>
+<polygon points="502,100 495,96.15 495,103.85" fill="#885EFD"/>
+<text x="462" y="92" font-size="10" fill="#A484FE" font-weight="600" text-anchor="middle" font-style="italic">build geometry</text>
+<line x1="683" y1="100" x2="746.4" y2="100" stroke="#885EFD" stroke-width="1.5"/>
+<polygon points="752,100 745,96.15 745,103.85" fill="#885EFD"/>
+<text x="717" y="92" font-size="10" fill="#A484FE" font-weight="600" text-anchor="middle" font-style="italic">over time</text>
+<rect x="30" y="240" width="145" height="65" rx="8" fill="#0f2040" stroke="#230C7C" stroke-width="1"/>
+<text x="102" y="266" font-size="15" fill="#FFFFFF" font-weight="600" text-anchor="middle">Edge</text>
+<text x="102" y="286" font-size="10" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">line · key · direction</text>
+<line x1="105" y1="240" x2="556" y2="150" stroke="#FFFFFF" stroke-width="1" stroke-dasharray="5,3" stroke-opacity="0.35"/>
+<text x="90" y="232" font-size="10" fill="#FFFFFF" fill-opacity="0.55" font-weight="600" text-anchor="middle">part of polygon</text>
+<rect x="270" y="230" width="200" height="80" rx="12" fill="#0f2040" stroke="#230C7C" stroke-width="1.2"/>
+<text x="370" y="258" font-size="17" fill="#FFFFFF" font-weight="700" text-anchor="middle">Pattern</text>
+<text x="370" y="278" font-size="11" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">μ, σ, θ calibration</text>
+<line x1="286" y1="286" x2="454" y2="286" stroke="#230C7C" stroke-width="1"/>
+<text x="370" y="304" font-size="11" fill="#FFFFFF" fill-opacity="0.85" text-anchor="middle">calibrates the geometry</text>
+<line x1="445" y1="230" x2="553.43" y2="153.24" stroke="#885EFD" stroke-width="1.5" stroke-dasharray="6,4"/>
+<polygon points="558,150 550.06,150.9 554.51,157.19" fill="#885EFD"/>
+<text x="520" y="200" font-size="10" fill="#A484FE" font-weight="600" text-anchor="middle" font-style="italic">calibrates</text>
+<rect x="565" y="230" width="200" height="80" rx="12" fill="#0f2040" stroke="#230C7C" stroke-width="1.2"/>
+<text x="665" y="258" font-size="17" fill="#FFFFFF" font-weight="700" text-anchor="middle">Alias</text>
+<text x="665" y="278" font-size="11" fill="#FFFFFF" fill-opacity="0.7" text-anchor="middle">cutting plane filter</text>
+<line x1="581" y1="286" x2="749" y2="286" stroke="#230C7C" stroke-width="1"/>
+<text x="665" y="304" font-size="11" fill="#FFFFFF" fill-opacity="0.85" text-anchor="middle">w · δ ≥ b</text>
+<line x1="565" y1="270" x2="483.6" y2="270" stroke="#885EFD" stroke-width="1.5" stroke-dasharray="6,4"/>
+<polygon points="478,270 485,273.85 485,266.15" fill="#885EFD"/>
+<text x="521" y="262" font-size="10" fill="#A484FE" font-weight="600" text-anchor="middle" font-style="italic">filters</text>
 </svg>

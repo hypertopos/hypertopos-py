@@ -1,4 +1,5 @@
 """Tests for hypertopos.engine.fdr --- BH FDR control."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -6,38 +7,11 @@ import pytest
 
 from hypertopos.engine.fdr import (
     benjamini_hochberg,
-    empirical_p_values_from_rank,
     parametric_p_values_chi2,
     q_values_from_p_values,
     storey_pi0,
     storey_q_values,
 )
-
-
-class TestEmpiricalPValues:
-    def test_basic_conversion(self):
-        # rank_pct=100 -> p~0 (clipped to 1e-10), rank_pct=0 -> p=1
-        rank = np.array([100.0, 50.0, 0.0])
-        p = empirical_p_values_from_rank(rank)
-        assert p[2] == 1.0
-        # p[0] should be clipped to 1e-10 (not 0)
-        assert p[0] == pytest.approx(1e-10)
-
-    def test_zero_to_one_scale(self):
-        rank = np.array([1.0, 0.5, 0.0])
-        p = empirical_p_values_from_rank(rank)
-        assert p[2] == 1.0
-        assert p[0] == pytest.approx(1e-10)
-
-    def test_empty_input(self):
-        p = empirical_p_values_from_rank(np.array([]))
-        assert len(p) == 0
-
-    def test_round_trip(self):
-        rank = np.linspace(0, 100, 100)
-        p = empirical_p_values_from_rank(rank)
-        assert np.all(p > 0)
-        assert np.all(p <= 1.0)
 
 
 class TestQValues:

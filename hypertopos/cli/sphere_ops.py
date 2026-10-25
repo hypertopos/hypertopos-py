@@ -23,6 +23,7 @@ Every command supports ``--json`` for machine-readable output. In JSON
 mode, stdout carries ONLY the JSON document; human-readable diagnostics
 and errors go to stderr.
 """
+
 from __future__ import annotations
 
 import json
@@ -34,6 +35,7 @@ from typing import Any
 import numpy as np
 
 from hypertopos._file_formats import normalized_suffix
+from hypertopos.storage.exceptions import GDSError
 
 
 def _sanitize_for_json(obj: Any) -> Any:
@@ -143,10 +145,7 @@ def run_sphere_health(
         n_med = sum(1 for a in alerts if a.get("severity") == "MEDIUM")
         print(f"Alerts: {len(alerts)} ({n_high} HIGH, {n_med} MEDIUM)")
         for a in alerts:
-            print(
-                f"  [{a.get('severity')}] {a.get('pattern_id')}: "
-                f"{a.get('message')}"
-            )
+            print(f"  [{a.get('severity')}] {a.get('pattern_id')}: {a.get('message')}")
 
     if exit_code_on_critical and status == "critical":
         sys.exit(2)
@@ -184,9 +183,7 @@ def run_sphere_validate(
     errors: list[str] = []
     warnings: list[str] = []
 
-    sphere_data = json.loads(
-        (base / "_gds_meta" / "sphere.json").read_text(encoding="utf-8")
-    )
+    sphere_data = json.loads((base / "_gds_meta" / "sphere.json").read_text(encoding="utf-8"))
 
     # Structural: line points + pattern geometry directories on disk.
     # Derived-dimension lines (``_d_`` prefix) are virtual — they live as
@@ -218,9 +215,7 @@ def run_sphere_validate(
             pid = entry["pattern_id"]
             cal = entry.get("calibration_health")
             if cal in ("suspect", "poor"):
-                warnings.append(
-                    f"Pattern '{pid}': calibration_health is '{cal}'"
-                )
+                warnings.append(f"Pattern '{pid}': calibration_health is '{cal}'")
             for w in entry.get("dim_quality_warnings", []) or []:
                 warnings.append(
                     f"Pattern '{pid}': dim_quality warning "
@@ -228,9 +223,7 @@ def run_sphere_validate(
                     f"'{w.get('dim_label', w.get('dim_index', '?'))}'"
                 )
     except Exception as exc:  # noqa: BLE001 — surface as a warning, never crash
-        warnings.append(
-            f"Soft-signal overview unavailable: {exc}"
-        )
+        warnings.append(f"Soft-signal overview unavailable: {exc}")
 
     if strict:
         errors.extend(warnings)
@@ -330,7 +323,10 @@ def run_sphere_diff(
                 )
                 continue
             report = _compute_calibration_drift(
-                fit_from, fit_to, top_n=10, verbose=False,
+                fit_from,
+                fit_to,
+                top_n=10,
+                verbose=False,
             )
             row = asdict(report)
             row["per_dimension"] = None  # always omit the full breakdown
@@ -362,10 +358,7 @@ def run_sphere_diff(
             if row.get("not_comparable"):
                 print(f"  {pid}: not comparable ({row.get('reason')})")
             else:
-                print(
-                    f"  {pid}: overall_drift_rms="
-                    f"{row.get('overall_drift_rms'):.4f}"
-                )
+                print(f"  {pid}: overall_drift_rms={row.get('overall_drift_rms'):.4f}")
 
 
 # ── sphere ingest ────────────────────────────────────────────────────
@@ -415,7 +408,7 @@ def _resolve_ingest_pattern(sphere_meta: Path, pattern: str | None) -> str:
     with zero or multiple patterns requires an explicit ``--pattern``.
     """
     sphere_data = json.loads(sphere_meta.read_text(encoding="utf-8"))
-    patterns = list(sphere_data.get("patterns", {}))
+    patterns: list[str] = list(sphere_data.get("patterns", {}))
 
     if pattern is not None:
         if pattern not in patterns:
@@ -436,23 +429,22 @@ def _resolve_ingest_pattern(sphere_meta: Path, pattern: str | None) -> str:
         )
         sys.exit(1)
     print(
-        f"error: sphere has {len(patterns)} patterns; pass --pattern to choose "
-        f"one of: {patterns}",
+        f"error: sphere has {len(patterns)} patterns; pass --pattern to choose one of: {patterns}",
         file=sys.stderr,
     )
     sys.exit(1)
 
 
-def _delta_index_rows(lance_path: str) -> int | None:
+def _delta_index_rows(lance_path: str, branch: str | None = None) -> int | None:
     """Return ``num_rows_indexed`` for the delta vector index, or None.
 
     None means no delta vector index is present. Used to detect whether an
     incremental update rebuilt / extended the ANN index over the geometry.
     """
-    import lance as _lance
+    from hypertopos.storage._lance_branches import open_ref
 
     try:
-        ds = _lance.dataset(lance_path)
+        ds = open_ref(lance_path, branch)
         for idx in ds.describe_indices():
             if "delta" in idx.field_names:
                 return idx.num_rows_indexed
@@ -469,6 +461,7 @@ def run_sphere_ingest(
     reindex: bool,
     finalize: bool,
     as_json: bool,
+    branch: str | None = None,
 ) -> None:
     """Incremental-ingest verb: append a new-/changed-entities table.
 
@@ -484,17 +477,16 @@ def run_sphere_ingest(
     dataset versions before/after; ``reindexed`` reports whether the delta
     ANN index's coverage changed across the update. Exits 1 on a non-sphere
     path, a missing/unsupported points file, an unknown pattern, or a
-    geometry-reconstruction error surfaced by the builder.
+    geometry-reconstruction error surfaced by the builder. With ``branch``
+    the rows go to that sphere branch only and the versions are the branch's.
     """
     meta = _sphere_json_path(sphere_path)
     pattern_id = _resolve_ingest_pattern(meta, pattern)
     points = _load_points_table(points_path)
 
-    lance_path = str(
-        Path(sphere_path) / "geometry" / pattern_id / "data.lance"
-    )
-    version_before = _geometry_version(lance_path)
-    index_rows_before = _delta_index_rows(lance_path)
+    lance_path = str(Path(sphere_path) / "geometry" / pattern_id / "data.lance")
+    version_before = _geometry_version(lance_path, branch)
+    index_rows_before = _delta_index_rows(lance_path, branch)
 
     from hypertopos.builder.builder import GDSBuilder
 
@@ -506,25 +498,29 @@ def run_sphere_ingest(
             changed_entities=points,
             recalibrate=recalibrate,
             reindex=reindex,
+            branch=branch,
         )
         if finalize:
-            builder.finalize_incremental(pattern_id)
-    except (ValueError, KeyError, FileNotFoundError) as exc:
+            builder.finalize_incremental(pattern_id, branch=branch)
+    except (ValueError, KeyError, FileNotFoundError, GDSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    version_after = _geometry_version(lance_path)
-    index_rows_after = _delta_index_rows(lance_path)
+    version_after = _geometry_version(lance_path, branch)
+    index_rows_after = _delta_index_rows(lance_path, branch)
     reindexed = index_rows_after != index_rows_before
 
     payload = {
         "sphere_path": str(Path(sphere_path).resolve()),
         "pattern_id": pattern_id,
+        "branch": branch,
         "added": result.added,
         "modified": result.modified,
         "deleted": result.deleted,
         "population_size": result.population_size,
         "drift_pct": result.drift_pct,
+        "recalibrated": result.recalibrated,
+        "theta_norm": result.theta_norm,
         "geometry_version_before": version_before,
         "geometry_version_after": version_after,
         "reindexed": reindexed,
@@ -535,22 +531,71 @@ def run_sphere_ingest(
         print(_dump_json(payload))
     else:
         print(f"Pattern: {pattern_id}")
-        print(
-            f"Added: {result.added}   Modified: {result.modified}   "
-            f"Deleted: {result.deleted}"
-        )
+        print(f"Added: {result.added}   Modified: {result.modified}   Deleted: {result.deleted}")
         print(f"Population: {result.population_size}")
+        print(f"Recalibrated: {result.recalibrated}   theta_norm={result.theta_norm:.4f}")
         print(
             f"Geometry version: {version_before} -> {version_after}   "
             f"reindexed={reindexed}   finalized={finalize}"
         )
 
 
-def _geometry_version(lance_path: str) -> int | None:
+def _geometry_version(lance_path: str, branch: str | None = None) -> int | None:
     """Return the current geometry Lance dataset version, or None if absent."""
-    import lance as _lance
+    from hypertopos.storage._lance_branches import open_ref
 
     try:
-        return int(_lance.dataset(lance_path).version)
+        return int(open_ref(lance_path, branch).version)
     except Exception:  # noqa: BLE001 — a pattern with no geometry yet → None
         return None
+
+
+def run_sphere_branch(
+    sphere_path: str,
+    action: str,
+    name: str | None,
+    purpose: str,
+    as_json: bool,
+) -> None:
+    """Branch verb: list, create, delete or promote sphere branches.
+
+    Exits 1 on a non-sphere path, a missing name, or a refused operation
+    (unknown branch, main moved since the branch was created, a replay that
+    diverged).
+    """
+    from dataclasses import asdict
+
+    from hypertopos.sphere import HyperSphere
+
+    _sphere_json_path(sphere_path)
+    if action != "list" and not name:
+        print(f"error: sphere branch {action} needs a branch name", file=sys.stderr)
+        sys.exit(1)
+    try:
+        hs = HyperSphere.open(sphere_path)
+        if action == "list":
+            payload: Any = {"branches": [asdict(b) for b in hs.branches()]}
+        elif action == "create":
+            payload = {"created": asdict(hs.create_branch(name or "", purpose=purpose))}
+        elif action == "delete":
+            hs.delete_branch(name or "")
+            payload = {"deleted": name}
+        else:
+            payload = {"promoted": asdict(hs.promote_branch(name or ""))}
+    except GDSError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if as_json:
+        print(_dump_json(payload))
+    elif action == "list":
+        for b in payload["branches"]:
+            state = "stale" if b["stale"] else "current"
+            print(f"{b['name']}  recipes={b['n_recipes']}  {state}  {b['purpose']}")
+        if not payload["branches"]:
+            print("no branches")
+    elif action == "promote":
+        report = payload["promoted"]
+        print(f"Promoted {report['name']}: {report['recipes_replayed']} recipes replayed")
+    else:
+        print(f"{action}d branch {name}")

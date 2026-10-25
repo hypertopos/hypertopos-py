@@ -192,7 +192,7 @@ autonomously. Save the final report to benchmark/berka/results/0.1.0/<run>/0.1.0
 
 **Rules:**
 - Same sphere path + MCP tool access as Experiment A
-- Additionally receives 3 skills from [`hypertopos-skills`](../../packages/hypertopos-skills/):
+- Additionally receives 3 skills from [`hypertopos-skills`](https://github.com/hypertopos/hypertopos-skills):
   - **gds-explorer** — orientation, population analysis, segmentation, aggregates
   - **gds-investigator** — anomaly root-cause tracing, entity deep-dive, incident reconstruction
   - **gds-monitor** — drift detection, regime changes, alerts, temporal health

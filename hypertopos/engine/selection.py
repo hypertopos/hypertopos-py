@@ -7,6 +7,7 @@
 Pure NumPy. No state. No I/O. Lazy-greedy facility location with the
 Nemhauser-Wolsey-Fisher (1-1/e) optimality guarantee.
 """
+
 from __future__ import annotations
 
 import heapq

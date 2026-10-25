@@ -13,6 +13,7 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 import pyarrow.parquet as pq
 import pytest
+
 from hypertopos.model.objects import SolidSlice
 from hypertopos.model.sphere import LayerStorage, Sphere, StorageConfig
 from hypertopos.storage.reader import GDSReader
@@ -918,7 +919,15 @@ def test_read_sphere_no_semantics(sphere_path):
     assert list(sphere.lines.values())[0].description is None
 
 
-def test_read_sphere_with_semantics(sphere_path):
+@pytest.fixture
+def semantics_sphere_path(tmp_path: Path) -> str:
+    """Private sphere copy: these tests write _gds_meta/semantics.json."""
+    from tests.conftest import FIXTURES_PATH, clone_sphere
+
+    return str(clone_sphere(FIXTURES_PATH, tmp_path / "s"))
+
+
+def test_read_sphere_with_semantics(semantics_sphere_path):
     """Sphere loads with descriptions when semantics.json is present."""
     import json
     from pathlib import Path
@@ -938,11 +947,11 @@ def test_read_sphere_with_semantics(sphere_path):
             }
         },
     }
-    sem_path = Path(sphere_path) / "_gds_meta" / "semantics.json"
+    sem_path = Path(semantics_sphere_path) / "_gds_meta" / "semantics.json"
     sem_path.write_text(json.dumps(sem))
 
     try:
-        reader = GDSReader(sphere_path)
+        reader = GDSReader(semantics_sphere_path)
         sphere = reader.read_sphere()
         assert sphere.description == "Test sphere"
         assert sphere.lines["customers"].description == "Customer master"
@@ -956,23 +965,23 @@ def test_read_sphere_with_semantics(sphere_path):
         sem_path.unlink(missing_ok=True)
 
 
-def test_read_sphere_semantics_description_too_long(sphere_path):
+def test_read_sphere_semantics_description_too_long(semantics_sphere_path):
     """ValueError raised when description exceeds 200 chars."""
     import json
     from pathlib import Path
 
     sem = {"sphere": {"description": "x" * 201}}
-    sem_path = Path(sphere_path) / "_gds_meta" / "semantics.json"
+    sem_path = Path(semantics_sphere_path) / "_gds_meta" / "semantics.json"
     sem_path.write_text(json.dumps(sem))
     try:
-        reader = GDSReader(sphere_path)
+        reader = GDSReader(semantics_sphere_path)
         with pytest.raises(ValueError, match="description.*exceeds"):
             reader.read_sphere()
     finally:
         sem_path.unlink(missing_ok=True)
 
 
-def test_read_sphere_semantics_display_name_too_long(sphere_path):
+def test_read_sphere_semantics_display_name_too_long(semantics_sphere_path):
     """ValueError raised when display_name exceeds 60 chars."""
     import json
     from pathlib import Path
@@ -980,17 +989,17 @@ def test_read_sphere_semantics_display_name_too_long(sphere_path):
     sem = {
         "patterns": {"customer_pattern": {"relations": {"products": {"display_name": "x" * 61}}}}
     }
-    sem_path = Path(sphere_path) / "_gds_meta" / "semantics.json"
+    sem_path = Path(semantics_sphere_path) / "_gds_meta" / "semantics.json"
     sem_path.write_text(json.dumps(sem))
     try:
-        reader = GDSReader(sphere_path)
+        reader = GDSReader(semantics_sphere_path)
         with pytest.raises(ValueError, match="display_name.*exceeds"):
             reader.read_sphere()
     finally:
         sem_path.unlink(missing_ok=True)
 
 
-def test_read_sphere_semantics_interpretation_too_long(sphere_path):
+def test_read_sphere_semantics_interpretation_too_long(semantics_sphere_path):
     """ValueError raised when interpretation exceeds 200 chars."""
     import json
     from pathlib import Path
@@ -998,26 +1007,26 @@ def test_read_sphere_semantics_interpretation_too_long(sphere_path):
     sem = {
         "patterns": {"customer_pattern": {"relations": {"products": {"interpretation": "x" * 201}}}}
     }
-    sem_path = Path(sphere_path) / "_gds_meta" / "semantics.json"
+    sem_path = Path(semantics_sphere_path) / "_gds_meta" / "semantics.json"
     sem_path.write_text(json.dumps(sem))
     try:
-        reader = GDSReader(sphere_path)
+        reader = GDSReader(semantics_sphere_path)
         with pytest.raises(ValueError, match="interpretation.*exceeds"):
             reader.read_sphere()
     finally:
         sem_path.unlink(missing_ok=True)
 
 
-def test_read_sphere_semantics_unknown_line_ignored(sphere_path):
+def test_read_sphere_semantics_unknown_line_ignored(semantics_sphere_path):
     """Unknown line_id in semantics.json is silently ignored."""
     import json
     from pathlib import Path
 
     sem = {"lines": {"nonexistent_line": {"description": "Ghost line"}}}
-    sem_path = Path(sphere_path) / "_gds_meta" / "semantics.json"
+    sem_path = Path(semantics_sphere_path) / "_gds_meta" / "semantics.json"
     sem_path.write_text(json.dumps(sem))
     try:
-        reader = GDSReader(sphere_path)
+        reader = GDSReader(semantics_sphere_path)
         sphere = reader.read_sphere()  # must not raise
         assert "nonexistent_line" not in sphere.lines
     finally:
@@ -1653,9 +1662,7 @@ class TestLanceGeometry:
         reader = GDSReader(base_path=str(tmp_path))
         reader.read_sphere()
         # CUST-000 appears every 5 rows → 100/5 = 20
-        count = reader.count_geometry_rows(
-            "pat1", filter="array_contains(entity_keys, 'CUST-000')"
-        )
+        count = reader.count_geometry_rows("pat1", filter="array_contains(entity_keys, 'CUST-000')")
         assert count == 20
 
     def test_count_geometry_rows_reuses_dataset_object(self, tmp_path):
@@ -1718,20 +1725,20 @@ class TestLanceGeometry:
         # Patch lance.dataset at the module level to count calls
         import hypertopos.storage.reader as reader_module
 
-        original_dataset = reader_module._lance.dataset
+        original_dataset = reader_module.open_dataset
         call_count = [0]
 
-        def counting_dataset(path):
+        def counting_dataset(path, **kwargs):
             call_count[0] += 1
-            return original_dataset(path)
+            return original_dataset(path, **kwargs)
 
-        reader_module._lance.dataset = counting_dataset
+        reader_module.open_dataset = counting_dataset
         try:
             reader.count_geometry_rows("pat1")
             reader.count_geometry_rows("pat1", filter="array_contains(entity_keys, 'K-000')")
             reader.count_geometry_rows("pat1", filter="array_contains(entity_keys, 'K-001')")
         finally:
-            reader_module._lance.dataset = original_dataset
+            reader_module.open_dataset = original_dataset
 
         # Dataset must be opened exactly ONCE, not 3 times
         assert call_count[0] == 1, (
@@ -1872,6 +1879,7 @@ class TestLanceGeometry:
         import json as json_mod
 
         import lance
+
         from hypertopos.builder.builder import EDGE_STRUCT_TYPE
 
         n = 1000
@@ -1949,6 +1957,7 @@ class TestLanceGeometry:
         import json as json_mod
 
         import lance
+
         from hypertopos.builder.builder import EDGE_STRUCT_TYPE
 
         n = 200
@@ -2077,6 +2086,7 @@ class TestLanceGeometry:
         import json as json_mod
 
         import lance
+
         from hypertopos.builder.builder import EDGE_STRUCT_TYPE
 
         n = 100
@@ -2734,9 +2744,7 @@ class TestReadPointsBatch:
         """A mix of present and absent keys returns only the present rows —
         the IN-filter scan naturally drops misses without per-key bookkeeping."""
         reader = GDSReader(base_path=str(_points_path))
-        result = reader.read_points_batch(
-            "customers", 1, ["C-003", "NOPE-1", "C-001", "NOPE-2"]
-        )
+        result = reader.read_points_batch("customers", 1, ["C-003", "NOPE-1", "C-001", "NOPE-2"])
         assert set(result["primary_key"].to_pylist()) == {"C-001", "C-003"}
 
     def test_batch_result_keyed_by_primary_key_not_input_order(self, _points_path):
@@ -2748,17 +2756,12 @@ class TestReadPointsBatch:
         # Storage order is C-001, C-002, C-003; request reversed.
         requested = ["C-003", "C-002", "C-001"]
         result = reader.read_points_batch("customers", 1, requested)
-        by_key = {
-            row["primary_key"]: row["name"]
-            for row in result.to_pylist()
-        }
+        by_key = {row["primary_key"]: row["name"] for row in result.to_pylist()}
         assert by_key == {"C-001": "Alice", "C-002": "Bob", "C-003": "Carol"}
 
     def test_batch_column_projection(self, _points_path):
         reader = GDSReader(base_path=str(_points_path))
-        result = reader.read_points_batch(
-            "customers", 1, ["C-001"], columns=["name"]
-        )
+        result = reader.read_points_batch("customers", 1, ["C-001"], columns=["name"])
         # primary_key is always included even when only 'name' is requested.
         assert set(result.column_names) == {"primary_key", "name"}
 
@@ -2782,9 +2785,7 @@ class TestReadPointsBatch:
         assert stats["points_handle_cache_misses"] == 1
         assert stats["points_handle_cache_hits"] == 1
 
-    def test_batch_runtime_error_propagates_from_in_filter_scan(
-        self, _points_path, monkeypatch
-    ):
+    def test_batch_runtime_error_propagates_from_in_filter_scan(self, _points_path, monkeypatch):
         """Unexpected scanner errors must not be swallowed by the per-key fallback."""
 
         class FakeScanner:
@@ -2793,7 +2794,7 @@ class TestReadPointsBatch:
 
         class FakeIndex:
             index_type = "BTree"
-            columns = ["primary_key"]
+            field_names = ["primary_key"]
 
         class FakeDataset:
             def describe_indices(self):
@@ -2804,7 +2805,7 @@ class TestReadPointsBatch:
 
         import hypertopos.storage.reader as reader_module
 
-        monkeypatch.setattr(reader_module._lance, "dataset", lambda *a, **kw: FakeDataset())
+        monkeypatch.setattr(reader_module, "open_dataset", lambda *a, **kw: FakeDataset())
 
         reader = GDSReader(base_path=str(_points_path))
         keys = [f"C-{i:03d}" for i in range(101)]
@@ -2973,9 +2974,9 @@ class TestResolveByEntityKeys:
                 "is_anomaly": [False, True, False],
                 "delta_rank_pct": pa.array([20.0, 70.0, 90.0], type=pa.float32()),
                 "entity_keys": [
-                    ["ACC-1", "ACC-2"],   # ACC-1 sends (slot 0)
-                    ["ACC-3", "ACC-1"],   # ACC-1 receives (slot 1)
-                    ["ACC-2", "ACC-3"],   # ACC-1 absent
+                    ["ACC-1", "ACC-2"],  # ACC-1 sends (slot 0)
+                    ["ACC-3", "ACC-1"],  # ACC-1 receives (slot 1)
+                    ["ACC-2", "ACC-3"],  # ACC-1 absent
                 ],
             }
         )
@@ -3172,9 +3173,9 @@ class TestAppendGeometry:
         lance.write_dataset(initial, str(lance_dir / "data.lance"))
         # Verify no index yet
         ds_before = lance.dataset(str(lance_dir / "data.lance"))
-        assert not any(
-            "delta" in idx.field_names for idx in ds_before.describe_indices()
-        ), "Expected no index before append_geometry"
+        assert not any("delta" in idx.field_names for idx in ds_before.describe_indices()), (
+            "Expected no index before append_geometry"
+        )
 
         # Append extra rows — this should trigger reindex (100% unindexed)
         extra = self._make_geo_table(n_extra, rng, start_idx=n_initial)
@@ -3333,7 +3334,14 @@ def test_parse_pattern_reads_prop_columns(tmp_path):
 def test_parse_pattern_reads_dim_percentiles(tmp_path):
     """Reader populates dim_percentiles from sphere.json."""
     percentiles = {
-        "avg_late_days": {"min": 0.0, "p25": 20.0, "p50": 26.0, "p75": 32.0, "p99": 50.0, "max": 322.0},
+        "avg_late_days": {
+            "min": 0.0,
+            "p25": 20.0,
+            "p50": 26.0,
+            "p75": 32.0,
+            "p99": 50.0,
+            "max": 322.0,
+        },
     }
     meta = tmp_path / "_gds_meta"
     meta.mkdir()
@@ -3443,73 +3451,3 @@ def test_append_temporal_uses_shape_snapshot(tmp_path):
     tbl = ds.to_table()
     stored = np.array(tbl["shape_snapshot"][0].as_py(), dtype=np.float32)
     np.testing.assert_allclose(stored, shape, rtol=1e-5)
-
-
-def test_migrate_temporal_to_shape_snapshot(tmp_path):
-    import lance
-
-    writer = GDSWriter(base_path=str(tmp_path))
-    mu = np.array([0.5, 0.4], dtype=np.float32)
-    sigma_diag = np.array([0.2, 0.3], dtype=np.float32)
-    delta_vecs = [
-        np.array([1.0, -1.0], dtype=np.float32),
-        np.array([0.5, 0.5], dtype=np.float32),
-    ]
-
-    # Write OLD schema (delta_snapshot, delta_norm_snapshot) manually via lance
-    old_schema = pa.schema(
-        [
-            pa.field("primary_key", pa.string()),
-            pa.field("slice_index", pa.int32()),
-            pa.field("timestamp", pa.timestamp("us", tz="UTC")),
-            pa.field("deformation_type", pa.string()),
-            pa.field("delta_snapshot", pa.list_(pa.float32())),
-            pa.field("delta_norm_snapshot", pa.float32()),
-            pa.field("pattern_ver", pa.int32()),
-            pa.field("changed_property", pa.string()),
-            pa.field("changed_line_id", pa.string()),
-        ]
-    )
-    ts = datetime(2024, 1, 1, tzinfo=UTC)
-    old_table = pa.table(
-        {
-            "primary_key": ["E-001", "E-002"],
-            "slice_index": pa.array([0, 1], type=pa.int32()),
-            "timestamp": pa.array([ts, ts], type=pa.timestamp("us", tz="UTC")),
-            "deformation_type": ["structural", "structural"],
-            "delta_snapshot": [d.tolist() for d in delta_vecs],
-            "delta_norm_snapshot": pa.array(
-                [float(np.linalg.norm(d)) for d in delta_vecs], type=pa.float32()
-            ),
-            "pattern_ver": pa.array([1, 1], type=pa.int32()),
-            "changed_property": pa.array([None, None], type=pa.string()),
-            "changed_line_id": pa.array([None, None], type=pa.string()),
-        },
-        schema=old_schema,
-    )
-    lance_path = tmp_path / "temporal" / "p2" / "data.lance"
-    lance_path.parent.mkdir(parents=True, exist_ok=True)
-    lance.write_dataset(old_table, str(lance_path))
-
-    # Migrate
-    count = writer.migrate_temporal_to_shape_snapshot("p2", mu, sigma_diag)
-    assert count == 2
-
-    # Verify new schema
-    ds = lance.dataset(str(lance_path))
-    field_names = {f.name for f in ds.schema}
-    assert "shape_snapshot" in field_names
-    assert "delta_snapshot" not in field_names
-    assert "delta_norm_snapshot" not in field_names
-
-    # Verify shape values = clip(delta * max(sigma, 1e-2) + mu, 0, 1)
-    tbl = ds.to_table()
-    _sigma = np.maximum(sigma_diag, 1e-2)
-    for i, delta_vec in enumerate(delta_vecs):
-        expected_shape = np.clip(delta_vec * _sigma + mu, 0.0, 1.0)
-        stored_shape = np.array(tbl["shape_snapshot"][i].as_py(), dtype=np.float32)
-        np.testing.assert_allclose(stored_shape, expected_shape, rtol=1e-5)
-
-    # Idempotent: second call returns 0
-    count2 = writer.migrate_temporal_to_shape_snapshot("p2", mu, sigma_diag)
-    assert count2 == 0

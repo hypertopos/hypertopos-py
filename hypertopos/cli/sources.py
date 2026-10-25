@@ -10,6 +10,7 @@ Three tiers of data ingestion:
   2.  Multi-file join (PyArrow ``table.join``)
   3.  Python script with ``prepare() -> pa.Table``
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -121,8 +122,7 @@ def _load_csv(p: Path, config: SourceConfig | None) -> pa.Table:
     if config and config.encoding:
         read_options = pa_csv.ReadOptions(encoding=config.encoding)
 
-    return pa_csv.read_csv(str(p), parse_options=parse_options,
-                           read_options=read_options)
+    return pa_csv.read_csv(str(p), parse_options=parse_options, read_options=read_options)
 
 
 def _apply_transforms(
@@ -146,9 +146,7 @@ def _apply_transforms(
         if tspec.type:
             target = _CAST_MAP.get(tspec.type)
             if target is None:
-                raise ValueError(
-                    f"Unknown cast type '{tspec.type}' for column '{col_name}'"
-                )
+                raise ValueError(f"Unknown cast type '{tspec.type}' for column '{col_name}'")
             col = pc.cast(col, target, safe=False)
 
         idx = table.schema.get_field_index(col_name)
@@ -205,19 +203,17 @@ def _load_script(script_path: str, base_dir: Path) -> pa.Table:
 
     try:
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
+        spec.loader.exec_module(module)
 
         if not hasattr(module, "prepare"):
             raise ValueError(
-                f"Script '{p}' must define a 'prepare()' function "
-                "that returns a pyarrow.Table"
+                f"Script '{p}' must define a 'prepare()' function that returns a pyarrow.Table"
             )
 
         result = module.prepare()
         if not isinstance(result, pa.Table):
             raise ValueError(
-                f"Script '{p}' prepare() must return a pyarrow.Table, "
-                f"got {type(result).__name__}"
+                f"Script '{p}' prepare() must return a pyarrow.Table, got {type(result).__name__}"
             )
 
         # Write cache

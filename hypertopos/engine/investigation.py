@@ -3,11 +3,14 @@
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
 """Investigative explanation engine for anomalous entities."""
+
 from __future__ import annotations
+
+from typing import Any
 
 import numpy as np
 
-from hypertopos.engine.geometry import GDSEngine
+from hypertopos.engine.geometry import GDSEngine, _per_dim_anomaly_contributions
 
 
 def build_explanation(
@@ -17,18 +20,18 @@ def build_explanation(
     delta_norm: float,
     conformal_p: float | None = None,
     temporal_slices: int | None = None,
-    reputation: dict | None = None,
+    reputation: dict[str, Any] | None = None,
     dimension_kinds: list[str] | None = None,
-    sigma: np.ndarray | None = None,
-    mu: np.ndarray | None = None,
-    dimension_weights: np.ndarray | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Build structured anomaly explanation combining all available signals.
 
-    When *dimension_kinds*, *sigma*, and *mu* are provided, the
-    ``top_dimensions`` section is replaced by per-dimension Bregman
-    contributions, which more accurately attribute anomaly mass across
-    mixed-family dimensions (Bernoulli, Poisson, Gaussian).
+    ``top_dimensions`` ranks every dim by its share of ``delta_norm**2``
+    (``delta[i]**2 / sum(delta**2)``) — the metric behind ``is_anomaly`` —
+    so ``top_dimensions[0]`` is the dim whose return to its population mu
+    drops ``delta_norm`` most. Each entry is ``{dim, kind, delta,
+    pct_of_total}``: ``dim`` is the label, ``kind`` the dim's distribution
+    family tag (present when *dimension_kinds* is given), ``delta`` the
+    signed stored delta. Dims with no share are left out.
     """
     delta = np.asarray(delta, dtype=np.float64)
 
@@ -52,37 +55,30 @@ def build_explanation(
     witness = GDSEngine.witness_set(delta, theta_norm, dim_labels)
     anti_w = GDSEngine.anti_witness(delta, theta_norm, dim_labels)
 
-    if dimension_kinds is not None and sigma is not None and mu is not None:
-        if len(dimension_kinds) != len(delta):
-            # Dimension count mismatch — fall through to legacy abs_delta path
-            dimension_kinds = None
+    kinds = (
+        dimension_kinds
+        if dimension_kinds is not None and len(dimension_kinds) == len(delta)
+        else None
+    )
+    contribs = _per_dim_anomaly_contributions(delta)
+    total = float(contribs.sum())
+    n = min(len(dim_labels), len(contribs))
+    # Stable sort: ties keep dim order, so top_dimensions[0] matches the
+    # np.argmax pick of reliability_flags.dominant_dim.
+    order = sorted(range(n), key=lambda j: -contribs[j]) if total > 0 else []
+    top_dims: list[dict[str, Any]] = []
+    for i in order:
+        pct = round(float(contribs[i]) / total, 4)
+        if pct <= 0.0:
+            continue
+        entry: dict[str, Any] = {"dim": dim_labels[i]}
+        if kinds is not None:
+            entry["kind"] = kinds[i]
+        entry["delta"] = round(float(delta[i]), 4)
+        entry["pct_of_total"] = pct
+        top_dims.append(entry)
 
-    if dimension_kinds is not None and sigma is not None and mu is not None:
-        from hypertopos.builder._bregman import bregman_divergence
-        d_arr = np.array(delta)
-        if dimension_weights is not None:
-            w = np.maximum(np.array(dimension_weights), 1e-9)
-            d_arr = d_arr / w
-        shape = d_arr * np.array(sigma) + np.array(mu)
-        contribs = bregman_divergence(shape, np.array(mu), np.array(sigma), dimension_kinds)
-        total = float(contribs.sum())
-        top_dims = sorted(
-            [
-                {
-                    "dim": dim_labels[i],
-                    "kind": dimension_kinds[i],
-                    "bregman": round(float(contribs[i]), 4),
-                    "pct_of_total": round(float(contribs[i]) / total, 4) if total > 0 else 0.0,
-                }
-                for i in range(min(len(dim_labels), len(contribs)))
-            ],
-            key=lambda x: x["bregman"],
-            reverse=True,
-        )
-    else:
-        top_dims = GDSEngine.anomaly_dimensions(delta, dim_labels, top_n=5)
-
-    result: dict = {
+    result: dict[str, Any] = {
         "severity": severity,
         "delta_norm": round(delta_norm, 4),
         "theta_norm": round(theta_norm, 4),

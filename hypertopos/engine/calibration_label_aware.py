@@ -20,6 +20,7 @@ direction is sign-oriented so projecting onto it lands the
 positive-labelled class on the positive side
 (``w . (mu_pos - mu_neg) > 0``).
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -122,8 +123,7 @@ def calibrate_label_aware(
         raise ValueError(f"deltas must be 2-D, got shape {deltas.shape}")
     if labels.shape != (deltas.shape[0],):
         raise ValueError(
-            f"labels shape mismatch: {labels.shape} vs "
-            f"({deltas.shape[0]},)",
+            f"labels shape mismatch: {labels.shape} vs ({deltas.shape[0]},)",
         )
     n_dims = deltas.shape[1]
     if dim_labels is None:
@@ -134,7 +134,9 @@ def calibrate_label_aware(
         )
 
     lda = fit_lda_direction(
-        deltas=deltas, labels=labels, regularization=regularization,
+        deltas=deltas,
+        labels=labels,
+        regularization=regularization,
     )
     direction: np.ndarray = lda["direction"]
 

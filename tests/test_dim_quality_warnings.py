@@ -3,12 +3,14 @@
 build-time issues from the cached pattern state. Direct static-helper
 tests; sphere_overview integration is exercised by the existing nav
 test suite plus a fixture-level sanity check."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
 
 import numpy as np
 import pytest
+
 from hypertopos.model.sphere import Pattern, RelationDef
 from hypertopos.navigation.navigator import GDSNavigator
 
@@ -164,16 +166,14 @@ def test_dead_and_sparse_can_coexist():
     fixture (e.g. dominant_dim_mass when one surviving-sigma dim drives
     the p99-tail mass)."""
     pat = _make_pattern(
-        sigma_diag=[1.0, 0.0, 1.0],   # dim 1 is dead
+        sigma_diag=[1.0, 0.0, 1.0],  # dim 1 is dead
         dim_percentiles={
             "line_0": {"p25": 1.0, "p50": 5.0, "p75": 10.0, "p99": 50.0, "max": 100.0},
             "line_2": {"p25": 0.0, "p50": 0.0, "p75": 0.0, "p99": 5.0, "max": 100.0},
         },
     )
     warnings = GDSNavigator._compute_dim_quality_warnings(pat)
-    scoped = {
-        w["type"] for w in warnings if w["type"] in {"dead_dim", "sparse_dim"}
-    }
+    scoped = {w["type"] for w in warnings if w["type"] in {"dead_dim", "sparse_dim"}}
     assert scoped == {"dead_dim", "sparse_dim"}
 
 
@@ -315,6 +315,8 @@ def test_heteroscedasticity_skipped_when_p_value_nan():
     )
     warnings = GDSNavigator._compute_dim_quality_warnings(pat)
     assert all(w["type"] != "heteroscedasticity" for w in warnings)
+
+
 # ── non_normal_dim warning ────────────────────────────────────────────
 
 

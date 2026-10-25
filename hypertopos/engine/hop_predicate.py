@@ -28,6 +28,7 @@ post-BFS — see ``GDSNavigator.find_motif_by_hops``. The engine here is
 not aware of anchor-pattern anomaly status; the navigator filters
 motifs by destination ``is_anomaly`` after this enumerator returns.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -63,6 +64,10 @@ def _passes_amount(
     amount_min: float | None,
     amount_max: float | None,
 ) -> bool:
+    # Without an amount predicate any edge passes: spheres without an amount
+    # column store 0.0 on every edge. With one, a zero / missing amount fails.
+    if amount_min is None and amount_max is None:
+        return True
     if amt is None or amt <= 0:
         return False
     if amount_min is not None and amt < amount_min:
@@ -80,15 +85,14 @@ class _FeatureLookup:
     smaller in heap memory because we skip the per-event nested dict
     allocation.
     """
+
     __slots__ = ("_idx", "_cols", "_dim_values_cache")
 
     def __init__(self, edge_features: pa.Table, requested_dims: set[str]) -> None:
         eks = edge_features["event_key"].to_pylist()
         self._idx: dict[str, int] = {ek: i for i, ek in enumerate(eks)}
         cols = [c for c in edge_features.column_names if c in requested_dims]
-        self._cols: dict[str, list[float]] = {
-            c: edge_features[c].to_pylist() for c in cols
-        }
+        self._cols: dict[str, list[float]] = {c: edge_features[c].to_pylist() for c in cols}
         self._dim_values_cache: dict[str, dict[str, float]] = {}
 
     def passes(
@@ -206,20 +210,15 @@ def validate_hops(
                 f"hops[{i}].direction must be one of {sorted(_VALID_DIRECTIONS)}; "
                 f"got {hp.direction!r}",
             )
-        if (
-            hp.time_delta_max_hours is not None
-            and hp.time_delta_max_hours <= 0
-        ):
+        if hp.time_delta_max_hours is not None and hp.time_delta_max_hours <= 0:
             raise ValueError(
-                f"hops[{i}].time_delta_max_hours must be positive; "
-                f"got {hp.time_delta_max_hours!r}",
+                f"hops[{i}].time_delta_max_hours must be positive; got {hp.time_delta_max_hours!r}",
             )
-        if hp.amount_ratio_to_prev is not None:
-            if not (0 < hp.amount_ratio_to_prev <= 1.0):
-                raise ValueError(
-                    f"hops[{i}].amount_ratio_to_prev must be in (0, 1]; "
-                    f"got {hp.amount_ratio_to_prev!r}",
-                )
+        if hp.amount_ratio_to_prev is not None and not (0 < hp.amount_ratio_to_prev <= 1.0):
+            raise ValueError(
+                f"hops[{i}].amount_ratio_to_prev must be in (0, 1]; "
+                f"got {hp.amount_ratio_to_prev!r}",
+            )
         for dim, (op, _v) in hp.edge_dim_predicates.items():
             if op not in _VALID_OPERATORS:
                 raise ValueError(
@@ -246,9 +245,7 @@ def _expand_one_level(
     """
     next_state: list[dict[str, Any]] = []
     frontier_cap = max(max_results * _FRONTIER_SLACK_FACTOR, max_results)
-    window_seconds = (
-        time_window_hours * 3600.0 if time_window_hours is not None else None
-    )
+    window_seconds = time_window_hours * 3600.0 if time_window_hours is not None else None
 
     for chain in state:
         prev_nodes: list[str] = chain["nodes"]
@@ -267,7 +264,7 @@ def _expand_one_level(
         direction = hp.direction
         edge_dim_predicates = hp.edge_dim_predicates
 
-        for (nxt, ts, amt, ek) in cands:
+        for nxt, ts, amt, ek in cands:
             if nxt in prev_nodes:
                 continue
             if not _passes_amount(amt, amount_min, amount_max):
@@ -296,25 +293,22 @@ def _expand_one_level(
                         continue
             # Global chain-span cap — independent of per-hop windows.
             # Compares current edge ts to the chain's first hop ts.
-            if window_seconds is not None and prev_ts:
-                if abs(ts - prev_ts[0]) > window_seconds:
-                    continue
+            if window_seconds is not None and prev_ts and abs(ts - prev_ts[0]) > window_seconds:
+                continue
             if not _passes_edge_dim(
-                ek, edge_dim_predicates, feature_lookup,
+                ek,
+                edge_dim_predicates,
+                feature_lookup,
             ):
                 continue
 
-            row_dims = (
-                feature_lookup.values_at(ek) if feature_lookup is not None else {}
-            )
+            row_dims = feature_lookup.values_at(ek) if feature_lookup is not None else {}
             new_chain: dict[str, Any] = {
                 "nodes": [*prev_nodes, nxt],
                 "edges": [*prev_edges, ek],
                 "ts": [*prev_ts, ts],
                 "amts": [*prev_amts, amt],
-                "dims": (
-                    [*prev_dims, row_dims] if prev_dims is not None else None
-                ),
+                "dims": ([*prev_dims, row_dims] if prev_dims is not None else None),
             }
             next_state.append(new_chain)
             if len(next_state) >= frontier_cap:
@@ -385,36 +379,38 @@ def enumerate_motifs_by_hops(
                 f"{sorted(unknown)}; available: {sorted(sidecar_dims)}",
             )
 
-    candidate_seeds: list[str] = (
-        seed_keys if seed_keys is not None else sorted(out_map.keys())
-    )
+    candidate_seeds: list[str] = seed_keys if seed_keys is not None else sorted(out_map.keys())
 
-    # Initial frontier: one trivial partial chain per seed (no edges yet).
-    state: list[dict[str, Any]] = [
-        {
-            "nodes": [s],
-            "edges": [],
-            "ts": [],
-            "amts": [],
-            "dims": [] if requested_dims else None,
-        }
-        for s in candidate_seeds
-    ]
-
-    # Apply each hop level-synchronously. Empty frontier short-circuits.
-    for hop_idx in range(len(hops)):
-        if not state:
+    # Seeds are expanded one at a time through every hop, so the frontier cap
+    # bounds a single seed's fan-out instead of dropping every later seed;
+    # results keep seed order and stop at max_results.
+    found: list[dict[str, Any]] = []
+    for seed in candidate_seeds:
+        state: list[dict[str, Any]] = [
+            {
+                "nodes": [seed],
+                "edges": [],
+                "ts": [],
+                "amts": [],
+                "dims": [] if requested_dims else None,
+            }
+        ]
+        for hop_idx in range(len(hops)):
+            state = _expand_one_level(
+                state,
+                out_map,
+                in_map,
+                hops[hop_idx],
+                hop_idx,
+                feature_lookup,
+                requested_dims,
+                time_window_hours,
+                max_results,
+            )
+            if not state:
+                break
+        found.extend(state)
+        if len(found) >= max_results:
             break
-        state = _expand_one_level(
-            state,
-            out_map,
-            in_map,
-            hops[hop_idx],
-            hop_idx,
-            feature_lookup,
-            requested_dims,
-            time_window_hours,
-            max_results,
-        )
 
-    return [_state_to_motif(c, requested_dims) for c in state[:max_results]]
+    return [_state_to_motif(c, requested_dims) for c in found[:max_results]]

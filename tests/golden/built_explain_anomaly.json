@@ -1,0 +1,71 @@
+{
+  "conformal_p": 0.025,
+  "delta_norm": 5.9249,
+  "pattern_id": "account_pattern",
+  "primary_key": "A029",
+  "ratio": 1.5,
+  "reliability_flags": {
+    "confidence": null,
+    "dominant_dim": "_d_amount_sum",
+    "dominant_dim_share": 0.5007,
+    "flags": [],
+    "low_confidence_bucket": false,
+    "single_dim_driven": false
+  },
+  "repair": {
+    "repair_dims": [
+      {
+        "delta_value": 4.1926,
+        "dim": 1,
+        "label": "_d_amount_sum"
+      },
+      {
+        "delta_value": 3.9337,
+        "dim": 3,
+        "label": "_d_burst_7d"
+      }
+    ],
+    "repair_size": 2,
+    "residual_norm": 1.4327
+  },
+  "severity": "high",
+  "temporal_slices": 7,
+  "theta_norm": 3.9372,
+  "top_dimensions": [
+    {
+      "delta": 4.1926,
+      "dim": "_d_amount_sum",
+      "kind": "gaussian",
+      "pct_of_total": 0.5007
+    },
+    {
+      "delta": 3.9337,
+      "dim": "_d_burst_7d",
+      "kind": "poisson",
+      "pct_of_total": 0.4408
+    },
+    {
+      "delta": 1.1307,
+      "dim": "_d_n_cpty",
+      "kind": "poisson",
+      "pct_of_total": 0.0364
+    },
+    {
+      "delta": 0.88,
+      "dim": "_d_tx_count",
+      "kind": "poisson",
+      "pct_of_total": 0.0221
+    }
+  ],
+  "witness": {
+    "delta_norm": 5.9249,
+    "witness_dims": [
+      {
+        "delta_value": 4.1926,
+        "dim": 1,
+        "label": "_d_amount_sum"
+      }
+    ],
+    "witness_size": 1
+  }
+}

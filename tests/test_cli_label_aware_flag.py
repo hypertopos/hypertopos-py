@@ -9,11 +9,12 @@ receive it, and on a builder without a sphere-level ``label_audit``
 block it must be a no-op. The YAML loader that populates the block
 lands in M1.2 — these tests only cover M1.1's flag-acceptance contract.
 """
+
 from __future__ import annotations
 
 import sys
 
-from hypertopos.cli import main as cli_main
+from hypertopos.cli.main import main as cli_main
 
 
 def test_label_aware_flag_threads_into_run_build(monkeypatch):
@@ -25,13 +26,18 @@ def test_label_aware_flag_threads_into_run_build(monkeypatch):
         captured.update(kwargs)
 
     monkeypatch.setattr(
-        "hypertopos.cli.build.run_build", fake_run_build, raising=True,
+        "hypertopos.cli.build.run_build",
+        fake_run_build,
+        raising=True,
     )
     monkeypatch.setattr(
-        sys, "argv",
+        sys,
+        "argv",
         [
-            "hypertopos", "build",
-            "--config", "dummy.yaml",
+            "hypertopos",
+            "build",
+            "--config",
+            "dummy.yaml",
             "--label-aware-calibration",
         ],
     )
@@ -47,10 +53,13 @@ def test_label_aware_flag_defaults_off(monkeypatch):
         captured.update(kwargs)
 
     monkeypatch.setattr(
-        "hypertopos.cli.build.run_build", fake_run_build, raising=True,
+        "hypertopos.cli.build.run_build",
+        fake_run_build,
+        raising=True,
     )
     monkeypatch.setattr(
-        sys, "argv",
+        sys,
+        "argv",
         ["hypertopos", "build", "--config", "dummy.yaml"],
     )
     cli_main()
@@ -83,16 +92,14 @@ def test_run_build_threads_flag_into_builder(monkeypatch, tmp_path):
 
     def fake_do_build(*args, **kwargs):
         captured["label_aware_calibration"] = kwargs.get(
-            "label_aware_calibration", False,
+            "label_aware_calibration",
+            False,
         )
 
     monkeypatch.setattr(build_mod, "_do_build", fake_do_build, raising=True)
     cfg_path = tmp_path / "sphere.yaml"
     cfg_path.write_text(
-        "sphere_id: x\n"
-        "sources: {}\n"
-        "lines: {}\n"
-        "patterns: {}\n",
+        "sphere_id: x\nsources: {}\nlines: {}\npatterns: {}\n",
     )
 
     # Stub parse_config so we don't depend on full schema validation.
@@ -105,8 +112,10 @@ def test_run_build_threads_flag_into_builder(monkeypatch, tmp_path):
     )
 
     build_mod.run_build(
-        str(cfg_path), str(tmp_path / "out"),
-        force=False, verbose=False,
+        str(cfg_path),
+        str(tmp_path / "out"),
+        force=False,
+        verbose=False,
         label_aware_calibration=True,
     )
     assert captured["label_aware_calibration"] is True

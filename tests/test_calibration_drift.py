@@ -4,11 +4,12 @@ Covers: DimensionDrift + CalibrationDriftReport dataclasses, _compute_calibratio
 math helper, GDSNavigator.compare_calibrations orchestration (auto-resolve, edge
 cases, error semantics).
 """
+
 from __future__ import annotations
 
 import dataclasses
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
@@ -106,8 +107,8 @@ def _make_fit(
         group_stats=None,
         gmm_components=None,
         edge_max=None,
-        computed_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc),
-        last_calibrated_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc),
+        computed_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=UTC),
+        last_calibrated_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=UTC),
     )
 
 
@@ -279,9 +280,7 @@ def _write_minimal_2_4_sphere(base: Path, epochs: dict[int, dict]) -> None:
             "computed_at": "2026-04-27T12:00:00+00:00",
             "last_calibrated_at": "2026-04-27T12:00:00+00:00",
         }
-        (history_dir / f"v={n}.json").write_text(
-            json.dumps(epoch_blob, indent=2), encoding="utf-8"
-        )
+        (history_dir / f"v={n}.json").write_text(json.dumps(epoch_blob, indent=2), encoding="utf-8")
 
 
 def _make_navigator(base: Path):

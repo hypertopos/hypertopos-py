@@ -3,6 +3,7 @@
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
 """Unit + integration tests for geometric edge potential."""
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock
@@ -16,14 +17,17 @@ from hypertopos.navigation.navigator import GDSNavigator
 
 def _mock_edges_table(pairs: list[tuple[str, str]]) -> pa.Table:
     """Build a fake Arrow edges table with from_key/to_key columns."""
-    return pa.table({
-        "from_key": [p[0] for p in pairs],
-        "to_key": [p[1] for p in pairs],
-    })
+    return pa.table(
+        {
+            "from_key": [p[0] for p in pairs],
+            "to_key": [p[1] for p in pairs],
+        }
+    )
 
 
 def _make_adjacency(pairs: list[tuple[str, str]]):
     from hypertopos.engine.adjacency import AdjacencyIndex
+
     if not pairs:
         return AdjacencyIndex._empty()
     return AdjacencyIndex.from_edge_lists(
@@ -39,9 +43,7 @@ def _make_nav_with_edges(pairs: list[tuple[str, str]]) -> GDSNavigator:
     storage = MagicMock()
     storage.read_edges = MagicMock(return_value=_mock_edges_table(pairs))
     storage.get_adjacency = MagicMock(return_value=_make_adjacency(pairs))
-    storage.count_geometry_rows = MagicMock(
-        return_value=max(1, len({k for p in pairs for k in p}))
-    )
+    storage.count_geometry_rows = MagicMock(return_value=max(1, len({k for p in pairs for k in p})))
     sphere = MagicMock()
     sphere.patterns = {
         "tx_pattern": MagicMock(pattern_type="event"),
@@ -51,27 +53,13 @@ def _make_nav_with_edges(pairs: list[tuple[str, str]]) -> GDSNavigator:
     return GDSNavigator(MagicMock(), storage, MagicMock(), MagicMock())
 
 
-class TestPairCountCache:
-    def test_counts_distinct_ordered_pairs(self):
-        nav = _make_nav_with_edges([
-            ("A", "B"), ("A", "B"), ("A", "C"), ("B", "A"),
-        ])
-        counts = nav._pair_count_for_pattern("tx_pattern", version=1)
-        assert counts == {("A", "B"): 2, ("A", "C"): 1, ("B", "A"): 1}
-
-    def test_cache_is_shared_with_adjacency(self):
-        # After the AdjacencyIndex reuse refactor, pair_counts share the
-        # same cache lifetime as the adjacency itself (one instance per
-        # pattern_id on the reader). Version parameter is cosmetic —
-        # invalidation happens when the adjacency is rebuilt.
-        nav = _make_nav_with_edges([("A", "B")])
-        _ = nav._pair_count_for_pattern("tx_pattern", version=1)
-        first = nav._storage.get_adjacency.call_count
-        _ = nav._pair_count_for_pattern("tx_pattern", version=1)
-        _ = nav._pair_count_for_pattern("tx_pattern", version=2)
-        # Navigator delegates unconditionally; reader-level cache suppresses
-        # the actual read_edges. We assert the delegation pattern works:
-        assert nav._storage.get_adjacency.call_count == first + 2
+class TestPairTxCount:
+    def test_warm_adjacency_counts_both_directions(self):
+        nav = _make_nav_with_edges([("A", "B"), ("A", "B"), ("A", "C"), ("B", "A")])
+        nav._storage._adjacency_cache = {"tx_pattern": object()}
+        assert nav._pair_tx_count("tx_pattern", "A", "B") == 3
+        assert nav._pair_tx_count("tx_pattern", "A", "C") == 1
+        nav._storage.read_edges.assert_not_called()
 
 
 class TestEdgePotentialScoring:
@@ -94,10 +82,12 @@ class TestEdgePotentialScoring:
 
         def fake_read_geometry(pid, version, primary_key=None, columns=None, **kw):
             if primary_key in deltas:
-                return pa.table({
-                    "primary_key": [primary_key],
-                    "delta": [deltas[primary_key].tolist()],
-                })
+                return pa.table(
+                    {
+                        "primary_key": [primary_key],
+                        "delta": [deltas[primary_key].tolist()],
+                    }
+                )
             return pa.table({"primary_key": [], "delta": []})
 
         storage.read_geometry = fake_read_geometry
@@ -167,6 +157,7 @@ class TestEdgePotentialScoring:
     def test_missing_endpoint_raises(self):
         """A key without geometry cannot be scored — raise GDSNavigationError."""
         from hypertopos.navigation.navigator import GDSNavigationError
+
         nav = self._make_nav_with_geometry(
             deltas={"A": np.array([1.0, 2.0])},
             edges=[("A", "B")],
@@ -185,7 +176,9 @@ class TestEdgePotentialScoring:
             edges=[("A", "B")],
         )
         nav.attract_edge_potential = MagicMock(
-            side_effect=AssertionError("attract_edge_potential must NOT be called when include_ranking=False")
+            side_effect=AssertionError(
+                "attract_edge_potential must NOT be called when include_ranking=False"
+            )
         )
         result = nav.edge_potential("A", "B", "account_pattern", include_ranking=False)
         assert result["score_rank_pct"] is None
@@ -232,15 +225,19 @@ class TestAttractEdgePotential:
 
         def fake_read_geometry(pid, version, primary_key=None, columns=None, **kw):
             if primary_key and primary_key in deltas:
-                return pa.table({
-                    "primary_key": [primary_key],
-                    "delta": [deltas[primary_key].tolist()],
-                })
+                return pa.table(
+                    {
+                        "primary_key": [primary_key],
+                        "delta": [deltas[primary_key].tolist()],
+                    }
+                )
             keys = sorted(deltas.keys())
-            return pa.table({
-                "primary_key": keys,
-                "delta": [deltas[k].tolist() for k in keys],
-            })
+            return pa.table(
+                {
+                    "primary_key": keys,
+                    "delta": [deltas[k].tolist() for k in keys],
+                }
+            )
 
         storage.read_geometry = fake_read_geometry
         nav = GDSNavigator(MagicMock(), storage, MagicMock(), MagicMock())
@@ -260,6 +257,19 @@ class TestAttractEdgePotential:
         results = nav.attract_edge_potential("account_pattern", top_n=10)
         scores = [r["score"] for r in results]
         assert scores == sorted(scores, reverse=True)
+
+    def test_tied_scores_rank_by_pair_keys(self):
+        # Equal distances and counts: the order must not depend on the
+        # edge-table / group-by row order.
+        deltas = {
+            "A": np.array([1.0, 0.0]),
+            "B": np.array([0.0, 0.0]),
+            "C": np.array([1.0, 0.0]),
+            "D": np.array([0.0, 0.0]),
+        }
+        nav = self._nav(deltas, [("C", "D"), ("A", "B")])
+        results = nav.attract_edge_potential("account_pattern", top_n=10)
+        assert [(r["from_key"], r["to_key"]) for r in results] == [("A", "B"), ("C", "D")]
 
     def test_top_n_cap(self):
         deltas = {k: np.array([float(i), 0.0]) for i, k in enumerate("ABCDE")}
@@ -301,10 +311,12 @@ class TestAttractEdgePotential:
         def spy_read_geometry(pid, version, point_keys=None, columns=None, **kw):
             seen_point_keys.append(list(point_keys) if point_keys is not None else None)
             keys = sorted(deltas.keys())
-            return pa.table({
-                "primary_key": keys,
-                "delta": [deltas[k].tolist() for k in keys],
-            })
+            return pa.table(
+                {
+                    "primary_key": keys,
+                    "delta": [deltas[k].tolist() for k in keys],
+                }
+            )
 
         storage.read_geometry = spy_read_geometry
         nav = GDSNavigator(MagicMock(), storage, MagicMock(), MagicMock())
@@ -331,7 +343,9 @@ class TestAttractEdgePotential:
         edges = [("A", "B"), ("A", "C"), ("A", "C"), ("A", "C")]
         nav = self._nav(deltas, edges)
         results = nav.attract_edge_potential(
-            "account_pattern", top_n=10, min_pair_count=2,
+            "account_pattern",
+            top_n=10,
+            min_pair_count=2,
         )
         pairs = {(r["from_key"], r["to_key"]) for r in results}
         assert ("A", "B") not in pairs
@@ -342,7 +356,9 @@ class TestAttractEdgePotential:
         edges = [("A", "B"), ("A", "C"), ("B", "D"), ("C", "D")]
         nav = self._nav(deltas, edges)
         results = nav.attract_edge_potential(
-            "account_pattern", top_n=10, from_key="A",
+            "account_pattern",
+            top_n=10,
+            from_key="A",
         )
         for r in results:
             assert r["from_key"] == "A"
@@ -361,15 +377,14 @@ class TestEdgePotentialFixtureSmoke:
         an event pattern, add a separate test `test_full_pipeline_on_extended_fixture`
         that exercises the non-empty path.
         """
-        from hypertopos.sphere import HyperSphere
         from hypertopos.navigation.navigator import GDSNavigationError
+        from hypertopos.sphere import HyperSphere
 
         hs = HyperSphere.open(sphere_path)
         with hs.session("test-agent") as session:
             sphere = session._reader.read_sphere()
             anchor_pids = [
-                pid for pid, pat in sphere.patterns.items()
-                if pat.pattern_type == "anchor"
+                pid for pid, pat in sphere.patterns.items() if pat.pattern_type == "anchor"
             ]
             assert anchor_pids, (
                 "Fixture regression: sales_sphere has no anchor pattern — "
@@ -390,15 +405,14 @@ class TestEdgePotentialFixtureSmoke:
 
     def test_edge_potential_single_lookup_graceful_when_no_companion(self, sphere_path):
         """score_edge on sales_sphere must raise loudly — same fail-loud contract."""
-        from hypertopos.sphere import HyperSphere
         from hypertopos.navigation.navigator import GDSNavigationError
+        from hypertopos.sphere import HyperSphere
 
         hs = HyperSphere.open(sphere_path)
         with hs.session("test-agent") as session:
             sphere = session._reader.read_sphere()
             anchor_pids = [
-                pid for pid, pat in sphere.patterns.items()
-                if pat.pattern_type == "anchor"
+                pid for pid, pat in sphere.patterns.items() if pat.pattern_type == "anchor"
             ]
             assert anchor_pids
             pid = anchor_pids[0]
@@ -431,10 +445,12 @@ class TestGlobalVsFilterRankPct:
 
         def fake_read_geometry(pid, version, primary_key=None, columns=None, **kw):
             keys = sorted(deltas.keys())
-            return pa.table({
-                "primary_key": keys,
-                "delta": [deltas[k].tolist() for k in keys],
-            })
+            return pa.table(
+                {
+                    "primary_key": keys,
+                    "delta": [deltas[k].tolist() for k in keys],
+                }
+            )
 
         storage.read_geometry = fake_read_geometry
         nav = GDSNavigator(MagicMock(), storage, MagicMock(), MagicMock())
@@ -456,7 +472,9 @@ class TestGlobalVsFilterRankPct:
         # Same top entry's global pct should match in filter query
         top_entry = base[0]
         filtered = nav.attract_edge_potential(
-            "account_pattern", top_n=10, from_key=top_entry["from_key"],
+            "account_pattern",
+            top_n=10,
+            from_key=top_entry["from_key"],
         )
         # The same (from, to) entry should have identical global pct
         match = [r for r in filtered if r["to_key"] == top_entry["to_key"]]
@@ -472,7 +490,9 @@ class TestGlobalVsFilterRankPct:
         edges = [("A", "B"), ("A", "B"), ("A", "B"), ("A", "C"), ("B", "C")]
         nav = self._nav(deltas, edges)
         filtered = nav.attract_edge_potential(
-            "account_pattern", top_n=5, min_pair_count=3,
+            "account_pattern",
+            top_n=5,
+            min_pair_count=3,
         )
         # Filter-local pct must exist and start at 100 for the top entry
         assert filtered
@@ -500,7 +520,9 @@ class TestGlobalVsFilterRankPct:
         # filter-local top (pct=100) but globally below p95 of the huge
         # singleton pool. is_high_potential should be False.
         filtered = nav.attract_edge_potential(
-            "account_pattern", top_n=5, min_pair_count=10,
+            "account_pattern",
+            top_n=5,
+            min_pair_count=10,
         )
         assert filtered
         assert filtered[0]["score_rank_pct_in_filter"] == 100.0

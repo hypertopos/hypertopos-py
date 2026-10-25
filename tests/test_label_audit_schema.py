@@ -3,12 +3,14 @@
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
 """YAML ``label_audit:`` block — schema parsing + round-trip through build."""
+
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
 import pytest
+
 from hypertopos.builder import GDSBuilder, RelationSpec
 from hypertopos.cli.schema import LabelAuditConfig, parse_config
 from hypertopos.sphere import HyperSphere
@@ -55,7 +57,8 @@ def _yaml_with_block(audit_block_yaml: str | None) -> str:
 
 
 def _build_sphere_with_block(
-    tmp_path: Path, audit_block: object | None,
+    tmp_path: Path,
+    audit_block: object | None,
 ) -> str:
     """Build a tiny sphere optionally carrying a label_audit block.
 
@@ -86,7 +89,10 @@ def _build_sphere_with_block(
         entity_line="orders",
         relations=[
             RelationSpec(
-                "customers", fk_col="cust_id", direction="in", required=True,
+                "customers",
+                fk_col="cust_id",
+                direction="in",
+                required=True,
             ),
         ],
     )
@@ -124,11 +130,7 @@ def test_parse_omitted_block_yields_none(tmp_path: Path) -> None:
 def test_parse_rejects_missing_label_column(tmp_path: Path) -> None:
     yaml_path = _write_yaml(
         tmp_path,
-        _yaml_with_block(
-            "  label_positive_value: true\n"
-            "  patterns:\n"
-            "    - account_pattern\n"
-        ),
+        _yaml_with_block("  label_positive_value: true\n  patterns:\n    - account_pattern\n"),
     )
     with pytest.raises(ValueError, match="label_column"):
         parse_config(yaml_path)
@@ -137,11 +139,7 @@ def test_parse_rejects_missing_label_column(tmp_path: Path) -> None:
 def test_parse_rejects_missing_label_positive_value(tmp_path: Path) -> None:
     yaml_path = _write_yaml(
         tmp_path,
-        _yaml_with_block(
-            "  label_column: laundering\n"
-            "  patterns:\n"
-            "    - account_pattern\n"
-        ),
+        _yaml_with_block("  label_column: laundering\n  patterns:\n    - account_pattern\n"),
     )
     with pytest.raises(ValueError, match="label_positive_value"):
         parse_config(yaml_path)
@@ -150,10 +148,7 @@ def test_parse_rejects_missing_label_positive_value(tmp_path: Path) -> None:
 def test_parse_rejects_missing_patterns(tmp_path: Path) -> None:
     yaml_path = _write_yaml(
         tmp_path,
-        _yaml_with_block(
-            "  label_column: laundering\n"
-            "  label_positive_value: true\n"
-        ),
+        _yaml_with_block("  label_column: laundering\n  label_positive_value: true\n"),
     )
     with pytest.raises(ValueError, match="patterns"):
         parse_config(yaml_path)
@@ -163,9 +158,7 @@ def test_parse_rejects_empty_patterns(tmp_path: Path) -> None:
     yaml_path = _write_yaml(
         tmp_path,
         _yaml_with_block(
-            "  label_column: laundering\n"
-            "  label_positive_value: true\n"
-            "  patterns: []\n"
+            "  label_column: laundering\n  label_positive_value: true\n  patterns: []\n"
         ),
     )
     with pytest.raises(ValueError, match="patterns"):

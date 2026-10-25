@@ -4,17 +4,19 @@
 # See LICENSE.md in the repository root for full terms.
 """Reader tests for read_calibration_fit + list_calibration_versions on
 hand-built sphere fixtures (2.3-shaped and 2.4-shaped)."""
+
 from __future__ import annotations
 
 import json
-
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 
-def _write_minimal_sphere_json(base: Path, format_version: str, pattern_extra: dict | None = None) -> None:
+def _write_minimal_sphere_json(
+    base: Path, format_version: str, pattern_extra: dict | None = None
+) -> None:
     pattern_node = {
         "pattern_id": "p",
         "version": 1,
@@ -77,7 +79,9 @@ def test_read_calibration_fit_2_4_explicit_version(tmp_path):
     from hypertopos.storage.reader import GDSReader
 
     base = tmp_path
-    _write_minimal_sphere_json(base, "2.4", pattern_extra={"calibration_epoch": 2, "schema_hash": "a" * 64})
+    _write_minimal_sphere_json(
+        base, "2.4", pattern_extra={"calibration_epoch": 2, "schema_hash": "a" * 64}
+    )
     _write_history_epoch(base, "p", 1, mu_value=0.1)
     _write_history_epoch(base, "p", 2, mu_value=0.2)
 
@@ -94,7 +98,9 @@ def test_read_calibration_fit_2_4_version_none_resolves_latest(tmp_path):
     from hypertopos.storage.reader import GDSReader
 
     base = tmp_path
-    _write_minimal_sphere_json(base, "2.4", pattern_extra={"calibration_epoch": 2, "schema_hash": "a" * 64})
+    _write_minimal_sphere_json(
+        base, "2.4", pattern_extra={"calibration_epoch": 2, "schema_hash": "a" * 64}
+    )
     _write_history_epoch(base, "p", 1, mu_value=0.1)
     _write_history_epoch(base, "p", 2, mu_value=0.2)
 
@@ -109,7 +115,9 @@ def test_read_calibration_fit_raises_when_version_missing(tmp_path):
     from hypertopos.storage.reader import GDSReader
 
     base = tmp_path
-    _write_minimal_sphere_json(base, "2.4", pattern_extra={"calibration_epoch": 2, "schema_hash": "a" * 64})
+    _write_minimal_sphere_json(
+        base, "2.4", pattern_extra={"calibration_epoch": 2, "schema_hash": "a" * 64}
+    )
     _write_history_epoch(base, "p", 2, mu_value=0.2)
 
     reader = GDSReader(base)
@@ -121,7 +129,9 @@ def test_list_calibration_versions_2_4(tmp_path):
     from hypertopos.storage.reader import GDSReader
 
     base = tmp_path
-    _write_minimal_sphere_json(base, "2.4", pattern_extra={"calibration_epoch": 3, "schema_hash": "a" * 64})
+    _write_minimal_sphere_json(
+        base, "2.4", pattern_extra={"calibration_epoch": 3, "schema_hash": "a" * 64}
+    )
     _write_history_epoch(base, "p", 1, mu_value=0.1)
     _write_history_epoch(base, "p", 2, mu_value=0.2)
     _write_history_epoch(base, "p", 3, mu_value=0.3)
@@ -183,7 +193,9 @@ def test_sphere_load_rejects_last_k_zero(tmp_path):
     from hypertopos.storage.reader import GDSReader
 
     base = tmp_path
-    _write_minimal_sphere_json(base, "2.4", pattern_extra={"calibration_epoch": 1, "schema_hash": "a" * 64})
+    _write_minimal_sphere_json(
+        base, "2.4", pattern_extra={"calibration_epoch": 1, "schema_hash": "a" * 64}
+    )
     sphere_path = base / "_gds_meta" / "sphere.json"
     sphere = json.loads(sphere_path.read_text())
     sphere["calibration_history_policy"] = {"last_k": 0}
@@ -198,7 +210,9 @@ def test_sphere_load_rejects_last_k_negative(tmp_path):
     from hypertopos.storage.reader import GDSReader
 
     base = tmp_path
-    _write_minimal_sphere_json(base, "2.4", pattern_extra={"calibration_epoch": 1, "schema_hash": "a" * 64})
+    _write_minimal_sphere_json(
+        base, "2.4", pattern_extra={"calibration_epoch": 1, "schema_hash": "a" * 64}
+    )
     sphere_path = base / "_gds_meta" / "sphere.json"
     sphere = json.loads(sphere_path.read_text())
     sphere["calibration_history_policy"] = {"last_k": -3}
@@ -214,7 +228,9 @@ def test_sphere_load_accepts_last_k_one_and_default(tmp_path):
 
     base1 = tmp_path / "k1"
     base1.mkdir()
-    _write_minimal_sphere_json(base1, "2.4", pattern_extra={"calibration_epoch": 1, "schema_hash": "a" * 64})
+    _write_minimal_sphere_json(
+        base1, "2.4", pattern_extra={"calibration_epoch": 1, "schema_hash": "a" * 64}
+    )
     sphere_path = base1 / "_gds_meta" / "sphere.json"
     sphere = json.loads(sphere_path.read_text())
     sphere["calibration_history_policy"] = {"last_k": 1}
@@ -223,7 +239,9 @@ def test_sphere_load_accepts_last_k_one_and_default(tmp_path):
 
     base_default = tmp_path / "default"
     base_default.mkdir()
-    _write_minimal_sphere_json(base_default, "2.4", pattern_extra={"calibration_epoch": 1, "schema_hash": "a" * 64})
+    _write_minimal_sphere_json(
+        base_default, "2.4", pattern_extra={"calibration_epoch": 1, "schema_hash": "a" * 64}
+    )
     sphere_path = base_default / "_gds_meta" / "sphere.json"
     sphere = json.loads(sphere_path.read_text())
     sphere.pop("calibration_history_policy", None)

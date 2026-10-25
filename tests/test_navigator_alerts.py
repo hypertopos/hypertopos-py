@@ -9,6 +9,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
+
 from hypertopos.navigation.navigator import GDSNavigator
 
 

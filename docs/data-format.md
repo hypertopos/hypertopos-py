@@ -15,13 +15,17 @@ gds_{sphere_id}/
 ├── _gds_meta/
 │   ├── sphere.json              # central config (lines, patterns, aliases, storage)
 │   ├── geometry_stats/          # precomputed population summaries
-│   ├── trajectory/              # per-entity trajectory summary vectors (optional IVF_FLAT ANN index — skipped for too-few-entity patterns, which then use a brute-force scan)
+│   ├── trajectory/              # per-entity trajectory summary vectors over active windows only (entities with < 2 active windows get no row); optional IVF_FLAT ANN index — skipped for too-few-entity patterns, which then use a brute-force scan
 │   ├── temporal_centroids/      # cached population centroids per time window
 │   ├── edge_stats/              # per-event-pattern edge table summary cache (row count, unique from/to, ts/amount range)
 │   ├── edge_features/           # per-edge derived dim sidecar (event patterns with edge_dimensions: in YAML)
 │   │   └── {pattern_id}/
 │   │       └── data.lance       # event_key + 5 dim columns; same values baked into polygon shape
-│   └── contagion_stats/         # per-pattern (primary_key, neighbor_count, anomalous_neighbor_count, contagion_ratio) — feeds the graph contagion scanner directly, BTREE-indexed on primary_key
+│   ├── contagion_stats/         # per-pattern (primary_key, neighbor_count, anomalous_neighbor_count, contagion_ratio) — feeds the graph contagion scanner directly, BTREE-indexed on primary_key
+│   └── branches/                # one directory per sphere branch (see "Branches" below)
+│       └── {branch}/
+│           ├── branch.json      # provenance: parent versions, metadata fingerprints, dataset mechanisms, recipe log
+│           └── _gds_meta/       # copy of every _gds_meta metadata file, same relative layout
 ├── points/
 │   ├── {line_id}/v={n}/
 │   │   └── data.lance           # entity records for this line version
@@ -36,11 +40,37 @@ gds_{sphere_id}/
 │   └── ...
 └── temporal/
     ├── {pattern_id}/
-    │   └── data.lance           # shape/delta snapshots over time
+    │   └── data.lance           # shape snapshots over time
     └── ...
 ```
 
-All data files use [Lance](https://github.com/lancedb/lance) format (columnar, versioned, with native ANN index support). The `v={n}` directories on `points/` are Hive-style version partitions; `geometry/` is a single flat Lance dataset per pattern with calibration epochs tracked via native Lance version tags (`epoch_<N>`).
+All data files use [Lance](https://github.com/lance-format/lance) format (columnar, versioned, with native ANN index support). Every dataset hypertopos writes — points, geometry, edges, temporal data and every sidecar — is written with Lance file format `2.2`, pinned explicitly rather than taken from the library default, so a newer Lance library never silently changes the on-disk format; spheres written by older supported Lance versions open without a rebuild. The `v={n}` directories on `points/` are Hive-style version partitions; `geometry/` is a single flat Lance dataset per pattern with calibration epochs tracked via native Lance version tags (`epoch_<N>`).
+
+### Branches
+
+A branch is created by `HyperSphere.create_branch(name)` and copies no data file:
+
+- **Geometry and temporal centroids** get a native Lance branch named `{branch}`, stored inside the dataset under `tree/{branch}/`. The branch keeps its parent version alive by reference. On Windows without long-path support, those paths must stay under 260 characters; `create_branch` refuses a branch whose files would exceed the limit and names the path.
+- **Every other dataset** (points, temporal, edges, trajectory, sidecars) is pinned at the version current when the branch was created. `branch.json` records the pin under `parent.lance_versions` and the mechanism of each dataset under `datasets` (`lance-branch` or `parent-pin`).
+- **`GDSBuilder.build()` and `sphere build --force` are refused** while `_gds_meta/branches/` holds a branch. A full build is the only writer of the pinned datasets.
+- **Recalibrate:** on main it invalidates the temporal centroid cache by deleting its rows, not the dataset, so the branches' copies survive.
+- **Recalibrate on a branch:**
+  - Commits the geometry column replacement (the calibration-dependent columns only), the rebuilt indexes on those columns and the centroid-cache delete on the branch's Lance branches.
+  - Writes `sphere.json`, the calibration history epoch, `geometry_stats` and the drift tracker under `branches/{branch}/_gds_meta/`.
+  - Appends one entry to `recipes` in `branch.json`:
+
+| Field | Description |
+|-------|-------------|
+| `seq` | 1-based position in the log |
+| `op` | `"recalibrate"` |
+| `pattern_id` | Recalibrated pattern |
+| `exclude_keys` | Sorted keys left out of the fit |
+| `soft_threshold`, `hard_threshold` | Tracker thresholds passed to the call (`null` = kept) |
+| `result` | `theta_norm`, `population_size`, `n_excluded`, `mu_sha256` (sha256 of the fitted mu as float64) |
+| `lance_version_after` | Branch version of each dataset the recipe wrote (geometry by pattern id, `centroids:{pattern_id}`) |
+
+An incremental ingest on a branch appends an `incremental_update` entry (`pattern_id`, `points_file` — a copy of the ingested rows as Arrow IPC under `branches/{branch}/recipes/` — `points_sha256`, `deleted_keys`, `recalibrate`, `reindex`, `recompute_ranks`, `result` with `added`, `modified`, `deleted`, `population_size`, and `lance_version_after`); `finalize_incremental` appends a `finalize_incremental` entry. An automatic recalibration during the ingest is its own `recalibrate` entry.
+- **Layout compatibility:** the sphere format version is unchanged. Readers that predate branches never open `tree/` or `_gds_meta/branches/`.
 
 ---
 
@@ -77,6 +107,7 @@ Example (abridged pattern entry):
       "sigma_diag": [0.01, 0.01, 0.379, 0.437, 0.209, 0.204],
       "theta": [1.284, 1.284, 1.284, 1.284, 1.284, 1.284],
       "population_size": 1056320,
+      "anomaly_percentile": 95.0,
       "has_edge_table": true,
       "edge_table": {
         "from_col": "from_account",
@@ -91,7 +122,7 @@ Example (abridged pattern entry):
 
 Event patterns with adjacency structure (`has_edge_table: true`) carry an `edge_table` block describing the source columns used to materialize `edges/{pattern_id}/data.lance`. `timestamp_col` and `amount_col` are present whenever they were resolved from explicit YAML config or auto-detected from the event line schema.
 
-`mu` is the population mean per dimension, `sigma_diag` is the standard deviation used for z-scoring, and `theta` is the per-dimension anomaly threshold vector (entities whose z-scored delta exceeds theta on any dimension are flagged).
+`mu` is the population mean per dimension, `sigma_diag` is the standard deviation used for z-scoring, and `theta` is the per-dimension anomaly threshold vector (entities whose z-scored delta exceeds theta on any dimension are flagged). `anomaly_percentile` is the population percentile of `delta_norm` that `theta` was set at; `recalibrate` reuses it (spheres written without it fall back to 95.0).
 
 ---
 
@@ -108,7 +139,7 @@ Domain columns vary per line. The `primary_key` column is always present and alw
 
 ### Geometry (`geometry/{pattern_id}/data.lance`)
 
-Single Lance dataset per pattern. Calibration epochs are not separate directories — each rebuild creates a new internal Lance dataset version, which is tagged `epoch_<N>` so historical epochs remain readable via `LanceDataset.checkout_version(<tag>)`. The current epoch counter is `Sphere.patterns[pid].version`; the on-disk Lance version is resolved via the tag.
+Single Lance dataset per pattern. Calibration epochs are not separate directories — each rebuild creates a new internal Lance dataset version, which is tagged `epoch_<N>` so historical epochs remain readable via `LanceDataset.checkout_version(<tag>)`. `recalibrate` records its fit as the next epoch in `_gds_meta/calibration_history/` (and bumps `calibration_epoch` in `sphere.json`) without tagging the geometry version. The current epoch counter is `Sphere.patterns[pid].version`; the on-disk Lance version is resolved via the tag.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -153,12 +184,15 @@ Written when an event pattern declares an `edge_dimensions:` block. The same per
 | Column | Type | Description |
 |--------|------|-------------|
 | `primary_key` | string | Entity identifier |
-| `shape_snapshot` | fixed_size_list\<float32\> | Shape vector at this point in time |
-| `delta_snapshot` | fixed_size_list\<float32\> | Delta vector at this point in time |
+| `slice_index` | int32 | Position in the entity's temporal sequence |
 | `timestamp` | timestamp | When this snapshot was taken |
 | `deformation_type` | string | How the shape changed (`internal` / `edge` / `structural`) |
+| `shape_snapshot` | list\<float32\> | Shape vector at this point in time |
+| `pattern_ver` | int32 | Pattern version the snapshot belongs to |
+| `changed_property` | string | Property that changed, if any |
+| `changed_line_id` | string | Line of the changed relation, if any |
 
-Each row is one entity at one point in time. Multiple rows per entity form the temporal solid.
+Each row is one entity at one point in time. Multiple rows per entity form the temporal solid. No delta is stored: a slice's delta is computed from `shape_snapshot` at read time with the pattern's current calibration.
 
 ---
 

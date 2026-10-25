@@ -4,6 +4,7 @@
 # See LICENSE.md in the repository root for full terms.
 """Tests for investigate_entity orchestrator — chains entity-side primitives
 into one aggregated report. Mirror of investigate_chain (0.6.7)."""
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
@@ -15,14 +16,17 @@ import pytest
 @pytest.fixture
 def nav():
     from hypertopos.navigation.navigator import GDSNavigator
+
     n = GDSNavigator.__new__(GDSNavigator)
     n._storage = MagicMock()
-    n._storage.read_geometry.return_value = pa.table({
-        "primary_key": ["A"],
-        "delta_norm": [1.5],
-        "is_anomaly": [True],
-        "delta_rank_pct": [97.2],
-    })
+    n._storage.read_geometry.return_value = pa.table(
+        {
+            "primary_key": ["A"],
+            "delta_norm": [1.5],
+            "is_anomaly": [True],
+            "delta_rank_pct": [97.2],
+        }
+    )
     n._storage.read_sphere.return_value = MagicMock(
         patterns={"account_pattern": MagicMock(), "tx_pattern": MagicMock()},
     )
@@ -30,16 +34,27 @@ def nav():
 
 
 def test_orchestrator_returns_all_blocks_and_steps_status(nav):
-    with patch.object(nav, "explain_anomaly", return_value={"top_witness_dims": ["d1"]}), \
-         patch.object(nav, "find_witness_cohort", return_value={"members": []}), \
-         patch.object(nav, "find_chains_for_entity", return_value=[]), \
-         patch.object(nav, "trace_root_cause", return_value={"steps": []}), \
-         patch.object(nav, "find_graph_geometry_tension", return_value={
-             "primary_key": "A", "hidden_cluster": [], "suspicious_links": [], "tension_score": 0.0,
-         }), \
-         patch.object(nav, "_resolve_version", return_value=1):
+    with (
+        patch.object(nav, "explain_anomaly", return_value={"top_witness_dims": ["d1"]}),
+        patch.object(nav, "find_witness_cohort", return_value={"members": []}),
+        patch.object(nav, "find_chains_for_entity", return_value=[]),
+        patch.object(nav, "trace_root_cause", return_value={"steps": []}),
+        patch.object(
+            nav,
+            "find_graph_geometry_tension",
+            return_value={
+                "primary_key": "A",
+                "hidden_cluster": [],
+                "suspicious_links": [],
+                "tension_score": 0.0,
+            },
+        ),
+        patch.object(nav, "_resolve_version", return_value=1),
+    ):
         result = nav.investigate_entity(
-            "A", pattern_id="account_pattern", line_id="tx_pattern",
+            "A",
+            pattern_id="account_pattern",
+            line_id="tx_pattern",
         )
 
     assert result["primary_key"] == "A"
@@ -50,23 +65,40 @@ def test_orchestrator_returns_all_blocks_and_steps_status(nav):
     assert "root_cause" in result
     assert "graph_geometry_tension" in result
     assert "steps_status" in result
-    for step in ("polygon", "explain_anomaly", "witness_cohort", "chains",
-                 "root_cause", "graph_geometry_tension"):
+    for step in (
+        "polygon",
+        "explain_anomaly",
+        "witness_cohort",
+        "chains",
+        "root_cause",
+        "graph_geometry_tension",
+    ):
         assert result["steps_status"][step]["ok"], f"step {step} should be ok"
     assert "elapsed_ms" in result
 
 
 def test_partial_failure_does_not_abort_whole_call(nav):
-    with patch.object(nav, "explain_anomaly", side_effect=KeyError("missing dim")), \
-         patch.object(nav, "find_witness_cohort", return_value={"members": []}), \
-         patch.object(nav, "find_chains_for_entity", return_value=[]), \
-         patch.object(nav, "trace_root_cause", return_value={"steps": []}), \
-         patch.object(nav, "find_graph_geometry_tension", return_value={
-             "primary_key": "A", "hidden_cluster": [], "suspicious_links": [], "tension_score": 0.0,
-         }), \
-         patch.object(nav, "_resolve_version", return_value=1):
+    with (
+        patch.object(nav, "explain_anomaly", side_effect=KeyError("missing dim")),
+        patch.object(nav, "find_witness_cohort", return_value={"members": []}),
+        patch.object(nav, "find_chains_for_entity", return_value=[]),
+        patch.object(nav, "trace_root_cause", return_value={"steps": []}),
+        patch.object(
+            nav,
+            "find_graph_geometry_tension",
+            return_value={
+                "primary_key": "A",
+                "hidden_cluster": [],
+                "suspicious_links": [],
+                "tension_score": 0.0,
+            },
+        ),
+        patch.object(nav, "_resolve_version", return_value=1),
+    ):
         result = nav.investigate_entity(
-            "A", pattern_id="p", line_id="l",
+            "A",
+            pattern_id="p",
+            line_id="l",
         )
 
     assert result["steps_status"]["polygon"]["ok"] is True
@@ -76,14 +108,18 @@ def test_partial_failure_does_not_abort_whole_call(nav):
 
 
 def test_include_flags_control_step_execution(nav):
-    with patch.object(nav, "explain_anomaly", return_value={"top_witness_dims": []}), \
-         patch.object(nav, "find_witness_cohort", return_value={"members": []}) as mock_witness, \
-         patch.object(nav, "find_chains_for_entity", return_value=[]) as mock_chains, \
-         patch.object(nav, "trace_root_cause", return_value={"steps": []}), \
-         patch.object(nav, "find_graph_geometry_tension", return_value={"tension_score": 0.0}), \
-         patch.object(nav, "_resolve_version", return_value=1):
+    with (
+        patch.object(nav, "explain_anomaly", return_value={"top_witness_dims": []}),
+        patch.object(nav, "find_witness_cohort", return_value={"members": []}) as mock_witness,
+        patch.object(nav, "find_chains_for_entity", return_value=[]) as mock_chains,
+        patch.object(nav, "trace_root_cause", return_value={"steps": []}),
+        patch.object(nav, "find_graph_geometry_tension", return_value={"tension_score": 0.0}),
+        patch.object(nav, "_resolve_version", return_value=1),
+    ):
         result = nav.investigate_entity(
-            "A", pattern_id="p", line_id="l",
+            "A",
+            pattern_id="p",
+            line_id="l",
             include_witness_cohort=False,
             include_chains=False,
         )
@@ -106,15 +142,20 @@ def test_dataclass_return_unwrapped_to_dict(nav):
         primary_key: str
         members: list
 
-    with patch.object(nav, "explain_anomaly", return_value={"top_witness_dims": []}), \
-         patch.object(nav, "find_witness_cohort",
-                      return_value=FakeWitness(primary_key="A", members=[])), \
-         patch.object(nav, "find_chains_for_entity", return_value=[]), \
-         patch.object(nav, "trace_root_cause", return_value={"steps": []}), \
-         patch.object(nav, "find_graph_geometry_tension", return_value={"tension_score": 0.0}), \
-         patch.object(nav, "_resolve_version", return_value=1):
+    with (
+        patch.object(nav, "explain_anomaly", return_value={"top_witness_dims": []}),
+        patch.object(
+            nav, "find_witness_cohort", return_value=FakeWitness(primary_key="A", members=[])
+        ),
+        patch.object(nav, "find_chains_for_entity", return_value=[]),
+        patch.object(nav, "trace_root_cause", return_value={"steps": []}),
+        patch.object(nav, "find_graph_geometry_tension", return_value={"tension_score": 0.0}),
+        patch.object(nav, "_resolve_version", return_value=1),
+    ):
         result = nav.investigate_entity(
-            "A", pattern_id="p", line_id="l",
+            "A",
+            pattern_id="p",
+            line_id="l",
         )
 
     # NOT a string repr — dict-shaped
@@ -126,14 +167,18 @@ def test_dataclass_return_unwrapped_to_dict(nav):
 def test_per_edge_counterfactual_off_by_default(nav):
     """M1.2 (simulate_edge_removal) not shipped — default include_per_edge_counterfactual=False
     so the orchestrator never tries to call it."""
-    with patch.object(nav, "explain_anomaly", return_value={"top_witness_dims": []}), \
-         patch.object(nav, "find_witness_cohort", return_value={"members": []}), \
-         patch.object(nav, "find_chains_for_entity", return_value=[]), \
-         patch.object(nav, "trace_root_cause", return_value={"steps": []}), \
-         patch.object(nav, "find_graph_geometry_tension", return_value={"tension_score": 0.0}), \
-         patch.object(nav, "_resolve_version", return_value=1):
+    with (
+        patch.object(nav, "explain_anomaly", return_value={"top_witness_dims": []}),
+        patch.object(nav, "find_witness_cohort", return_value={"members": []}),
+        patch.object(nav, "find_chains_for_entity", return_value=[]),
+        patch.object(nav, "trace_root_cause", return_value={"steps": []}),
+        patch.object(nav, "find_graph_geometry_tension", return_value={"tension_score": 0.0}),
+        patch.object(nav, "_resolve_version", return_value=1),
+    ):
         result = nav.investigate_entity(
-            "A", pattern_id="p", line_id="l",
+            "A",
+            pattern_id="p",
+            line_id="l",
         )
 
     assert "per_edge_counterfactual" not in result["steps_status"]
@@ -149,14 +194,18 @@ def test_chains_block_passes_top_n_not_python_slice(nav):
         captured["top_n"] = top_n
         return {"primary_key": pk, "pattern_id": chain_pid, "chains": [], "summary": {}}
 
-    with patch.object(nav, "explain_anomaly", return_value={"top_witness_dims": []}), \
-         patch.object(nav, "find_witness_cohort", return_value={"members": []}), \
-         patch.object(nav, "find_chains_for_entity", side_effect=fake_find_chains), \
-         patch.object(nav, "trace_root_cause", return_value={"steps": []}), \
-         patch.object(nav, "find_graph_geometry_tension", return_value={"tension_score": 0.0}), \
-         patch.object(nav, "_resolve_version", return_value=1):
+    with (
+        patch.object(nav, "explain_anomaly", return_value={"top_witness_dims": []}),
+        patch.object(nav, "find_witness_cohort", return_value={"members": []}),
+        patch.object(nav, "find_chains_for_entity", side_effect=fake_find_chains),
+        patch.object(nav, "trace_root_cause", return_value={"steps": []}),
+        patch.object(nav, "find_graph_geometry_tension", return_value={"tension_score": 0.0}),
+        patch.object(nav, "_resolve_version", return_value=1),
+    ):
         result = nav.investigate_entity(
-            "A", pattern_id="p", line_id="l",
+            "A",
+            pattern_id="p",
+            line_id="l",
             chain_pattern_id="tx_chains_pattern",
             top_n_chains=3,
         )
@@ -187,15 +236,19 @@ def test_per_edge_counterfactual_opt_in_calls_simulate_edge_removal(nav):
         "edges_evaluated": 2,
         "truncated": False,
     }
-    with patch.object(nav, "explain_anomaly", return_value={"top_witness_dims": []}), \
-         patch.object(nav, "find_witness_cohort", return_value={"members": []}), \
-         patch.object(nav, "find_chains_for_entity", return_value=[]), \
-         patch.object(nav, "trace_root_cause", return_value={"steps": []}), \
-         patch.object(nav, "find_graph_geometry_tension", return_value={"tension_score": 0.0}), \
-         patch.object(nav, "simulate_edge_removal", return_value=sim_envelope) as mock_sim, \
-         patch.object(nav, "_resolve_version", return_value=1):
+    with (
+        patch.object(nav, "explain_anomaly", return_value={"top_witness_dims": []}),
+        patch.object(nav, "find_witness_cohort", return_value={"members": []}),
+        patch.object(nav, "find_chains_for_entity", return_value=[]),
+        patch.object(nav, "trace_root_cause", return_value={"steps": []}),
+        patch.object(nav, "find_graph_geometry_tension", return_value={"tension_score": 0.0}),
+        patch.object(nav, "simulate_edge_removal", return_value=sim_envelope) as mock_sim,
+        patch.object(nav, "_resolve_version", return_value=1),
+    ):
         result = nav.investigate_entity(
-            "A", pattern_id="p", line_id="l",
+            "A",
+            pattern_id="p",
+            line_id="l",
             include_per_edge_counterfactual=True,
             top_n_edges=3,
         )
@@ -205,5 +258,38 @@ def test_per_edge_counterfactual_opt_in_calls_simulate_edge_removal(nav):
     assert pec["error"] is None
     assert result["per_edge_counterfactual"] == expected_rows
     mock_sim.assert_called_once_with(
-        "A", pattern_id="p", line_id="l", top_n=3,
+        "A",
+        pattern_id="p",
+        line_id="l",
+        top_n=3,
     )
+
+
+def test_storage_error_and_null_rank_do_not_abort_the_report(nav):
+    from hypertopos.storage.exceptions import GDSError
+
+    nav._storage.read_geometry.return_value = pa.table(
+        {
+            "primary_key": ["A"],
+            "delta_norm": [1.5],
+            "is_anomaly": [False],
+            "delta_rank_pct": pa.array([None], pa.float64()),
+        }
+    )
+    with (
+        patch.object(nav, "explain_anomaly", side_effect=GDSError("calibration file missing")),
+        patch.object(nav, "find_witness_cohort", return_value={"members": []}),
+        patch.object(nav, "find_chains_for_entity", return_value=[]),
+        patch.object(nav, "trace_root_cause", return_value={"steps": []}),
+        patch.object(nav, "find_graph_geometry_tension", return_value={"tension_score": 0.0}),
+        patch.object(nav, "_resolve_version", return_value=1),
+    ):
+        result = nav.investigate_entity("A", pattern_id="account_pattern", line_id="tx_pattern")
+
+    assert result["steps_status"]["polygon"]["ok"]
+    assert result["polygon"]["delta_rank_pct"] is None
+    assert result["steps_status"]["explain_anomaly"] == {
+        "ok": False,
+        "error": "GDSError: calibration file missing",
+    }
+    assert result["steps_status"]["witness_cohort"]["ok"]

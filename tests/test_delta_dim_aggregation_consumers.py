@@ -36,7 +36,6 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pyarrow as pa
-import pytest
 
 from hypertopos.model.sphere import (
     EdgeDimAggregationsRef,
@@ -45,7 +44,6 @@ from hypertopos.model.sphere import (
     Sphere,
 )
 from hypertopos.navigation.navigator import GDSNavigator
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -56,7 +54,11 @@ def _make_anchor_with_aggregations(
     n_relations: int = 3,
     n_source_dims: int = 2,
     aggregates: tuple[str, ...] = (
-        "mean", "max", "std", "p95", "count_above_threshold",
+        "mean",
+        "max",
+        "std",
+        "p95",
+        "count_above_threshold",
     ),
 ) -> Pattern:
     """Build an anchor pattern with edge_dim_aggregations.
@@ -91,9 +93,7 @@ def _make_anchor_with_aggregations(
         edge_dim_aggregations=EdgeDimAggregationsRef(
             from_event_pattern="ev_pattern",
             dims=tuple(f"src_{j}" for j in range(n_source_dims)),
-            aggregates_per_dim={
-                f"src_{j}": aggregates for j in range(n_source_dims)
-            },
+            aggregates_per_dim={f"src_{j}": aggregates for j in range(n_source_dims)},
         ),
     )
 
@@ -114,14 +114,11 @@ def _make_event_with_edge_dims(
     """
     stored_width = n_relations + n_event_dims + n_edge_dims
     relations = [
-        RelationDef(line_id=f"rel_{i}", direction="in", required=False)
-        for i in range(n_relations)
+        RelationDef(line_id=f"rel_{i}", direction="in", required=False) for i in range(n_relations)
     ]
     from hypertopos.model.sphere import EventDimDef
-    event_dimensions = [
-        EventDimDef(column=f"col_{j}", edge_max=1.0)
-        for j in range(n_event_dims)
-    ]
+
+    event_dimensions = [EventDimDef(column=f"col_{j}", edge_max=1.0) for j in range(n_event_dims)]
     edge_dim_names = [
         "pair_edge_count",
         "position_in_chain",
@@ -189,13 +186,15 @@ def test_attract_hub_with_aggregation_dims_does_not_broadcast_crash():
     # 5 rows of full-width deltas — values irrelevant to the broadcast check
     rng = np.random.default_rng(0)
     deltas = rng.standard_normal((5, delta_dim)).astype(np.float32) * 0.1
-    table = pa.table({
-        "primary_key": [f"e{i}" for i in range(5)],
-        "delta": pa.array(
-            [d.tolist() for d in deltas],
-            type=pa.list_(pa.float32()),
-        ),
-    })
+    table = pa.table(
+        {
+            "primary_key": [f"e{i}" for i in range(5)],
+            "delta": pa.array(
+                [d.tolist() for d in deltas],
+                type=pa.list_(pa.float32()),
+            ),
+        }
+    )
     nav._storage.read_geometry = MagicMock(return_value=table)
 
     # Must not raise ValueError("operands could not be broadcast together")
@@ -228,20 +227,23 @@ def test_attract_hub_and_stats_full_pattern_with_aggregation_dims_does_not_broad
 
     rng = np.random.default_rng(3)
     deltas = rng.standard_normal((7, delta_dim)).astype(np.float32) * 0.1
-    table = pa.table({
-        "primary_key": [f"H{i}" for i in range(7)],
-        "delta": pa.array(
-            [d.tolist() for d in deltas],
-            type=pa.list_(pa.float32()),
-        ),
-    })
+    table = pa.table(
+        {
+            "primary_key": [f"H{i}" for i in range(7)],
+            "delta": pa.array(
+                [d.tolist() for d in deltas],
+                type=pa.list_(pa.float32()),
+            ),
+        }
+    )
     nav._storage.read_geometry = MagicMock(return_value=table)
 
     # Must not raise — full-pattern path (line_id_filter=None) hits
     # both _compute_hub_scores' aggregated branch and the post-loop
     # np.mean/np.percentile stats over the same scores array.
     results, stats = nav.π7_attract_hub_and_stats(
-        pattern_id="anchor_with_aggs", top_n=5,
+        pattern_id="anchor_with_aggs",
+        top_n=5,
     )
     assert len(results) == 5
     # Each result is (primary_key, alive_edge_count, hub_score, hub_score_pct)
@@ -250,8 +252,7 @@ def test_attract_hub_and_stats_full_pattern_with_aggregation_dims_does_not_broad
         assert isinstance(alive, int)
         assert isinstance(score, float)
         assert np.isfinite(score), (
-            f"hub_score must be finite, got {score!r} — broadcast bug "
-            f"would yield NaN or raise"
+            f"hub_score must be finite, got {score!r} — broadcast bug would yield NaN or raise"
         )
         # pct is a percentage of max_hub_score (finite, non-negative)
         assert pct is not None
@@ -259,9 +260,7 @@ def test_attract_hub_and_stats_full_pattern_with_aggregation_dims_does_not_broad
         assert np.isfinite(pct)
     # Stats must be finite numbers across the full population
     for key in ("mean", "std", "p25", "p50", "p75", "p90", "p95", "max"):
-        assert np.isfinite(stats[key]), (
-            f"stats[{key!r}] must be finite, got {stats[key]!r}"
-        )
+        assert np.isfinite(stats[key]), f"stats[{key!r}] must be finite, got {stats[key]!r}"
     assert stats["total_entities"] == 7
 
 
@@ -308,7 +307,8 @@ def test_hub_score_history_with_aggregation_dims_does_not_broadcast_crash():
             timestamp=ts2,
             deformation_type="edge",
             delta_snapshot=np.array(
-                [0.1, 0.2, 0.3], dtype=np.float32,
+                [0.1, 0.2, 0.3],
+                dtype=np.float32,
             ),
             delta_norm_snapshot=float(np.linalg.norm([0.1, 0.2, 0.3])),
             pattern_ver=pat.version,
@@ -341,14 +341,18 @@ def test_hub_score_history_with_aggregation_dims_does_not_broadcast_crash():
     # Base delta read — full delta_dim width on disk.
     base_delta = np.zeros(delta_dim, dtype=np.float32)
     base_delta[:n_rel] = [0.15, 0.25, 0.35]
-    base_table = pa.table({
-        "delta": pa.array(
-            [base_delta.tolist()], type=pa.list_(pa.float32()),
-        ),
-        "delta_norm": pa.array(
-            [float(np.linalg.norm(base_delta))], type=pa.float32(),
-        ),
-    })
+    base_table = pa.table(
+        {
+            "delta": pa.array(
+                [base_delta.tolist()],
+                type=pa.list_(pa.float32()),
+            ),
+            "delta_norm": pa.array(
+                [float(np.linalg.norm(base_delta))],
+                type=pa.float32(),
+            ),
+        }
+    )
     nav._storage.read_geometry = MagicMock(return_value=base_table)
 
     # Must not raise the (n_rel,) vs (delta_dim,) broadcast crash.
@@ -392,22 +396,24 @@ def test_build_solid_with_aggregations_handles_narrow_shape_snapshot():
     # Temporal read — shape_snapshot is structural-only (width = n_rel)
     ts1 = datetime(2026, 1, 1, tzinfo=UTC)
     ts2 = datetime(2026, 2, 1, tzinfo=UTC)
-    temporal_table = pa.table({
-        "primary_key": ["E1", "E1"],
-        "slice_index": pa.array([0, 1], type=pa.int32()),
-        "timestamp": pa.array([ts1, ts2], type=pa.timestamp("us", tz="UTC")),
-        "deformation_type": ["base", "edge_added"],
-        "shape_snapshot": pa.array(
-            [
-                np.zeros(n_rel, dtype=np.float32).tolist(),
-                np.ones(n_rel, dtype=np.float32).tolist(),
-            ],
-            type=pa.list_(pa.float32()),
-        ),
-        "pattern_ver": pa.array([1, 1], type=pa.int32()),
-        "changed_property": [None, None],
-        "changed_line_id": [None, "line_0"],
-    })
+    temporal_table = pa.table(
+        {
+            "primary_key": ["E1", "E1"],
+            "slice_index": pa.array([0, 1], type=pa.int32()),
+            "timestamp": pa.array([ts1, ts2], type=pa.timestamp("us", tz="UTC")),
+            "deformation_type": ["base", "edge_added"],
+            "shape_snapshot": pa.array(
+                [
+                    np.zeros(n_rel, dtype=np.float32).tolist(),
+                    np.ones(n_rel, dtype=np.float32).tolist(),
+                ],
+                type=pa.list_(pa.float32()),
+            ),
+            "pattern_ver": pa.array([1, 1], type=pa.int32()),
+            "changed_property": [None, None],
+            "changed_line_id": [None, "line_0"],
+        }
+    )
     nav._storage.read_temporal = MagicMock(return_value=temporal_table)
 
     cache_stub = MagicMock()
@@ -450,37 +456,36 @@ def test_attract_drift_with_aggregations_handles_narrow_shape_snapshot():
     pat = _make_anchor_with_aggregations(n_relations=3, n_source_dims=2)
     nav = _make_navigator_with_sphere(pat)
 
-    n_rel = len(pat.relations)
     delta_dim = pat.delta_dim()
 
     # Geometry table — full delta_dim width
     rng = np.random.default_rng(1)
     deltas = rng.standard_normal((4, delta_dim)).astype(np.float32) * 0.1
-    geo_table = pa.table({
-        "primary_key": [f"E{i}" for i in range(4)],
-        "delta": pa.array(
-            [d.tolist() for d in deltas],
-            type=pa.list_(pa.float32()),
-        ),
-    })
+    geo_table = pa.table(
+        {
+            "primary_key": [f"E{i}" for i in range(4)],
+            "delta": pa.array(
+                [d.tolist() for d in deltas],
+                type=pa.list_(pa.float32()),
+            ),
+        }
+    )
     nav._storage.read_geometry = MagicMock(return_value=geo_table)
 
     # Temporal batch — narrow shape_snapshot
-    ts_seq = [
-        datetime(2026, 1, m, tzinfo=UTC) for m in (1, 2, 3, 4, 5)
-    ]
+    ts_seq = [datetime(2026, 1, m, tzinfo=UTC) for m in (1, 2, 3, 4, 5)]
     pks = ["E0"] * 5
-    snapshots = [
-        np.array([0.1 * i, 0.2 * i, 0.3 * i], dtype=np.float32).tolist()
-        for i in range(5)
-    ]
-    temporal_table = pa.table({
-        "primary_key": pks,
-        "timestamp": pa.array(ts_seq, type=pa.timestamp("us", tz="UTC")),
-        "shape_snapshot": pa.array(
-            snapshots, type=pa.list_(pa.float32()),
-        ),
-    })
+    snapshots = [np.array([0.1 * i, 0.2 * i, 0.3 * i], dtype=np.float32).tolist() for i in range(5)]
+    temporal_table = pa.table(
+        {
+            "primary_key": pks,
+            "timestamp": pa.array(ts_seq, type=pa.timestamp("us", tz="UTC")),
+            "shape_snapshot": pa.array(
+                snapshots,
+                type=pa.list_(pa.float32()),
+            ),
+        }
+    )
     nav._storage.read_temporal_batched = MagicMock(
         return_value=iter([temporal_table.to_batches()[0]])
     )
@@ -491,7 +496,9 @@ def test_attract_drift_with_aggregations_handles_narrow_shape_snapshot():
     nav._storage.list_calibration_versions = MagicMock(return_value=[])
 
     results = nav.π9_attract_drift(
-        pattern_id="anchor_with_aggs", sample_size=4, top_n=1,
+        pattern_id="anchor_with_aggs",
+        sample_size=4,
+        top_n=1,
     )
     assert isinstance(results, list)
     # Pre-fix this raises ValueError on the broadcast — passing is the
@@ -515,17 +522,17 @@ def test_detect_trajectory_anomaly_with_aggregations_handles_narrow_snapshot():
     # An arch-shaped trajectory: norms go up then down across 5 slices.
     ts_seq = [datetime(2026, 1, m, tzinfo=UTC) for m in (1, 2, 3, 4, 5)]
     norms_target = [0.1, 0.5, 1.2, 0.6, 0.15]
-    snapshots = [
-        (np.ones(n_rel, dtype=np.float32) * norms_target[i]).tolist()
-        for i in range(5)
-    ]
-    temporal_table = pa.table({
-        "primary_key": ["E0"] * 5,
-        "timestamp": pa.array(ts_seq, type=pa.timestamp("us", tz="UTC")),
-        "shape_snapshot": pa.array(
-            snapshots, type=pa.list_(pa.float32()),
-        ),
-    })
+    snapshots = [(np.ones(n_rel, dtype=np.float32) * norms_target[i]).tolist() for i in range(5)]
+    temporal_table = pa.table(
+        {
+            "primary_key": ["E0"] * 5,
+            "timestamp": pa.array(ts_seq, type=pa.timestamp("us", tz="UTC")),
+            "shape_snapshot": pa.array(
+                snapshots,
+                type=pa.list_(pa.float32()),
+            ),
+        }
+    )
     nav._storage.read_temporal_batched = MagicMock(
         return_value=iter([temporal_table.to_batches()[0]])
     )
@@ -533,7 +540,9 @@ def test_detect_trajectory_anomaly_with_aggregations_handles_narrow_snapshot():
     # Must not raise — even when no entity is classified as anomalous, the
     # function must return without a broadcast crash.
     results = nav.detect_trajectory_anomaly(
-        pattern_id="anchor_with_aggs", sample_size=10, top_n_per_range=3,
+        pattern_id="anchor_with_aggs",
+        sample_size=10,
+        top_n_per_range=3,
     )
     assert isinstance(results, list)
 
@@ -551,15 +560,16 @@ def test_anomaly_summary_with_edge_dim_names_does_not_crash():
     the per-cluster sq vector exactly — no truncation, no fallback
     label, no broadcast error."""
     pat = _make_event_with_edge_dims(
-        n_relations=4, n_event_dims=8, n_edge_dims=5,
+        n_relations=4,
+        n_event_dims=8,
+        n_edge_dims=5,
     )
     nav = _make_navigator_with_sphere(pat)
 
     stored_width = len(pat.mu)
     labels_width = len(pat.dim_labels)
     assert labels_width == stored_width == pat.delta_dim(), (
-        "fixture must hold the post-fix invariant: "
-        "delta_dim() == len(dim_labels) == len(mu)"
+        "fixture must hold the post-fix invariant: delta_dim() == len(dim_labels) == len(mu)"
     )
 
     theta_norm = float(np.linalg.norm(pat.theta))
@@ -573,17 +583,20 @@ def test_anomaly_summary_with_edge_dim_names_does_not_crash():
     deltas[1] = np.ones(stored_width, dtype=np.float32) * 2.5
     delta_norms = np.linalg.norm(deltas, axis=1)
 
-    geo_table = pa.table({
-        "primary_key": [f"E{i}" for i in range(6)],
-        "delta": pa.array(
-            [d.tolist() for d in deltas],
-            type=pa.list_(pa.float32()),
-        ),
-        "delta_norm": pa.array(delta_norms, type=pa.float32()),
-        "is_anomaly": pa.array(
-            (delta_norms >= theta_norm).tolist(), type=pa.bool_(),
-        ),
-    })
+    geo_table = pa.table(
+        {
+            "primary_key": [f"E{i}" for i in range(6)],
+            "delta": pa.array(
+                [d.tolist() for d in deltas],
+                type=pa.list_(pa.float32()),
+            ),
+            "delta_norm": pa.array(delta_norms, type=pa.float32()),
+            "is_anomaly": pa.array(
+                (delta_norms >= theta_norm).tolist(),
+                type=pa.bool_(),
+            ),
+        }
+    )
     nav._storage.read_geometry = MagicMock(return_value=geo_table)
 
     result = nav.anomaly_summary(pattern_id="event_with_edge_dims")
@@ -621,7 +634,7 @@ def test_aggregation_fixture_invariants():
     # event_dimensions and BEFORE prop_columns (storage layout).
     n_rel = len(pat_c.relations)
     n_ev = len(pat_c.event_dimensions)
-    assert pat_c.dim_labels[n_rel + n_ev:n_rel + n_ev + 5] == [
+    assert pat_c.dim_labels[n_rel + n_ev : n_rel + n_ev + 5] == [
         "pair_edge_count",
         "position_in_chain",
         "time_since_pair_last_edge",
@@ -636,11 +649,13 @@ def test_pattern_delta_dim_matches_mu_for_event_with_edge_dims():
     pat = _make_event_with_edge_dims(n_relations=4, n_event_dims=8, n_edge_dims=5)
     assert pat.delta_dim() == len(pat.mu) == 17
     # dim_index() must round-trip every edge_dim_name to a valid offset.
-    for offset, name in enumerate([
-        "pair_edge_count",
-        "position_in_chain",
-        "time_since_pair_last_edge",
-        "pair_amount_zscore",
-        "find_motif_structuring",
-    ]):
+    for offset, name in enumerate(
+        [
+            "pair_edge_count",
+            "position_in_chain",
+            "time_since_pair_last_edge",
+            "pair_amount_zscore",
+            "find_motif_structuring",
+        ]
+    ):
         assert pat.dim_index(name) == 4 + 8 + offset

@@ -7,10 +7,10 @@ from __future__ import annotations
 import dataclasses
 import logging
 import math
-from collections import defaultdict, deque
+from collections import defaultdict
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
 import pyarrow as pa
@@ -18,10 +18,26 @@ import pyarrow.compute as pc
 
 from hypertopos.model.objects import Edge, Point, Polygon, Solid
 from hypertopos.model.sphere import (
+    BranchDiffReport,
     CalibrationDriftReport,
     CalibrationFit,
     DimensionDrift,
     IntrinsicExtrinsicReport,
+)
+from hypertopos.storage.exceptions import (
+    GDSCorruptedFileError as GDSCorruptedFileError,
+)
+from hypertopos.storage.exceptions import (
+    GDSError as GDSError,
+)
+from hypertopos.storage.exceptions import (
+    GDSMissingFileError as GDSMissingFileError,
+)
+from hypertopos.storage.exceptions import (
+    GDSStorageError as GDSStorageError,
+)
+from hypertopos.storage.exceptions import (
+    GDSVersionError as GDSVersionError,
 )
 from hypertopos.utils.arrow import delta_matrix_from_arrow
 
@@ -47,6 +63,43 @@ _HMP_INPUT_P_FLOOR = 1e-12
 
 logger = logging.getLogger(__name__)
 
+
+def active_slice_mask(shapes: np.ndarray) -> np.ndarray:
+    """Which of one entity's temporal slices hold activity.
+
+    A window without events has every time-varying dim at zero; dims that do
+    not vary across the entity's slices (anchor-level values broadcast into
+    every window) do not count. When nothing varies, every slice is kept.
+    The build writes trajectory vectors under the same rule
+    (``engine.geometry.active_window_rows``).
+    """
+    varying = np.ptp(shapes, axis=0) > 0
+    if not varying.any():
+        return np.ones(len(shapes), dtype=bool)
+    return np.asarray((shapes[:, varying] != 0).any(axis=1))
+
+
+def label_aware_unavailable_reason(sphere: Any, pattern_id: str) -> str:
+    """Why ``pattern_id`` has no label-aware calibration, naming the real gap."""
+    label_audit = getattr(sphere, "label_audit", None)
+    if not isinstance(label_audit, dict):
+        return (
+            "no label-aware calibration available — the sphere was built with "
+            "no 'label_audit:' block in sphere.yaml"
+        )
+    covered = list(label_audit.get("patterns") or [])
+    if pattern_id not in covered:
+        return (
+            f"no label-aware calibration available — the 'label_audit:' block "
+            f"does not list {pattern_id!r} (it covers {covered})"
+        )
+    return (
+        f"no label-aware calibration available — 'label_audit:' lists "
+        f"{pattern_id!r} but the pattern carries no calibration; rebuild the "
+        f"sphere to compute it"
+    )
+
+
 _NAVIGATION_RECOVERABLE_ERRORS = (
     OSError,
     ValueError,
@@ -69,8 +122,16 @@ def _auroc_rank_sum(scores: np.ndarray, labels: np.ndarray) -> float:
     where R_pos is the sum of ranks of positive-class scores after a
     stable sort assigning ties the average of the tied positions.
 
-    Caller must ensure ``n_pos > 0`` AND ``n_neg > 0``.
+    Caller must ensure ``n_pos > 0`` AND ``n_neg > 0``. Non-finite scores
+    are left out (argsort would rank NaN highest); NaN when that leaves a
+    class empty.
     """
+    finite = np.isfinite(scores)
+    if not finite.all():
+        scores = scores[finite]
+        labels = labels[finite]
+        if not 0 < int(labels.sum()) < labels.size:
+            return float("nan")
     n = scores.shape[0]
     if n == 0:
         return float("nan")
@@ -98,10 +159,31 @@ def _auroc_rank_sum(scores: np.ndarray, labels: np.ndarray) -> float:
     rank_sum_pos = float(ranks[labels == 1].sum())
     return (rank_sum_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
 
+
+def _validate_p_value_method(p_value_method: str) -> None:
+    """Reject any p-value source other than the χ² model p-value."""
+    if p_value_method != "chi2":
+        raise ValueError(
+            f"p_value_method must be 'chi2', got {p_value_method!r} — rank-derived "
+            "p-values only encode an entity's position in the result set, so FDR "
+            "on them carries no evidence"
+        )
+
+
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from hypertopos.engine.adjacency import AdjacencyIndex
     from hypertopos.engine.geometry import GDSEngine
     from hypertopos.model.manifest import Contract, Manifest
+    from hypertopos.model.sphere import (
+        GroupInfluenceReport,
+        InfluenceReport,
+        InfluencerHistoryReport,
+        LeadLagReport,
+        Pattern,
+        ThetaSensitivityReport,
+    )
     from hypertopos.storage.reader import GDSReader
 
 
@@ -109,32 +191,28 @@ if TYPE_CHECKING:
 # GDSError hierarchy
 # ---------------------------------------------------------------------------
 
-from hypertopos.storage.exceptions import (  # noqa: E402
-    GDSCorruptedFileError as GDSCorruptedFileError,
-    GDSError as GDSError,
-    GDSMissingFileError as GDSMissingFileError,
-    GDSStorageError as GDSStorageError,
-    GDSVersionError as GDSVersionError,
-)
-
 
 class GDSNavigationError(GDSError):
     """Navigation-related errors (π operations, goto, position queries)."""
+
     pass
 
 
 class GDSNoAliveEdgeError(GDSNavigationError):
     """π2 fails because no alive edge connects to the target line."""
+
     pass
 
 
 class GDSPositionError(GDSNavigationError):
     """Current position type is incompatible with the requested operation."""
+
     pass
 
 
 class GDSEntityNotFoundError(GDSNavigationError):
     """A primary-key / entity was not found in the specified line."""
+
     pass
 
 
@@ -142,7 +220,8 @@ class GDSEntityNotFoundError(GDSNavigationError):
 # Similarity result container (backward-compatible list subclass)
 # ---------------------------------------------------------------------------
 
-class SimilarityResult(list):
+
+class SimilarityResult(list[Any]):
     """List of (primary_key, distance) tuples with optional sidecar attributes.
 
     Extends ``list`` so all existing callers that iterate, slice, or convert to
@@ -247,10 +326,10 @@ class CohortMember:
     """
 
     primary_key: str
-    score: float                            # final composite ∈ [0, 1]
-    delta_similarity: float                 # exp(-distance / theta_norm)
-    witness_overlap: float                  # Jaccard ∈ [0, 1]
-    trajectory_alignment: float | None      # cos sim remapped to [0, 1], or None
+    score: float  # final composite ∈ [0, 1]
+    delta_similarity: float  # exp(-distance / theta_norm)
+    witness_overlap: float  # Jaccard ∈ [0, 1]
+    trajectory_alignment: float | None  # cos sim remapped to [0, 1], or None
     is_anomaly: bool
     delta_rank_pct: float
     explanation: str
@@ -292,22 +371,22 @@ class MotifSpec:
     min_instances: int
 
 
-def _derive_edge_line_ids(edges_list: list[dict] | None) -> list[str]:
+def _derive_edge_line_ids(edges_list: list[dict[str, Any]] | None) -> list[str]:
     """Derive alive edge line_ids from a single row's edges struct list."""
     return [e["line_id"] for e in (edges_list or []) if e.get("status") == "alive"]
 
 
-def _derive_edge_point_keys(edges_list: list[dict] | None) -> list[str]:
+def _derive_edge_point_keys(edges_list: list[dict[str, Any]] | None) -> list[str]:
     """Derive alive edge point_keys from a single row's edges struct list."""
     return [e["point_key"] for e in (edges_list or []) if e.get("status") == "alive"]
 
 
-def _derive_edge_line_ids_list(edges_col: list[list[dict] | None]) -> list[list[str]]:
+def _derive_edge_line_ids_list(edges_col: list[list[dict[str, Any]] | None]) -> list[list[str]]:
     """Derive alive edge line_ids for each row from an edges column (to_pylist)."""
     return [_derive_edge_line_ids(row) for row in edges_col]
 
 
-def _derive_edge_point_keys_list(edges_col: list[list[dict] | None]) -> list[list[str]]:
+def _derive_edge_point_keys_list(edges_col: list[list[dict[str, Any]] | None]) -> list[list[str]]:
     """Derive alive edge point_keys for each row from an edges column (to_pylist)."""
     return [_derive_edge_point_keys(row) for row in edges_col]
 
@@ -321,33 +400,28 @@ def _derive_edge_line_ids_from_table(table: Any) -> list[list[str]]:
 # Entity-keys reconstruction helpers (for event geometry without edges column)
 # ---------------------------------------------------------------------------
 
+
 def _derive_line_ids_from_entity_keys(
     entity_keys: list[str] | None,
-    relations: list,
+    relations: list[Any],
 ) -> list[str]:
     """Derive alive edge line_ids from entity_keys + relations for one row."""
     keys = entity_keys or []
-    return [
-        rel.line_id for i, rel in enumerate(relations)
-        if i < len(keys) and keys[i]
-    ]
+    return [rel.line_id for i, rel in enumerate(relations) if i < len(keys) and keys[i]]
 
 
 def _derive_point_keys_from_entity_keys(
     entity_keys: list[str] | None,
-    relations: list,
+    relations: list[Any],
 ) -> list[str]:
     """Derive alive edge point_keys from entity_keys + relations for one row."""
     keys = entity_keys or []
-    return [
-        keys[i] for i, rel in enumerate(relations)
-        if i < len(keys) and keys[i]
-    ]
+    return [keys[i] for i, rel in enumerate(relations) if i < len(keys) and keys[i]]
 
 
 def _derive_line_ids_from_entity_keys_list(
     entity_keys_col: list[list[str] | None],
-    relations: list,
+    relations: list[Any],
 ) -> list[list[str]]:
     """Derive alive edge line_ids for each row from entity_keys column."""
     return [_derive_line_ids_from_entity_keys(ek, relations) for ek in entity_keys_col]
@@ -355,36 +429,39 @@ def _derive_line_ids_from_entity_keys_list(
 
 def _derive_point_keys_from_entity_keys_list(
     entity_keys_col: list[list[str] | None],
-    relations: list,
+    relations: list[Any],
 ) -> list[list[str]]:
     """Derive alive edge point_keys for each row from entity_keys column."""
     return [_derive_point_keys_from_entity_keys(ek, relations) for ek in entity_keys_col]
 
 
-def _table_edge_line_ids(table: Any, relations: list | None = None) -> list[list[str]]:
+def _table_edge_line_ids(table: Any, relations: list[Any] | None = None) -> list[list[str]]:
     """Derive alive edge line_ids from table — edges column or entity_keys fallback."""
     if "edges" in table.schema.names:
         return _derive_edge_line_ids_from_table(table)
     if "entity_keys" in table.schema.names and relations:
         return _derive_line_ids_from_entity_keys_list(
-            table.column("entity_keys").to_pylist(), relations,
+            table.column("entity_keys").to_pylist(),
+            relations,
         )
     return [[] for _ in range(table.num_rows)]
 
 
-def _table_edge_point_keys(table: Any, relations: list | None = None) -> list[list[str]]:
+def _table_edge_point_keys(table: Any, relations: list[Any] | None = None) -> list[list[str]]:
     """Derive alive edge point_keys from table — edges column or entity_keys fallback."""
     if "edges" in table.schema.names:
         return _derive_edge_point_keys_list(table.column("edges").to_pylist())
     if "entity_keys" in table.schema.names and relations:
         return _derive_point_keys_from_entity_keys_list(
-            table.column("entity_keys").to_pylist(), relations,
+            table.column("entity_keys").to_pylist(),
+            relations,
         )
     return [[] for _ in range(table.num_rows)]
 
 
 def _table_edge_line_and_point_keys(
-    table: Any, relations: list | None = None,
+    table: Any,
+    relations: list[Any] | None = None,
 ) -> tuple[list[list[str]], list[list[str]]]:
     """Derive both alive edge line_ids and point_keys from table."""
     if "edges" in table.schema.names:
@@ -404,7 +481,8 @@ def _table_edge_line_and_point_keys(
 
 
 def _reconstruct_edges_from_row(
-    row: dict, relations: list,
+    row: dict[str, Any],
+    relations: list[Any],
 ) -> list[Edge]:
     """Reconstruct Edge objects from a row dict using edges or entity_keys."""
     if row.get("edges"):
@@ -420,7 +498,13 @@ def _reconstruct_edges_from_row(
         ]
     # Fallback: reconstruct from entity_keys + relations
     from hypertopos.engine.geometry import _reconstruct_edges_from_entity_keys
+
     return _reconstruct_edges_from_entity_keys(row.get("entity_keys"), relations)
+
+
+def _cp_key_order(key: Any) -> tuple[bool, str]:
+    """Ascending tie-break key for counterparty keys; null keys sort last."""
+    return (key is None, "" if key is None else str(key))
 
 
 def _classify_calibration_health(anomaly_rate: float, total_entities: int) -> str:
@@ -627,9 +711,14 @@ def _empty_coherent_diagnostics(
         "n_runs_total_pre_truncation": 0,
         "top_dim_counts_full": {},
         "run_length_distribution_full": {
-            "min": 0, "p50": 0, "p75": 0, "p90": 0, "max": 0, "mean": 0.0,
+            "min": 0,
+            "p50": 0,
+            "p75": 0,
+            "p90": 0,
+            "max": 0,
+            "mean": 0.0,
         },
-        "all_coherent_chain_ids": set(),
+        "all_coherent_chain_ids": [],
         "elapsed_ms": elapsed_ms,
     }
 
@@ -652,6 +741,20 @@ class GDSNavigator:
         self._cross_pattern_map: dict[str, dict[str, str]] = {}
         self._chain_reverse_index: dict[tuple[str, int], dict[str, list[str]]] = {}
         self._anomaly_map_cache: dict[tuple[str, int], dict[str, bool]] = {}
+        # (pattern, version) -> {primary_key: (total_impact, classification)};
+        # population-wide and geometry-only, so one computation per version.
+        self._influence_cache: dict[tuple[str, int], dict[str, tuple[float, str]]] = {}
+        # Everything cached above (and lazily below) is derived from the
+        # reader's snapshot; drop it when the session moves to a new one.
+        add_listener = getattr(storage, "add_repin_listener", None)
+        if callable(add_listener):
+            add_listener(self._clear_snapshot_caches)
+
+    def _clear_snapshot_caches(self) -> None:
+        """Empty every per-snapshot cache this navigator holds."""
+        for name, value in vars(self).items():
+            if name.endswith(("_cache", "_index", "_map")) and isinstance(value, dict):
+                value.clear()
 
     def _get_anomaly_map(self, pattern_id: str, version: int) -> dict[str, bool]:
         """Lazy session-scoped {primary_key: is_anomaly} cache per (pattern, version).
@@ -665,12 +768,15 @@ class GDSNavigator:
         if cached is not None:
             return cached
         table = self._storage.read_geometry(
-            pattern_id, version, columns=["primary_key", "is_anomaly"],
+            pattern_id,
+            version,
+            columns=["primary_key", "is_anomaly"],
         )
         pk_list = table["primary_key"].to_pylist()
         anom_list = table["is_anomaly"].to_pylist()
         full_map = {
-            pk: bool(flag) for pk, flag in zip(pk_list, anom_list, strict=False)
+            pk: bool(flag)
+            for pk, flag in zip(pk_list, anom_list, strict=False)
             if pk is not None and flag is not None
         }
         self._anomaly_map_cache[key] = full_map
@@ -682,9 +788,7 @@ class GDSNavigator:
 
     def goto(self, primary_key: str, line_id: str) -> GDSNavigator:
         version = self._manifest.line_version(line_id) or 1
-        table = self._storage.read_points(line_id, version)
-        mask = pc.equal(table["primary_key"], primary_key)
-        rows = table.filter(mask)
+        rows = self._storage.read_points(line_id, version, primary_key=primary_key)
         if rows.num_rows == 0:
             raise GDSEntityNotFoundError(f"Point {primary_key} not found in {line_id}")
         row = {col: rows[col][0].as_py() for col in rows.schema.names}
@@ -693,8 +797,11 @@ class GDSNavigator:
             line_id=line_id,
             version=row["version"],
             status=row["status"],
-            properties={k: row[k] for k in row if k not in
-                        {"primary_key", "version", "status", "created_at", "changed_at"}},
+            properties={
+                k: row[k]
+                for k in row
+                if k not in {"primary_key", "version", "status", "created_at", "changed_at"}
+            },
             created_at=row["created_at"],
             changed_at=row["changed_at"],
         )
@@ -723,15 +830,17 @@ class GDSNavigator:
             table = table.drop("_score")
         results: list[dict[str, Any]] = []
         for row in table.to_pylist():
-            results.append({
-                "primary_key": row["primary_key"],
-                "status": row.get("status", "unknown"),
-                "properties": {
-                    k: v
-                    for k, v in row.items()
-                    if k not in {"primary_key", "status"} and v is not None
-                },
-            })
+            results.append(
+                {
+                    "primary_key": row["primary_key"],
+                    "status": row.get("status", "unknown"),
+                    "properties": {
+                        k: v
+                        for k, v in row.items()
+                        if k not in {"primary_key", "status"} and v is not None
+                    },
+                }
+            )
         return results
 
     def _search_fts_scored(
@@ -821,12 +930,14 @@ class GDSNavigator:
             text_score = round(bm25 / max_bm25, 4) if bm25 is not None else 0.0
             final_score = round(alpha * vector_score + (1.0 - alpha) * text_score, 4)
 
-            results.append({
-                "primary_key": key,
-                "vector_score": vector_score,
-                "text_score": text_score,
-                "final_score": final_score,
-            })
+            results.append(
+                {
+                    "primary_key": key,
+                    "vector_score": vector_score,
+                    "text_score": text_score,
+                    "final_score": final_score,
+                }
+            )
 
         results.sort(key=lambda r: r["final_score"], reverse=True)
         return {
@@ -835,9 +946,7 @@ class GDSNavigator:
             "fts_candidates": len(fts_score),
         }
 
-    def π1_walk_line(
-        self, line_id: str, direction: Literal["+", "-"] = "+"
-    ) -> GDSNavigator:
+    def π1_walk_line(self, line_id: str, direction: Literal["+", "-"] = "+") -> GDSNavigator:
         if not isinstance(self._position, Point):
             raise GDSPositionError("π1 requires position to be a Point")
         version = self._manifest.line_version(line_id) or 1
@@ -846,9 +955,7 @@ class GDSNavigator:
         try:
             idx = keys.index(self._position.primary_key)
         except ValueError as exc:
-            raise GDSEntityNotFoundError(
-                f"{self._position.primary_key} not in {line_id}"
-            ) from exc
+            raise GDSEntityNotFoundError(f"{self._position.primary_key} not in {line_id}") from exc
         next_idx = idx + (1 if direction == "+" else -1)
         if next_idx < 0 or next_idx >= len(keys):
             raise GDSNavigationError("No adjacent point in that direction")
@@ -857,10 +964,7 @@ class GDSNavigator:
     def π2_jump_polygon(
         self, polygon: Polygon, target_line_id: str, edge_index: int = 0
     ) -> GDSNavigator:
-        alive_targets = [
-            e for e in polygon.edges
-            if e.line_id == target_line_id and e.is_alive()
-        ]
+        alive_targets = [e for e in polygon.edges if e.line_id == target_line_id and e.is_alive()]
         if not alive_targets:
             raise GDSNoAliveEdgeError(
                 f"No alive edge to {target_line_id} in polygon {polygon.primary_key}"
@@ -917,17 +1021,18 @@ class GDSNavigator:
             self._position = Point(
                 primary_key=self._position.primary_key,
                 line_id="emerged",
-                version=0, status="active", properties={},
-                created_at=datetime.now(), changed_at=datetime.now(),
+                version=0,
+                status="active",
+                properties={},
+                created_at=datetime.now(),
+                changed_at=datetime.now(),
             )
         return self
 
     def _resolve_version(self, pattern_id: str) -> int:
         version = self._manifest.pattern_version(pattern_id)
         if version is None:
-            raise GDSNavigationError(
-                f"No geometry version for pattern '{pattern_id}' in manifest."
-            )
+            raise GDSNavigationError(f"No geometry version for pattern '{pattern_id}' in manifest.")
         return version
 
     def dead_dim_indices(self, pattern_id: str) -> list[int]:
@@ -972,14 +1077,55 @@ class GDSNavigator:
     # Reader silently drops columns missing from the Lance schema (e.g. "edges"
     # on event geometry), so it is safe to include both "edges" and "entity_keys".
     _POLYGON_COLUMNS: list[str] = [
-        "primary_key", "scale", "delta", "delta_norm", "delta_rank_pct",
-        "is_anomaly", "last_refresh_at", "updated_at",
-        "edges", "entity_keys",
+        "primary_key",
+        "scale",
+        "delta",
+        "delta_norm",
+        "delta_rank_pct",
+        "is_anomaly",
+        "last_refresh_at",
+        "updated_at",
+        "edges",
+        "entity_keys",
     ]
     _CLUSTER_COLUMNS: list[str] = [
-        "primary_key", "delta", "delta_norm", "is_anomaly",
+        "primary_key",
+        "delta",
+        "delta_norm",
+        "is_anomaly",
     ]
     _CENTROID_AUTO_SAMPLE: int = 100_000
+
+    def _fdr_population(
+        self,
+        pattern_id: str,
+        pattern: Pattern,
+        *,
+        fdr_alpha: float | None,
+        fdr_method: str,
+        n_candidates: int,
+    ) -> tuple[int | None, float | None]:
+        """(n_tests, pi0) for FDR over the tested population, not the returned page.
+
+        n_tests = the pattern's population size (at least the candidate count).
+        pi0 (Storey only) = #{p > 0.5} / (0.5 · n_tests), counted on the stored
+        ``delta_norm`` column: p > 0.5 ⇔ ‖δ‖² < χ²_df⁻¹(0.5).
+        """
+        if fdr_alpha is None:
+            return None, None
+        n_tests = max(int(pattern.population_size), n_candidates)
+        if fdr_method != "storey":
+            return n_tests, None
+        from scipy.stats import chi2
+
+        cut = float(np.sqrt(chi2.isf(0.5, len(pattern.theta))))
+        try:
+            n_tail = int(
+                self._storage.count_geometry_rows(pattern_id, filter=f"delta_norm < {cut}")
+            )
+        except _NAVIGATION_RECOVERABLE_ERRORS:
+            return n_tests, None
+        return n_tests, float(min(max(n_tail / (0.5 * n_tests), 1.0 / n_tests), 1.0))
 
     @staticmethod
     def _apply_fdr_select_polygons(
@@ -989,20 +1135,27 @@ class GDSNavigator:
         select: str,
         top_n: int,
         fdr_method: str = "bh",
-        p_value_method: str = "rank",
+        p_value_method: str = "chi2",
         pattern_df: int | None = None,
         fdr_axis: str = "entity",
+        n_tests: int | None = None,
+        rank_offset: int = 0,
+        pi0: float | None = None,
     ) -> list[Polygon]:
         """Apply FDR filtering and diverse selection to a list of Polygons.
 
         Mutates Polygon objects in-place (sets q_value / representativeness)
         and returns the filtered/reordered list.
 
-        p_value_method: "rank" (default, uniform-by-construction) or "chi2"
-          (upper-tail χ²(df) on ||delta||²). Rank-based p-values carry no null
-          vs alternative signal for the Storey estimator; "chi2" is the option
-          that makes fdr_method="storey" actually shrink q-values. Requires
-          pattern_df to be supplied by the caller.
+        ``polygons`` is usually a top-n page of the tested population, so BH
+        is applied with ``n_tests`` = population size and ``rank_offset`` =
+        number of more-extreme entities skipped before the page (see
+        ``engine.fdr.q_values_from_p_values``); ``pi0`` is the population-level
+        Storey π̂₀ (π₀ = 1 when absent). Required whenever ``fdr_alpha`` is set.
+
+        p_value_method: "chi2" — upper-tail χ²(df) on ||delta||². The only
+          supported value: FDR needs model p-values that carry null vs
+          alternative evidence. Requires pattern_df when fdr_alpha is set.
 
         fdr_axis: "entity" (default, current behaviour — flat FDR over per-
           entity anomaly p-values), "per_dim" (independent BH/Storey per
@@ -1011,23 +1164,18 @@ class GDSNavigator:
           surviving per-dim FDR). Per-dim mode reduces inflation when one
           dim drives many anomalies.
         """
-        if p_value_method not in ("rank", "chi2"):
-            raise ValueError(
-                f"p_value_method must be 'rank' or 'chi2', got {p_value_method!r}"
-            )
-        if p_value_method == "chi2" and pattern_df is None:
-            raise ValueError("p_value_method='chi2' requires pattern_df")
+        _validate_p_value_method(p_value_method)
+        if fdr_alpha is not None and (pattern_df is None or n_tests is None):
+            raise ValueError("FDR requires pattern_df and n_tests (tested population size)")
         if fdr_axis not in ("entity", "per_dim", "both"):
             raise ValueError(
-                f"fdr_axis must be 'entity', 'per_dim', or 'both', got "
-                f"{fdr_axis!r}",
+                f"fdr_axis must be 'entity', 'per_dim', or 'both', got {fdr_axis!r}",
             )
 
         # --- FDR filtering (opt-in) ---
         if fdr_alpha is not None and len(polygons) > 0:
             from hypertopos.engine.fdr import (
                 benjamini_hochberg,
-                empirical_p_values_from_rank,
                 fdr_per_dimension,
                 parametric_p_values_chi2,
                 per_dim_p_values_chi2_univariate,
@@ -1036,21 +1184,20 @@ class GDSNavigator:
             # Entity-axis FDR (always computed when fdr_alpha is set so that
             # poly.q_value reflects the entity-level test, even in per_dim
             # mode where the keep-decision is dim-driven).
-            if p_value_method == "rank":
-                rank_pct = np.array(
-                    [p.delta_rank_pct if p.delta_rank_pct is not None else 0.0
-                     for p in polygons],
-                    dtype=np.float64,
-                )
-                p_values = empirical_p_values_from_rank(rank_pct)
-            else:  # chi2
-                delta_norms = np.array(
-                    [float(p.delta_norm) for p in polygons],
-                    dtype=np.float64,
-                )
-                p_values = parametric_p_values_chi2(delta_norms, df=int(pattern_df))
+            delta_norms = np.array(
+                [float(p.delta_norm) for p in polygons],
+                dtype=np.float64,
+            )
+            p_values = parametric_p_values_chi2(
+                delta_norms, df=int(cast(int, pattern_df))
+            )  # None raises above
             rejected_entity, q_values = benjamini_hochberg(
-                p_values, fdr_alpha, method=fdr_method,
+                p_values,
+                fdr_alpha,
+                method=fdr_method,
+                n_tests=n_tests,
+                rank_offset=rank_offset,
+                pi0=pi0,
             )
             for poly, q in zip(polygons, q_values, strict=True):
                 poly.q_value = float(q)  # type: ignore[attr-defined]
@@ -1058,14 +1205,18 @@ class GDSNavigator:
             # Per-dim FDR — opt-in via fdr_axis.
             if fdr_axis in ("per_dim", "both"):
                 delta_matrix = np.array(
-                    [p.delta for p in polygons], dtype=np.float64,
+                    [p.delta for p in polygons],
+                    dtype=np.float64,
                 )
                 p_per_dim = per_dim_p_values_chi2_univariate(delta_matrix)
                 rejected_per_dim, q_per_dim = fdr_per_dimension(
-                    p_per_dim, alpha=fdr_alpha, method=fdr_method,
+                    p_per_dim,
+                    alpha=fdr_alpha,
+                    method=fdr_method,
+                    n_tests=n_tests,
                 )
                 # Per-entity decision: ≥ 1 dim survives.
-                rejected_any_dim = rejected_per_dim.any(axis=1)
+                rejected_any_dim = cast(np.ndarray, rejected_per_dim.any(axis=1))  # 2-D input
                 # Attach per-dim q-values + most-significant-dim summary.
                 for i, poly in enumerate(polygons):
                     poly.q_values_per_dim = q_per_dim[i, :].tolist()  # type: ignore[attr-defined]
@@ -1079,22 +1230,22 @@ class GDSNavigator:
                     rejected_final = rejected_entity & rejected_any_dim
             else:
                 rejected_final = rejected_entity
-            polygons = [
-                p for p, keep in zip(polygons, rejected_final, strict=True)
-                if keep
-            ]
+            polygons = [p for p, keep in zip(polygons, rejected_final, strict=True) if keep]
 
         # --- Diverse selection (opt-in) ---
         if select not in ("top_norm", "diverse"):
             raise ValueError(f"unknown select mode: {select!r}")
         if select == "diverse" and len(polygons) > 0:
             from hypertopos.engine.selection import lazy_greedy_facility_location
+
             delta_vectors = np.array(
-                [p.delta for p in polygons], dtype=np.float64,
+                [p.delta for p in polygons],
+                dtype=np.float64,
             )
             k = min(top_n, len(polygons))
             selected_idx, representativeness = lazy_greedy_facility_location(
-                delta_vectors, k,
+                delta_vectors,
+                k,
             )
             out: list[Polygon] = []
             for i, idx in enumerate(selected_idx):
@@ -1164,6 +1315,7 @@ class GDSNavigator:
         (``NaN`` / ``±inf`` → ``None``) per the strict-JSON convention.
         """
         from hypertopos.engine.geometry import compute_reliability_flags
+
         for poly in polygons:
             poly.reliability_flags = compute_reliability_flags(  # type: ignore[attr-defined]
                 poly.delta,
@@ -1278,7 +1430,9 @@ class GDSNavigator:
             read_cols.append(temporal_dim)
         try:
             geo_slice = self._storage.read_geometry(
-                pattern_id, version, columns=read_cols,
+                pattern_id,
+                version,
+                columns=read_cols,
             )
         except _NAVIGATION_RECOVERABLE_ERRORS as exc:
             raise GDSNavigationError(
@@ -1316,15 +1470,12 @@ class GDSNavigator:
             cell_dims.append(temporal_dim)
         pks = geo_slice["primary_key"].to_pylist()
         cell_value_cols = [geo_slice[d].to_pylist() for d in cell_dims]
-        cell_by_entity: dict[str, tuple] = {}
+        cell_by_entity: dict[str, tuple[Any, ...]] = {}
         for i, pk in enumerate(pks):
             cell_by_entity[pk] = tuple(col[i] for col in cell_value_cols)
 
         # Filter survivors (set membership preserves order)
-        filtered = [
-            p for p in polygons
-            if cell_by_entity.get(p.primary_key) in surviving_cells
-        ]
+        filtered = [p for p in polygons if cell_by_entity.get(p.primary_key) in surviving_cells]
 
         # Annotate survivors
         spatial_n = len(hierarchy_dims)
@@ -1358,10 +1509,10 @@ class GDSNavigator:
         missing_edge_to: str | None = None,
         include_emerging: bool = False,
         rank_by_property: str | None = None,
-        property_filters: dict | None = None,
+        property_filters: dict[str, Any] | None = None,
         fdr_alpha: float | None = None,
         fdr_method: str | None = None,
-        p_value_method: str | None = None,
+        p_value_method: str = "chi2",
         fdr_axis: str = "entity",
         fdr_resolution: str | None = None,
         fdr_temporal_resolution: str | None = None,
@@ -1372,8 +1523,13 @@ class GDSNavigator:
         dimension_weights: dict[str, float] | None = None,
         sample_size: int | None = None,
         boundary_aware: bool = False,
-    ) -> tuple[list[Polygon], int, list[dict] | None, dict | None]:
+        rank_order: Literal["desc", "asc"] = "desc",
+    ) -> tuple[list[Polygon], int, list[dict[str, Any]] | None, dict[str, Any] | None]:
         """Find the most anomalous polygons in a pattern.
+
+        ``rank_order`` (``"desc"`` default, or ``"asc"``) is the direction of
+        a ``rank_by_property`` ranking — ``"asc"`` puts the lowest property
+        values first. Missing values rank last either way.
 
         Returns ``(polygons, total_found, emerging, meta)`` where *emerging*
         is a list of not-yet-anomalous entities trending toward theta (only
@@ -1444,23 +1600,12 @@ class GDSNavigator:
         hierarchy declared via ``Pattern.fdr_temporal_hierarchy``. Survivors
         gain ``cell_q_temporal`` and ``cell_path`` attributes.
 
-        When either ``fdr_resolution`` or ``fdr_temporal_resolution`` is set
-        on the entity axis (the default), the entity-level FDR parameters
-        switch to ``p_value_method='chi2'`` and ``fdr_method='storey'`` —
-        but only when the caller left those values implicit. Implementation
-        uses the ``None`` sentinel: ``p_value_method=None`` (and analogously
-        ``fdr_method=None``) means "pick the context-correct value", which
-        is ``'chi2'`` / ``'storey'`` when ``fdr_resolution`` is active and
-        ``'rank'`` / ``'bh'`` otherwise. A caller who explicitly passes
-        ``p_value_method='rank'`` keeps rank semantics — useful for
-        reproducing pre-upgrade behaviour, validating migrations, or
-        benchmarking the degenerate path on purpose. ``fdr_axis`` in
-        ``{'per_dim', 'both'}`` skips the upgrade since per-dim chi²(1)
-        is independent of ``p_value_method``. Rank-based p-values are
-        uniform-by-construction; BH at any reasonable alpha rejects nothing,
-        which would collapse the entity-level FDR to a no-op and leave
-        survivors ordered by ``delta_norm`` alone — that's the failure mode
-        the context-sensitive default avoids by default.
+        Entity-level FDR always runs on χ² model p-values
+        (``p_value_method='chi2'``, the only accepted value — upper-tail
+        χ²(df) on ``||delta||²`` with ``df = len(pattern.theta)``).
+        ``fdr_method=None`` means "pick the context-correct value":
+        ``'storey'`` when ``fdr_resolution`` / ``fdr_temporal_resolution`` is
+        set on the entity axis, ``'bh'`` otherwise.
 
         When both are set, intersection-FDR applies: an entity survives iff
         its cell cleared every named spatial level AND every named temporal
@@ -1486,25 +1631,17 @@ class GDSNavigator:
         minority of the population. Requires ``sample_size`` to be set; raises
         ``ValueError`` otherwise. Forces the in-process scan path.
         """
-        # Resolve sentinel-None defaults BEFORE the fdr_method / p_value_method
-        # value-set validation runs (the check directly below expects a string).
-        # Upgrade applies only when fdr_resolution / fdr_temporal_resolution is
-        # set on the entity axis (per_dim / both compute chi2(1) per-dim
-        # regardless of p_value_method). Explicit non-None values pass through
-        # — the sentinel distinguishes "caller left this implicit" from
-        # "caller asked for this specific value".
-        _needs_resolution_upgrade = (
-            fdr_axis == "entity"
-            and (fdr_resolution is not None or fdr_temporal_resolution is not None)
+        _validate_p_value_method(p_value_method)
+        # Resolve the sentinel-None fdr_method BEFORE its value-set validation.
+        # Storey applies only when fdr_resolution / fdr_temporal_resolution is
+        # set on the entity axis; explicit non-None values pass through.
+        _needs_resolution_upgrade = fdr_axis == "entity" and (
+            fdr_resolution is not None or fdr_temporal_resolution is not None
         )
-        if p_value_method is None:
-            p_value_method = "chi2" if _needs_resolution_upgrade else "rank"
         if fdr_method is None:
             fdr_method = "storey" if _needs_resolution_upgrade else "bh"
         if fdr_method not in ("bh", "storey"):
-            raise ValueError(
-                f"fdr_method must be 'bh' or 'storey', got {fdr_method!r}"
-            )
+            raise ValueError(f"fdr_method must be 'bh' or 'storey', got {fdr_method!r}")
         if metric not in ("L2", "Linf"):
             raise ValueError(f"metric must be 'L2' or 'Linf', got '{metric}'")
         if boundary_aware and sample_size is None:
@@ -1519,6 +1656,8 @@ class GDSNavigator:
                 f"rank_by must be 'delta_norm', 'min_q_per_dim', or "
                 f"'signed_confidence', got {rank_by!r}"
             )
+        if rank_order not in ("desc", "asc"):
+            raise ValueError(f"rank_order must be 'desc' or 'asc', got {rank_order!r}")
         if rank_by == "min_q_per_dim":
             if fdr_alpha is None:
                 raise ValueError(
@@ -1558,8 +1697,7 @@ class GDSNavigator:
         if fdr_resolution is not None or fdr_temporal_resolution is not None:
             if fdr_alpha is None:
                 raise ValueError(
-                    "fdr_resolution / fdr_temporal_resolution require "
-                    "fdr_alpha to be set",
+                    "fdr_resolution / fdr_temporal_resolution require fdr_alpha to be set",
                 )
             if fdr_resolution is not None:
                 spatial_levels = [lvl.level for lvl in pattern.fdr_hierarchy]
@@ -1569,9 +1707,7 @@ class GDSNavigator:
                         f"fdr_hierarchy levels {spatial_levels!r}",
                     )
             if fdr_temporal_resolution is not None:
-                temporal_levels_decl = [
-                    lvl.level for lvl in pattern.fdr_temporal_hierarchy
-                ]
+                temporal_levels_decl = [lvl.level for lvl in pattern.fdr_temporal_hierarchy]
                 if fdr_temporal_resolution not in temporal_levels_decl:
                     raise ValueError(
                         f"fdr_temporal_resolution={fdr_temporal_resolution!r} "
@@ -1607,7 +1743,8 @@ class GDSNavigator:
         try:
             _geo_count = (
                 int(self._storage.count_geometry_rows(pattern_id))
-                if not missing_edge_to and not property_filters else 0
+                if not missing_edge_to and not property_filters
+                else 0
             )
         except _NAVIGATION_RECOVERABLE_ERRORS:
             _geo_count = 0
@@ -1623,9 +1760,9 @@ class GDSNavigator:
             from hypertopos.engine.lance_sql_agg import (
                 find_anomalies as _lance_sql_find_anomalies,
             )
+
             geo_lance_path = str(
-                self._storage._base.resolve()
-                / "geometry" / pattern_id / "data.lance"
+                self._storage._base.resolve() / "geometry" / pattern_id / "data.lance"
             )
             resp = _lance_sql_find_anomalies(
                 geo_lance_path,
@@ -1633,26 +1770,38 @@ class GDSNavigator:
                 top_n=offset + top_n,
                 offset=0,
                 min_confidence=min_confidence,
+                lance_version=self._storage.pinned_geometry_version(pattern_id),
             )
             total_found = resp["total_found"]
             # Build norm lookup from full response first (handles duplicates)
-            _all_norm_lookup = dict(zip(resp["keys"], resp["delta_norms"]))
+            _all_norm_lookup = dict(zip(resp["keys"], resp["delta_norms"], strict=False))
             sub_keys = list(dict.fromkeys(resp["keys"][offset:]))
             if sub_keys:
                 light_cols = [
-                    "primary_key", "scale", "delta", "delta_norm",
-                    "delta_rank_pct", "is_anomaly",
-                    "last_refresh_at", "updated_at",
-                    "bregman_divergence", "anomaly_confidence",
-                    "edges", "entity_keys",
+                    "primary_key",
+                    "scale",
+                    "delta",
+                    "delta_norm",
+                    "delta_rank_pct",
+                    "is_anomaly",
+                    "last_refresh_at",
+                    "updated_at",
+                    "bregman_divergence",
+                    "anomaly_confidence",
+                    "edges",
+                    "entity_keys",
                 ]
                 full_geo = self._storage.read_geometry(
-                    pattern_id, version, point_keys=sub_keys,
+                    pattern_id,
+                    version,
+                    point_keys=sub_keys,
                     columns=light_cols,
                 )
                 norm_lookup = {k: _all_norm_lookup[k] for k in sub_keys if k in _all_norm_lookup}
                 results = self._engine.geometry_to_polygons(
-                    full_geo, norm_lookup=norm_lookup, top_n=top_n,
+                    full_geo,
+                    norm_lookup=norm_lookup,
+                    top_n=top_n,
                     pattern=pattern,
                     pattern_id=pattern_id,
                     pattern_type=pattern.pattern_type,
@@ -1660,14 +1809,28 @@ class GDSNavigator:
                 )
             else:
                 results = []
+            _n_tests, _pi0 = self._fdr_population(
+                pattern_id,
+                pattern,
+                fdr_alpha=fdr_alpha,
+                fdr_method=fdr_method,
+                n_candidates=offset + len(results),
+            )
             results = self._apply_fdr_select_polygons(
-                results, fdr_alpha=fdr_alpha, select=select, top_n=top_n,
-                fdr_method=fdr_method, p_value_method=p_value_method,
-                pattern_df=len(pattern.theta) if p_value_method == "chi2" else None,
+                results,
+                fdr_alpha=fdr_alpha,
+                select=select,
+                top_n=top_n,
+                fdr_method=fdr_method,
+                p_value_method=p_value_method,
+                pattern_df=len(pattern.theta),
                 fdr_axis=fdr_axis,
+                n_tests=_n_tests,
+                rank_offset=offset,
+                pi0=_pi0,
             )
             if rank_by == "min_q_per_dim":
-                results.sort(key=lambda p: p.min_q_per_dim)
+                results.sort(key=lambda p: p.min_q_per_dim)  # type: ignore[attr-defined]  # set dynamically by FDR
             if fdr_resolution is not None or fdr_temporal_resolution is not None:
                 results = self._apply_fdr_multi_resolution_gate(
                     results,
@@ -1680,7 +1843,12 @@ class GDSNavigator:
                     fdr_alpha=fdr_alpha,  # type: ignore[arg-type]
                 )
             emerging = self._find_emerging(
-                pattern_id, version, pattern, include_emerging, offset, top_n,
+                pattern_id,
+                version,
+                pattern,
+                include_emerging,
+                offset,
+                top_n,
             )
             self._attach_reliability_flags(results, pattern=pattern)
             return results, total_found, emerging, None
@@ -1696,31 +1864,40 @@ class GDSNavigator:
             cols.append("edges")
         if min_confidence > 0.0:
             cols.append("anomaly_confidence")
-        if metric == "bregman":
-            cols.append("bregman_divergence")
         # Sampling needs visibility into entities BELOW the threshold (the
         # boundary band straddles theta_norm and the uniform-sampling acceptance
         # ratio assumes the full population is in scope). Drop the pre-filter
         # in that case — the threshold check still happens post-sampling below.
         _drop_norm_prefilter = sample_size is not None or boundary_aware
-        if metric in ("Linf", "bregman") or _drop_norm_prefilter:
-            # Linf/bregman: can't use pre-computed delta_norm filter, read all
+        if metric == "Linf" or _drop_norm_prefilter:
+            # Linf: can't use pre-computed delta_norm filter, read all
             light = self._storage.read_geometry(
-                pattern_id, version, columns=cols,
+                pattern_id,
+                version,
+                columns=cols,
             )
         else:
             light = self._storage.read_geometry(
-                pattern_id, version, columns=cols,
+                pattern_id,
+                version,
+                columns=cols,
                 filter=f"delta_norm >= {threshold}",
             )
         if _drop_norm_prefilter and light.num_rows > 0:
             light = self._stratified_sample_light(
-                light, sample_size=sample_size, boundary_aware=boundary_aware,
+                light,
+                sample_size=sample_size,
+                boundary_aware=boundary_aware,
                 theta_norm=theta_norm,
             )
         if light.num_rows == 0:
             emerging = self._find_emerging(
-                pattern_id, version, pattern, include_emerging, offset, top_n,
+                pattern_id,
+                version,
+                pattern,
+                include_emerging,
+                offset,
+                top_n,
             )
             return [], 0, emerging, None
 
@@ -1731,7 +1908,12 @@ class GDSNavigator:
             light = light.filter(pa.array(mask))
             if light.num_rows == 0:
                 emerging = self._find_emerging(
-                    pattern_id, version, pattern, include_emerging, offset, top_n,
+                    pattern_id,
+                    version,
+                    pattern,
+                    include_emerging,
+                    offset,
+                    top_n,
                 )
                 return [], 0, emerging, None
 
@@ -1741,14 +1923,17 @@ class GDSNavigator:
             delta_matrix = delta_matrix * weight_vector
         if metric == "Linf":
             norms = np.max(np.abs(delta_matrix), axis=1).astype(np.float32)
-        elif metric == "bregman" and "bregman_divergence" in light.schema.names:
-            norms = light["bregman_divergence"].to_numpy(zero_copy_only=False).astype(np.float32)
         else:
-            norms = np.sqrt(np.einsum('ij,ij->i', delta_matrix, delta_matrix)).astype(np.float32)
+            norms = np.sqrt(np.einsum("ij,ij->i", delta_matrix, delta_matrix)).astype(np.float32)
         valid = norms >= threshold
         if not np.any(valid):
             emerging = self._find_emerging(
-                pattern_id, version, pattern, include_emerging, offset, top_n,
+                pattern_id,
+                version,
+                pattern,
+                include_emerging,
+                offset,
+                top_n,
             )
             return [], 0, emerging, None
         valid_idx = np.where(valid)[0]
@@ -1767,7 +1952,9 @@ class GDSNavigator:
             )
             min_confidence = 0.0
         if min_confidence > 0.0 and "anomaly_confidence" in light.schema.names:
-            conf_values = light["anomaly_confidence"].to_numpy(zero_copy_only=False).astype(np.float32)
+            conf_values = (
+                light["anomaly_confidence"].to_numpy(zero_copy_only=False).astype(np.float32)
+            )
             conf_mask = conf_values[valid_idx] >= min_confidence
             valid_idx = valid_idx[conf_mask]
             valid_norms = norms[valid_idx]
@@ -1788,15 +1975,19 @@ class GDSNavigator:
             if rank_by_property and rank_by_property not in read_cols:
                 read_cols.append(rank_by_property)
             pts = self._storage.read_points_batch(
-                entity_line_id, line_ver, all_keys,
+                entity_line_id,
+                line_ver,
+                all_keys,
                 columns=read_cols,
             )
             from hypertopos.engine.aggregation import _apply_event_filters
+
             for col in property_filters:
                 if col not in pts.column_names:
                     raise GDSNavigationError(
                         f"property_filters column '{col}' not found on entity line "
-                        f"'{entity_line_id}'. Available: {sorted(c for c in pts.column_names if c != 'primary_key')}"
+                        f"'{entity_line_id}'. Available: "
+                        f"{sorted(c for c in pts.column_names if c != 'primary_key')}"
                     )
             pts = _apply_event_filters(pts, property_filters)
             surviving = set(pts["primary_key"].to_pylist())
@@ -1820,9 +2011,15 @@ class GDSNavigator:
                     f"rank_by_property is not supported on pattern '{pattern_id}' — "
                     f"no entity line found (event patterns don't have entity properties)"
                 )
-            pts = _pre_loaded_pts if _pre_loaded_pts is not None else self._storage.read_points_batch(
-                entity_line_id, line_ver, all_keys,
-                columns=["primary_key", rank_by_property],
+            pts = (
+                _pre_loaded_pts
+                if _pre_loaded_pts is not None
+                else self._storage.read_points_batch(
+                    entity_line_id,
+                    line_ver,
+                    all_keys,
+                    columns=["primary_key", rank_by_property],
+                )
             )
             if rank_by_property not in pts.column_names:
                 raise GDSNavigationError(
@@ -1831,23 +2028,36 @@ class GDSNavigator:
                     f"via get_sphere_info."
                 )
             prop_pairs: list[tuple[str, float]] = []
+            missing: list[str] = []
             for i in range(pts.num_rows):
                 pk = pts["primary_key"][i].as_py()
                 val = pts[rank_by_property][i].as_py()
                 try:
-                    prop_pairs.append((pk, float(val) if val is not None else float("-inf")))
+                    prop_pairs.append((pk, float(val)))
                 except (TypeError, ValueError):
-                    prop_pairs.append((pk, float("-inf")))
-            prop_pairs.sort(key=lambda x: x[1], reverse=True)
-            top_keys = [pk for pk, _ in prop_pairs[offset:offset + top_n]]
+                    missing.append(pk)
+            prop_pairs.sort(key=lambda x: (x[1] if rank_order == "asc" else -x[1], x[0]))
+            ranked = [pk for pk, _ in prop_pairs] + sorted(missing)
+            top_keys = ranked[offset : offset + top_n]
             # Build norm lookup for these keys
-            key_to_norm = {str(light["primary_key"][int(i)].as_py()): float(norms[i]) for i in valid_idx}
+            key_to_norm = {
+                str(light["primary_key"][int(i)].as_py()): float(norms[i]) for i in valid_idx
+            }
         else:
             if len(valid_norms) == 0:
                 emerging = self._find_emerging(
-                    pattern_id, version, pattern, include_emerging, offset, top_n,
+                    pattern_id,
+                    version,
+                    pattern,
+                    include_emerging,
+                    offset,
+                    top_n,
                 )
-                meta = {"total_anomalies_unfiltered": total_anomalies_unfiltered} if property_filters else None
+                meta = (
+                    {"total_anomalies_unfiltered": total_anomalies_unfiltered}
+                    if property_filters
+                    else None
+                )
                 return [], total_found, emerging, meta
             # Full sort for deterministic pagination (population is pre-filtered
             # to anomalies above threshold, typically 5-20% of total)
@@ -1870,25 +2080,36 @@ class GDSNavigator:
                         n += 1
             top_idx = valid_idx[sorted_local[:n]]
             top_keys = [str(light["primary_key"][int(i)].as_py()) for i in top_idx]
-            key_to_norm = {str(light["primary_key"][int(i)].as_py()): float(norms[i]) for i in top_idx}
+            key_to_norm = {
+                str(light["primary_key"][int(i)].as_py()): float(norms[i]) for i in top_idx
+            }
 
         # Pass 2: light geometry read for selected keys only
         escaped = [k.replace("'", "''") for k in top_keys]
         pk_in = ", ".join(f"'{k}'" for k in escaped)
         _anomaly_light_cols = [
-            "primary_key", "scale", "delta", "delta_norm",
-            "delta_rank_pct", "is_anomaly",
-            "last_refresh_at", "updated_at",
-            "bregman_divergence", "anomaly_confidence",
-            "edges", "entity_keys",
+            "primary_key",
+            "scale",
+            "delta",
+            "delta_norm",
+            "delta_rank_pct",
+            "is_anomaly",
+            "last_refresh_at",
+            "updated_at",
+            "bregman_divergence",
+            "anomaly_confidence",
+            "edges",
+            "entity_keys",
         ]
         full = self._storage.read_geometry(
-            pattern_id, version, filter=f"primary_key IN ({pk_in})",
+            pattern_id,
+            version,
+            filter=f"primary_key IN ({pk_in})",
             columns=_anomaly_light_cols,
         )
         from hypertopos.engine.geometry import _reconstruct_edges_from_entity_keys
 
-        results: list[Polygon] = []
+        results = []
         for i in range(full.num_rows):
             row = {col: full[col][i].as_py() for col in full.schema.names}
             pk = row["primary_key"]
@@ -1909,63 +2130,82 @@ class GDSNavigator:
                 ]
             elif row.get("entity_keys") and pattern.relations:
                 edges = _reconstruct_edges_from_entity_keys(
-                    row["entity_keys"], pattern.relations,
+                    row["entity_keys"],
+                    pattern.relations,
                 )
             else:
                 edges = []
-            results.append(Polygon(
-                primary_key=pk,
-                pattern_id=row.get("pattern_id", pattern_id),
-                pattern_ver=row.get("pattern_ver", version),
-                pattern_type=row.get("pattern_type", pattern.pattern_type),
-                scale=row["scale"],
-                delta=np.array(row["delta"], dtype=np.float32),
-                delta_norm=recomputed_norm,
-                is_anomaly=bool(row["is_anomaly"]),
-                edges=edges,
-                last_refresh_at=row["last_refresh_at"],
-                updated_at=row["updated_at"],
-                delta_rank_pct=(
-                    None if row.get("delta_rank_pct") is None
-                    else float(row["delta_rank_pct"])
-                ),
-                bregman_divergence=(
-                    None if row.get("bregman_divergence") is None
-                    else float(row["bregman_divergence"])
-                ),
-                anomaly_confidence=(
-                    None if row.get("anomaly_confidence") is None
-                    else float(row["anomaly_confidence"])
-                ),
-            ))
-        if rank_by_property is not None:
-            # Preserve property-based order (Pass 2 may scramble it)
-            key_order = {k: i for i, k in enumerate(top_keys)}
-            results.sort(key=lambda p: key_order.get(p.primary_key, 999999))
-        else:
-            results.sort(key=lambda p: p.delta_norm, reverse=True)
-
+            results.append(
+                Polygon(
+                    primary_key=pk,
+                    pattern_id=row.get("pattern_id", pattern_id),
+                    pattern_ver=row.get("pattern_ver", version),
+                    pattern_type=row.get("pattern_type", pattern.pattern_type),
+                    scale=row["scale"],
+                    delta=np.array(row["delta"], dtype=np.float32),
+                    delta_norm=recomputed_norm,
+                    is_anomaly=bool(row["is_anomaly"]),
+                    edges=edges,
+                    last_refresh_at=row["last_refresh_at"],
+                    updated_at=row["updated_at"],
+                    delta_rank_pct=(
+                        None if row.get("delta_rank_pct") is None else float(row["delta_rank_pct"])
+                    ),
+                    bregman_divergence=(
+                        None
+                        if row.get("bregman_divergence") is None
+                        else float(row["bregman_divergence"])
+                    ),
+                    anomaly_confidence=(
+                        None
+                        if row.get("anomaly_confidence") is None
+                        else float(row["anomaly_confidence"])
+                    ),
+                )
+            )
         # Deduplicate on primary_key — Lance may have duplicate rows from
         # interrupted incremental_update. Keep highest delta_norm per key.
         seen: dict[str, Polygon] = {}
         for p in results:
             if p.primary_key not in seen or p.delta_norm > seen[p.primary_key].delta_norm:
                 seen[p.primary_key] = p
-        # Sort by (-delta_norm, primary_key) for deterministic pagination on tied norms
-        results = sorted(seen.values(), key=lambda p: (-p.delta_norm, p.primary_key))
+        if rank_by_property is not None:
+            # The property ranking already chose and ordered this page.
+            key_order = {k: i for i, k in enumerate(top_keys)}
+            results = sorted(seen.values(), key=lambda p: key_order.get(p.primary_key, 999999))
+        else:
+            # Sort by (-delta_norm, primary_key) for deterministic pagination on tied norms
+            results = sorted(seen.values(), key=lambda p: (-p.delta_norm, p.primary_key))
         # signed_confidence defers the top_n truncation until after the
         # score is computed so the full anomalous pool is re-ranked rather
         # than only the delta_norm top_n.
+        _rank_offset = 0
         if rank_by != "signed_confidence":
-            results = results[offset:offset + top_n]
+            if rank_by_property is None:
+                results = results[offset : offset + top_n]
+            _rank_offset = offset
+        _n_tests, _pi0 = self._fdr_population(
+            pattern_id,
+            pattern,
+            fdr_alpha=fdr_alpha,
+            fdr_method=fdr_method,
+            n_candidates=_rank_offset + len(results),
+        )
         results = self._apply_fdr_select_polygons(
-            results, fdr_alpha=fdr_alpha, select=select, top_n=top_n,
-            fdr_method=fdr_method, p_value_method=p_value_method,
-            pattern_df=len(pattern.theta) if p_value_method == "chi2" else None,
+            results,
+            fdr_alpha=fdr_alpha,
+            select=select,
+            top_n=top_n,
+            fdr_method=fdr_method,
+            p_value_method=p_value_method,
+            pattern_df=len(pattern.theta),
             fdr_axis=fdr_axis,
+            n_tests=_n_tests,
+            rank_offset=_rank_offset,
+            pi0=_pi0,
         )
         if rank_by == "min_q_per_dim":
-            results.sort(key=lambda p: p.min_q_per_dim)
+            results.sort(key=lambda p: p.min_q_per_dim)  # type: ignore[attr-defined]  # set dynamically by FDR
         if fdr_resolution is not None or fdr_temporal_resolution is not None:
             results = self._apply_fdr_multi_resolution_gate(
                 results,
@@ -1979,9 +2219,16 @@ class GDSNavigator:
             )
 
         emerging = self._find_emerging(
-            pattern_id, version, pattern, include_emerging, offset, top_n,
+            pattern_id,
+            version,
+            pattern,
+            include_emerging,
+            offset,
+            top_n,
         )
-        meta = {"total_anomalies_unfiltered": total_anomalies_unfiltered} if property_filters else None
+        meta = (
+            {"total_anomalies_unfiltered": total_anomalies_unfiltered} if property_filters else None
+        )
         self._attach_reliability_flags(results, pattern=pattern)
         if rank_by == "signed_confidence":
             self._attach_signed_confidence_fields(results, pattern=pattern)
@@ -1994,7 +2241,7 @@ class GDSNavigator:
                     p.primary_key,
                 ),
             )
-            results = results[offset:offset + top_n]
+            results = results[offset : offset + top_n]
         return results, total_found, emerging, meta
 
     @staticmethod
@@ -2023,17 +2270,14 @@ class GDSNavigator:
             )
         if not isinstance(weights, dict):
             raise ValueError(
-                f"dimension_weights must be a dict[str, float], got "
-                f"{type(weights).__name__}"
+                f"dimension_weights must be a dict[str, float], got {type(weights).__name__}"
             )
         labels = pattern.dim_labels
         # Edge-dim aggregations live at the tail of dim_labels and are not
         # resolvable via Pattern.dim_index — build a fallback map for them.
         edge_agg_names = pattern._edge_dim_aggregation_names()
         n_non_edge = len(labels) - len(edge_agg_names)
-        edge_agg_to_idx = {
-            name: n_non_edge + i for i, name in enumerate(edge_agg_names)
-        }
+        edge_agg_to_idx = {name: n_non_edge + i for i, name in enumerate(edge_agg_names)}
         vec = np.ones(len(labels), dtype=np.float32)
         for name, raw in weights.items():
             # Try Pattern.dim_index first — it accepts both line_id and
@@ -2052,13 +2296,11 @@ class GDSNavigator:
                 w = float(raw)
             except (TypeError, ValueError) as e:
                 raise ValueError(
-                    f"dimension_weights[{name!r}] must be a number, got "
-                    f"{raw!r}"
+                    f"dimension_weights[{name!r}] must be a number, got {raw!r}"
                 ) from e
             if not np.isfinite(w) or w < 0:
                 raise ValueError(
-                    f"dimension_weights[{name!r}] must be a non-negative "
-                    f"finite number, got {w}"
+                    f"dimension_weights[{name!r}] must be a non-negative finite number, got {w}"
                 )
             vec[idx] = w
         return vec
@@ -2071,7 +2313,7 @@ class GDSNavigator:
         include_emerging: bool,
         offset: int,
         top_n: int,
-    ) -> list[dict] | None:
+    ) -> list[dict[str, Any]] | None:
         """Scan non-anomalous entities for emerging anomaly trajectories.
 
         Returns a sorted list of dicts or None when *include_emerging* is
@@ -2083,13 +2325,14 @@ class GDSNavigator:
         from hypertopos.engine.forecast import forecast_anomaly_status
 
         non_anom_geo = self._storage.read_geometry(
-            pattern_id, version,
+            pattern_id,
+            version,
             filter="is_anomaly = false",
             columns=["primary_key"],
         )
         candidate_keys = non_anom_geo["primary_key"].to_pylist()[:100]
 
-        emerging: list[dict] = []
+        emerging: list[dict[str, Any]] = []
         for pk in candidate_keys:
             try:
                 solid = self._engine.build_solid(pk, pattern_id, self._manifest)
@@ -2097,18 +2340,23 @@ class GDSNavigator:
                     deltas = [s.delta_snapshot for s in solid.slices]
                     base_delta_norm = float(solid.base_polygon.delta_norm)
                     af = forecast_anomaly_status(
-                        deltas, pattern.theta_norm, horizon=1,
+                        deltas,
+                        pattern.theta_norm,
+                        horizon=1,
                         current_delta_norm=base_delta_norm,
                     )
                     if af.forecast_is_anomaly and not af.current_is_anomaly:
-                        emerging.append({
-                            "primary_key": pk,
-                            "current_delta_norm": round(base_delta_norm, 4),
-                            "predicted_delta_norm": round(
-                                af.predicted_delta_norm, 4,
-                            ),
-                            "reliability": af.reliability,
-                        })
+                        emerging.append(
+                            {
+                                "primary_key": pk,
+                                "current_delta_norm": round(base_delta_norm, 4),
+                                "predicted_delta_norm": round(
+                                    af.predicted_delta_norm,
+                                    4,
+                                ),
+                                "reliability": af.reliability,
+                            }
+                        )
             except _NAVIGATION_RECOVERABLE_ERRORS:
                 pass
 
@@ -2131,12 +2379,12 @@ class GDSNavigator:
             total = stats_cache["total_entities"]
             cached_pcts = stats_cache["percentiles"]
             percentiles = {
-                "p50":  round(float(cached_pcts["p50"]),  4),
-                "p75":  round(float(cached_pcts["p75"]),  4),
-                "p90":  round(float(cached_pcts["p90"]),  4),
-                "p95":  round(float(cached_pcts["p95"]),  4),
-                "p99":  round(float(cached_pcts["p99"]),  4),
-                "max":  round(float(cached_pcts["max"]),  4),
+                "p50": round(float(cached_pcts["p50"]), 4),
+                "p75": round(float(cached_pcts["p75"]), 4),
+                "p90": round(float(cached_pcts["p90"]), 4),
+                "p95": round(float(cached_pcts["p95"]), 4),
+                "p99": round(float(cached_pcts["p99"]), 4),
+                "max": round(float(cached_pcts["max"]), 4),
             }
 
             if total == 0:
@@ -2155,7 +2403,8 @@ class GDSNavigator:
 
             # Distribution scan: skip large delta column — only delta_norm needed.
             dist_table = self._storage.read_geometry(
-                pattern_id, version,
+                pattern_id,
+                version,
                 columns=["primary_key", "delta_norm", "is_anomaly"],
             )
             norms_arr = dist_table["delta_norm"].to_numpy().astype(np.float64)
@@ -2176,14 +2425,16 @@ class GDSNavigator:
 
             # Load delta only for anomalous rows (typically <5% of total) for cluster breakdown.
             anomaly_table = self._storage.read_geometry(
-                pattern_id, version,
+                pattern_id,
+                version,
                 columns=["primary_key", "delta"],
                 filter=f"delta_norm >= {theta_norm}",
             )
         else:
             # Cache miss: full scan including delta column (backwards compatibility)
             table = self._storage.read_geometry(
-                pattern_id, version,
+                pattern_id,
+                version,
                 columns=["primary_key", "delta", "delta_norm"],
             )
             total = table.num_rows
@@ -2229,36 +2480,30 @@ class GDSNavigator:
             else:
                 anomaly_table = table.slice(0, 0)  # empty — no anomalies when theta=0
 
-        # Build cluster breakdown from anomalous rows (uses delta column)
-        clusters: dict[tuple, list[str]] = {}
+        # Build cluster breakdown from anomalous rows (uses delta column).
+        # Group by label: a rounded continuous delta is unique per entity, so
+        # grouping by it gave one "cluster" per anomaly.
+        from hypertopos.engine.geometry import cluster_dim_names, cluster_label
+
+        dim_names = cluster_dim_names(pattern)
+        clusters: dict[str, list[int]] = {}
+        anom_rounded = np.zeros((0, 0))
+        anom_pks: list[Any] = []
         if anomaly_table.num_rows > 0:
-            anom_deltas = delta_matrix_from_arrow(anomaly_table)
-            anom_rounded = np.round(anom_deltas, 1)
+            anom_rounded = np.round(delta_matrix_from_arrow(anomaly_table), 1)
             anom_pks = anomaly_table["primary_key"].to_pylist()
             for i in range(anomaly_table.num_rows):
-                key = tuple(anom_rounded[i].tolist())
-                clusters.setdefault(key, []).append(str(anom_pks[i]))
-        cluster_list = []
-        for delta_key, pks in sorted(clusters.items(), key=lambda x: -len(x[1])):
-            k = len(pattern.relations)
-            missing_edges = [
-                pattern.relations[j].line_id
-                for j, v in enumerate(delta_key)
-                if j < k and v < 0
-            ]
-            missing_props = [
-                pattern.prop_columns[j - k]
-                for j, v in enumerate(delta_key)
-                if j >= k and j < k + len(pattern.prop_columns) and v < 0
-            ]
-            all_missing = missing_edges + [f"prop:{p}" for p in missing_props]
-            label = f"missing: {', '.join(all_missing)}" if all_missing else "excess edges"
-            cluster_list.append({
-                "delta": list(delta_key),
+                label = cluster_label(anom_rounded[i].tolist(), dim_names)
+                clusters.setdefault(label, []).append(i)
+        cluster_list: list[dict[str, Any]] = [
+            {
+                "delta": np.round(anom_rounded[rows].mean(axis=0), 1).tolist(),
                 "label": label,
-                "count": len(pks),
-                "examples": pks[:3],
-            })
+                "count": len(rows),
+                "examples": [str(anom_pks[i]) for i in rows[:3]],
+            }
+            for label, rows in sorted(clusters.items(), key=lambda x: -len(x[1]))
+        ]
 
         total_clusters = len(cluster_list)
         truncated = max_clusters > 0 and total_clusters > max_clusters
@@ -2271,7 +2516,7 @@ class GDSNavigator:
         total_weight = 0.0
         for cluster in cluster_list:
             delta = np.array(cluster["delta"], dtype=np.float32)
-            sq = delta ** 2
+            sq = delta**2
             count = cluster["count"]
             delta_norm_c = float(np.linalg.norm(delta))
             weight = delta_norm_c * count
@@ -2286,7 +2531,8 @@ class GDSNavigator:
                     "label": labels[i],
                     "mean_contribution_pct": round(float(pcts[i]), 1),
                 }
-                for i in top_idx if pcts[i] > 3.0
+                for i in top_idx
+                if pcts[i] > 3.0
             ]
         else:
             top_driving_dimensions = []
@@ -2313,7 +2559,7 @@ class GDSNavigator:
         sample_size: int | None = None,
         include_keys: bool = False,
         keys_per_group: int = 5,
-        property_filters: dict | None = None,
+        property_filters: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         version = self._resolve_version(pattern_id)
         sphere = self._storage.read_sphere()
@@ -2321,15 +2567,13 @@ class GDSNavigator:
         if pattern.pattern_type == "event":
             raise ValueError(
                 "aggregate_anomalies is for anchor/composite patterns. "
-                "For event patterns, use aggregate(geometry_filters={\"is_anomaly\": true})."
+                'For event patterns, use aggregate(geometry_filters={"is_anomaly": true}).'
             )
         entity_line_id = pattern.entity_line_id
         if entity_line_id is None:
             entity_line_id = sphere.entity_line(pattern_id)
         if entity_line_id is None:
-            raise ValueError(
-                f"Cannot resolve entity line for pattern '{pattern_id}'"
-            )
+            raise ValueError(f"Cannot resolve entity line for pattern '{pattern_id}'")
 
         line = sphere.lines.get(entity_line_id)
         if line and line.columns:
@@ -2345,7 +2589,8 @@ class GDSNavigator:
         # grouped patterns, which diverges from the global threshold.
         theta_norm = float(np.linalg.norm(pattern.theta))
         geom = self._storage.read_geometry(
-            pattern_id, version,
+            pattern_id,
+            version,
             columns=["primary_key", "delta_norm"],
             filter=f"delta_norm >= {theta_norm}" if theta_norm > 0.0 else "is_anomaly = true",
             sample_size=sample_size,
@@ -2368,17 +2613,18 @@ class GDSNavigator:
         # Read entity points — combine group_by + filter columns in single read
         read_cols = [group_by]
         if property_filters:
-            read_cols = list(dict.fromkeys(
-                read_cols + list(property_filters.keys())
-            ))
+            read_cols = list(dict.fromkeys(read_cols + list(property_filters.keys())))
         pts_tbl = self._storage.read_points_batch(
-            entity_line_id, version, anom_pks,
+            entity_line_id,
+            version,
+            anom_pks,
             columns=read_cols,
         )
 
         # Apply property_filters if set
         if property_filters:
             from hypertopos.engine.aggregation import _apply_event_filters
+
             pts_tbl = _apply_event_filters(pts_tbl, property_filters)
             # Narrow anom_pks/norms to surviving keys
             surviving = set(pts_tbl["primary_key"].to_pylist())
@@ -2386,14 +2632,15 @@ class GDSNavigator:
             anom_pks = [anom_pks[i] for i in keep]
             anom_norms = anom_norms[keep]
 
-        pk_to_norm = dict(zip(anom_pks, anom_norms.tolist()))
+        pk_to_norm = dict(zip(anom_pks, anom_norms.tolist(), strict=True))
 
         from collections import defaultdict
+
         groups: dict[str, list[tuple[str, float]]] = defaultdict(list)
         pks = pts_tbl["primary_key"].to_pylist()
         gvs = pts_tbl[group_by].to_pylist()
         seen_pks: set[str] = set()
-        for pk, gv in zip(pks, gvs):
+        for pk, gv in zip(pks, gvs, strict=True):
             if pk not in pk_to_norm or pk in seen_pks:
                 continue
             seen_pks.add(pk)
@@ -2458,7 +2705,8 @@ class GDSNavigator:
 
         version = self._resolve_version(pattern_id)
         geo = self._storage.read_geometry(
-            pattern_id, version,
+            pattern_id,
+            version,
             primary_key=self._position.primary_key,
             columns=["delta", "delta_norm", "is_anomaly", "delta_rank_pct"],
         )
@@ -2556,7 +2804,8 @@ class GDSNavigator:
                 if not final_pks:
                     # No matching rows — return empty table immediately
                     table = self._storage.read_geometry(
-                        event_pattern_id, version,
+                        event_pattern_id,
+                        version,
                         columns=_epf_cols,
                         filter="primary_key = '__no_match__'",
                     ).slice(0, 0)
@@ -2564,22 +2813,28 @@ class GDSNavigator:
                     escaped_pks = [p.replace("'", "''") for p in final_pks]
                     pk_filter = "primary_key IN ('" + "', '".join(escaped_pks) + "')"
                     table = self._storage.read_geometry(
-                        event_pattern_id, version, columns=_epf_cols,
+                        event_pattern_id,
+                        version,
+                        columns=_epf_cols,
                         filter=pk_filter,
                     )
             else:
                 # entity_keys index unavailable — fall back to full scan + Python filter
                 table = self._storage.read_geometry(
-                    event_pattern_id, version, point_keys=[entity_key],
+                    event_pattern_id,
+                    version,
+                    point_keys=[entity_key],
                     columns=_epf_cols,
                 )
                 sphere = self._storage.read_sphere()
                 _ep = sphere.patterns[event_pattern_id]
                 line_ids_col, pt_keys_col = _table_edge_line_and_point_keys(
-                    table, _ep.relations,
+                    table,
+                    _ep.relations,
                 )
                 keep = [
-                    i for i, (row_lids, row_pks) in enumerate(
+                    i
+                    for i, (row_lids, row_pks) in enumerate(
                         zip(line_ids_col, pt_keys_col, strict=False)
                     )
                     if all(
@@ -2590,15 +2845,13 @@ class GDSNavigator:
                         for f in filters
                     )
                 ]
-                table = (
-                    table.take(pa.array(keep, type=pa.int64()))
-                    if keep
-                    else table.slice(0, 0)
-                )
+                table = table.take(pa.array(keep, type=pa.int64())) if keep else table.slice(0, 0)
         else:
             # No filters — use entity_keys scan
             table = self._storage.read_geometry(
-                event_pattern_id, version, point_keys=[entity_key],
+                event_pattern_id,
+                version,
+                point_keys=[entity_key],
                 columns=_epf_cols,
             )
         # Record total before geometry_filters are applied so callers can
@@ -2617,8 +2870,13 @@ class GDSNavigator:
                 )
             if "delta_rank_pct" in geometry_filters:
                 spec = geometry_filters["delta_rank_pct"]
-                _ops = {"gt": pc.greater, "gte": pc.greater_equal,
-                        "lt": pc.less, "lte": pc.less_equal, "eq": pc.equal}
+                _ops = {
+                    "gt": pc.greater,
+                    "gte": pc.greater_equal,
+                    "lt": pc.less,
+                    "lte": pc.less_equal,
+                    "eq": pc.equal,
+                }
                 if isinstance(spec, dict):
                     mask = None
                     for op_name, value in spec.items():
@@ -2636,8 +2894,11 @@ class GDSNavigator:
                 event_pattern = sphere.patterns[event_pattern_id]
                 delta_dim_spec = geometry_filters["delta_dim"]
                 _pc_ops = {
-                    "gt": pc.greater, "gte": pc.greater_equal,
-                    "lt": pc.less, "lte": pc.less_equal, "eq": pc.equal,
+                    "gt": pc.greater,
+                    "gte": pc.greater_equal,
+                    "lt": pc.less,
+                    "lte": pc.less_equal,
+                    "eq": pc.equal,
                 }
                 mask = None
                 for dim_name, predicates in delta_dim_spec.items():
@@ -2647,8 +2908,7 @@ class GDSNavigator:
                     for op_name, threshold in predicates.items():
                         if op_name not in _pc_ops:
                             raise ValueError(
-                                f"Unknown comparison op '{op_name}'. "
-                                f"Supported: {list(_pc_ops)}"
+                                f"Unknown comparison op '{op_name}'. Supported: {list(_pc_ops)}"
                             )
                         pred = _pc_ops[op_name](col, float(threshold))
                         mask = pred if mask is None else pc.and_(mask, pred)
@@ -2673,23 +2933,24 @@ class GDSNavigator:
         for i in range(table.num_rows):
             row = {col: table[col][i].as_py() for col in table.schema.names}
             edges = _reconstruct_edges_from_row(row, _ep.relations)
-            results.append(Polygon(
-                primary_key=row["primary_key"],
-                pattern_id=row.get("pattern_id", event_pattern_id),
-                pattern_ver=row.get("pattern_ver", version),
-                pattern_type=row.get("pattern_type", _ep.pattern_type),
-                scale=row["scale"],
-                delta=np.array(row["delta"], dtype=np.float32),
-                delta_norm=float(row["delta_norm"]),
-                is_anomaly=bool(row["is_anomaly"]),
-                edges=edges,
-                last_refresh_at=row["last_refresh_at"],
-                updated_at=row["updated_at"],
-                delta_rank_pct=(
-                    None if row.get("delta_rank_pct") is None
-                    else float(row["delta_rank_pct"])
-                ),
-            ))
+            results.append(
+                Polygon(
+                    primary_key=row["primary_key"],
+                    pattern_id=row.get("pattern_id", event_pattern_id),
+                    pattern_ver=row.get("pattern_ver", version),
+                    pattern_type=row.get("pattern_type", _ep.pattern_type),
+                    scale=row["scale"],
+                    delta=np.array(row["delta"], dtype=np.float32),
+                    delta_norm=float(row["delta_norm"]),
+                    is_anomaly=bool(row["is_anomaly"]),
+                    edges=edges,
+                    last_refresh_at=row["last_refresh_at"],
+                    updated_at=row["updated_at"],
+                    delta_rank_pct=(
+                        None if row.get("delta_rank_pct") is None else float(row["delta_rank_pct"])
+                    ),
+                )
+            )
 
         # Apply random sampling if requested (post-construction, pre-return)
         if sample_size is not None or sample_pct is not None:
@@ -2697,7 +2958,7 @@ class GDSNavigator:
             if sample_pct is not None:
                 n = max(1, min(int(total_polygons * sample_pct), total_polygons))
             else:
-                n = min(sample_size, total_polygons)  # type: ignore[arg-type]
+                n = min(cast(int, sample_size), total_polygons)  # not None: guarded above
             if n < total_polygons:
                 rng = np.random.default_rng(seed)
                 chosen = sorted(rng.choice(total_polygons, size=n, replace=False))
@@ -2713,18 +2974,21 @@ class GDSNavigator:
         top_n: int = 10,
         fdr_alpha: float | None = None,
         fdr_method: str = "bh",
-        p_value_method: str = "rank",
+        p_value_method: str = "chi2",
         select: str = "top_norm",
     ) -> list[tuple[Polygon, float]]:
         """Find entities closest to an alias segment boundary (cutting plane).
 
         Returns (polygon, signed_distance) pairs sorted by |signed_distance|.
         signed_distance >= 0 → inside segment, < 0 → outside segment.
+
+        ``fdr_alpha`` (optional) filters the boundary set by BH/Storey FDR on
+        χ² model p-values of ``||delta||²`` (``p_value_method='chi2'``, the
+        only accepted value).
         """
+        _validate_p_value_method(p_value_method)
         if fdr_method not in ("bh", "storey"):
-            raise ValueError(
-                f"fdr_method must be 'bh' or 'storey', got {fdr_method!r}"
-            )
+            raise ValueError(f"fdr_method must be 'bh' or 'storey', got {fdr_method!r}")
         sphere = self._storage.read_sphere()
         alias = sphere.aliases.get(alias_id)
         if alias is None:
@@ -2739,7 +3003,9 @@ class GDSNavigator:
 
         # Pass 1: light scan — only delta needed for boundary ranking
         light = self._storage.read_geometry(
-            pattern_id, version, columns=["primary_key", "delta"],
+            pattern_id,
+            version,
+            columns=["primary_key", "delta"],
         )
         if light.num_rows == 0:
             return []
@@ -2774,15 +3040,16 @@ class GDSNavigator:
             for li in rank_order
         }
         delta_lookup = {
-            str(light["primary_key"][i].as_py()): delta_matrix[i].copy()
-            for i in top_orig_idx
+            str(light["primary_key"][i].as_py()): delta_matrix[i].copy() for i in top_orig_idx
         }
 
         # Pass 2: full rows for top-N only (Lance pushdown on primary_key)
         escaped = [k.replace("'", "''") for k in top_keys]
         pk_in = ", ".join(f"'{k}'" for k in escaped)
         full = self._storage.read_geometry(
-            pattern_id, version, filter=f"primary_key IN ({pk_in})",
+            pattern_id,
+            version,
+            filter=f"primary_key IN ({pk_in})",
             columns=self._POLYGON_COLUMNS,
         )
 
@@ -2807,8 +3074,7 @@ class GDSNavigator:
                 last_refresh_at=row["last_refresh_at"],
                 updated_at=row["updated_at"],
                 delta_rank_pct=(
-                    None if row.get("delta_rank_pct") is None
-                    else float(row["delta_rank_pct"])
+                    None if row.get("delta_rank_pct") is None else float(row["delta_rank_pct"])
                 ),
             )
             results.append((polygon, signed_dist))
@@ -2817,13 +3083,27 @@ class GDSNavigator:
         # --- FDR + diverse selection post-processing ---
         if fdr_alpha is not None or select != "top_norm":
             polygons = [p for p, _ in results]
-            polygons = self._apply_fdr_select_polygons(
-                polygons, fdr_alpha=fdr_alpha, select=select, top_n=top_n,
-                fdr_method=fdr_method, p_value_method=p_value_method,
-                pattern_df=len(pattern.theta) if p_value_method == "chi2" else None,
-                fdr_axis="entity",
+            # Boundary candidates are not the most-extreme prefix, so the
+            # population-sized BH is conservative here (rank_offset = 0).
+            _n_tests, _pi0 = self._fdr_population(
+                pattern_id,
+                pattern,
+                fdr_alpha=fdr_alpha,
+                fdr_method=fdr_method,
+                n_candidates=len(polygons),
             )
-            kept_keys = {p.primary_key for p in polygons}
+            polygons = self._apply_fdr_select_polygons(
+                polygons,
+                fdr_alpha=fdr_alpha,
+                select=select,
+                top_n=top_n,
+                fdr_method=fdr_method,
+                p_value_method=p_value_method,
+                pattern_df=len(pattern.theta),
+                fdr_axis="entity",
+                n_tests=_n_tests,
+                pi0=_pi0,
+            )
             dist_lookup = {p.primary_key: d for p, d in results}
             results = [(p, dist_lookup[p.primary_key]) for p in polygons]
 
@@ -2832,9 +3112,9 @@ class GDSNavigator:
     def contrast_populations(
         self,
         pattern_id: str,
-        group_a: dict,
-        group_b: dict | None = None,
-    ) -> list[dict]:
+        group_a: dict[str, Any],
+        group_b: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
         """Compare two entity groups dimension-by-dimension.
 
         Returns per-dimension contrast sorted by |effect_size| descending,
@@ -2865,15 +3145,13 @@ class GDSNavigator:
             else self._resolve_group_mask(group_b, table, keys, delta_matrix, pattern_id)
         )
 
-        dim_labels = (
-            [rel.display_name or rel.line_id for rel in pattern.relations]
-            + list(pattern.prop_columns)
+        return self._engine.contrast_populations(
+            delta_matrix, mask_a, mask_b, list(pattern.dim_labels)
         )
-        return self._engine.contrast_populations(delta_matrix, mask_a, mask_b, dim_labels)
 
     def _resolve_group_mask(
         self,
-        group_spec: dict,
+        group_spec: dict[str, Any],
         table: Any,
         keys: list[str],
         delta_matrix: np.ndarray,
@@ -2883,7 +3161,8 @@ class GDSNavigator:
         if "anomaly" in group_spec:
             target = bool(group_spec["anomaly"])
             anomaly_arr = table["is_anomaly"].combine_chunks().to_numpy(zero_copy_only=False)
-            return anomaly_arr == target
+            anomaly_mask: np.ndarray = anomaly_arr == target
+            return anomaly_mask
         if "keys" in group_spec:
             key_set = set(group_spec["keys"])
             mask = np.array([k in key_set for k in keys])
@@ -2933,7 +3212,8 @@ class GDSNavigator:
             _rels = _pat.relations if _pat else None
             # Derive alive-only line_ids and point_keys — edges struct or entity_keys fallback
             line_ids_col, pt_keys_col = _table_edge_line_and_point_keys(
-                table, _rels,
+                table,
+                _rels,
             )
             # Guard: detect continuous-mode patterns (edge_max) — all point_keys are ""
             # Sample first rows for the target line; if all keys are "" → continuous mode.
@@ -2951,7 +3231,7 @@ class GDSNavigator:
                     f"continuous mode (edge_max) — edges store counts, not entity keys. "
                     f"Specify the group by 'anomaly', 'keys', or 'alias' instead."
                 )
-            mask = []
+            match_flags: list[bool] = []
             for i in range(len(keys)):
                 row_lines = line_ids_col[i] or []
                 row_keys = pt_keys_col[i] or []
@@ -2959,8 +3239,8 @@ class GDSNavigator:
                     pk == target_key and (target_line is None or lid == target_line)
                     for lid, pk in zip(row_lines, row_keys, strict=False)
                 )
-                mask.append(matched)
-            return np.array(mask)
+                match_flags.append(matched)
+            return np.array(match_flags)
         raise GDSNavigationError(
             "Unknown group spec: expected 'anomaly', 'keys', 'alias', or 'edge' key, "
             f"got {list(group_spec.keys())}"
@@ -2973,7 +3253,8 @@ class GDSNavigator:
         group_by_property: str | None = None,
         sample_size: int | None = None,
         include_drift: bool = True,
-    ) -> dict:
+        max_groups: int | None = None,
+    ) -> dict[str, Any]:
         """Compute centroid map — meta-geometry of entity groups.
 
         Groups entities by their edge to ``group_by_line`` (or by a property
@@ -2985,6 +3266,9 @@ class GDSNavigator:
             group_by_line: Line ID whose edges define group membership.
             group_by_property: Optional ``"line_id:property"`` — use property
                 value as group label instead of edge key.
+            max_groups: keep the largest ``max_groups`` groups by member count
+                (the structural outlier is always kept); distances and drift are
+                computed for the kept groups only. None keeps every group.
 
         Returns:
             Dict with global_centroid, group_centroids, inter_centroid_distances,
@@ -3040,9 +3324,13 @@ class GDSNavigator:
         _total_before_sample = table.num_rows
         if sample_size is not None and table.num_rows > sample_size:
             rng = np.random.default_rng(42)
-            idx = np.sort(rng.choice(
-                table.num_rows, size=sample_size, replace=False,
-            ))
+            idx = np.sort(
+                rng.choice(
+                    table.num_rows,
+                    size=sample_size,
+                    replace=False,
+                )
+            )
             table = table.take(pa.array(idx, type=pa.int64()))
             _sampled = True
 
@@ -3055,7 +3343,10 @@ class GDSNavigator:
             raw_labels = keys
         else:
             raw_labels = self._extract_group_labels(
-                table, keys, group_by_line, pattern.relations,
+                table,
+                keys,
+                group_by_line,
+                pattern.relations,
             )
 
         # Fallback guard: detect continuous-mode patterns (all edge keys empty → no FK stored).
@@ -3077,7 +3368,9 @@ class GDSNavigator:
                 )
             prop_line_id, prop_name = group_by_property.split(":", 1)
             prop_version = self._manifest.line_version(prop_line_id) or 1
-            prop_table = self._storage.read_points(prop_line_id, prop_version)
+            prop_table = self._storage.read_points(
+                prop_line_id, prop_version, columns=["primary_key", prop_name]
+            )
             prop_keys = prop_table["primary_key"].to_pylist()
             prop_vals = prop_table[prop_name].to_pylist()
             prop_lookup = {
@@ -3096,12 +3389,13 @@ class GDSNavigator:
         filtered_keys = [k for k, lb in zip(keys, labels, strict=False) if lb is not None]
         labels = [lb for lb in labels if lb is not None]
 
-        dim_labels = (
-            [rel.display_name or rel.line_id for rel in pattern.relations]
-            + list(pattern.prop_columns)
-        )
+        dim_labels = list(pattern.dim_labels)
         result = self._engine.compute_centroid_map(
-            delta_matrix, labels, dim_labels, entity_keys=filtered_keys
+            delta_matrix,
+            cast("list[str]", labels),
+            dim_labels,
+            entity_keys=filtered_keys,
+            max_groups=max_groups,
         )
         if _sampled:
             result["sampled"] = True
@@ -3120,7 +3414,9 @@ class GDSNavigator:
                 for pk in member_keys:
                     try:
                         solid = self._engine.build_solid(
-                            pk, pattern_id, self._manifest,
+                            pk,
+                            pattern_id,
+                            self._manifest,
                         )
                     except _NAVIGATION_RECOVERABLE_ERRORS:
                         continue
@@ -3128,24 +3424,23 @@ class GDSNavigator:
                         continue
                     deltas_arr = [s.delta_snapshot for s in solid.slices]
                     traj = extrapolate_trajectory(deltas_arr, horizon=1)
-                    drift = (
-                        traj.predicted_delta
-                        - deltas_arr[-1].astype(np.float32)
-                    )
+                    drift = traj.predicted_delta - deltas_arr[-1].astype(np.float32)
                     drift_vectors.append(drift)
                     n_samples += 1
                 if drift_vectors:
                     avg_drift = np.mean(drift_vectors, axis=0)
+                    # Temporal slices hold the leading structural dims only, so
+                    # the drift may be shorter than dim_labels; label it.
                     g["centroid_drift"] = {
-                        "direction": [
-                            round(float(v), 6) for v in avg_drift
-                        ],
+                        "direction": {
+                            label: round(float(v), 6)
+                            for label, v in zip(dim_labels, avg_drift, strict=False)
+                        },
                         "magnitude": round(
-                            float(np.linalg.norm(avg_drift)), 6,
+                            float(np.linalg.norm(avg_drift)),
+                            6,
                         ),
-                        "reliability": (
-                            "medium" if n_samples >= 3 else "low"
-                        ),
+                        "reliability": ("medium" if n_samples >= 3 else "low"),
                     }
 
         return result
@@ -3155,7 +3450,7 @@ class GDSNavigator:
         table: Any,
         keys: list[str],
         group_by_line: str,
-        relations: list | None = None,
+        relations: list[Any] | None = None,
     ) -> list[str | None]:
         """Extract group label per row from edges or entity_keys for a given line_id.
 
@@ -3166,7 +3461,8 @@ class GDSNavigator:
         or ``None`` if the entity has no edge to that line.
         """
         line_ids_col, pt_keys_col = _table_edge_line_and_point_keys(
-            table, relations,
+            table,
+            relations,
         )
         labels: list[str | None] = []
         for i in range(len(keys)):
@@ -3228,7 +3524,10 @@ class GDSNavigator:
                 )
 
         table = self._storage.read_geometry(
-            pattern_id, version, primary_key=primary_key, columns=["delta"],
+            pattern_id,
+            version,
+            primary_key=primary_key,
+            columns=["delta"],
         )
         if table.num_rows == 0:
             raise KeyError(f"Entity '{primary_key}' not found in {pattern_id} v{version}")
@@ -3246,10 +3545,7 @@ class GDSNavigator:
                 if name in labels:
                     dim_mask_indices.append(labels.index(name))
                 else:
-                    raise ValueError(
-                        f"Unknown dimension '{name}' in dim_mask. "
-                        f"Available: {labels}"
-                    )
+                    raise ValueError(f"Unknown dimension '{name}' in dim_mask. Available: {labels}")
         if metric not in ("L2", "cosine"):
             raise ValueError(f"metric must be 'L2' or 'cosine', got '{metric}'")
 
@@ -3272,7 +3568,8 @@ class GDSNavigator:
             candidate_keys = {k for k, _ in results}
             _pat = sphere.patterns[pattern_id]
             geo = self._storage.read_geometry(
-                pattern_id, version,
+                pattern_id,
+                version,
                 columns=["primary_key", "edges", "entity_keys"],
             )
             key_col = geo.column("primary_key")
@@ -3281,10 +3578,9 @@ class GDSNavigator:
             pk_list = geo.column("primary_key").to_pylist()
             eli_list = _table_edge_line_ids(geo, _pat.relations)
             eli_map = dict(zip(pk_list, eli_list, strict=False))
-            results = [
-                (k, d) for k, d in results
-                if missing_edge_to not in (eli_map.get(k) or [])
-            ][:top_n]
+            results = [(k, d) for k, d in results if missing_edge_to not in (eli_map.get(k) or [])][
+                :top_n
+            ]
 
         # B17: detect degenerate ANN results (many identical delta vectors)
         degenerate_warning = None
@@ -3299,9 +3595,7 @@ class GDSNavigator:
         is_anomaly_map: dict[str, bool] | None = None
         if with_neighbor_anomaly and results:
             full_map = self._get_anomaly_map(pattern_id, version)
-            is_anomaly_map = {
-                k: full_map[k] for k, _ in results if k in full_map
-            }
+            is_anomaly_map = {k: full_map[k] for k, _ in results if k in full_map}
         elif with_neighbor_anomaly:
             is_anomaly_map = {}
 
@@ -3315,7 +3609,7 @@ class GDSNavigator:
         self,
         primary_key: str,
         pattern_id: str,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Read stored geometry metadata for a single entity.
 
         Returns dict with delta_norm (float), is_anomaly (bool), delta_rank_pct (float | None).
@@ -3324,7 +3618,10 @@ class GDSNavigator:
         version = self._resolve_version(pattern_id)
         cols = ["delta_norm", "is_anomaly", "delta_rank_pct"]
         table = self._storage.read_geometry(
-            pattern_id, version, primary_key=primary_key, columns=cols,
+            pattern_id,
+            version,
+            primary_key=primary_key,
+            columns=cols,
         )
         if table.num_rows == 0:
             raise KeyError(f"Entity '{primary_key}' not found in {pattern_id} v{version}")
@@ -3340,7 +3637,7 @@ class GDSNavigator:
         key_a: str,
         key_b: str,
         pattern_id: str,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Compare two entities by their stored delta vectors (direct key lookup).
 
         Reads delta from the geometry Lance dataset via primary_key BTREE index —
@@ -3354,13 +3651,19 @@ class GDSNavigator:
         cols = ["primary_key", "delta", "delta_norm", "delta_rank_pct", "is_anomaly"]
 
         table_a = self._storage.read_geometry(
-            pattern_id, version, primary_key=key_a, columns=cols,
+            pattern_id,
+            version,
+            primary_key=key_a,
+            columns=cols,
         )
         if table_a.num_rows == 0:
             raise KeyError(f"Entity '{key_a}' not found in {pattern_id} v{version}")
 
         table_b = self._storage.read_geometry(
-            pattern_id, version, primary_key=key_b, columns=cols,
+            pattern_id,
+            version,
+            primary_key=key_b,
+            columns=cols,
         )
         if table_b.num_rows == 0:
             raise KeyError(f"Entity '{key_b}' not found in {pattern_id} v{version}")
@@ -3377,10 +3680,14 @@ class GDSNavigator:
             return float(val) if val is not None else None
 
         interpretation = (
-            "identical shapes" if distance == 0.0
-            else "very similar" if distance < 0.1
-            else "similar" if distance < 0.5
-            else "moderately different" if distance < 1.0
+            "identical shapes"
+            if distance == 0.0
+            else "very similar"
+            if distance < 0.1
+            else "similar"
+            if distance < 0.5
+            else "moderately different"
+            if distance < 1.0
             else "very different"
         )
 
@@ -3410,9 +3717,12 @@ class GDSNavigator:
         solid_b = self._engine.build_solid(key_b, pattern_id, self._manifest)
         dist = self._engine.compute_distance_temporal(solid_a, solid_b)
         interpretation = (
-            "identical history" if dist == 0.0
-            else "similar history" if dist < 1.0
-            else "divergent history" if dist < 3.0
+            "identical history"
+            if dist == 0.0
+            else "similar history"
+            if dist < 1.0
+            else "divergent history"
+            if dist < 3.0
             else "very different history"
         )
         return {
@@ -3496,35 +3806,38 @@ class GDSNavigator:
                 timestamp_to=timestamp_cutoff,
                 columns=["from_key", "timestamp", "amount", "event_key"],
             )
-            fwd_edges = list(zip(
-                from_tbl["to_key"].to_pylist(),
-                from_tbl["timestamp"].to_pylist(),
-                from_tbl["amount"].to_pylist(),
-                from_tbl["event_key"].to_pylist(),
-                strict=True,
-            ))
-            rev_edges = list(zip(
-                to_tbl["from_key"].to_pylist(),
-                to_tbl["timestamp"].to_pylist(),
-                to_tbl["amount"].to_pylist(),
-                to_tbl["event_key"].to_pylist(),
-                strict=True,
-            ))
+            fwd_edges = list(
+                zip(
+                    from_tbl["to_key"].to_pylist(),
+                    from_tbl["timestamp"].to_pylist(),
+                    from_tbl["amount"].to_pylist(),
+                    from_tbl["event_key"].to_pylist(),
+                    strict=True,
+                )
+            )
+            rev_edges = list(
+                zip(
+                    to_tbl["from_key"].to_pylist(),
+                    to_tbl["timestamp"].to_pylist(),
+                    to_tbl["amount"].to_pylist(),
+                    to_tbl["event_key"].to_pylist(),
+                    strict=True,
+                )
+            )
 
-        def _group(edges: list, top_n: int) -> list[dict[str, Any]]:
+        def _group(edges: list[Any], top_n: int) -> list[dict[str, Any]]:
             if not edges:
                 return []
             from collections import defaultdict
+
             agg: dict[str, list[float]] = defaultdict(list)
             for target, _ts, amount, _ek in edges:
                 agg[target].append(amount)
+            # tx_count desc, ties by the emitted (rounded) amount_sum desc, then
+            # key asc — rounding keeps the order independent of summation order
             pairs = sorted(
-                [
-                    (k, len(amounts), sum(amounts), max(amounts))
-                    for k, amounts in agg.items()
-                ],
-                key=lambda x: x[1],
-                reverse=True,
+                [(k, len(amounts), sum(amounts), max(amounts)) for k, amounts in agg.items()],
+                key=lambda x: (-x[1], -round(float(x[2]), 2), _cp_key_order(x[0])),
             )[:top_n]
             return [
                 {
@@ -3536,13 +3849,13 @@ class GDSNavigator:
                 for k, c, s, m in pairs
             ]
 
-        outgoing = _group(fwd_edges, top_n)
-        incoming = _group(rev_edges, top_n)
+        # A transfer to itself is not a counterparty relation; count it apart.
+        n_self = sum(1 for e in fwd_edges if e[0] == primary_key)
+        outgoing = _group([e for e in fwd_edges if e[0] != primary_key], top_n)
+        incoming = _group([e for e in rev_edges if e[0] != primary_key], top_n)
 
         # Anomaly enrichment via anchor pattern geometry
-        scoring_pattern = (
-            self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
-        )
+        scoring_pattern = self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
         all_cp_keys = {e["key"] for e in outgoing} | {e["key"] for e in incoming}
         geo_lookup: dict[str, dict[str, Any]] = {}
         _enrichment_warning: str | None = None
@@ -3554,8 +3867,10 @@ class GDSNavigator:
                 # Detect composite-key patterns by sampling one geometry PK
                 _composite_map: dict[str, str] = {}
                 _geo_sample = self._storage.read_geometry(
-                    scoring_pattern, geo_version,
-                    columns=["primary_key"], sample_size=1,
+                    scoring_pattern,
+                    geo_version,
+                    columns=["primary_key"],
+                    sample_size=1,
                 )
                 if _geo_sample.num_rows > 0:
                     _sample_pk = str(_geo_sample["primary_key"][0].as_py())
@@ -3568,12 +3883,14 @@ class GDSNavigator:
                 # Read geometry — use point_keys for direct match, full scan for composite
                 if _composite_map:
                     geo = self._storage.read_geometry(
-                        scoring_pattern, geo_version,
+                        scoring_pattern,
+                        geo_version,
                         columns=["primary_key", "is_anomaly", "delta_rank_pct"],
                     )
                 else:
                     geo = self._storage.read_geometry(
-                        scoring_pattern, geo_version,
+                        scoring_pattern,
+                        geo_version,
                         point_keys=list(all_cp_keys),
                         columns=["primary_key", "is_anomaly", "delta_rank_pct"],
                     )
@@ -3583,7 +3900,8 @@ class GDSNavigator:
                     _data = {
                         "is_anomaly": bool(geo["is_anomaly"][i].as_py()),
                         "delta_rank_pct": round(
-                            float(geo["delta_rank_pct"][i].as_py()), 2,
+                            float(geo["delta_rank_pct"][i].as_py()),
+                            2,
                         ),
                     }
                     if pk in all_cp_keys:
@@ -3617,6 +3935,7 @@ class GDSNavigator:
                 "total_incoming": len(incoming),
                 "anomalous_outgoing": anomalous_out,
                 "anomalous_incoming": anomalous_in,
+                "self_transfers": n_self,
             },
         }
         if _enrichment_warning:
@@ -3644,6 +3963,11 @@ class GDSNavigator:
         If *pattern_id* is provided, each counterparty is enriched with ``is_anomaly``
         and ``delta_rank_pct`` from that pattern's geometry.
 
+        Each direction is ordered by ``tx_count`` descending; ties are broken
+        by ``amount_sum`` descending (edge-table path only) and then by
+        counterparty key ascending, so a ``top_n`` cut inside a tie is
+        deterministic.
+
         ``timestamp_cutoff`` restricts the lookup to edges with
         ``timestamp <= timestamp_cutoff``. **Edge-table fast path only.** The
         points-scan fallback has no timestamp column available and cannot
@@ -3654,13 +3978,12 @@ class GDSNavigator:
         Returns ``{primary_key, outgoing, incoming, summary}``.
         """
         # Fast path: edge table BTREE lookup
-        if (
-            pattern_id
-            and use_edge_table
-            and self._storage.has_edge_table(pattern_id)
-        ):
+        if pattern_id and use_edge_table and self._storage.has_edge_table(pattern_id):
             return self._find_counterparties_via_edges(
-                primary_key, line_id, pattern_id, top_n,
+                primary_key,
+                line_id,
+                pattern_id,
+                top_n,
                 timestamp_cutoff=timestamp_cutoff,
             )
 
@@ -3686,33 +4009,32 @@ class GDSNavigator:
         for col in (from_col, to_col):
             if col not in available:
                 raise GDSNavigationError(
-                    f"Column '{col}' not found in line '{line_id}'. "
-                    f"Available: {sorted(available)}"
+                    f"Column '{col}' not found in line '{line_id}'. Available: {sorted(available)}"
                 )
         points = points.select([c for c in needed_cols if c in available])
 
         # Outgoing: rows where from_col == primary_key → group by to_col
         out_mask = pc.equal(points[from_col], primary_key)
         out_rows = points.filter(out_mask)
-        out_grouped = out_rows.group_by(to_col).aggregate(
-            [("primary_key", "count")]
-        )
+        out_grouped = out_rows.group_by(to_col).aggregate([("primary_key", "count")])
         out_keys_col = out_grouped[to_col].to_pylist()
         out_counts = out_grouped["primary_key_count"].to_pylist()
+        n_self = sum(c for k, c in zip(out_keys_col, out_counts, strict=True) if k == primary_key)
+        # tx_count desc, ties by key asc (no amounts on the points scan)
         out_pairs = sorted(
-            zip(out_keys_col, out_counts, strict=False), key=lambda x: x[1], reverse=True
+            ((k, c) for k, c in zip(out_keys_col, out_counts, strict=True) if k != primary_key),
+            key=lambda x: (-x[1], _cp_key_order(x[0])),
         )[:top_n]
 
         # Incoming: rows where to_col == primary_key → group by from_col
         in_mask = pc.equal(points[to_col], primary_key)
         in_rows = points.filter(in_mask)
-        in_grouped = in_rows.group_by(from_col).aggregate(
-            [("primary_key", "count")]
-        )
+        in_grouped = in_rows.group_by(from_col).aggregate([("primary_key", "count")])
         in_keys_col = in_grouped[from_col].to_pylist()
         in_counts = in_grouped["primary_key_count"].to_pylist()
         in_pairs = sorted(
-            zip(in_keys_col, in_counts, strict=False), key=lambda x: x[1], reverse=True
+            ((k, c) for k, c in zip(in_keys_col, in_counts, strict=True) if k != primary_key),
+            key=lambda x: (-x[1], _cp_key_order(x[0])),
         )[:top_n]
 
         # Anomaly enrichment — handles both direct and composite-key patterns
@@ -3721,8 +4043,7 @@ class GDSNavigator:
         if pattern_id:
             if pattern_id not in sphere.patterns:
                 raise GDSNavigationError(
-                    f"Pattern '{pattern_id}' not found. "
-                    f"Available: {sorted(sphere.patterns)}"
+                    f"Pattern '{pattern_id}' not found. Available: {sorted(sphere.patterns)}"
                 )
             geo_version = self._resolve_version(pattern_id)
             all_cp_keys = {k for k, _ in out_pairs} | {k for k, _ in in_pairs}
@@ -3730,8 +4051,10 @@ class GDSNavigator:
             # Detect composite-key patterns by sampling one geometry PK
             _composite_map: dict[str, str] = {}
             _geo_sample = self._storage.read_geometry(
-                pattern_id, geo_version,
-                columns=["primary_key"], sample_size=1,
+                pattern_id,
+                geo_version,
+                columns=["primary_key"],
+                sample_size=1,
             )
             if _geo_sample.num_rows > 0:
                 _sample_pk = str(_geo_sample["primary_key"][0].as_py())
@@ -3742,7 +4065,8 @@ class GDSNavigator:
                         break
 
             geo = self._storage.read_geometry(
-                pattern_id, geo_version,
+                pattern_id,
+                geo_version,
                 columns=["primary_key", "is_anomaly", "delta_rank_pct"],
             )
             geo_pks = geo["primary_key"].to_pylist()
@@ -3751,9 +4075,7 @@ class GDSNavigator:
             for pk, anom, rank in zip(geo_pks, geo_anom, geo_rank, strict=False):
                 _data = {
                     "is_anomaly": bool(anom),
-                    "delta_rank_pct": (
-                        round(float(rank), 2) if rank is not None else None
-                    ),
+                    "delta_rank_pct": (round(float(rank), 2) if rank is not None else None),
                 }
                 if pk in all_cp_keys:
                     geo_lookup[pk] = _data
@@ -3789,6 +4111,7 @@ class GDSNavigator:
                 "total_incoming": len(incoming),
                 "anomalous_outgoing": anomalous_out,
                 "anomalous_incoming": anomalous_in,
+                "self_transfers": n_self,
             },
         }
         if _enrichment_warning:
@@ -3817,14 +4140,14 @@ class GDSNavigator:
         """
         if not self._storage.has_edge_table(pattern_id):
             raise GDSNavigationError(
-                f"Pattern '{pattern_id}' has no edge table. "
-                "entity_flow requires an edge table."
+                f"Pattern '{pattern_id}' has no edge table. entity_flow requires an edge table."
             )
         adj = self._storage.get_adjacency(pattern_id)
         fwd_edges = adj.neighbors_out(primary_key, ts_to=timestamp_cutoff)
         rev_edges = adj.neighbors_in(primary_key, ts_to=timestamp_cutoff)
 
         from collections import defaultdict
+
         out_by_cp: dict[str, float] = defaultdict(float)
         for target, _ts, amount, _ek in fwd_edges:
             out_by_cp[target] += amount
@@ -3844,12 +4167,18 @@ class GDSNavigator:
             cp_out = out_by_cp.get(cp, 0.0)
             cp_in = in_by_cp.get(cp, 0.0)
             cp_net = cp_out - cp_in
-            cp_flows.append({
-                "key": cp,
-                "net_flow": round(cp_net, 2),
-                "direction": "outgoing" if cp_net > 0 else "incoming" if cp_net < 0 else "balanced",
-            })
-        cp_flows.sort(key=lambda x: abs(x["net_flow"]), reverse=True)
+            cp_flows.append(
+                {
+                    "key": cp,
+                    "net_flow": round(cp_net, 2),
+                    "direction": "outgoing"
+                    if cp_net > 0
+                    else "incoming"
+                    if cp_net < 0
+                    else "balanced",
+                }
+            )
+        cp_flows.sort(key=lambda x: (-abs(x["net_flow"]), str(x["key"])))
         cp_flows = cp_flows[:top_n]
 
         return {
@@ -3858,7 +4187,11 @@ class GDSNavigator:
             "outgoing_total": round(outgoing_total, 2),
             "incoming_total": round(incoming_total, 2),
             "net_flow": round(net_flow, 2),
-            "flow_direction": "outgoing" if net_flow > 0 else "incoming" if net_flow < 0 else "balanced",
+            "flow_direction": "outgoing"
+            if net_flow > 0
+            else "incoming"
+            if net_flow < 0
+            else "balanced",
             "counterparties": cp_flows,
         }
 
@@ -3884,14 +4217,30 @@ class GDSNavigator:
         """
         if not self._storage.has_edge_table(pattern_id):
             raise GDSNavigationError(
-                f"Pattern '{pattern_id}' has no edge table. "
-                "contagion_score requires an edge table."
+                f"Pattern '{pattern_id}' has no edge table. contagion_score requires an edge table."
             )
-        adj = self._storage.get_adjacency(pattern_id)
-        fwd_edges = adj.neighbors_out(primary_key, ts_to=timestamp_cutoff)
-        rev_edges = adj.neighbors_in(primary_key, ts_to=timestamp_cutoff)
-
-        cp_keys: set[str] = {e[0] for e in fwd_edges} | {e[0] for e in rev_edges}
+        adj_cache = getattr(self._storage, "_adjacency_cache", None)
+        if isinstance(adj_cache, dict) and pattern_id in adj_cache:
+            adj = self._storage.get_adjacency(pattern_id)
+            fwd_edges = adj.neighbors_out(primary_key, ts_to=timestamp_cutoff)
+            rev_edges = adj.neighbors_in(primary_key, ts_to=timestamp_cutoff)
+            cp_keys: set[str] = {e[0] for e in fwd_edges} | {e[0] for e in rev_edges}
+        else:
+            # Cold path: one entity needs only its own edges — a key-filtered
+            # read of the edge table, not the full adjacency index build.
+            out_tbl = self._storage.read_edges(
+                pattern_id,
+                from_keys=[primary_key],
+                timestamp_to=timestamp_cutoff,
+                columns=["to_key"],
+            )
+            in_tbl = self._storage.read_edges(
+                pattern_id,
+                to_keys=[primary_key],
+                timestamp_to=timestamp_cutoff,
+                columns=["from_key"],
+            )
+            cp_keys = set(out_tbl["to_key"].to_pylist()) | set(in_tbl["from_key"].to_pylist())
         cp_keys.discard(primary_key)
 
         total = len(cp_keys)
@@ -3905,12 +4254,12 @@ class GDSNavigator:
                 "interpretation": "No counterparties found.",
             }
 
-        scoring_pattern = (
-            self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
-        )
+        scoring_pattern = self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
         try:
             batch = self.check_anomaly_batch(
-                scoring_pattern, list(cp_keys), max_keys=500,
+                scoring_pattern,
+                list(cp_keys),
+                max_keys=500,
             )
             anomalous = batch["anomalous_count"]
         except GDSNavigationError:
@@ -3924,8 +4273,7 @@ class GDSNavigator:
             "total_counterparties": total,
             "anomalous_counterparties": anomalous,
             "interpretation": (
-                f"{anomalous}/{total} counterparties are anomalous "
-                f"(contagion score {score:.2f})."
+                f"{anomalous}/{total} counterparties are anomalous (contagion score {score:.2f})."
             ),
         }
 
@@ -3950,7 +4298,9 @@ class GDSNavigator:
         for pk in keys:
             results.append(
                 self.contagion_score(
-                    pk, pattern_id, timestamp_cutoff=timestamp_cutoff,
+                    pk,
+                    pattern_id,
+                    timestamp_cutoff=timestamp_cutoff,
                 )
             )
 
@@ -3992,14 +4342,17 @@ class GDSNavigator:
         """
         if not self._storage.has_edge_table(pattern_id):
             raise GDSNavigationError(
-                f"Pattern '{pattern_id}' has no edge table. "
-                "degree_velocity requires an edge table."
+                f"Pattern '{pattern_id}' has no edge table. degree_velocity requires an edge table."
             )
         fwd = self._storage.read_edges(
-            pattern_id, from_keys=[primary_key], timestamp_to=timestamp_cutoff,
+            pattern_id,
+            from_keys=[primary_key],
+            timestamp_to=timestamp_cutoff,
         )
         rev = self._storage.read_edges(
-            pattern_id, to_keys=[primary_key], timestamp_to=timestamp_cutoff,
+            pattern_id,
+            to_keys=[primary_key],
+            timestamp_to=timestamp_cutoff,
         )
 
         # Collect all timestamps
@@ -4042,11 +4395,13 @@ class GDSNavigator:
         for i in range(n_buckets):
             period_start = ts_min + i * bucket_width
             period_end = period_start + bucket_width
-            buckets.append({
-                "period": f"{period_start:.0f}-{period_end:.0f}",
-                "out_degree": len(out_buckets[i]),
-                "in_degree": len(in_buckets[i]),
-            })
+            buckets.append(
+                {
+                    "period": f"{period_start:.0f}-{period_end:.0f}",
+                    "out_degree": len(out_buckets[i]),
+                    "in_degree": len(in_buckets[i]),
+                }
+            )
 
         first_out = len(out_buckets[0]) or 1
         last_out = len(out_buckets[-1])
@@ -4063,9 +4418,9 @@ class GDSNavigator:
             "velocity_in": velocity_in,
             "interpretation": (
                 f"Out-degree velocity {velocity_out:.2f} "
-                f"({'accelerating' if velocity_out > 1 else 'decelerating' if velocity_out < 1 else 'stable'}), "
+                f"({'accelerating' if velocity_out > 1 else 'decelerating' if velocity_out < 1 else 'stable'}), "  # noqa: E501
                 f"in-degree velocity {velocity_in:.2f} "
-                f"({'accelerating' if velocity_in > 1 else 'decelerating' if velocity_in < 1 else 'stable'})."
+                f"({'accelerating' if velocity_in > 1 else 'decelerating' if velocity_in < 1 else 'stable'})."  # noqa: E501
             ),
         }
 
@@ -4110,16 +4465,14 @@ class GDSNavigator:
         # Batch anomaly check on unexplored counterparties
         unexplored_anomalous: list[dict[str, Any]] = []
         if unexplored:
-            scoring_pattern = (
-                self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
-            )
+            scoring_pattern = self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
             try:
                 batch = self.check_anomaly_batch(
-                    scoring_pattern, list(unexplored), max_keys=500,
+                    scoring_pattern,
+                    list(unexplored),
+                    max_keys=500,
                 )
-                unexplored_anomalous = [
-                    r for r in batch["results"] if r["is_anomaly"]
-                ]
+                unexplored_anomalous = [r for r in batch["results"] if r["is_anomaly"]]
             except GDSNavigationError:
                 pass  # no geometry — skip enrichment
 
@@ -4172,9 +4525,7 @@ class GDSNavigator:
                 f"Pattern '{pattern_id}' has no edge table. "
                 "propagate_influence requires an edge table."
             )
-        scoring_pattern = (
-            self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
-        )
+        scoring_pattern = self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
         seed_set = set(seed_keys)
 
         # Build weighted adjacency directly from edges (not _build_adjacency,
@@ -4189,10 +4540,14 @@ class GDSNavigator:
             """Read edges for keys and aggregate tx_count per neighbor."""
             key_list = list(keys)
             fwd = self._storage.read_edges(
-                pattern_id, from_keys=key_list, timestamp_to=timestamp_cutoff,
+                pattern_id,
+                from_keys=key_list,
+                timestamp_to=timestamp_cutoff,
             )
             rev = self._storage.read_edges(
-                pattern_id, to_keys=key_list, timestamp_to=timestamp_cutoff,
+                pattern_id,
+                to_keys=key_list,
+                timestamp_to=timestamp_cutoff,
             )
             for tbl in (fwd, rev):
                 from_arr = tbl["from_key"].to_pylist()
@@ -4252,7 +4607,9 @@ class GDSNavigator:
         if affected_keys:
             try:
                 batch = self.check_anomaly_batch(
-                    scoring_pattern, affected_keys, max_keys=500,
+                    scoring_pattern,
+                    affected_keys,
+                    max_keys=500,
                 )
                 for r in batch["results"]:
                     anomaly_map[r["primary_key"]] = r["is_anomaly"]
@@ -4270,7 +4627,7 @@ class GDSNavigator:
                 }
                 for k, (s, d, tc) in visited.items()
             ],
-            key=lambda x: x["influence_score"],
+            key=lambda x: cast(float, x["influence_score"]),
             reverse=True,
         )
 
@@ -4309,17 +4666,16 @@ class GDSNavigator:
         """
         if not self._storage.has_edge_table(pattern_id):
             raise GDSNavigationError(
-                f"Pattern '{pattern_id}' has no edge table. "
-                "cluster_bridges requires an edge table."
+                f"Pattern '{pattern_id}' has no edge table. cluster_bridges requires an edge table."
             )
-        scoring_pattern = (
-            self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
-        )
+        scoring_pattern = self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
 
         # Step 1: cluster the anchor pattern — get full membership
         clusters = self.π8_attract_cluster(
-            scoring_pattern, n_clusters=n_clusters,
-            top_n=None, sample_size=sample_size,
+            scoring_pattern,
+            n_clusters=n_clusters,
+            top_n=None,
+            sample_size=sample_size,
         )
 
         # Build entity → cluster_id map
@@ -4333,12 +4689,15 @@ class GDSNavigator:
         import pandas as pd
 
         edges = self._storage.read_edges(
-            pattern_id, columns=["from_key", "to_key"],
+            pattern_id,
+            columns=["from_key", "to_key"],
         )
-        df = pd.DataFrame({
-            "f": edges["from_key"].to_pandas(),
-            "t": edges["to_key"].to_pandas(),
-        })
+        df = pd.DataFrame(
+            {
+                "f": edges["from_key"].to_pandas(),
+                "t": edges["to_key"].to_pandas(),
+            }
+        )
         df = df[df["f"] != df["t"]]  # drop self-loops
         df["c_f"] = df["f"].map(entity_cluster)
         df["c_t"] = df["t"].map(entity_cluster)
@@ -4363,14 +4722,18 @@ class GDSNavigator:
 
         # Step 3: batch anomaly check on top bridge entities
         top_bridge_entities = sorted(
-            bridge_entity_count.items(), key=lambda x: x[1], reverse=True,
+            bridge_entity_count.items(),
+            key=lambda x: x[1],
+            reverse=True,
         )
         bridge_keys = [k for k, _ in top_bridge_entities[:200]]
         anomaly_map: dict[str, bool] = {}
         if bridge_keys:
             try:
                 batch = self.check_anomaly_batch(
-                    scoring_pattern, bridge_keys, max_keys=200,
+                    scoring_pattern,
+                    bridge_keys,
+                    max_keys=200,
                 )
                 for r in batch["results"]:
                     anomaly_map[r["primary_key"]] = r["is_anomaly"]
@@ -4390,15 +4753,19 @@ class GDSNavigator:
                             "is_anomaly": anomaly_map.get(k, False),
                         }
                         for k, _ in sorted(
-                            [(e, c) for e, c in bridge_entity_count.items()
-                             if entity_cluster.get(e) in (a, b)],
-                            key=lambda x: x[1], reverse=True,
+                            [
+                                (e, c)
+                                for e, c in bridge_entity_count.items()
+                                if entity_cluster.get(e) in (a, b)
+                            ],
+                            key=lambda x: x[1],
+                            reverse=True,
                         )[:5]
                     ],
                 }
                 for (a, b), cnt in bridge_edges.items()
             ],
-            key=lambda x: x["edge_count"],
+            key=lambda x: cast(int, x["edge_count"]),
             reverse=True,
         )[:top_n_bridges]
 
@@ -4444,8 +4811,7 @@ class GDSNavigator:
         """
         if not self._storage.has_edge_table(pattern_id):
             raise GDSNavigationError(
-                f"Pattern '{pattern_id}' has no edge table. "
-                "anomalous_edges requires an edge table."
+                f"Pattern '{pattern_id}' has no edge table. anomalous_edges requires an edge table."
             )
         adj = self._storage.get_adjacency(pattern_id)
         # A→B edges
@@ -4467,13 +4833,15 @@ class GDSNavigator:
             if ek in seen_event_keys:
                 continue
             seen_event_keys.add(ek)
-            all_edges.append({
-                "event_key": ek,
-                "from_key": f,
-                "to_key": t,
-                "amount": round(float(amt), 2),
-                "timestamp": float(ts),
-            })
+            all_edges.append(
+                {
+                    "event_key": ek,
+                    "from_key": f,
+                    "to_key": t,
+                    "amount": round(float(amt), 2),
+                    "timestamp": float(ts),
+                }
+            )
 
         if not all_edges:
             return {
@@ -4494,7 +4862,8 @@ class GDSNavigator:
         try:
             version = self._resolve_version(pattern_id)
             geo = self._storage.read_geometry(
-                pattern_id, version,
+                pattern_id,
+                version,
                 point_keys=event_keys,
                 columns=["primary_key", "delta_norm", "is_anomaly", "delta_rank_pct"],
             )
@@ -4536,7 +4905,8 @@ class GDSNavigator:
         }
 
     def _resolve_edge_pattern_for_anchor(
-        self, anchor_pattern_id: str,
+        self,
+        anchor_pattern_id: str,
     ) -> str | None:
         """Find an event pattern with edge table whose relations cover this anchor.
 
@@ -4563,9 +4933,7 @@ class GDSNavigator:
                 continue
             if not self._storage.has_edge_table(pid):
                 continue
-            relevance = sum(
-                1 for rel in pat.relations if rel.line_id == anchor_line
-            )
+            relevance = sum(1 for rel in pat.relations if rel.line_id == anchor_line)
             if relevance == 0:
                 continue
             if best is None or relevance > best[1]:
@@ -4575,33 +4943,22 @@ class GDSNavigator:
         self._edge_pattern_cache[anchor_pattern_id] = result
         return result
 
-    def _pair_count_for_pattern(
-        self, graph_pid: str, version: int,
-    ) -> dict[tuple[str, str], int]:
-        """Delegate to AdjacencyIndex.pair_counts() — shared with motif ranking."""
-        return self._storage.get_adjacency(graph_pid).pair_counts()
+    def _pair_tx_count(self, graph_pid: str, from_key: str, to_key: str) -> int:
+        """Transactions between two entities in either direction (a self-loop
+        counts once). Uses the adjacency pair counts when the index is built,
+        else key-filtered reads of the two entities' outgoing edges."""
+        adj_cache = getattr(self._storage, "_adjacency_cache", None)
+        if isinstance(adj_cache, dict) and graph_pid in adj_cache:
+            counts = self._storage.get_adjacency(graph_pid).pair_counts()
+            n = counts.get((from_key, to_key), 0)
+            return int(n if from_key == to_key else n + counts.get((to_key, from_key), 0))
 
-    def _pair_count_direct(
-        self, graph_pid: str,
-    ) -> dict[tuple[str, str], int]:
-        """Compute pair counts from edge table via PyArrow groupby.
+        def _sent(src: str, dst: str) -> int:
+            tbl = self._storage.read_edges(graph_pid, from_keys=[src], columns=["to_key"])
+            return int(pc.sum(pc.equal(tbl["to_key"], dst)).as_py() or 0)
 
-        Reads only from_key/to_key (2 columns), bypassing AdjacencyIndex.
-        10–20× faster than get_adjacency().pair_counts() on large edge tables
-        because it skips the 5-column full-table to_pylist() in AdjacencyIndex.
-        """
-        tbl = self._storage.read_edges(graph_pid, columns=["from_key", "to_key"])
-        if tbl.num_rows == 0:
-            return {}
-        agg = tbl.group_by(["from_key", "to_key"]).aggregate(
-            [("from_key", "count")]
-        )
-        return {
-            (agg["from_key"][i].as_py(), agg["to_key"][i].as_py()): int(
-                agg["from_key_count"][i].as_py()
-            )
-            for i in range(agg.num_rows)
-        }
+        n = _sent(from_key, to_key)
+        return n if from_key == to_key else n + _sent(to_key, from_key)
 
     _EDGE_POTENTIAL_PAIR_CAP = 1000
 
@@ -4634,9 +4991,7 @@ class GDSNavigator:
         """
         sphere = self._storage.read_sphere()
         if pattern_id not in sphere.patterns:
-            raise GDSNavigationError(
-                f"Pattern '{pattern_id}' not found in sphere."
-            )
+            raise GDSNavigationError(f"Pattern '{pattern_id}' not found in sphere.")
         pattern = sphere.patterns[pattern_id]
         graph_pid: str | None = None
         if pattern.pattern_type == "anchor":
@@ -4650,10 +5005,14 @@ class GDSNavigator:
             )
 
         version = self._resolve_version(pattern_id)
+
         # Load endpoint delta vectors — fail loudly if either missing.
         def _load_delta(key: str) -> np.ndarray:
             geo = self._storage.read_geometry(
-                pattern_id, version, primary_key=key, columns=["primary_key", "delta"],
+                pattern_id,
+                version,
+                primary_key=key,
+                columns=["primary_key", "delta"],
             )
             if geo.num_rows == 0:
                 if pattern.pattern_type == "event":
@@ -4675,8 +5034,7 @@ class GDSNavigator:
                         f"to discover valid keys."
                     )
                 raise GDSNavigationError(
-                    f"Entity '{key}' not found in pattern '{pattern_id}' "
-                    f"geometry. {entity_hint}"
+                    f"Entity '{key}' not found in pattern '{pattern_id}' geometry. {entity_hint}"
                 )
             return np.asarray(geo["delta"][0].as_py(), dtype=np.float64)
 
@@ -4684,13 +5042,7 @@ class GDSNavigator:
         d_to = _load_delta(to_key)
         distance = float(np.linalg.norm(d_from - d_to))
 
-        counts = self._pair_count_for_pattern(graph_pid, version)
-        if from_key == to_key:
-            # Self-loop: use the stored count once; do not double by adding the
-            # reverse direction (which is the same pair in this dict).
-            pair_tx_count = counts.get((from_key, to_key), 0)
-        else:
-            pair_tx_count = counts.get((from_key, to_key), 0) + counts.get((to_key, from_key), 0)
+        pair_tx_count = self._pair_tx_count(graph_pid, from_key, to_key)
         # Cap the weight denominator so a single 10 000-tx pair doesn't underflow
         # to 0; raw count is still reported separately so the agent sees the cap.
         effective_count = max(1, min(pair_tx_count, self._EDGE_POTENTIAL_PAIR_CAP))
@@ -4704,14 +5056,18 @@ class GDSNavigator:
         if include_ranking:
             try:
                 full_ranking = self.attract_edge_potential(
-                    pattern_id, top_n=10**9, min_pair_count=1,
+                    pattern_id,
+                    top_n=10**9,
+                    min_pair_count=1,
                 )
                 if full_ranking:
                     better = sum(1 for r in full_ranking if r["score"] > score)
                     n = len(full_ranking)
                     score_rank_pct = round(100.0 * (n - better) / n, 2)
                     p95_idx = max(0, int(n * 0.05) - 1)
-                    p95_threshold = full_ranking[p95_idx]["score"] if p95_idx < n else full_ranking[0]["score"]
+                    p95_threshold = (
+                        full_ranking[p95_idx]["score"] if p95_idx < n else full_ranking[0]["score"]
+                    )
                     is_high_potential = bool(score >= p95_threshold)
             except (*_NAVIGATION_RECOVERABLE_ERRORS, GDSError):
                 pass
@@ -4732,6 +5088,80 @@ class GDSNavigator:
                 f"(pair_tx_count={pair_tx_count})."
             ),
         }
+
+    def _edge_potential_base_ranking(
+        self,
+        pattern_id: str,
+        version: int,
+        graph_pid: str,
+    ) -> list[dict[str, Any]]:
+        """Score every (from, to) pair of the edge table, highest first.
+
+        One group-by for the pair counts, one geometry read, and numpy for the
+        distances, scores and ranking; ties break on (from_key, to_key).
+        """
+        edges = self._storage.read_edges(graph_pid, columns=["from_key", "to_key"])
+        if edges.num_rows == 0:
+            return []
+        agg = edges.group_by(["from_key", "to_key"]).aggregate([("from_key", "count")])
+        from_arr = agg["from_key"].combine_chunks()
+        to_arr = agg["to_key"].combine_chunks()
+        # Late-stage ratio guard — fires on spheres without the build-time
+        # edge_stats cache (older builds). Same predicate as the early bail in
+        # attract_edge_potential; here we skip only the geometry scan.
+        n_endpoints = len(pc.unique(pa.concat_arrays([from_arr, to_arr])))
+        geo_row_count = self._storage.count_geometry_rows(pattern_id)
+        if geo_row_count > 0 and n_endpoints / geo_row_count < 0.01:
+            return []
+        # A full scan of a cached file beats a point_keys pushdown with
+        # hundreds of thousands of keys on endpoint-dense patterns.
+        geo = self._storage.read_geometry(pattern_id, version, columns=["primary_key", "delta"])
+        geo_keys = geo["primary_key"].combine_chunks()
+        deltas = delta_matrix_from_arrow(geo).astype(np.float64)
+        fi = pc.index_in(from_arr, value_set=geo_keys).fill_null(-1).to_numpy()
+        ti = pc.index_in(to_arr, value_set=geo_keys).fill_null(-1).to_numpy()
+        counts = agg["from_key_count"].to_numpy()
+        keep = np.flatnonzero((fi >= 0) & (ti >= 0))
+        if keep.size == 0:
+            return []
+        distance = np.empty(keep.size, dtype=np.float64)
+        for start in range(0, keep.size, 200_000):
+            rows = keep[start : start + 200_000]
+            distance[start : start + rows.size] = np.linalg.norm(
+                deltas[fi[rows]] - deltas[ti[rows]], axis=1
+            )
+        effective = np.clip(counts[keep], 1, self._EDGE_POTENTIAL_PAIR_CAP)
+        score = np.round(distance * (1.0 / effective), 6)
+        # Ties break on the pair keys: the group-by row order is not stable
+        # across runs, so ranking by score alone was not reproducible.
+        order = pc.sort_indices(
+            pa.table({"s": score, "f": from_arr.take(keep), "t": to_arr.take(keep)}),
+            sort_keys=[("s", "descending"), ("f", "ascending"), ("t", "ascending")],
+        ).to_numpy()
+        rows = keep[order]
+        n = int(rows.size)
+        p95_threshold = float(score[order][max(0, int(n * 0.05) - 1)])
+        rank_pct = np.round(100.0 * (n - np.arange(n)) / n, 2)
+        return [
+            {
+                "from_key": f,
+                "to_key": t,
+                "score": s,
+                "delta_distance": d,
+                "pair_tx_count": c,
+                "score_rank_pct_global": r,
+                "is_high_potential": s >= p95_threshold,
+            }
+            for f, t, s, d, c, r in zip(
+                from_arr.take(rows).to_pylist(),
+                to_arr.take(rows).to_pylist(),
+                score[order].tolist(),
+                np.round(distance[order], 4).tolist(),
+                counts[rows].tolist(),
+                rank_pct.tolist(),
+                strict=True,
+            )
+        ]
 
     def attract_edge_potential(
         self,
@@ -4803,8 +5233,8 @@ class GDSNavigator:
                     and "unique_from" in edge_stats
                     and "unique_to" in edge_stats
                 ):
-                    n_endpoints_upper = (
-                        int(edge_stats["unique_from"]) + int(edge_stats["unique_to"])
+                    n_endpoints_upper = int(edge_stats["unique_from"]) + int(
+                        edge_stats["unique_to"]
                     )
                     # Use pattern.population_size (already loaded from sphere.json)
                     # as the geometry-row denominator — avoids opening the Lance
@@ -4812,10 +5242,7 @@ class GDSNavigator:
                     # geometry rowcount at calibration time and matches the
                     # current dataset within the freshness window we accept here.
                     geo_count = int(pattern.population_size or 0)
-                    if (
-                        geo_count > 0
-                        and n_endpoints_upper / geo_count < 0.01
-                    ):
+                    if geo_count > 0 and n_endpoints_upper / geo_count < 0.01:
                         self._attract_edge_base_cache[base_key] = []
                         base_sorted = []
 
@@ -4834,12 +5261,14 @@ class GDSNavigator:
                 if base_sorted is None and pattern.pattern_type == "event":
                     try:
                         sample_edge = self._storage.read_edges(
-                            graph_pid, columns=["from_key"],
+                            graph_pid,
+                            columns=["from_key"],
                         ).slice(0, 1)
                         if sample_edge.num_rows > 0:
                             sample_endpoint = sample_edge["from_key"][0].as_py()
                             probe = self._storage.read_geometry(
-                                pattern_id, version,
+                                pattern_id,
+                                version,
                                 primary_key=sample_endpoint,
                                 columns=["primary_key"],
                             )
@@ -4853,70 +5282,8 @@ class GDSNavigator:
                         pass
 
             if base_sorted is None:
-                # Use direct PyArrow groupby (reads only 2 columns) instead of
-                # AdjacencyIndex.from_lance() which reads 5 columns and calls
-                # to_pylist() on the full edge table — 10–20× slower on large
-                # event patterns (e.g. 7.5 M trip edges = 132 s vs ~5 s).
-                counts = self._pair_count_direct(graph_pid)
-                if not counts:
-                    self._attract_edge_base_cache[base_key] = []
-                    base_sorted = []
-                else:
-                    # Batch-load ALL endpoint delta vectors in one geometry read.
-                    # We intentionally do NOT push endpoints into Lance as a
-                    # point_keys filter here, even though on first glance that
-                    # looks like free pruning. On endpoint-dense patterns (e.g.
-                    # AML-shaped transaction graphs where every account appears
-                    # in at least one edge) Lance BTREE predicate pushdown with
-                    # hundreds of thousands of keys is ~1000-1500× slower than a
-                    # full-population scan of a cached file. The full scan plus
-                    # Python-side membership check is consistently fast across
-                    # the endpoint-density regimes we see in practice.
-                    all_keys = {k for pair in counts.keys() for k in pair}
-                    # Late-stage ratio guard — fires on spheres without the
-                    # build-time edge_stats cache (older builds).  Same predicate
-                    # as the early bail above; here we already paid for the
-                    # groupby, so we skip only the geometry scan.
-                    geo_row_count = self._storage.count_geometry_rows(pattern_id)
-                    if geo_row_count > 0 and len(all_keys) / geo_row_count < 0.01:
-                        self._attract_edge_base_cache[base_key] = []
-                        base_sorted = []
-                    else:
-                        geo = self._storage.read_geometry(
-                            pattern_id, version, columns=["primary_key", "delta"],
-                        )
-                        delta_by_key: dict[str, np.ndarray] = {}
-                        for i in range(geo.num_rows):
-                            k = geo["primary_key"][i].as_py()
-                            if k in all_keys:
-                                delta_by_key[k] = np.asarray(geo["delta"][i].as_py(), dtype=np.float64)
-
-                        scored: list[dict[str, Any]] = []
-                        for (f, t), cnt in counts.items():
-                            if f not in delta_by_key or t not in delta_by_key:
-                                continue
-                            distance = float(np.linalg.norm(delta_by_key[f] - delta_by_key[t]))
-                            effective_count = max(1, min(cnt, self._EDGE_POTENTIAL_PAIR_CAP))
-                            score = distance * (1.0 / effective_count)
-                            scored.append({
-                                "from_key": f,
-                                "to_key": t,
-                                "score": round(score, 6),
-                                "delta_distance": round(distance, 4),
-                                "pair_tx_count": cnt,
-                            })
-                        scored.sort(key=lambda r: -r["score"])
-
-                        # Assign GLOBAL rank_pct + is_high_potential (pattern-wide p95).
-                        n = len(scored)
-                        if n > 0:
-                            p95_idx = max(0, int(n * 0.05) - 1)
-                            p95_threshold = scored[p95_idx]["score"] if p95_idx < n else scored[0]["score"]
-                            for i, r in enumerate(scored):
-                                r["score_rank_pct_global"] = round(100.0 * (n - i) / n, 2)
-                                r["is_high_potential"] = bool(r["score"] >= p95_threshold)
-                        base_sorted = scored
-                        self._attract_edge_base_cache[base_key] = base_sorted
+                base_sorted = self._edge_potential_base_ranking(pattern_id, version, graph_pid)
+                self._attract_edge_base_cache[base_key] = base_sorted
 
         # ---- Fast-path: unfiltered default call returns base directly ----
         if from_key is None and to_key is None and min_pair_count == 1:
@@ -4928,7 +5295,7 @@ class GDSNavigator:
         # ---- Filter path: O(m) pass over base_sorted, no rescoring ----
         filter_key = (pattern_id, version, from_key, to_key, min_pair_count)
         if not hasattr(self, "_attract_edge_filter_cache"):
-            self._attract_edge_filter_cache: dict[tuple, list[dict[str, Any]]] = {}
+            self._attract_edge_filter_cache: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
         filtered = self._attract_edge_filter_cache.get(filter_key)
         if filtered is None:
             filtered = []
@@ -4969,7 +5336,7 @@ class GDSNavigator:
         Lazy-initialised so subclasses or monkey-patched test doubles can
         swap enumerators without fighting a class-level attribute.
         """
-        cached = getattr(self, "_motif_registry_cache", None)
+        cached: dict[str, MotifSpec] | None = getattr(self, "_motif_registry_cache", None)
         if cached is not None:
             return cached
         registry: dict[str, MotifSpec] = {
@@ -5024,8 +5391,12 @@ class GDSNavigator:
         *,
         event_keys: list[str] | None = None,
         event_pattern_id: str | None = None,
+        adj: AdjacencyIndex | None = None,
     ) -> dict[str, Any]:
         """Score a motif as the product of edge_potential across its edges.
+
+        ``adj`` (optional) supplies the pair counts — any index holding every
+        edge between the motif's endpoints, such as a seed-scoped one.
 
         Batched implementation: pre-fetches all unique endpoint deltas in a
         single filtered Lance scan, then reuses the warm AdjacencyIndex
@@ -5065,7 +5436,7 @@ class GDSNavigator:
                 f"length {len(edges)} — invariant violation.",
             )
         endpoint_keys: set[str] = set()
-        for (u, v) in edges:
+        for u, v in edges:
             endpoint_keys.add(u)
             endpoint_keys.add(v)
         version = self._resolve_version(pattern_id)
@@ -5075,7 +5446,9 @@ class GDSNavigator:
         if event_keys is not None and event_pattern_id is not None:
             event_version = self._resolve_version(event_pattern_id)
             event_delta_map = self._batch_read_deltas(
-                event_pattern_id, event_version, set(event_keys),
+                event_pattern_id,
+                event_version,
+                set(event_keys),
             )
             event_factors = []
             for ek in event_keys:
@@ -5088,19 +5461,19 @@ class GDSNavigator:
                 else:
                     event_factors.append(1.0 + float(np.linalg.norm(ed)))
 
-        graph_pid = self._resolve_motif_graph_pid(pattern_id)
-        adj = self._storage.get_adjacency(graph_pid)
+        if adj is None:
+            adj = self._storage.get_adjacency(self._resolve_motif_graph_pid(pattern_id))
         pair_counts = adj.pair_counts()
         result = self._lean_score_motif(
-            edges, delta_map, pair_counts,
+            edges,
+            delta_map,
+            pair_counts,
             event_factors=event_factors,
         )
         if result is None:
-            # _lean_score_motif returned None — at least one endpoint is absent from the batched delta read.
-            missing = next(
-                (u, v) for (u, v) in edges
-                if u not in delta_map or v not in delta_map
-            )
+            # _lean_score_motif returned None — at least one endpoint is absent
+            # from the batched delta read.
+            missing = next((u, v) for (u, v) in edges if u not in delta_map or v not in delta_map)
             raise GDSNavigationError(
                 f"Entity {missing[0]!r} or {missing[1]!r} not found in "
                 f"pattern {pattern_id!r} geometry.",
@@ -5156,20 +5529,19 @@ class GDSNavigator:
             raise GDSNavigationError(
                 f"min_k must be ≥ 1 when provided, got {min_k}.",
             )
-        if motif_type == "structuring":
-            if amt1_min <= 0 or amt2_max <= 0:
-                raise GDSNavigationError(
-                    "amt1_min and amt2_max must be positive for structuring motif.",
-                )
-        if motif_type == "chain_k":
-            if k < 3 or k > 8:
-                raise GDSNavigationError(
-                    f"chain_k requires 3 ≤ k ≤ 8, got k={k}.",
-                )
+        if motif_type == "structuring" and (amt1_min <= 0 or amt2_max <= 0):
+            raise GDSNavigationError(
+                "amt1_min and amt2_max must be positive for structuring motif.",
+            )
+        if motif_type == "chain_k" and (k < 3 or k > 8):
+            raise GDSNavigationError(
+                f"chain_k requires 3 ≤ k ≤ 8, got k={k}.",
+            )
         if motif_type == "split_recombine":
             if direction not in ("forward", "backward"):
                 raise GDSNavigationError(
-                    f"split_recombine direction must be 'forward' or 'backward', got {direction!r}.",
+                    "split_recombine direction must be 'forward' or 'backward', "
+                    f"got {direction!r}.",
                 )
             if min_k is not None and min_k < 2:
                 raise GDSNavigationError(
@@ -5179,20 +5551,31 @@ class GDSNavigator:
             effective_mk = min_k if min_k is not None else 3
             if effective_mk < 2 or min_m < 2:
                 raise GDSNavigationError(
-                    f"bipartite_burst requires min_k >= 2 and min_m >= 2, got min_k={effective_mk}, min_m={min_m}.",
+                    "bipartite_burst requires min_k >= 2 and min_m >= 2, "
+                    f"got min_k={effective_mk}, min_m={min_m}.",
                 )
         self._require_anchor_pattern_for_motif(pattern_id)
         spec = self._motif_registry[motif_type]
         window = time_window_hours if time_window_hours is not None else spec.default_window_hours
 
         enum_kwargs: dict[str, Any] = {
-            "amt1_min": amt1_min, "amt2_max": amt2_max, "k": k,
-            "direction": direction, "min_m": min_m,
+            "amt1_min": amt1_min,
+            "amt2_max": amt2_max,
+            "k": k,
+            "direction": direction,
+            "min_m": min_m,
         }
         if min_k is not None:
             enum_kwargs["min_k"] = min_k
+        adj = self._motif_adjacency(pattern_id, entity_key, motif_type)
+        if adj is not None:
+            enum_kwargs["adj"] = adj
         instances = spec.enumerate(
-            self, entity_key, pattern_id, window, **enum_kwargs,
+            self,
+            entity_key,
+            pattern_id,
+            window,
+            **enum_kwargs,
         )
         if not instances:
             return {
@@ -5207,7 +5590,7 @@ class GDSNavigator:
         best: dict[str, Any] | None = None
         best_score = -1.0
         for inst in instances:
-            scored = self._score_motif_from_edges(inst["edges"], pattern_id)
+            scored = self._score_motif_from_edges(inst["edges"], pattern_id, adj=adj)
             if scored["score"] > best_score:
                 best_score = scored["score"]
                 best = {**inst, **scored}
@@ -5216,6 +5599,67 @@ class GDSNavigator:
         best["found"] = True
         best["time_window_hours"] = window
         return best
+
+    # Motif types whose single-seed enumeration and scoring read only the
+    # seed's edges, mapped to whether they also read its neighbours' out-edges.
+    _SEED_SCOPED_MOTIFS: dict[str, bool] = {"cycle_2": False, "fan_out": False, "cycle_3": True}
+
+    def _motif_adjacency(
+        self, pattern_id: str, seed: str, motif_type: str
+    ) -> AdjacencyIndex | None:
+        """Adjacency for a single-seed ``score_motif`` call.
+
+        The full index when it is already built; otherwise, for the motif
+        types in ``_SEED_SCOPED_MOTIFS``, an index over the seed's
+        neighbourhood only, so a one-entity question does not build the whole
+        edge table. ``None`` for other motif types (they use the full index).
+        """
+        two_hop = self._SEED_SCOPED_MOTIFS.get(motif_type)
+        if two_hop is None:
+            return None
+        graph_pid = self._resolve_motif_graph_pid(pattern_id)
+        adj_cache = getattr(self._storage, "_adjacency_cache", None)
+        if isinstance(adj_cache, dict) and graph_pid in adj_cache:
+            full: AdjacencyIndex = self._storage.get_adjacency(graph_pid)
+            return full
+        memo: dict[tuple[str, str], AdjacencyIndex] | None = getattr(
+            self, "_seed_adjacency_memo", None
+        )
+        if memo is None:
+            return self._seed_scoped_adjacency(graph_pid, seed, two_hop)
+        # Shared across motif types: build the wider scope once per seed.
+        key = (graph_pid, seed)
+        if key not in memo:
+            memo.clear()  # keep only the current seed's index alive
+            memo[key] = self._seed_scoped_adjacency(graph_pid, seed, True)
+        return memo[key]
+
+    def _seed_scoped_adjacency(self, graph_pid: str, seed: str, two_hop: bool) -> AdjacencyIndex:
+        """Index over every edge into ``seed`` and every edge out of ``seed``
+        (``two_hop``: also out of each of its in- and out-neighbours).
+
+        Holds the same edges per source key, and the same pair counts between
+        source keys, as the full index. Rows enter the build in edge-table
+        order, as they do for the full index.
+        """
+        from hypertopos.engine.adjacency import AdjacencyIndex
+
+        cols = ["from_key", "to_key", "timestamp", "amount", "event_key", "_rowid"]
+        inbound = self._storage.read_edges(graph_pid, to_keys=[seed], columns=cols)
+        if "_rowid" not in inbound.schema.names:
+            return AdjacencyIndex.from_table(inbound)  # no edge table: empty index
+        sources = [seed]
+        if two_hop:
+            out_keys = self._storage.read_edges(graph_pid, from_keys=[seed], columns=["to_key"])
+            sources = sorted(
+                {seed}
+                | set(pc.unique(out_keys["to_key"]).to_pylist())
+                | set(pc.unique(inbound["from_key"]).to_pylist())
+            )
+        outbound = self._storage.read_edges(graph_pid, from_keys=sources, columns=cols)
+        rest = inbound.filter(pc.invert(pc.is_in(inbound["from_key"], pa.array(sources))))
+        table = pa.concat_tables([outbound, rest]).sort_by("_rowid").drop_columns(["_rowid"])
+        return AdjacencyIndex.from_table(table)
 
     def find_high_potential_motifs(
         self,
@@ -5234,7 +5678,7 @@ class GDSNavigator:
         """Rank ``motif_type`` instances across the pattern by score, desc.
 
         LRU-cached per ``(pattern_id, version, motif_type, time_window_hours,
-        amt1_min, amt2_max, k, direction, min_m)``. Filters by ``seeds``
+        amt1_min, amt2_max, k, direction, min_m, min_k)``. Filters by ``seeds``
         (post-cache) if provided. For ``cycle_3`` results are deduplicated
         by canonical ring (sorted tuple of primary keys) so each physical
         cycle appears once regardless of which of 3 seeds surfaces it. For
@@ -5257,20 +5701,19 @@ class GDSNavigator:
             raise GDSNavigationError(
                 f"time_window_hours must be positive, got {time_window_hours}.",
             )
-        if motif_type == "structuring":
-            if amt1_min <= 0 or amt2_max <= 0:
-                raise GDSNavigationError(
-                    "amt1_min and amt2_max must be positive for structuring motif.",
-                )
-        if motif_type == "chain_k":
-            if k < 3 or k > 8:
-                raise GDSNavigationError(
-                    f"chain_k requires 3 ≤ k ≤ 8, got k={k}.",
-                )
+        if motif_type == "structuring" and (amt1_min <= 0 or amt2_max <= 0):
+            raise GDSNavigationError(
+                "amt1_min and amt2_max must be positive for structuring motif.",
+            )
+        if motif_type == "chain_k" and (k < 3 or k > 8):
+            raise GDSNavigationError(
+                f"chain_k requires 3 ≤ k ≤ 8, got k={k}.",
+            )
         if motif_type == "split_recombine":
             if direction not in ("forward", "backward"):
                 raise GDSNavigationError(
-                    f"split_recombine direction must be 'forward' or 'backward', got {direction!r}.",
+                    "split_recombine direction must be 'forward' or 'backward', "
+                    f"got {direction!r}.",
                 )
             if min_k is not None and min_k < 2:
                 raise GDSNavigationError(
@@ -5280,7 +5723,8 @@ class GDSNavigator:
             effective_mk = min_k if min_k is not None else 3
             if effective_mk < 2 or min_m < 2:
                 raise GDSNavigationError(
-                    f"bipartite_burst requires min_k >= 2 and min_m >= 2, got min_k={effective_mk}, min_m={min_m}.",
+                    "bipartite_burst requires min_k >= 2 and min_m >= 2, "
+                    f"got min_k={effective_mk}, min_m={min_m}.",
                 )
         self._require_anchor_pattern_for_motif(pattern_id)
         spec = self._motif_registry[motif_type]
@@ -5288,12 +5732,23 @@ class GDSNavigator:
         version = self._resolve_version(pattern_id)
 
         cache_key = (
-            pattern_id, version, motif_type, window,
-            amt1_min, amt2_max, k, direction, min_m,
+            pattern_id,
+            version,
+            motif_type,
+            window,
+            amt1_min,
+            amt2_max,
+            k,
+            direction,
+            min_m,
+            min_k,
         )
         if not hasattr(self, "_motif_ranking_cache"):
             from collections import OrderedDict
-            self._motif_ranking_cache: OrderedDict[tuple, list[dict[str, Any]]] = OrderedDict()
+
+            self._motif_ranking_cache: OrderedDict[tuple[Any, ...], list[dict[str, Any]]] = (
+                OrderedDict()
+            )
         cache = self._motif_ranking_cache
         if cache_key in cache:
             cache.move_to_end(cache_key)
@@ -5301,13 +5756,22 @@ class GDSNavigator:
         else:
             # Discover all seeds from the pattern's geometry primary_key column.
             geo = self._storage.read_geometry(
-                pattern_id, version, columns=["primary_key"],
+                pattern_id,
+                version,
+                columns=["primary_key"],
             )
             all_seeds = geo["primary_key"].to_pylist() if geo.num_rows else []
             ranked = self._rank_motifs(
-                all_seeds, pattern_id, motif_type, window, min_k,
-                amt1_min=amt1_min, amt2_max=amt2_max, k=k,
-                direction=direction, min_m=min_m,
+                all_seeds,
+                pattern_id,
+                motif_type,
+                window,
+                min_k,
+                amt1_min=amt1_min,
+                amt2_max=amt2_max,
+                k=k,
+                direction=direction,
+                min_m=min_m,
             )
             cache[cache_key] = ranked
             while len(cache) > self._MOTIF_RANKING_CACHE_MAX:
@@ -5321,7 +5785,10 @@ class GDSNavigator:
         return filtered[:top_n]
 
     def _batch_read_deltas(
-        self, pattern_id: str, version: int, keys: set[str],
+        self,
+        pattern_id: str,
+        version: int,
+        keys: set[str],
     ) -> dict[str, np.ndarray]:
         """Filtered geometry read → ``{primary_key: delta_vector}`` for ``keys``.
 
@@ -5334,7 +5801,8 @@ class GDSNavigator:
         if not keys:
             return {}
         geo = self._storage.read_geometry(
-            pattern_id, version,
+            pattern_id,
+            version,
             point_keys=list(keys),
             columns=["primary_key", "delta"],
         )
@@ -5376,9 +5844,7 @@ class GDSNavigator:
             else:
                 cnt = pair_counts.get((u, v), 0) + pair_counts.get((v, u), 0)
             effective = max(1, min(cnt, self._EDGE_POTENTIAL_PAIR_CAP))
-            event_factor = (
-                event_factors[i] if event_factors is not None else 1.0
-            )
+            event_factor = event_factors[i] if event_factors is not None else 1.0
             edge_score = distance * (1.0 / effective) * event_factor
             entry: dict[str, Any] = {
                 "edge": (u, v),
@@ -5436,27 +5902,36 @@ class GDSNavigator:
         pair_counts = adj.pair_counts()
         window_sec = float(window) * 3600.0
         effective_min_k = (
-            min_k if (
+            min_k
+            if (
                 motif_type in {"fan_out", "fan_in", "split_recombine", "bipartite_burst"}
                 and min_k is not None
-            ) else 3
+            )
+            else 3
         )
         effective_min_m = min_m if min_m is not None else 3
 
         active_seeds = self._active_seeds_for_motif(
-            adj, all_seeds, motif_type, effective_min_k,
+            adj,
+            all_seeds,
+            motif_type,
+            effective_min_k,
             amt1_min=amt1_min,
-            direction=direction, min_m=effective_min_m,
+            direction=direction,
+            min_m=effective_min_m,
         )
 
         instances: list[dict[str, Any]] = []
-        seen_rings: set = set()
+        seen_rings: set[Any] = set()
         for seed in active_seeds:
             if motif_type == "fan_out":
                 found = self._enum_fan_out_via_adj(seed, adj, window_sec, effective_min_k)
             elif motif_type == "fan_in":
                 found = self._enum_fan_in_via_adj(
-                    seed, adj, window_sec, effective_min_k,
+                    seed,
+                    adj,
+                    window_sec,
+                    effective_min_k,
                 )
             elif motif_type == "cycle_2":
                 found = self._enum_cycle_2_via_adj(seed, adj, window_sec)
@@ -5464,21 +5939,39 @@ class GDSNavigator:
                 found = self._enum_cycle_3_via_adj(seed, adj, window_sec)
             elif motif_type == "structuring":
                 found = self._enum_structuring_via_adj(
-                    seed, adj, window_sec, amt1_min, amt2_max,
+                    seed,
+                    adj,
+                    window_sec,
+                    amt1_min,
+                    amt2_max,
                 )
             elif motif_type == "chain_k":
-                _chain_k_frontier = self._CHAIN_K_MAX_FRONTIER_PER_K.get(k, self._CHAIN_K_MAX_FRONTIER)
+                _chain_k_frontier = self._CHAIN_K_MAX_FRONTIER_PER_K.get(
+                    k, self._CHAIN_K_MAX_FRONTIER
+                )
                 found = self._enum_chain_k_via_adj(
-                    seed, adj, window_sec, k,
-                    _chain_k_frontier, self._CHAIN_K_MAX_RESULTS,
+                    seed,
+                    adj,
+                    window_sec,
+                    k,
+                    _chain_k_frontier,
+                    self._CHAIN_K_MAX_RESULTS,
                 )
             elif motif_type == "split_recombine":
                 found = self._enum_split_recombine_via_adj(
-                    seed, adj, window_sec, effective_min_k, direction,
+                    seed,
+                    adj,
+                    window_sec,
+                    effective_min_k,
+                    direction,
                 )
             elif motif_type == "bipartite_burst":
                 found = self._enum_bipartite_burst_via_adj(
-                    seed, adj, window_sec, effective_min_k, effective_min_m,
+                    seed,
+                    adj,
+                    window_sec,
+                    effective_min_k,
+                    effective_min_m,
                 )
             else:
                 found = []
@@ -5500,7 +5993,9 @@ class GDSNavigator:
                     seen_rings.add(canonical)
                 elif motif_type == "split_recombine":
                     canonical_sr = (
-                        inst["direction"], inst["source"], inst["sink"],
+                        inst["direction"],
+                        inst["source"],
+                        inst["sink"],
                         tuple(sorted(inst["intermediaries"])),
                     )
                     if canonical_sr in seen_rings:
@@ -5518,7 +6013,7 @@ class GDSNavigator:
 
         all_endpoint_keys: set[str] = set()
         for inst in instances:
-            for (u, v) in inst["edges"]:
+            for u, v in inst["edges"]:
                 all_endpoint_keys.add(u)
                 all_endpoint_keys.add(v)
         delta_map = self._batch_read_deltas(pattern_id, version, all_endpoint_keys)
@@ -5557,46 +6052,28 @@ class GDSNavigator:
     ) -> list[str]:
         all_seeds_set = set(all_seeds)
         if motif_type in {"cycle_2", "cycle_3"}:
-            return [
-                s for s in (set(adj._out.keys()) & set(adj._in.keys()))
-                if s in all_seeds_set
-            ]
+            return [s for s in (set(adj._out.keys()) & set(adj._in.keys())) if s in all_seeds_set]
         if motif_type == "fan_out":
-            return [
-                s for s in all_seeds_set
-                if adj.distinct_neighbors_out(s) >= effective_min_k
-            ]
+            return [s for s in all_seeds_set if adj.distinct_neighbors_out(s) >= effective_min_k]
         if motif_type == "fan_in":
-            return [
-                s for s in all_seeds_set
-                if adj.distinct_neighbors_in(s) >= effective_min_k
-            ]
+            return [s for s in all_seeds_set if adj.distinct_neighbors_in(s) >= effective_min_k]
         if motif_type == "split_recombine":
             if direction == "forward":
                 return [
-                    s for s in all_seeds_set
-                    if adj.distinct_neighbors_out(s) >= effective_min_k
+                    s for s in all_seeds_set if adj.distinct_neighbors_out(s) >= effective_min_k
                 ]
-            return [
-                s for s in all_seeds_set
-                if adj.distinct_neighbors_in(s) >= effective_min_k
-            ]
+            return [s for s in all_seeds_set if adj.distinct_neighbors_in(s) >= effective_min_k]
         if motif_type == "bipartite_burst":
             return [
-                s for s in all_seeds_set
+                s
+                for s in all_seeds_set
                 if adj.distinct_neighbors_out(s) >= min_m
                 or adj.distinct_neighbors_in(s) >= effective_min_k
             ]
         if motif_type == "structuring":
-            return [
-                s for s in all_seeds_set
-                if adj.max_amount_out_excl_self(s) >= amt1_min
-            ]
+            return [s for s in all_seeds_set if adj.max_amount_out_excl_self(s) >= amt1_min]
         if motif_type == "chain_k":
-            return [
-                s for s in all_seeds_set
-                if adj.distinct_neighbors_out(s) > 0
-            ]
+            return [s for s in all_seeds_set if adj.distinct_neighbors_out(s) > 0]
         return [s for s in all_seeds if s in adj._out]
 
     @staticmethod
@@ -5613,18 +6090,21 @@ class GDSNavigator:
         to_keys = nbr["to_key"]
         max_ts = max(timestamps)
         recent = [
-            (t, ts) for t, ts in zip(to_keys, timestamps, strict=True)
+            (t, ts)
+            for t, ts in zip(to_keys, timestamps, strict=True)
             if t != seed and ts >= max_ts - window_sec
         ]
         unique = sorted({t for (t, _) in recent})
         if len(unique) < min_k:
             return []
-        return [{
-            "motif_type": "fan_out",
-            "seed": seed,
-            "k": len(unique),
-            "edges": [(seed, t) for t in unique],
-        }]
+        return [
+            {
+                "motif_type": "fan_out",
+                "seed": seed,
+                "k": len(unique),
+                "edges": [(seed, t) for t in unique],
+            }
+        ]
 
     @staticmethod
     def _enum_fan_in_via_adj(
@@ -5641,18 +6121,21 @@ class GDSNavigator:
         from_keys = nbr["from_key"]
         max_ts = max(timestamps)
         recent = [
-            (f, ts) for f, ts in zip(from_keys, timestamps, strict=True)
+            (f, ts)
+            for f, ts in zip(from_keys, timestamps, strict=True)
             if f != seed and ts >= max_ts - window_sec
         ]
         unique = sorted({f for (f, _) in recent})
         if len(unique) < min_k:
             return []
-        return [{
-            "motif_type": "fan_in",
-            "seed": seed,
-            "k": len(unique),
-            "edges": [(f, seed) for f in unique],
-        }]
+        return [
+            {
+                "motif_type": "fan_in",
+                "seed": seed,
+                "k": len(unique),
+                "edges": [(f, seed) for f in unique],
+            }
+        ]
 
     @staticmethod
     def _enum_split_recombine_via_adj(
@@ -5671,7 +6154,7 @@ class GDSNavigator:
                 return []
             max_ts = max(ts for (_n, ts, *_r) in out_edges)
             latest_split_in: dict[str, float] = {}
-            for (m, ts, *_r) in out_edges:
+            for m, ts, *_r in out_edges:
                 if m == seed or ts < max_ts - window_sec:
                     continue
                 if ts > latest_split_in.get(m, float("-inf")):
@@ -5680,8 +6163,8 @@ class GDSNavigator:
                 return []
             sink_to_inter: dict[str, set[str]] = {}
             for m, s_in_ts in latest_split_in.items():
-                for (d, t, *_r) in adj.neighbors_out(m):
-                    if d == seed or d == m:
+                for d, t, *_r in adj.neighbors_out(m):
+                    if d in (seed, m):
                         continue
                     if t <= s_in_ts or t - s_in_ts > window_sec:
                         continue
@@ -5694,19 +6177,19 @@ class GDSNavigator:
             if best_sink is None:
                 return []
             inter_sorted = sorted(best_inter)
-            edges = [(seed, m) for m in inter_sorted] + [
-                (m, best_sink) for m in inter_sorted
+            edges = [(seed, m) for m in inter_sorted] + [(m, best_sink) for m in inter_sorted]
+            return [
+                {
+                    "motif_type": "split_recombine",
+                    "direction": "forward",
+                    "seed": seed,
+                    "source": seed,
+                    "sink": best_sink,
+                    "k": len(inter_sorted),
+                    "intermediaries": inter_sorted,
+                    "edges": edges,
+                }
             ]
-            return [{
-                "motif_type": "split_recombine",
-                "direction": "forward",
-                "seed": seed,
-                "source": seed,
-                "sink": best_sink,
-                "k": len(inter_sorted),
-                "intermediaries": inter_sorted,
-                "edges": edges,
-            }]
 
         # direction == "backward"
         in_edges = adj.neighbors_in(seed)
@@ -5714,7 +6197,7 @@ class GDSNavigator:
             return []
         max_ts = max(ts for (_n, ts, *_r) in in_edges)
         earliest_recomb_out: dict[str, float] = {}
-        for (m, ts, *_r) in in_edges:
+        for m, ts, *_r in in_edges:
             if m == seed or ts < max_ts - window_sec:
                 continue
             if ts < earliest_recomb_out.get(m, float("inf")):
@@ -5723,8 +6206,8 @@ class GDSNavigator:
             return []
         source_to_inter: dict[str, set[str]] = {}
         for m, r_out_ts in earliest_recomb_out.items():
-            for (s, t, *_r) in adj.neighbors_in(m):
-                if s == seed or s == m:
+            for s, t, *_r in adj.neighbors_in(m):
+                if s in (seed, m):
                     continue
                 if t >= r_out_ts or r_out_ts - t > window_sec:
                     continue
@@ -5737,19 +6220,19 @@ class GDSNavigator:
         if best_source is None:
             return []
         inter_sorted = sorted(best_inter)
-        edges = [(best_source, m) for m in inter_sorted] + [
-            (m, seed) for m in inter_sorted
+        edges = [(best_source, m) for m in inter_sorted] + [(m, seed) for m in inter_sorted]
+        return [
+            {
+                "motif_type": "split_recombine",
+                "direction": "backward",
+                "seed": seed,
+                "source": best_source,
+                "sink": seed,
+                "k": len(inter_sorted),
+                "intermediaries": inter_sorted,
+                "edges": edges,
+            }
         ]
-        return [{
-            "motif_type": "split_recombine",
-            "direction": "backward",
-            "seed": seed,
-            "source": best_source,
-            "sink": seed,
-            "k": len(inter_sorted),
-            "intermediaries": inter_sorted,
-            "edges": edges,
-        }]
 
     @staticmethod
     def _enum_bipartite_burst_via_adj(
@@ -5784,10 +6267,13 @@ class GDSNavigator:
                 return None
             to_keys = out_window_["to_key"]
             max_ts = max(timestamps)
-            sinks = sorted({
-                d for d, ts in zip(to_keys, timestamps, strict=True)
-                if d != seed_ and ts >= max_ts - window_sec
-            })
+            sinks = sorted(
+                {
+                    d
+                    for d, ts in zip(to_keys, timestamps, strict=True)
+                    if d != seed_ and ts >= max_ts - window_sec
+                }
+            )
             if len(sinks) < min_m:
                 return None
             sources_per_sink: dict[str, set[str]] = {}
@@ -5813,10 +6299,7 @@ class GDSNavigator:
                 return None
             sources_sorted = sorted(common)
             sources_set = set(sources_sorted)
-            sinks_final = [
-                d for d in sorted(sinks)
-                if sources_set <= sources_per_sink[d]
-            ]
+            sinks_final = [d for d in sorted(sinks) if sources_set <= sources_per_sink[d]]
             if len(sinks_final) < min_m:
                 return None
             edges = [(s, d) for s in sources_sorted for d in sinks_final]
@@ -5839,10 +6322,13 @@ class GDSNavigator:
                 return None
             from_keys = in_window_["from_key"]
             max_ts = max(timestamps)
-            sources = sorted({
-                f for f, ts in zip(from_keys, timestamps, strict=True)
-                if f != seed_ and ts >= max_ts - window_sec
-            })
+            sources = sorted(
+                {
+                    f
+                    for f, ts in zip(from_keys, timestamps, strict=True)
+                    if f != seed_ and ts >= max_ts - window_sec
+                }
+            )
             if len(sources) < min_k:
                 return None
             sinks_per_source: dict[str, set[str]] = {}
@@ -5868,10 +6354,7 @@ class GDSNavigator:
                 return None
             sinks_sorted = sorted(common)
             sinks_set = set(sinks_sorted)
-            sources_final = [
-                s for s in sorted(sources)
-                if sinks_set <= sinks_per_source[s]
-            ]
+            sources_final = [s for s in sorted(sources) if sinks_set <= sinks_per_source[s]]
             if len(sources_final) < min_k:
                 return None
             edges = [(s, d) for s in sources_final for d in sinks_sorted]
@@ -5895,7 +6378,7 @@ class GDSNavigator:
         distinct_out = len({t for t in out_to_keys if t != seed})
         distinct_in = len({f for f in in_from_keys if f != seed})
 
-        candidates: list = []
+        candidates: list[Any] = []
         if distinct_out >= min_m:
             candidates.append(lambda: _try_source_inner(seed, out_window))
         if distinct_in >= min_k:
@@ -5930,12 +6413,14 @@ class GDSNavigator:
             closest = min(abs(a - b) for a in out_by_cp[cp] for b in in_by_cp[cp])
             if closest > window_sec:
                 continue
-            results.append({
-                "motif_type": "cycle_2",
-                "seed": seed,
-                "counterparty": cp,
-                "edges": [(seed, cp), (cp, seed)],
-            })
+            results.append(
+                {
+                    "motif_type": "cycle_2",
+                    "seed": seed,
+                    "counterparty": cp,
+                    "edges": [(seed, cp), (cp, seed)],
+                }
+            )
         return results
 
     @staticmethod
@@ -5949,7 +6434,7 @@ class GDSNavigator:
         if not out_from_seed:
             return []
         seed_to_b: dict[str, list[float]] = defaultdict(list)
-        for (b, ts, *_r) in out_from_seed:
+        for b, ts, *_r in out_from_seed:
             if b != seed:
                 seed_to_b[b].append(ts)
         # Pre-filter: keep only b-nodes that have at least one out-neighbor already
@@ -5963,8 +6448,8 @@ class GDSNavigator:
         }
         triads: list[dict[str, Any]] = []
         for b, ts_ab_list in seed_to_b.items():
-            for (c, ts_bc, *_r) in adj.neighbors_out(b):
-                if c == seed or c == b:
+            for c, ts_bc, *_r in adj.neighbors_out(b):
+                if c in (seed, b):
                     continue
                 closing = [ts for (x, ts, *_r) in adj.neighbors_out(c) if x == seed]
                 if not closing:
@@ -5982,13 +6467,15 @@ class GDSNavigator:
                             best = (t_ab, ts_bc, t_ca)
                 if best is None:
                     continue
-                triads.append({
-                    "motif_type": "cycle_3",
-                    "seed": seed,
-                    "ring": [seed, b, c],
-                    "edges": [(seed, b), (b, c), (c, seed)],
-                    "timestamps": list(best),
-                })
+                triads.append(
+                    {
+                        "motif_type": "cycle_3",
+                        "seed": seed,
+                        "ring": [seed, b, c],
+                        "edges": [(seed, b), (b, c), (c, seed)],
+                        "timestamps": list(best),
+                    }
+                )
                 if len(triads) >= max_triads:
                     return triads
         return triads
@@ -6017,37 +6504,37 @@ class GDSNavigator:
         large_first = [
             (b, ts, amt)
             for (b, ts, amt, _ek) in out1
-            if b != seed
-            and amt is not None and amt > 0
-            and amt >= amt1_min
+            if b != seed and amt is not None and amt > 0 and amt >= amt1_min
         ]
         if not large_first:
             return []
 
         results: list[dict[str, Any]] = []
-        for (b, ts_ab, amt_ab) in large_first:
-            for (c, ts_bc, amt_bc, _ek_bc) in adj.neighbors_out(b):
-                if c == seed or c == b:
+        for b, ts_ab, amt_ab in large_first:
+            for c, ts_bc, amt_bc, _ek_bc in adj.neighbors_out(b):
+                if c in (seed, b):
                     continue
                 if ts_bc <= ts_ab or ts_bc - ts_ab > window_sec:
                     continue
                 if amt_bc is None or amt_bc <= 0 or amt_bc > amt2_max:
                     continue
-                for (d, ts_cd, amt_cd, _ek_cd) in adj.neighbors_out(c):
-                    if d == seed or d == b or d == c:
+                for d, ts_cd, amt_cd, _ek_cd in adj.neighbors_out(c):
+                    if d in (seed, b, c):
                         continue
                     if ts_cd <= ts_bc or ts_cd - ts_ab > window_sec:
                         continue
                     if amt_cd is None or amt_cd <= 0 or amt_cd > amt2_max:
                         continue
-                    results.append({
-                        "motif_type": "structuring",
-                        "seed": seed,
-                        "path": [seed, b, c, d],
-                        "edges": [(seed, b), (b, c), (c, d)],
-                        "timestamps": [ts_ab, ts_bc, ts_cd],
-                        "amounts": [amt_ab, amt_bc, amt_cd],
-                    })
+                    results.append(
+                        {
+                            "motif_type": "structuring",
+                            "seed": seed,
+                            "path": [seed, b, c, d],
+                            "edges": [(seed, b), (b, c), (c, d)],
+                            "timestamps": [ts_ab, ts_bc, ts_cd],
+                            "amounts": [amt_ab, amt_bc, amt_cd],
+                        }
+                    )
                     if len(results) >= max_instances:
                         return results
         return results
@@ -6075,9 +6562,9 @@ class GDSNavigator:
         truncated = False
         for _hop in range(k - 1):
             next_frontier: list[_Partial] = []
-            for (path, edge_list, ts_first, ts_last) in frontier:
+            for path, edge_list, ts_first, ts_last in frontier:
                 tail = path[-1]
-                for (nxt, ts_new, _amt, _ek) in adj.neighbors_out(tail):
+                for nxt, ts_new, _amt, _ek in adj.neighbors_out(tail):
                     if nxt in path:
                         continue
                     if ts_last is not None and ts_new <= ts_last:
@@ -6085,12 +6572,14 @@ class GDSNavigator:
                     new_first = ts_first if ts_first is not None else ts_new
                     if ts_new - new_first > window_sec:
                         continue
-                    next_frontier.append((
-                        path + (nxt,),
-                        edge_list + [(tail, nxt)],
-                        new_first,
-                        ts_new,
-                    ))
+                    next_frontier.append(
+                        (
+                            path + (nxt,),
+                            edge_list + [(tail, nxt)],
+                            new_first,
+                            ts_new,
+                        )
+                    )
                     if len(next_frontier) >= max_frontier:
                         truncated = True
                         break
@@ -6102,18 +6591,20 @@ class GDSNavigator:
                 return []
         results: list[dict[str, Any]] = []
         seen: set[tuple[str, ...]] = set()
-        for (path, edge_list, _ts_first, _ts_last) in frontier:
+        for path, edge_list, _ts_first, _ts_last in frontier:
             if path in seen:
                 continue
             seen.add(path)
-            results.append({
-                "motif_type": "chain_k",
-                "seed": seed,
-                "k": k,
-                "path": list(path),
-                "edges": edge_list,
-                "frontier_truncated": truncated,
-            })
+            results.append(
+                {
+                    "motif_type": "chain_k",
+                    "seed": seed,
+                    "k": k,
+                    "path": list(path),
+                    "edges": edge_list,
+                    "frontier_truncated": truncated,
+                }
+            )
             if len(results) >= max_results:
                 break
         return results
@@ -6160,9 +6651,14 @@ class GDSNavigator:
             sphere = self._storage.read_sphere()
         except Exception:  # noqa: BLE001
             return
-        pattern = sphere.patterns.get(pattern_id) if hasattr(
-            sphere.patterns, "get",
-        ) else None
+        pattern = (
+            sphere.patterns.get(pattern_id)
+            if hasattr(
+                sphere.patterns,
+                "get",
+            )
+            else None
+        )
         if pattern is None or getattr(pattern, "pattern_type", None) != "event":
             return
         suggestion: str | None = None
@@ -6193,20 +6689,22 @@ class GDSNavigator:
         pattern_id: str,
         time_window_hours: int,
         min_k: int = 3,
+        adj: AdjacencyIndex | None = None,
         **_kwargs: Any,
     ) -> list[dict[str, Any]]:
         """Hub → k distinct targets within a sliding time window.
 
         Delegates to the in-memory adjacency enumerator. Single-seed cost on
         a high-out-degree hub is dominated by ``adj.neighbors_out`` dict
-        lookups instead of a Lance ``read_edges`` scan.
+        lookups instead of a Lance ``read_edges`` scan. ``adj`` defaults to
+        the full index.
         """
         if min_k < 2:
             raise GDSNavigationError(
                 f"fan_out min_k must be >= 2, got {min_k}.",
             )
-        graph_pid = self._resolve_motif_graph_pid(pattern_id)
-        adj = self._storage.get_adjacency(graph_pid)
+        if adj is None:
+            adj = self._storage.get_adjacency(self._resolve_motif_graph_pid(pattern_id))
         window_sec = float(time_window_hours) * 3600.0
         return self._enum_fan_out_via_adj(seed, adj, window_sec, min_k)
 
@@ -6216,15 +6714,17 @@ class GDSNavigator:
         pattern_id: str,
         time_window_hours: int,
         counterparty: str | None = None,
+        adj: AdjacencyIndex | None = None,
         **_kwargs: Any,
     ) -> list[dict[str, Any]]:
         """Bidirectional pair (A ↔ B) with both directions within ``time_window_hours``.
 
         Delegates to the in-memory adjacency enumerator. ``counterparty`` filter
-        applied post-delegate to preserve the public signature.
+        applied post-delegate to preserve the public signature. ``adj``
+        defaults to the full index.
         """
-        graph_pid = self._resolve_motif_graph_pid(pattern_id)
-        adj = self._storage.get_adjacency(graph_pid)
+        if adj is None:
+            adj = self._storage.get_adjacency(self._resolve_motif_graph_pid(pattern_id))
         window_sec = float(time_window_hours) * 3600.0
         results = self._enum_cycle_2_via_adj(seed, adj, window_sec)
         if counterparty is not None:
@@ -6237,14 +6737,16 @@ class GDSNavigator:
         pattern_id: str,
         time_window_hours: int,
         max_triads: int = 50,
+        adj: AdjacencyIndex | None = None,
         **_kwargs: Any,
     ) -> list[dict[str, Any]]:
         """Directed triad A→B→C→A with strictly monotonic timestamps within window.
 
-        Delegates to the in-memory adjacency enumerator.
+        Delegates to the in-memory adjacency enumerator. ``adj`` defaults to
+        the full index.
         """
-        graph_pid = self._resolve_motif_graph_pid(pattern_id)
-        adj = self._storage.get_adjacency(graph_pid)
+        if adj is None:
+            adj = self._storage.get_adjacency(self._resolve_motif_graph_pid(pattern_id))
         window_sec = float(time_window_hours) * 3600.0
         return self._enum_cycle_3_via_adj(seed, adj, window_sec, max_triads)
 
@@ -6266,7 +6768,12 @@ class GDSNavigator:
         adj = self._storage.get_adjacency(graph_pid)
         window_sec = float(time_window_hours) * 3600.0
         return self._enum_structuring_via_adj(
-            seed, adj, window_sec, amt1_min, amt2_max, max_instances,
+            seed,
+            adj,
+            window_sec,
+            amt1_min,
+            amt2_max,
+            max_instances,
         )
 
     def _existing_neighbors(
@@ -6307,7 +6814,9 @@ class GDSNavigator:
         return existing
 
     def _load_trajectory_vector(
-        self, primary_key: str, pattern_id: str,
+        self,
+        primary_key: str,
+        pattern_id: str,
     ) -> np.ndarray | None:
         """Load a single trajectory summary vector from the trajectory ANN index.
 
@@ -6317,7 +6826,9 @@ class GDSNavigator:
         return result.get(primary_key)
 
     def _load_trajectory_vectors_batch(
-        self, primary_keys: list[str], pattern_id: str,
+        self,
+        primary_keys: list[str],
+        pattern_id: str,
     ) -> dict[str, np.ndarray]:
         """Batch-load trajectory summary vectors via single Lance scan.
 
@@ -6327,18 +6838,13 @@ class GDSNavigator:
         """
         if not primary_keys:
             return {}
-        import lance as _lance_local
 
-        traj_path = (
-            self._storage._base / "_gds_meta" / "trajectory" / f"{pattern_id}.lance"
-        )
+        traj_path = self._storage._base / "_gds_meta" / "trajectory" / f"{pattern_id}.lance"
         if not traj_path.exists():
             return {}
-        escaped = ", ".join(
-            f"'{k.replace(chr(39), chr(39)*2)}'" for k in primary_keys
-        )
+        escaped = ", ".join(f"'{k.replace(chr(39), chr(39) * 2)}'" for k in primary_keys)
         try:
-            ds = _lance_local.dataset(str(traj_path))
+            ds = self._storage.dataset(traj_path)
             scanner = ds.scanner(
                 columns=["primary_key", "trajectory_vector"],
                 filter=f"primary_key IN ({escaped})",
@@ -6350,10 +6856,7 @@ class GDSNavigator:
             return {}
         keys = tbl["primary_key"].to_pylist()
         vectors = tbl["trajectory_vector"].to_pylist()
-        return {
-            keys[i]: np.asarray(vectors[i], dtype=np.float64)
-            for i in range(tbl.num_rows)
-        }
+        return {keys[i]: np.asarray(vectors[i], dtype=np.float64) for i in range(tbl.num_rows)}
 
     def _enumerate_fan_in(
         self,
@@ -6405,8 +6908,12 @@ class GDSNavigator:
         window_sec = float(time_window_hours) * 3600.0
         max_frontier = self._CHAIN_K_MAX_FRONTIER_PER_K.get(k, self._CHAIN_K_MAX_FRONTIER)
         return self._enum_chain_k_via_adj(
-            seed, adj, window_sec, k,
-            max_frontier, self._CHAIN_K_MAX_RESULTS,
+            seed,
+            adj,
+            window_sec,
+            k,
+            max_frontier,
+            self._CHAIN_K_MAX_RESULTS,
         )
 
     def _enumerate_split_recombine(
@@ -6437,7 +6944,11 @@ class GDSNavigator:
         adj = self._storage.get_adjacency(graph_pid)
         window_sec = float(time_window_hours) * 3600.0
         return self._enum_split_recombine_via_adj(
-            seed, adj, window_sec, min_k, direction,
+            seed,
+            adj,
+            window_sec,
+            min_k,
+            direction,
         )
 
     def _enumerate_bipartite_burst(
@@ -6458,13 +6969,18 @@ class GDSNavigator:
         """
         if min_k < 2 or min_m < 2:
             raise GDSNavigationError(
-                f"bipartite_burst requires min_k >= 2 and min_m >= 2, got min_k={min_k}, min_m={min_m}.",
+                "bipartite_burst requires min_k >= 2 and min_m >= 2, "
+                f"got min_k={min_k}, min_m={min_m}.",
             )
         graph_pid = self._resolve_motif_graph_pid(pattern_id)
         adj = self._storage.get_adjacency(graph_pid)
         window_sec = float(time_window_hours) * 3600.0
         return self._enum_bipartite_burst_via_adj(
-            seed, adj, window_sec, min_k, min_m,
+            seed,
+            adj,
+            window_sec,
+            min_k,
+            min_m,
         )
 
     def find_witness_cohort(
@@ -6541,7 +7057,7 @@ class GDSNavigator:
                     "table. Either pass a different pattern or omit the override "
                     "and let auto-resolution pick one."
                 )
-            resolved_edge_pattern = edge_pattern_id
+            resolved_edge_pattern: str | None = edge_pattern_id
         else:
             resolved_edge_pattern = self._resolve_edge_pattern_for_anchor(pattern_id)
 
@@ -6554,26 +7070,25 @@ class GDSNavigator:
 
         version = self._resolve_version(pattern_id)
         dim_labels = pattern.dim_labels
-        theta_norm = (
-            float(np.linalg.norm(pattern.theta))
-            if pattern.theta is not None else 0.0
-        )
+        theta_norm = float(np.linalg.norm(pattern.theta)) if pattern.theta is not None else 0.0
         # Guard against zero theta — fall back to 1.0 to keep delta_sim defined
         theta_scale = theta_norm if theta_norm > 1e-9 else 1.0
 
         # Reference entity: delta + witness
         ref_table = self._storage.read_geometry(
-            pattern_id, version, primary_key=primary_key,
+            pattern_id,
+            version,
+            primary_key=primary_key,
             columns=["delta", "delta_norm", "is_anomaly", "delta_rank_pct"],
         )
         if ref_table.num_rows == 0:
-            raise KeyError(
-                f"Entity '{primary_key}' not found in {pattern_id} v{version}"
-            )
+            raise KeyError(f"Entity '{primary_key}' not found in {pattern_id} v{version}")
         ref_delta = np.asarray(ref_table["delta"][0].as_py(), dtype=np.float64)
         ref_is_anomaly = bool(ref_table["is_anomaly"][0].as_py())
         ref_witness_struct = self._engine.witness_set(
-            ref_delta, theta_norm, dim_labels,
+            ref_delta,
+            theta_norm,
+            dim_labels,
         )
         ref_witness = {d["label"] for d in ref_witness_struct.get("witness_dims", [])}
         target_witness_size = len(ref_witness)
@@ -6629,7 +7144,8 @@ class GDSNavigator:
                 candidate_pool_size=candidate_pool_size,
                 weights_used=weights,
                 summary={
-                    "max_score": 0.0, "mean_score": 0.0,
+                    "max_score": 0.0,
+                    "mean_score": 0.0,
                     "anomaly_count": 0,
                     "trajectory_used": trajectory_active,
                     "target_witness_size": target_witness_size,
@@ -6642,7 +7158,8 @@ class GDSNavigator:
 
         # Batch fetch candidate geometry
         cand_geo = self._storage.read_geometry(
-            pattern_id, version,
+            pattern_id,
+            version,
             point_keys=candidate_keys,
             columns=["primary_key", "delta", "delta_norm", "is_anomaly", "delta_rank_pct"],
         )
@@ -6660,7 +7177,8 @@ class GDSNavigator:
         cand_trajectories: dict[str, np.ndarray] = {}
         if trajectory_active:
             cand_trajectories = self._load_trajectory_vectors_batch(
-                candidate_keys, pattern_id,
+                candidate_keys,
+                pattern_id,
             )
 
         scored: list[CohortMember] = []
@@ -6679,11 +7197,11 @@ class GDSNavigator:
 
             # Component 2 — witness overlap
             cand_witness_struct = self._engine.witness_set(
-                delta_arr, theta_norm, dim_labels,
+                delta_arr,
+                theta_norm,
+                dim_labels,
             )
-            cand_witness = {
-                d["label"] for d in cand_witness_struct.get("witness_dims", [])
-            }
+            cand_witness = {d["label"] for d in cand_witness_struct.get("witness_dims", [])}
             witness_overlap = self._engine.witness_jaccard(ref_witness, cand_witness)
 
             if witness_overlap < cfg.min_witness_overlap:
@@ -6701,7 +7219,8 @@ class GDSNavigator:
                     traj_align = 0.5
                 else:
                     traj_align = self._engine.trajectory_cosine(
-                        ref_trajectory, cand_traj,
+                        cast(np.ndarray, ref_trajectory),  # trajectory_active implies not None
+                        cand_traj,
                     )
             else:
                 traj_align = None
@@ -6723,8 +7242,7 @@ class GDSNavigator:
 
             shared = ", ".join(sorted(ref_witness & cand_witness)) or "—"
             traj_phrase = (
-                f", trajectory alignment {traj_align:.2f}"
-                if traj_align is not None else ""
+                f", trajectory alignment {traj_align:.2f}" if traj_align is not None else ""
             )
             anom_phrase = " (anomalous)" if is_anom_y else ""
             explanation = (
@@ -6733,29 +7251,26 @@ class GDSNavigator:
                 f"{traj_phrase}{anom_phrase}"
             )
 
-            scored.append(CohortMember(
-                primary_key=cand_key,
-                score=round(score, 4),
-                delta_similarity=round(delta_sim, 4),
-                witness_overlap=round(witness_overlap, 4),
-                trajectory_alignment=(
-                    round(traj_align, 4) if traj_align is not None else None
-                ),
-                is_anomaly=bool(is_anom_y),
-                delta_rank_pct=round(float(rank_y), 2),
-                explanation=explanation,
-                component_scores={k: round(v, 4) for k, v in components.items()},
-            ))
+            scored.append(
+                CohortMember(
+                    primary_key=cand_key,
+                    score=round(score, 4),
+                    delta_similarity=round(delta_sim, 4),
+                    witness_overlap=round(witness_overlap, 4),
+                    trajectory_alignment=(round(traj_align, 4) if traj_align is not None else None),
+                    is_anomaly=bool(is_anom_y),
+                    delta_rank_pct=round(float(rank_y), 2),
+                    explanation=explanation,
+                    component_scores={k: round(v, 4) for k, v in components.items()},
+                )
+            )
 
         scored.sort(key=lambda m: m.score, reverse=True)
         top_members = scored[:top_n]
 
         anomaly_count = sum(1 for m in top_members if m.is_anomaly)
         max_score = top_members[0].score if top_members else 0.0
-        mean_score = (
-            sum(m.score for m in top_members) / len(top_members)
-            if top_members else 0.0
-        )
+        mean_score = sum(m.score for m in top_members) / len(top_members) if top_members else 0.0
 
         return WitnessCohortResult(
             primary_key=primary_key,
@@ -6797,29 +7312,42 @@ class GDSNavigator:
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns[pattern_id]
         deltas = [s.delta_snapshot for s in solid.slices]
-        af = forecast_anomaly_status(
-            deltas,
-            pattern.theta_norm,
-            horizon=1,
-            current_delta_norm=current_delta_norm,
+        # Temporal slices can carry fewer dims than the pattern (dims derived
+        # from the edge table are not sliced). Compare the extrapolated norm
+        # with the threshold of the same dims, not with the full-space one.
+        n_slice_dims = len(deltas[-1])
+        theta_vec = np.asarray(pattern.theta if pattern.theta is not None else [], dtype=np.float64)
+        sliced_subspace = 0 < n_slice_dims < len(theta_vec)
+        theta_forecast = (
+            float(np.linalg.norm(theta_vec[:n_slice_dims]))
+            if sliced_subspace
+            else float(pattern.theta_norm)
+        )
+        af = forecast_anomaly_status(deltas, theta_forecast, horizon=1)
+        current_is_anomaly = (
+            pattern.theta_norm > 0.0 and float(current_delta_norm) >= pattern.theta_norm
+            if current_delta_norm is not None
+            else af.current_is_anomaly
         )
         forecast: dict[str, Any] = {
             "horizon": af.horizon,
             "predicted_delta_norm": round(af.predicted_delta_norm, 4),
             "current_delta_norm": (
-                round(float(current_delta_norm), 4)
-                if current_delta_norm is not None else None
+                round(float(current_delta_norm), 4) if current_delta_norm is not None else None
             ),
             "forecast_is_anomaly": af.forecast_is_anomaly,
-            "current_is_anomaly": af.current_is_anomaly,
+            "current_is_anomaly": bool(current_is_anomaly),
             "reliability": af.reliability,
         }
+        if sliced_subspace:
+            forecast["forecast_dims"] = n_slice_dims
+            forecast["forecast_theta_norm"] = round(theta_forecast, 4)
         last_ts = solid.slices[-1].timestamp
         if last_ts:
             forecast = check_stale_forecast(last_ts, forecast)
         return forecast
 
-    def solid_reputation(self, primary_key: str, pattern_id: str) -> dict | None:
+    def solid_reputation(self, primary_key: str, pattern_id: str) -> dict[str, Any] | None:
         """Compute reputation from entity's temporal history.
 
         Reads only delta_norm_snapshot from temporal data (avoids full build_solid).
@@ -6838,11 +7366,14 @@ class GDSNavigator:
             return None
         slice_norms = temporal.column("delta_norm_snapshot").to_numpy().astype(np.float32)
         from hypertopos.engine.geometry import GDSEngine as _GE
+
         return _GE.compute_reputation(slice_norms, theta_norm)
 
     def classify_anomalies(
-        self, polygons: list[Polygon], pattern_id: str,
-    ) -> list[dict]:
+        self,
+        polygons: list[Polygon],
+        pattern_id: str,
+    ) -> list[dict[str, Any]]:
         """Classify anomalous polygons into labeled clusters."""
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns[pattern_id]
@@ -6856,13 +7387,13 @@ class GDSNavigator:
     ) -> np.ndarray:
         """Compute hub scores from a geometry table. Returns float64 scores array."""
         if pattern.edge_max is not None:
+            from hypertopos.engine.geometry import shapes_from_deltas
+
             deltas = delta_matrix_from_arrow(table)
-            sigma = np.maximum(pattern.sigma_diag, 1e-2)
-            shape_matrix = np.clip(deltas * sigma + pattern.mu, 0.0, 1.0)
+            shape_matrix = np.clip(shapes_from_deltas(deltas, pattern), 0.0, 1.0)
             if line_id_filter is not None:
                 dim_idx = next(
-                    (i for i, r in enumerate(pattern.relations)
-                     if r.line_id == line_id_filter),
+                    (i for i, r in enumerate(pattern.relations) if r.line_id == line_id_filter),
                     None,
                 )
                 if dim_idx is None:
@@ -6870,14 +7401,21 @@ class GDSNavigator:
                         f"line_id_filter '{line_id_filter}' not found in "
                         f"pattern '{pattern.pattern_id}' relations."
                     )
-                return (shape_matrix[:, dim_idx] * pattern.edge_max[dim_idx]).astype(np.float64)
+                dim_scores: np.ndarray = (
+                    shape_matrix[:, dim_idx] * pattern.edge_max[dim_idx]
+                ).astype(np.float64)
+                return dim_scores
             _ew = len(pattern.edge_max)
-            return np.sum(shape_matrix[:, :_ew] * pattern.edge_max, axis=1).astype(np.float64)
+            total_scores: np.ndarray = np.sum(
+                shape_matrix[:, :_ew] * pattern.edge_max, axis=1
+            ).astype(np.float64)
+            return total_scores
         elif "edges" in table.schema.names:
             return np.array(
                 [
                     sum(
-                        1 for e in (table["edges"][i].as_py() or [])
+                        1
+                        for e in (table["edges"][i].as_py() or [])
                         if e.get("status") == "alive"
                         and (line_id_filter is None or e.get("line_id") == line_id_filter)
                     )
@@ -6888,12 +7426,14 @@ class GDSNavigator:
         else:
             # Fallback: reconstruct from entity_keys + relations
             line_ids_col, _ = _table_edge_line_and_point_keys(
-                table, pattern.relations,
+                table,
+                pattern.relations,
             )
             return np.array(
                 [
                     sum(
-                        1 for lid in (row_lids or [])
+                        1
+                        for lid in (row_lids or [])
                         if line_id_filter is None or lid == line_id_filter
                     )
                     for row_lids in line_ids_col
@@ -6906,9 +7446,6 @@ class GDSNavigator:
         pattern_id: str,
         top_n: int = 10,
         line_id_filter: str | None = None,
-        fdr_alpha: float | None = None,
-        fdr_method: str = "bh",
-        p_value_method: str = "rank",
         select: str = "top_norm",
     ) -> list[tuple[str, int, float]]:
         """π7 — Find entities with highest geometric connectivity (hub score).
@@ -6916,27 +7453,26 @@ class GDSNavigator:
         Scans geometry and ranks entities by shape-vector footprint.
         Returns list of (primary_key, alive_edge_count, hub_score) sorted DESC.
 
-        Continuous path (edge_max defined): numpy vectorized — shape = delta*sigma + mu,
-        score = shape * edge_max → raw alive count.
+        Continuous path (edge_max defined): numpy vectorized — shape recovered from
+        delta in the pattern's stored metric, score = shape * edge_max → raw alive count.
         Binary fallback (no edge_max): parse edges struct → count alive edges.
 
         Use line_id_filter to rank by edges to a specific line only.
         """
-        if fdr_method not in ("bh", "storey"):
-            raise ValueError(
-                f"fdr_method must be 'bh' or 'storey', got {fdr_method!r}"
-            )
         version = self._resolve_version(pattern_id)
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns[pattern_id]
 
         # Continuous path only needs primary_key + delta
         hub_columns: list[str] = (
-            ["primary_key", "delta"] if pattern.edge_max is not None
+            ["primary_key", "delta"]
+            if pattern.edge_max is not None
             else ["primary_key", "edges", "entity_keys"]
         )
         table = self._storage.read_geometry(
-            pattern_id, version, columns=hub_columns,
+            pattern_id,
+            version,
+            columns=hub_columns,
         )
         if table.num_rows == 0:
             return []
@@ -6946,15 +7482,15 @@ class GDSNavigator:
 
         if pattern.edge_max is not None:
             # --- Continuous path: numpy vectorized ---
+            from hypertopos.engine.geometry import shapes_from_deltas
+
             deltas = delta_matrix_from_arrow(table)
             _hub_deltas = deltas
-            sigma = np.maximum(pattern.sigma_diag, 1e-2)
-            shape_matrix = np.clip(deltas * sigma + pattern.mu, 0.0, 1.0)
+            shape_matrix = np.clip(shapes_from_deltas(deltas, pattern), 0.0, 1.0)
 
             if line_id_filter is not None:
                 dim_idx = next(
-                    (i for i, r in enumerate(pattern.relations)
-                     if r.line_id == line_id_filter),
+                    (i for i, r in enumerate(pattern.relations) if r.line_id == line_id_filter),
                     None,
                 )
                 if dim_idx is None:
@@ -6972,16 +7508,12 @@ class GDSNavigator:
 
             # Round to int for alive_edge_count
             edge_counts = np.rint(scores).astype(int)
-            # Full-population scores for FDR rank percentiles, captured before
-            # the top_n truncation below so p-values stay population-relative.
-            full_scores = scores
             n = min(top_n, len(scores))
             top_indices = np.argpartition(scores, -n)[-n:]
             top_indices = top_indices[np.argsort(scores[top_indices])[::-1]]
 
             results: list[tuple[str, int, float]] = [
-                (keys[i], int(edge_counts[i]), float(scores[i]))
-                for i in top_indices
+                (keys[i], int(edge_counts[i]), float(scores[i])) for i in top_indices
             ]
         elif "edges" in table.schema.names:
             # --- Binary fallback: JSON edge count ---
@@ -6990,59 +7522,38 @@ class GDSNavigator:
                 bk = keys[i]
                 edges = table["edges"][i].as_py() or []
                 count = sum(
-                    1 for e in edges
+                    1
+                    for e in edges
                     if e.get("status") == "alive"
                     and (line_id_filter is None or e.get("line_id") == line_id_filter)
                 )
                 results.append((bk, count, float(count)))
             results.sort(key=lambda r: r[2], reverse=True)
-            full_scores = np.array([r[2] for r in results], dtype=np.float64)
             results = results[:top_n]
         else:
             # --- entity_keys fallback: reconstruct from relations ---
             line_ids_col, _ = _table_edge_line_and_point_keys(
-                table, pattern.relations,
+                table,
+                pattern.relations,
             )
             results = []
             for i in range(table.num_rows):
                 bk = keys[i]
                 count = sum(
-                    1 for lid in (line_ids_col[i] or [])
+                    1
+                    for lid in (line_ids_col[i] or [])
                     if line_id_filter is None or lid == line_id_filter
                 )
                 results.append((bk, count, float(count)))
             results.sort(key=lambda r: r[2], reverse=True)
-            full_scores = np.array([r[2] for r in results], dtype=np.float64)
             results = results[:top_n]
-
-        # --- FDR filtering (opt-in) ---
-        if fdr_alpha is not None and len(results) > 0:
-            from hypertopos.engine.fdr import (
-                benjamini_hochberg,
-                empirical_p_values_from_rank,
-            )
-            # Population rank percentile from the full scores array (same
-            # right-tail convention as π7_attract_hub_and_stats): the strongest
-            # hub sits at the top of the population → smallest p. The earlier
-            # inline (N-i)/N was inverted (strongest hub at index 0 → p=1.0) and
-            # capped at best-p = 1/top_n, so it could not pass BH at a small alpha.
-            total = len(full_scores)
-            rank_pcts = np.array(
-                [float(np.sum(full_scores <= r[2])) / total * 100
-                 for r in results],
-                dtype=np.float64,
-            )
-            p_values = empirical_p_values_from_rank(rank_pcts)
-            rejected, q_values = benjamini_hochberg(p_values, fdr_alpha, method=fdr_method)
-            results = [
-                r for r, keep in zip(results, rejected) if keep
-            ]
 
         # --- Diverse selection (opt-in) ---
         if select not in ("top_norm", "diverse"):
             raise ValueError(f"unknown select mode: {select!r}")
         if select == "diverse" and len(results) > 0 and _hub_deltas is not None:
             from hypertopos.engine.selection import lazy_greedy_facility_location
+
             # Build delta matrix for the result keys
             key_to_idx = {k: i for i, k in enumerate(keys)}
             result_indices = [key_to_idx[r[0]] for r in results if r[0] in key_to_idx]
@@ -7054,128 +7565,44 @@ class GDSNavigator:
 
         return results
 
-    def hub_score_stats(
-        self, pattern_id: str, line_id_filter: str | None = None
-    ) -> dict:
-        """Compute hub score distribution statistics.
-
-        When line_id_filter is provided, scores are computed for that line only
-        (same filtering logic as π7_attract_hub). Returns stats on the filtered
-        score distribution so agents can correctly interpret top-N results.
-        """
-        version = self._resolve_version(pattern_id)
-        sphere = self._storage.read_sphere()
-        pattern = sphere.patterns[pattern_id]
-        stats_columns: list[str] = (
-            ["primary_key", "delta"] if pattern.edge_max is not None
-            else ["primary_key", "edges", "entity_keys"]
-        )
-        table = self._storage.read_geometry(
-            pattern_id, version, columns=stats_columns,
-        )
-        if table.num_rows == 0:
-            return {
-                "mean": 0.0, "std": 0.0,
-                "p25": 0.0, "p50": 0.0, "p75": 0.0, "p90": 0.0, "p95": 0.0,
-                "max": 0.0, "total_entities": 0,
-            }
-
-        if pattern.edge_max is not None:
-            deltas = delta_matrix_from_arrow(table)
-            sigma = np.maximum(pattern.sigma_diag, 1e-2)
-            shape_matrix = np.clip(deltas * sigma + pattern.mu, 0.0, 1.0)
-            if line_id_filter is not None:
-                dim_idx = next(
-                    (i for i, r in enumerate(pattern.relations)
-                     if r.line_id == line_id_filter),
-                    None,
-                )
-                if dim_idx is None:
-                    raise GDSNavigationError(
-                        f"line_id_filter '{line_id_filter}' not found in "
-                        f"pattern '{pattern_id}' relations."
-                    )
-                scores = (shape_matrix[:, dim_idx] * pattern.edge_max[dim_idx]).astype(np.float64)
-            else:
-                _ew = len(pattern.edge_max)
-                scores = np.sum(shape_matrix[:, :_ew] * pattern.edge_max, axis=1).astype(np.float64)
-        elif "edges" in table.schema.names:
-            scores = np.array(
-                [
-                    sum(
-                        1 for e in (table["edges"][i].as_py() or [])
-                        if e.get("status") == "alive"
-                        and (line_id_filter is None or e.get("line_id") == line_id_filter)
-                    )
-                    for i in range(table.num_rows)
-                ],
-                dtype=np.float64,
-            )
-        else:
-            # Fallback: reconstruct from entity_keys + relations
-            line_ids_col, _ = _table_edge_line_and_point_keys(
-                table, pattern.relations,
-            )
-            scores = np.array(
-                [
-                    sum(
-                        1 for lid in (row_lids or [])
-                        if line_id_filter is None or lid == line_id_filter
-                    )
-                    for row_lids in line_ids_col
-                ],
-                dtype=np.float64,
-            )
-
-        return {
-            "mean": round(float(np.mean(scores)), 3),
-            "std": round(float(np.std(scores)), 3),
-            "p25": round(float(np.percentile(scores, 25)), 3),
-            "p50": round(float(np.percentile(scores, 50)), 3),
-            "p75": round(float(np.percentile(scores, 75)), 3),
-            "p90": round(float(np.percentile(scores, 90)), 3),
-            "p95": round(float(np.percentile(scores, 95)), 3),
-            "max": round(float(np.max(scores)), 3),
-            "total_entities": int(table.num_rows),
-        }
-
     def π7_attract_hub_and_stats(
         self,
         pattern_id: str,
         top_n: int = 10,
         line_id_filter: str | None = None,
-        fdr_alpha: float | None = None,
-        fdr_method: str = "bh",
-        p_value_method: str = "rank",
         select: str = "top_norm",
-    ) -> tuple[list[tuple[str, int, float, float | None]], dict]:
+    ) -> tuple[list[tuple[str, int, float, float | None]], dict[str, Any]]:
         """π7 variant — returns (top_n_results, score_stats) in ONE geometry scan.
 
-        Avoids the two-scan overhead of calling π7_attract_hub + hub_score_stats separately.
+        The population stats (mean, std, percentiles, max, total_entities) come
+        from the same scan as the ranked hubs.
 
         Each result tuple is (primary_key, alive_edge_count, hub_score, hub_score_pct).
         hub_score_pct is the score as a percentage of max_hub_score (None in binary mode).
         stats dict includes max_hub_score for continuous patterns.
         """
-        if fdr_method not in ("bh", "storey"):
-            raise ValueError(
-                f"fdr_method must be 'bh' or 'storey', got {fdr_method!r}"
-            )
         version = self._resolve_version(pattern_id)
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns[pattern_id]
         max_hub_score = pattern.max_hub_score
         hub_columns: list[str] = (
-            ["primary_key", "delta"] if pattern.edge_max is not None
+            ["primary_key", "delta"]
+            if pattern.edge_max is not None
             else ["primary_key", "edges", "entity_keys"]
         )
         table = self._storage.read_geometry(pattern_id, version, columns=hub_columns)
 
         if table.num_rows == 0:
             empty_stats: dict[str, Any] = {
-                "mean": 0.0, "std": 0.0,
-                "p25": 0.0, "p50": 0.0, "p75": 0.0, "p90": 0.0, "p95": 0.0,
-                "max": 0.0, "total_entities": 0,
+                "mean": 0.0,
+                "std": 0.0,
+                "p25": 0.0,
+                "p50": 0.0,
+                "p75": 0.0,
+                "p90": 0.0,
+                "p95": 0.0,
+                "max": 0.0,
+                "total_entities": 0,
                 "max_hub_score": max_hub_score,
             }
             return [], empty_stats
@@ -7203,26 +7630,6 @@ class GDSNavigator:
             )
             for i in top_indices
         ]
-
-        # --- FDR filtering (opt-in) ---
-        if fdr_alpha is not None and len(results) > 0:
-            from hypertopos.engine.fdr import (
-                benjamini_hochberg,
-                empirical_p_values_from_rank,
-            )
-
-            # Population rank percentile from the full scores array
-            total = len(scores)
-            rank_pcts = np.array(
-                [float(np.sum(scores <= r[2])) / total * 100
-                 for r in results],
-                dtype=np.float64,
-            )
-            p_values = empirical_p_values_from_rank(rank_pcts)
-            rejected, q_values = benjamini_hochberg(p_values, fdr_alpha, method=fdr_method)
-            results = [
-                r for r, keep in zip(results, rejected) if keep
-            ]
 
         # --- Diverse selection (opt-in) ---
         if select not in ("top_norm", "diverse"):
@@ -7253,7 +7660,7 @@ class GDSNavigator:
         }
         return results, stats
 
-    def hub_score_history(self, primary_key: str, pattern_id: str) -> list[dict]:
+    def hub_score_history(self, primary_key: str, pattern_id: str) -> list[dict[str, Any]]:
         """Hub score evolution per temporal slice. Returns [] in binary mode."""
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns[pattern_id]
@@ -7262,32 +7669,37 @@ class GDSNavigator:
 
         solid = self._engine.build_solid(primary_key, pattern_id, self._manifest)
 
-        sigma = np.maximum(pattern.sigma_diag, 1e-2)
+        from hypertopos.engine.geometry import shapes_from_deltas
+
         _ew = len(pattern.edge_max)
 
         def _score(delta: np.ndarray) -> tuple[float, int]:
-            shape_vec = delta[:_ew] * sigma[:_ew] + pattern.mu[:_ew]
+            shape_vec = shapes_from_deltas(delta[:_ew], pattern)
             s = float(np.sum(shape_vec * pattern.edge_max))
             return round(max(0.0, s), 3), max(0, int(round(s)))
 
         history = []
         for sl in solid.slices:
             sc, alive = _score(sl.delta_snapshot)
-            history.append({
-                "timestamp": sl.timestamp.isoformat(),
-                "hub_score": sc,
-                "alive_edges_est": alive,
-                "deformation_type": sl.deformation_type,
-                "changed_line_id": sl.changed_line_id,
-                "delta_norm": round(float(sl.delta_norm_snapshot), 4),
-            })
+            history.append(
+                {
+                    "timestamp": sl.timestamp.isoformat(),
+                    "hub_score": sc,
+                    "alive_edges_est": alive,
+                    "deformation_type": sl.deformation_type,
+                    "changed_line_id": sl.changed_line_id,
+                    "delta_norm": round(float(sl.delta_norm_snapshot), 4),
+                }
+            )
 
         base = solid.base_polygon
         # Read stored delta directly — build_polygon recomputes delta from Edge structs
         # which in continuous mode have point_key="" and yield wrong alive counts.
         version = self._resolve_version(pattern_id)
         geo = self._storage.read_geometry(
-            pattern_id, version, primary_key=primary_key,
+            pattern_id,
+            version,
+            primary_key=primary_key,
             columns=["delta", "delta_norm"],
         )
         if geo.num_rows > 0:
@@ -7297,14 +7709,16 @@ class GDSNavigator:
             base_delta = base.delta
             base_delta_norm = base.delta_norm
         sc, alive = _score(base_delta)
-        history.append({
-            "timestamp": base.updated_at.isoformat(),
-            "hub_score": sc,
-            "alive_edges_est": alive,
-            "deformation_type": "current",
-            "changed_line_id": None,
-            "delta_norm": round(base_delta_norm, 4),
-        })
+        history.append(
+            {
+                "timestamp": base.updated_at.isoformat(),
+                "hub_score": sc,
+                "alive_edges_est": alive,
+                "deformation_type": "current",
+                "changed_line_id": None,
+                "delta_norm": round(base_delta_norm, 4),
+            }
+        )
 
         return history
 
@@ -7312,9 +7726,8 @@ class GDSNavigator:
     def _us_to_iso(us: int) -> str:
         """Convert microseconds-since-epoch to ISO 8601 UTC string."""
         from datetime import datetime
-        return datetime.fromtimestamp(us / 1_000_000, tz=UTC).strftime(
-            "%Y-%m-%dT%H:%M:%S+00:00"
-        )
+
+        return datetime.fromtimestamp(us / 1_000_000, tz=UTC).strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
     def π9_attract_drift(
         self,
@@ -7324,11 +7737,8 @@ class GDSNavigator:
         filters: dict[str, str | list[str]] | None = None,
         forecast_horizon: int | None = None,
         rank_by_dimension: str | None = None,
-        fdr_alpha: float | None = None,
-        fdr_method: str = "bh",
-        p_value_method: str = "rank",
         select: str = "top_norm",
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """π9 — Find entities with highest geometric drift (temporal velocity and direction).
 
         Scans anchor pattern population, reads all temporal history in one pass,
@@ -7357,11 +7767,10 @@ class GDSNavigator:
         keeps all four metrics focused on geometric/behavioural drift.
         dimension_diffs and dimension_diffs_current still include prop_columns as
         informational context so agents can see property acquisition separately.
+        ``prop_column_changes`` is filled only when temporal slices carry the
+        property dims; slices written by the builder hold the structural dims
+        only, so on built spheres it is ``{}``.
         """
-        if fdr_method not in ("bh", "storey"):
-            raise ValueError(
-                f"fdr_method must be 'bh' or 'storey', got {fdr_method!r}"
-            )
         import random
 
         sphere = self._storage.read_sphere()
@@ -7374,14 +7783,22 @@ class GDSNavigator:
             )
 
         dim_names_early = [r.line_id for r in pattern.relations]
+        # dimension_diffs is keyed by dim label (display_name when set); accept
+        # the line id or the label and sort on the label.
+        rel_labels = [r.display_name or r.line_id for r in pattern.relations]
         rank_dim_index: int | None = None
+        rank_label: str | None = None
         if rank_by_dimension is not None:
-            if rank_by_dimension not in dim_names_early:
+            if rank_by_dimension in dim_names_early:
+                rank_dim_index = dim_names_early.index(rank_by_dimension)
+            elif rank_by_dimension in rel_labels:
+                rank_dim_index = rel_labels.index(rank_by_dimension)
+            else:
                 raise GDSNavigationError(
                     f"rank_by_dimension='{rank_by_dimension}' not found in "
                     f"structural dimensions: {dim_names_early}"
                 )
-            rank_dim_index = dim_names_early.index(rank_by_dimension)
+            rank_label = rel_labels[rank_dim_index]
 
         _theta_norm = float(np.linalg.norm(pattern.theta)) if pattern.theta is not None else 0.0
         version = self._resolve_version(pattern_id)
@@ -7398,7 +7815,7 @@ class GDSNavigator:
 
         keys = pk_col
         if sample_size is not None and sample_size < len(keys):
-            keys = random.sample(keys, sample_size)
+            keys = random.Random(0).sample(keys, sample_size)
 
         dim_names = pattern.dim_labels or (
             [r.line_id for r in pattern.relations] + list(pattern.prop_columns)
@@ -7416,22 +7833,19 @@ class GDSNavigator:
         temporal_keys = keys if (sample_size is not None and sample_size < len(pk_col)) else None
         batch_iter = self._storage.read_temporal_batched(
             pattern_id,
-            timestamp_from=filters.get("timestamp_from") if filters else None,
-            timestamp_to=filters.get("timestamp_to") if filters else None,
+            timestamp_from=filters.get("timestamp_from") if filters else None,  # type: ignore[arg-type]  # timestamp filters are scalar str
+            timestamp_to=filters.get("timestamp_to") if filters else None,  # type: ignore[arg-type]  # timestamp filters are scalar str
             keys=temporal_keys,
         )
         try:
             first_batch = next(batch_iter)
         except StopIteration:
             return []
-        temporal_table = pa.Table.from_batches(
-            itertools.chain([first_batch], batch_iter)
-        )
+        temporal_table = pa.Table.from_batches(itertools.chain([first_batch], batch_iter))
         # Only apply remaining filters (e.g. "year") — timestamp bounds already
         # handled by read_temporal_batched predicate pushdown above.
         remaining_filters = {
-            k: v for k, v in (filters or {}).items()
-            if k not in ("timestamp_from", "timestamp_to")
+            k: v for k, v in (filters or {}).items() if k not in ("timestamp_from", "timestamp_to")
         }
         if remaining_filters and temporal_table.num_rows > 0:
             temporal_table = self._storage._apply_temporal_filters(
@@ -7444,7 +7858,7 @@ class GDSNavigator:
         if "shape_snapshot" not in temporal_table.schema.names:
             raise GDSNavigationError(
                 f"Temporal data for pattern '{pattern_id}' uses legacy schema "
-                "(delta_snapshot). Run GDSWriter.migrate_temporal_to_shape_snapshot() "
+                "(delta_snapshot). Rebuild the sphere "
                 "to upgrade."
             )
 
@@ -7478,7 +7892,8 @@ class GDSNavigator:
         n_rel = len(pattern.relations)
 
         from hypertopos.engine.geometry import GDSEngine as _GE
-        from hypertopos.engine.geometry import _decomposition_scalars
+        from hypertopos.engine.geometry import _decomposition_scalars, slice_deltas
+
         _compute_rep = _GE.compute_reputation
 
         # M3 decomposition pre-flight: load oldest+latest calibration epochs once
@@ -7495,10 +7910,12 @@ class GDSNavigator:
                 _decomp_versions = self._storage.list_calibration_versions(pattern_id)
                 if len(_decomp_versions) >= 2:
                     _f1 = self._storage.read_calibration_fit(
-                        pattern_id, version=_decomp_versions[0],
+                        pattern_id,
+                        version=_decomp_versions[0],
                     )
                     _f2 = self._storage.read_calibration_fit(
-                        pattern_id, version=_decomp_versions[-1],
+                        pattern_id,
+                        version=_decomp_versions[-1],
                     )
                     if _f1.schema_hash == _f2.schema_hash:
                         _decomp_fit_v1 = _f1
@@ -7506,7 +7923,8 @@ class GDSNavigator:
             except (GDSError, KeyError, OSError, ValueError):
                 pass
 
-        results: list[dict] = []
+        results: list[dict[str, Any]] = []
+        active_masks: dict[str, np.ndarray] = {}
 
         for bk in keys:
             rng = groups_range.get(bk)
@@ -7519,12 +7937,18 @@ class GDSNavigator:
 
             # Slice pre-extracted lists — no Arrow table creation in the hot loop
             all_shapes = np.array(t_shape[start:end], dtype=np.float32)  # shape (n, d)
-            # Temporal shape_snapshot carries structural dims only; aggregated
-            # edge_dim dims have no temporal history. Slice calibration arrays
-            # to the snapshot width before the broadcast.
+            # A window without events is no position in behaviour space: drop
+            # it so a busy-then-silent entity does not read as drifting.
+            active = active_slice_mask(all_shapes)
+            n_inactive = int(n - active.sum())
+            if active.sum() < 2:
+                continue
+            active_idx = np.flatnonzero(active)
+            all_shapes = all_shapes[active]
+            n = len(active_idx)
+            active_masks[bk] = active
             _w = all_shapes.shape[-1]
-            _sigma = np.maximum(pattern.sigma_diag[:_w], 1e-2)
-            all_deltas = (all_shapes - pattern.mu[:_w]) / _sigma
+            all_deltas = slice_deltas(all_shapes, pattern)
             delta_first = all_deltas[0]
             delta_last = all_deltas[-1]
             diff = delta_last - delta_first
@@ -7538,7 +7962,7 @@ class GDSNavigator:
             displacement_current = float(np.linalg.norm(diff_current[:n_rel]))
 
             step_diffs = np.diff(all_deltas[:, :n_rel], axis=0)  # shape (n-1, n_rel)
-            path_length = float(np.sqrt(np.einsum('ij,ij->i', step_diffs, step_diffs)).sum())
+            path_length = float(np.sqrt(np.einsum("ij,ij->i", step_diffs, step_diffs)).sum())
             ratio = displacement / path_length if path_length > 0 else 0.0
 
             # Gradient alignment: radially-inward component of the drift vector.
@@ -7548,8 +7972,7 @@ class GDSNavigator:
             _first_norm = float(np.linalg.norm(delta_first[:n_rel]))
             if displacement > 1e-9 and _first_norm > 1e-9:
                 _gradient_alignment = float(
-                    -np.dot(diff[:n_rel], delta_first[:n_rel])
-                    / (displacement * _first_norm)
+                    -np.dot(diff[:n_rel], delta_first[:n_rel]) / (displacement * _first_norm)
                 )
             else:
                 _gradient_alignment = 0.0
@@ -7561,13 +7984,11 @@ class GDSNavigator:
                 _drift_direction = "neutral"
 
             _rel_deltas = all_deltas[:, :n_rel]
-            delta_norms = np.sqrt(np.einsum('ij,ij->i', _rel_deltas, _rel_deltas))
+            delta_norms = np.sqrt(np.einsum("ij,ij->i", _rel_deltas, _rel_deltas))
             if n >= 3:
                 _mean = float(np.mean(delta_norms))
-                tac: float | None = round(
-                    1.0 - float(np.std(delta_norms)) / max(_mean, 1e-4), 4
-                )
-                tac = max(0.0, min(1.0, tac))
+                _tac_raw = round(1.0 - float(np.std(delta_norms)) / max(_mean, 1e-4), 4)
+                tac: float | None = max(0.0, min(1.0, _tac_raw))
             else:
                 tac = None
 
@@ -7575,8 +7996,10 @@ class GDSNavigator:
 
             if _decomp_fit_v1 is not None and _decomp_fit_v2 is not None:
                 _intr, _extr, _frac = _decomposition_scalars(
-                    all_shapes[0], all_shapes[-1],
-                    _decomp_fit_v1, _decomp_fit_v2,
+                    all_shapes[0],
+                    all_shapes[-1],
+                    _decomp_fit_v1,
+                    _decomp_fit_v2,
                 )
                 _intrinsic_displacement = round(_intr, 4)
                 _extrinsic_displacement = round(_extr, 4)
@@ -7586,50 +8009,52 @@ class GDSNavigator:
                 _extrinsic_displacement = None
                 _intrinsic_fraction = None
 
-            results.append({
-                "primary_key": bk,
-                "displacement": round(displacement, 4),
-                "displacement_current": round(displacement_current, 4),
-                "dimension_diffs_current": {
-                    name: round(float(diff_current[i]), 4)
-                    for i, name in enumerate(dim_names[:n_rel])
-                    if i < len(diff_current)
-                },
-                "prop_column_changes": {
-                    name: (abs(float(diff_current[n_rel + j])) > 0.5)
-                    for j, name in enumerate(pattern.prop_columns)
-                    if (n_rel + j) < len(diff_current)
-                },
-                "path_length": round(path_length, 4),
-                "ratio": round(ratio, 4),
-                "gradient_alignment": round(_gradient_alignment, 4),
-                "drift_direction": _drift_direction,
-                "num_slices": n,
-                "first_timestamp": self._us_to_iso(t_ts_us[start]),
-                "last_timestamp": self._us_to_iso(t_ts_us[end - 1]),
-                "delta_norm_first": round(float(np.linalg.norm(all_deltas[0])), 4),
-                "delta_norm_last": round(float(np.linalg.norm(all_deltas[-1])), 4),
-                "tac": tac,
-                "reputation": rep["reputation"],
-                "anomaly_tenure": rep["anomaly_tenure"],
-                "dimension_diffs": {
-                    name: round(float(diff[i]), 4)
-                    for i, name in enumerate(dim_names[:n_rel])
-                    if i < len(diff)
-                },
-                "intrinsic_displacement": _intrinsic_displacement,
-                "extrinsic_displacement": _extrinsic_displacement,
-                "intrinsic_fraction": _intrinsic_fraction,
-            })
+            results.append(
+                {
+                    "primary_key": bk,
+                    "displacement": round(displacement, 4),
+                    "displacement_current": round(displacement_current, 4),
+                    "dimension_diffs_current": {
+                        name: round(float(diff_current[i]), 4)
+                        for i, name in enumerate(dim_names[:n_rel])
+                        if i < len(diff_current)
+                    },
+                    "prop_column_changes": {
+                        name: (abs(float(diff_current[n_rel + j])) > 0.5)
+                        for j, name in enumerate(pattern.prop_columns)
+                        if (n_rel + j) < len(diff_current)
+                    },
+                    "path_length": round(path_length, 4),
+                    "ratio": round(ratio, 4),
+                    "gradient_alignment": round(_gradient_alignment, 4),
+                    "drift_direction": _drift_direction,
+                    "num_slices": n,
+                    "num_inactive_slices": n_inactive,
+                    "first_timestamp": self._us_to_iso(t_ts_us[start + active_idx[0]]),
+                    "last_timestamp": self._us_to_iso(t_ts_us[start + active_idx[-1]]),
+                    "delta_norm_first": round(float(np.linalg.norm(all_deltas[0])), 4),
+                    "delta_norm_last": round(float(np.linalg.norm(all_deltas[-1])), 4),
+                    "tac": tac,
+                    "reputation": rep["reputation"],
+                    "anomaly_tenure": rep["anomaly_tenure"],
+                    "dimension_diffs": {
+                        name: round(float(diff[i]), 4)
+                        for i, name in enumerate(dim_names[:n_rel])
+                        if i < len(diff)
+                    },
+                    "intrinsic_displacement": _intrinsic_displacement,
+                    "extrinsic_displacement": _extrinsic_displacement,
+                    "intrinsic_fraction": _intrinsic_fraction,
+                }
+            )
 
         if rank_dim_index is not None:
             results.sort(
-                key=lambda r: abs(r["dimension_diffs"].get(rank_by_dimension, 0)),
+                key=lambda r: abs(r["dimension_diffs"].get(rank_label, 0)),
                 reverse=True,
             )
         else:
             results.sort(key=lambda r: r["displacement"], reverse=True)
-        total_drift_population = len(results)
         results = results[:top_n]
 
         # Add slice_window_days to each entry
@@ -7653,38 +8078,46 @@ class GDSNavigator:
                 planes = {
                     aid: a.filter.cutting_plane
                     for aid, a in sphere.aliases.items()
-                    if a.base_pattern_id == pattern_id
-                    and a.filter.cutting_plane is not None
+                    if a.base_pattern_id == pattern_id and a.filter.cutting_plane is not None
                 }
             for entry in results:
                 pk = entry["primary_key"]
                 try:
                     solid = self._engine.build_solid(
-                        pk, pattern_id, self._manifest,
+                        pk,
+                        pattern_id,
+                        self._manifest,
                     )
                 except _NAVIGATION_RECOVERABLE_ERRORS:
                     continue
-                if len(solid.slices) < 3:
-                    continue
                 deltas_arr = [s.delta_snapshot for s in solid.slices]
+                # Same windows as the drift itself: no extrapolating a dormant tail.
+                mask = active_masks.get(pk)
+                if mask is not None and len(mask) == len(deltas_arr):
+                    deltas_arr = [d for d, keep in zip(deltas_arr, mask, strict=True) if keep]
+                if len(deltas_arr) < 3:
+                    continue
                 traj = extrapolate_trajectory(
-                    deltas_arr, horizon=forecast_horizon,
+                    deltas_arr,
+                    horizon=forecast_horizon,
                 )
                 crossings = (
                     forecast_segment_crossing(
-                        deltas_arr, planes, horizon=forecast_horizon,
+                        deltas_arr,
+                        planes,
+                        horizon=forecast_horizon,
                     )
                     if planes
                     else []
                 )
                 time_to_boundary = min(
-                    (c.time_to_boundary for c in crossings
-                     if c.time_to_boundary is not None),
+                    (c.time_to_boundary for c in crossings if c.time_to_boundary is not None),
                     default=None,
                 )
                 forecast = {
                     "predicted_delta_norm": round(
-                        traj.predicted_delta_norm, 4,
+                        traj.predicted_delta_norm,
+                        4,
                     ),
                     "time_to_boundary": time_to_boundary,
                     "reliability": traj.reliability,
@@ -7695,30 +8128,12 @@ class GDSNavigator:
                 forecast = check_stale_forecast(last_ts, forecast)
                 entry["drift_forecast"] = forecast
 
-        # --- FDR filtering (opt-in) ---
-        if fdr_alpha is not None and len(results) > 0:
-            from hypertopos.engine.fdr import (
-                benjamini_hochberg,
-                empirical_p_values_from_rank,
-            )
-            # Population rank percentile: rank i (0-based) in sorted top
-            # corresponds to position i in total_drift_population
-            rank_pcts = np.array(
-                [(total_drift_population - i) / total_drift_population * 100
-                 for i in range(len(results))],
-                dtype=np.float64,
-            )
-            p_values = empirical_p_values_from_rank(rank_pcts)
-            rejected, q_values = benjamini_hochberg(p_values, fdr_alpha, method=fdr_method)
-            for row, q in zip(results, q_values):
-                row["q_value"] = float(q)
-            results = [row for row, keep in zip(results, rejected) if keep]
-
         # --- Diverse selection (opt-in) ---
         if select not in ("top_norm", "diverse"):
             raise ValueError(f"unknown select mode: {select!r}")
         if select == "diverse" and len(results) > 0:
             from hypertopos.engine.selection import lazy_greedy_facility_location
+
             dim_keys = list(results[0].get("dimension_diffs", {}).keys())
             if dim_keys:
                 delta_vectors = np.array(
@@ -7727,9 +8142,10 @@ class GDSNavigator:
                 )
                 k = min(top_n, len(results))
                 selected_idx, representativeness = lazy_greedy_facility_location(
-                    delta_vectors, k,
+                    delta_vectors,
+                    k,
                 )
-                out: list[dict] = []
+                out: list[dict[str, Any]] = []
                 for i, idx in enumerate(selected_idx):
                     row = dict(results[int(idx)])
                     row["representativeness"] = int(representativeness[i])
@@ -7738,16 +8154,17 @@ class GDSNavigator:
 
         return results
 
-    def find_drifting_similar(
+    def π10_attract_trajectory(
         self,
         primary_key: str,
         pattern_id: str,
         top_n: int = 5,
-    ) -> list[dict]:
-        """Find entities that changed in a geometrically similar way.
+    ) -> list[dict[str, Any]]:
+        """π10 — Find entities that changed in a geometrically similar way.
 
-        Uses ANN search over trajectory summary vectors (mean + std of all temporal
-        deformations). Only meaningful for anchor patterns with temporal history.
+        Uses ANN search over trajectory summary vectors (mean + std of the
+        entity's active temporal windows — the windows π9 measures drift over).
+        Only meaningful for anchor patterns with temporal history.
 
         Returns list of dicts: {primary_key, distance, displacement, num_slices,
         first_timestamp, last_timestamp}, sorted by distance ascending.
@@ -7755,7 +8172,6 @@ class GDSNavigator:
         Raises ValueError if pattern is not an anchor type.
         Raises ValueError if trajectory index has not been built yet.
         """
-        import lance as _lance_local
 
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns.get(pattern_id)
@@ -7763,7 +8179,7 @@ class GDSNavigator:
             raise ValueError(f"Pattern '{pattern_id}' not found in sphere")
         if pattern.pattern_type != "anchor":
             raise ValueError(
-                f"find_drifting_similar requires an anchor pattern, "
+                f"Trajectory search requires an anchor pattern, "
                 f"but '{pattern_id}' is type '{pattern.pattern_type}'"
             )
 
@@ -7774,13 +8190,22 @@ class GDSNavigator:
                 f"Run GDSWriter.build_trajectory_index('{pattern_id}') first."
             )
 
-        traj_ds = _lance_local.dataset(str(traj_path))
+        traj_ds = self._storage.dataset(traj_path)
         escaped = primary_key.replace("'", "''")
         query_row = traj_ds.scanner(
             filter=f"primary_key = '{escaped}'",
             columns=["trajectory_vector", "num_slices"],
         ).to_table()
         if query_row.num_rows == 0:
+            if self.temporal_hint(primary_key, pattern_id) is not None:
+                # Stored windows exist, but fewer than two hold activity.
+                raise ValueError(
+                    f"insufficient_temporal_history: entity '{primary_key}' has fewer "
+                    f"than 2 active temporal windows — minimum 2 required (need a start "
+                    f"and end point to define a direction). To find entities with "
+                    f"similar current shape use "
+                    f"find_similar_entities('{primary_key}', '{pattern_id}')."
+                )
             raise ValueError(
                 f"Entity '{primary_key}' has no trajectory data in pattern '{pattern_id}'. "
                 f"Ensure the entity has at least one temporal deformation."
@@ -7805,32 +8230,18 @@ class GDSNavigator:
             exclude_keys={primary_key},
         )
         if results is None:
-            raise ValueError(
-                f"Trajectory index not found for pattern '{pattern_id}'."
-            )
+            raise ValueError(f"Trajectory index not found for pattern '{pattern_id}'.")
 
         return results[:top_n]
-
-    def π10_attract_trajectory(
-        self,
-        primary_key: str,
-        pattern_id: str,
-        top_n: int = 5,
-    ) -> list[dict]:
-        """π10 — Find entities with similar temporal trajectory (ANN search).
-
-        Alias for ``find_drifting_similar``.
-        """
-        return self.find_drifting_similar(primary_key, pattern_id, top_n)
 
     def π8_attract_cluster(
         self,
         pattern_id: str,
         n_clusters: int = 5,
-        top_n: int = 10,
+        top_n: int | None = 10,
         sample_size: int | None = None,
         seed: int = 42,
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """Discover intrinsic geometric archetypes in delta-space via k-means++.
 
         Returns cluster dicts sorted by size descending. Each dict:
@@ -7840,7 +8251,9 @@ class GDSNavigator:
         """
         version = self._resolve_version(pattern_id)
         table = self._storage.read_geometry(
-            pattern_id, version, sample_size=sample_size,
+            pattern_id,
+            version,
+            sample_size=sample_size,
             columns=self._CLUSTER_COLUMNS,
         )
         if table.num_rows == 0:
@@ -7882,9 +8295,7 @@ class GDSNavigator:
     # Observability methods
     # ------------------------------------------------------------------
 
-    def _detect_geometry_mode(
-        self, pattern_id: str, version: int, total: int
-    ) -> str:
+    def _detect_geometry_mode(self, pattern_id: str, version: int, total: int) -> str:
         """Detect whether geometry delta vectors are binary, continuous, or mixed.
 
         Samples up to 200 rows from the geometry dataset (delta column only)
@@ -7920,7 +8331,7 @@ class GDSNavigator:
         except _NAVIGATION_RECOVERABLE_ERRORS:
             return "continuous"
 
-    def sphere_overview(self, pattern_id: str | None = None) -> list[dict]:
+    def sphere_overview(self, pattern_id: str | None = None) -> list[dict[str, Any]]:
         """Return population-level summary for one or all patterns.
 
         The recommended first call for any agent entering a sphere cold.
@@ -7932,16 +8343,13 @@ class GDSNavigator:
         """
         sphere = self._storage.read_sphere()
         pattern_ids = [pattern_id] if pattern_id else list(sphere.patterns.keys())
-        results: list[dict] = []
+        results: list[dict[str, Any]] = []
         for pid in pattern_ids:
             version = self._resolve_version(pid)
             pattern = sphere.patterns[pid]
             theta_norm = round(float(np.linalg.norm(pattern.theta)), 4)
             stats = self._storage.read_geometry_stats(pid, version)
-            if stats:
-                total = stats["total_entities"]
-            else:
-                total = self._storage.count_geometry_rows(pid)
+            total = stats["total_entities"] if stats else self._storage.count_geometry_rows(pid)
             # Count anomalies by delta_norm >= theta_norm to match
             # anomaly_summary / find_anomalies semantics.
             # The is_anomaly column uses per-group thetas for grouped
@@ -7972,6 +8380,7 @@ class GDSNavigator:
             # dimension_kinds summary — compact view of divergence families
             if pattern.dimension_kinds:
                 from hypertopos.builder._bregman import format_kinds_summary
+
                 entry["dimension_kinds"] = format_kinds_summary(pattern.dimension_kinds)
 
             # inactive_ratio from geometry_stats cache (no geometry scan)
@@ -7983,13 +8392,8 @@ class GDSNavigator:
                 entry["inactive_ratio"] = stats["inactive_ratio"]
 
             # has_temporal — O(1) path existence check
-            if (
-                entry["pattern_type"] == "anchor"
-                and hasattr(self._storage, "_base")
-            ):
-                temporal_path = (
-                    self._storage._base / "temporal" / pid / "data.lance"
-                )
+            if entry["pattern_type"] == "anchor" and hasattr(self._storage, "_base"):
+                temporal_path = self._storage._base / "temporal" / pid / "data.lance"
                 if temporal_path.exists():
                     entry["has_temporal"] = True
 
@@ -8094,6 +8498,7 @@ class GDSNavigator:
         ``label_aware_calibration``, ``signed_percentiles``,
         ``label_aware_n_pos``) — sub-millisecond, no storage scan.
         """
+
         def _build_raw_dim_name_to_index(pattern: Any) -> dict[str, int]:
             """Map dim_percentiles raw keys (column / line_id-without-_d_
             prefix / prop name) to their delta-vector index. Mirrors the
@@ -8170,7 +8575,7 @@ class GDSNavigator:
                 if not np.isfinite(p99) or p99 <= mu_i:
                     continue
                 z_p99 = (p99 - mu_i) / sigma_i
-                mass_i = z_p99 ** 2
+                mass_i = z_p99**2
                 survivors.append((i, raw_name, mass_i))
 
             if not survivors:
@@ -8248,25 +8653,27 @@ class GDSNavigator:
                     fraction_zero_estimate = ">=0.75"
                 else:
                     fraction_zero_estimate = "0.50-0.75"
-                out.append({
-                    "type": "negative_space",
-                    "dim_label": label,
-                    "reason": (
-                        f"p50=0 with declared gaussian kind (empirical "
-                        f"distribution is point-mass-at-zero, approx "
-                        f"fraction zero {fraction_zero_estimate}; gaussian "
-                        f"z-score is wrong for this dim — it sits at the "
-                        f"mode of the distribution, not the tail)"
-                    ),
-                    "advice": (
-                        "Re-declare this dim with kind='bernoulli' "
-                        "(presence/absence) or kind='poisson' (count), or "
-                        "split into a binary 'is_active' dim + a "
-                        "continuous 'value_when_active' dim. As long as "
-                        "it's gaussian, every anomaly score on this dim "
-                        "is geometry noise."
-                    ),
-                })
+                out.append(
+                    {
+                        "type": "negative_space",
+                        "dim_label": label,
+                        "reason": (
+                            f"p50=0 with declared gaussian kind (empirical "
+                            f"distribution is point-mass-at-zero, approx "
+                            f"fraction zero {fraction_zero_estimate}; gaussian "
+                            f"z-score is wrong for this dim — it sits at the "
+                            f"mode of the distribution, not the tail)"
+                        ),
+                        "advice": (
+                            "Re-declare this dim with kind='bernoulli' "
+                            "(presence/absence) or kind='poisson' (count), or "
+                            "split into a binary 'is_active' dim + a "
+                            "continuous 'value_when_active' dim. As long as "
+                            "it's gaussian, every anomaly score on this dim "
+                            "is geometry noise."
+                        ),
+                    }
+                )
             return out
 
         warnings: list[dict[str, Any]] = []
@@ -8285,22 +8692,24 @@ class GDSNavigator:
             for i, s in enumerate(sigma_arr):
                 if s < 1e-10:
                     label = labels[i] if i < len(labels) else f"dim_{i}"
-                    warnings.append({
-                        "type": "dead_dim",
-                        "dim_label": label,
-                        "reason": (
-                            f"sigma_diag = {float(s):.2e} (below 1e-10 — "
-                            f"zero variance across population)"
-                        ),
-                        "advice": (
-                            "z-score is undefined / explodes; this dim "
-                            "contributes nothing meaningful to delta_norm "
-                            "and silently dilutes other dims' signal. "
-                            "Drop the dim from the pattern, or investigate "
-                            "the data source for missing values / "
-                            "constant column."
-                        ),
-                    })
+                    warnings.append(
+                        {
+                            "type": "dead_dim",
+                            "dim_label": label,
+                            "reason": (
+                                f"sigma_diag = {float(s):.2e} (below 1e-10 — "
+                                f"zero variance across population)"
+                            ),
+                            "advice": (
+                                "z-score is undefined / explodes; this dim "
+                                "contributes nothing meaningful to delta_norm "
+                                "and silently dilutes other dims' signal. "
+                                "Drop the dim from the pattern, or investigate "
+                                "the data source for missing values / "
+                                "constant column."
+                            ),
+                        }
+                    )
 
         # Sparse dims — keyed by dim name, not delta-vector index.
         # `dim_percentiles` holds {dim_name: {p25, p50, p75, p99, max}}.
@@ -8317,22 +8726,24 @@ class GDSNavigator:
                     fraction_zero_estimate = "0.50-0.75"
                 else:
                     fraction_zero_estimate = "0.25-0.50"
-                warnings.append({
-                    "type": "sparse_dim",
-                    "dim_label": dim_name,
-                    "reason": (
-                        f"median = 0 with p99 = {p99} "
-                        f"(mostly-zero with rare nonzero; approx "
-                        f"fraction zero {fraction_zero_estimate})"
-                    ),
-                    "advice": (
-                        "Gaussian z-score assumption is wrong for this "
-                        "dim. Use Bregman divergence with a "
-                        "poisson / bernoulli kind tag instead, or split "
-                        "into a binary 'is_active' dim + a continuous "
-                        "'value_when_active' dim."
-                    ),
-                })
+                warnings.append(
+                    {
+                        "type": "sparse_dim",
+                        "dim_label": dim_name,
+                        "reason": (
+                            f"median = 0 with p99 = {p99} "
+                            f"(mostly-zero with rare nonzero; approx "
+                            f"fraction zero {fraction_zero_estimate})"
+                        ),
+                        "advice": (
+                            "Gaussian z-score assumption is wrong for this "
+                            "dim. Use Bregman divergence with a "
+                            "poisson / bernoulli kind tag instead, or split "
+                            "into a binary 'is_active' dim + a continuous "
+                            "'value_when_active' dim."
+                        ),
+                    }
+                )
 
         # Pattern-level audits. Helpers return None / [] for legacy
         # spheres missing mu / sigma_diag / dimension_kinds / dim_percentiles —
@@ -8352,12 +8763,11 @@ class GDSNavigator:
         # kinds). Suppress for dims already flagged by `negative_space`
         # because that warning's remediation ("re-declare kind") is the
         # right action and the normality complaint is downstream noise.
-        negative_space_labels = {
-            w["dim_label"] for w in negative_space_warnings
-        }
+        negative_space_labels = {w["dim_label"] for w in negative_space_warnings}
         warnings.extend(
             GDSNavigator._compute_non_normal_dim_warnings(
-                pattern, suppress_labels=negative_space_labels,
+                pattern,
+                suppress_labels=negative_space_labels,
             ),
         )
 
@@ -8377,7 +8787,8 @@ class GDSNavigator:
                 pattern,
                 negative_space_indices=(
                     GDSNavigator._negative_space_indices(
-                        pattern, negative_space_warnings,
+                        pattern,
+                        negative_space_warnings,
                     )
                 ),
             ),
@@ -8421,24 +8832,26 @@ class GDSNavigator:
             if p_value >= _HETEROSCEDASTICITY_P_THRESHOLD:
                 continue
             w_stat = entry.get("W_statistic")
-            warnings.append({
-                "type": "heteroscedasticity",
-                "dim_label": prop_name,
-                "reason": (
-                    f"Levene W={float(w_stat):.2f} p={float(p_value):.2e} "
-                    f"on group_by={prop_name} — global θ assumption "
-                    f"violated"
-                ),
-                "advice": (
-                    "Per-group θ calibration is statistically warranted "
-                    "on this grouping; if per-group θ is undesirable "
-                    "downstream consider a variance-stabilizing "
-                    "transform (log1p) on delta_norm before "
-                    "thresholding."
-                ),
-                "evidence_value": float(p_value),
-                "threshold": _HETEROSCEDASTICITY_P_THRESHOLD,
-            })
+            warnings.append(
+                {
+                    "type": "heteroscedasticity",
+                    "dim_label": prop_name,
+                    "reason": (
+                        f"Levene W={float(w_stat):.2f} p={float(p_value):.2e} "
+                        f"on group_by={prop_name} — global θ assumption "
+                        f"violated"
+                    ),
+                    "advice": (
+                        "Per-group θ calibration is statistically warranted "
+                        "on this grouping; if per-group θ is undesirable "
+                        "downstream consider a variance-stabilizing "
+                        "transform (log1p) on delta_norm before "
+                        "thresholding."
+                    ),
+                    "evidence_value": float(p_value),
+                    "threshold": _HETEROSCEDASTICITY_P_THRESHOLD,
+                }
+            )
 
         return warnings
 
@@ -8504,27 +8917,29 @@ class GDSNavigator:
                 continue
             if p_value >= _NON_NORMAL_DIM_PVALUE_THRESHOLD:
                 continue
-            out.append({
-                "type": "non_normal_dim",
-                "dim_label": raw_name,
-                "reason": (
-                    f"normality test p={p_value:.2e} < "
-                    f"{_NON_NORMAL_DIM_PVALUE_THRESHOLD} — z-score "
-                    f"assumes normality, this dim's distribution is "
-                    f"heavy-tailed or otherwise non-normal"
-                ),
-                "advice": (
-                    "Consider a log1p / sqrt / rank transform of the "
-                    "raw shape values before mu/sigma computation, or "
-                    "re-declare kind as 'poisson' (discrete counts) or "
-                    "'bernoulli' (binary presence) if applicable. "
-                    "Untransformed, the gaussian z-score concentrates "
-                    "the delta mass in a few extreme rows and poorly "
-                    "discriminates the bulk of the population."
-                ),
-                "evidence_value": float(p_value),
-                "threshold": _NON_NORMAL_DIM_PVALUE_THRESHOLD,
-            })
+            out.append(
+                {
+                    "type": "non_normal_dim",
+                    "dim_label": raw_name,
+                    "reason": (
+                        f"normality test p={p_value:.2e} < "
+                        f"{_NON_NORMAL_DIM_PVALUE_THRESHOLD} — z-score "
+                        f"assumes normality, this dim's distribution is "
+                        f"heavy-tailed or otherwise non-normal"
+                    ),
+                    "advice": (
+                        "Consider a log1p / sqrt / rank transform of the "
+                        "raw shape values before mu/sigma computation, or "
+                        "re-declare kind as 'poisson' (discrete counts) or "
+                        "'bernoulli' (binary presence) if applicable. "
+                        "Untransformed, the gaussian z-score concentrates "
+                        "the delta mass in a few extreme rows and poorly "
+                        "discriminates the bulk of the population."
+                    ),
+                    "evidence_value": float(p_value),
+                    "threshold": _NON_NORMAL_DIM_PVALUE_THRESHOLD,
+                }
+            )
         return out
 
     @staticmethod
@@ -8619,10 +9034,7 @@ class GDSNavigator:
             if not np.isfinite(direction):
                 continue
             denom_sq = (sigma_pos * sigma_pos + sigma_neg * sigma_neg) / 2.0
-            if denom_sq <= 0.0:
-                cohens_d = 0.0
-            else:
-                cohens_d = abs(mu_pos - mu_neg) / float(np.sqrt(denom_sq))
+            cohens_d = 0.0 if denom_sq <= 0.0 else abs(mu_pos - mu_neg) / float(np.sqrt(denom_sq))
             if not np.isfinite(cohens_d):
                 continue
 
@@ -8632,25 +9044,27 @@ class GDSNavigator:
             if cohens_d < _KIND_MISMATCH_COHENS_D_THRESHOLD:
                 continue
 
-            out.append({
-                "type": "kind_mismatch",
-                "dim_label": label,
-                "reason": (
-                    f"kind=gaussian declared but Fisher direction shows "
-                    f"|direction|={abs_dir:.3f} < "
-                    f"{_KIND_MISMATCH_DIRECTION_THRESHOLD} while raw "
-                    f"classes show cohens_d={cohens_d:.3f} >= "
-                    f"{_KIND_MISMATCH_COHENS_D_THRESHOLD} — likely "
-                    f"confounded with another dim"
-                ),
-                "advice": (
-                    "consider kind='bernoulli' / 'poisson' "
-                    "re-declaration, or split the dim into binary + "
-                    "continuous components"
-                ),
-                "evidence_value": abs_dir,
-                "threshold": _KIND_MISMATCH_DIRECTION_THRESHOLD,
-            })
+            out.append(
+                {
+                    "type": "kind_mismatch",
+                    "dim_label": label,
+                    "reason": (
+                        f"kind=gaussian declared but Fisher direction shows "
+                        f"|direction|={abs_dir:.3f} < "
+                        f"{_KIND_MISMATCH_DIRECTION_THRESHOLD} while raw "
+                        f"classes show cohens_d={cohens_d:.3f} >= "
+                        f"{_KIND_MISMATCH_COHENS_D_THRESHOLD} — likely "
+                        f"confounded with another dim"
+                    ),
+                    "advice": (
+                        "consider kind='bernoulli' / 'poisson' "
+                        "re-declaration, or split the dim into binary + "
+                        "continuous components"
+                    ),
+                    "evidence_value": abs_dir,
+                    "threshold": _KIND_MISMATCH_DIRECTION_THRESHOLD,
+                }
+            )
         return out
 
     @staticmethod
@@ -8708,7 +9122,7 @@ class GDSNavigator:
             "threshold": _SIGNED_TAIL_RATIO_THRESHOLD,
         }
 
-    def _build_theta_sensitivity_summary(self, pattern_id: str) -> dict | None:
+    def _build_theta_sensitivity_summary(self, pattern_id: str) -> dict[str, Any] | None:
         """Compact theta_sensitivity diagnostic for sphere_overview.
 
         Returns None when the calibration epoch lacks the diagnostic field
@@ -8731,7 +9145,8 @@ class GDSNavigator:
             if not versions:
                 return None
             fit = self._storage.read_calibration_fit(
-                pattern_id, version=versions[-1],
+                pattern_id,
+                version=versions[-1],
             )
         except (CalibrationNotFoundError, FileNotFoundError):
             # Race between list_versions and read_fit (GC trimmed the
@@ -8742,23 +9157,21 @@ class GDSNavigator:
         if fit.theta_sensitivity is None:
             return None
 
-        derived = derive_stable_band_and_cliffs(fit.theta_sensitivity)
+        derived: dict[str, Any] = derive_stable_band_and_cliffs(fit.theta_sensitivity)
         p95 = fit.theta_sensitivity.get("p95")
         return {
             "stable_band_from": derived["stable_band"]["from"],
             "stable_band_to": derived["stable_band"]["to"],
             "stable_band_length": derived["stable_band_length"],
             "n_cliffs": derived["n_cliffs"],
-            "theta_at_p95": (
-                round(float(p95["theta_mean"]), 4) if p95 else None
-            ),
+            "theta_at_p95": (round(float(p95["theta_mean"]), 4) if p95 else None),
         }
 
     def temporal_quality_summary(
         self,
         pattern_id: str,
         max_sample: int = 1000,
-    ) -> dict | None:
+    ) -> dict[str, Any] | None:
         """Compute temporal anomaly persistence metrics for a pattern.
 
         Measures how stable anomaly status is across consecutive temporal
@@ -8768,7 +9181,10 @@ class GDSNavigator:
         Returns dict with:
           persistence_rate  — fraction of anomaly→anomaly transitions
           transition_rate   — fraction of anomaly→normal transitions
-          signal_quality    — "persistent" | "volatile" | "mixed"
+          signal_quality    — "persistent" | "volatile" | "mixed", or
+                              "insufficient_data" when no anomalous slice is
+                              followed by another slice (no transitions to
+                              measure)
           n_entities_sampled — how many entities were evaluated
           n_anomaly_transitions — total anomaly→X transitions counted
         """
@@ -8795,15 +9211,14 @@ class GDSNavigator:
         if "shape_snapshot" not in temporal_table.schema.names:
             return None  # Legacy schema, can't compute
 
-        sigma = np.maximum(
-            np.array(pattern.sigma_diag, dtype=np.float64), 1e-2,
-        )
-        mu = np.array(pattern.mu, dtype=np.float64)
+        from hypertopos.engine.geometry import slice_deltas
 
-        sorted_t = temporal_table.sort_by([
-            ("primary_key", "ascending"),
-            ("timestamp", "ascending"),
-        ])
+        sorted_t = temporal_table.sort_by(
+            [
+                ("primary_key", "ascending"),
+                ("timestamp", "ascending"),
+            ]
+        )
         pks = sorted_t["primary_key"].to_pylist()
         shapes = sorted_t["shape_snapshot"].to_pylist()
 
@@ -8835,10 +9250,10 @@ class GDSNavigator:
 
         for key in keys:
             shape_list = groups[key]
-            arr = np.array(shape_list, dtype=np.float64)
-            deltas = (arr - mu) / sigma
-            norms = np.sqrt(np.einsum('ij,ij->i', deltas, deltas))
-            is_anom = norms >= theta_norm
+            deltas = slice_deltas(np.array(shape_list, dtype=np.float64), pattern)
+            norms = np.sqrt(np.einsum("ij,ij->i", deltas, deltas))
+            # Snapshots carry the structural dims only; compare against θ over the same dims.
+            is_anom = norms >= float(np.linalg.norm(pattern.theta[: deltas.shape[-1]]))
 
             for j in range(len(is_anom) - 1):
                 if is_anom[j]:
@@ -8851,7 +9266,9 @@ class GDSNavigator:
         persistence_rate = persist_count / all_pairs if all_pairs > 0 else 0.0
         transition_rate = flip_count / all_pairs if all_pairs > 0 else 0.0
 
-        if persistence_rate > 0.7:
+        if all_pairs == 0:
+            quality = "insufficient_data"
+        elif persistence_rate > 0.7:
             quality = "persistent"
         elif persistence_rate < 0.3:
             quality = "volatile"
@@ -8866,7 +9283,7 @@ class GDSNavigator:
             "n_anomaly_transitions": all_pairs,
         }
 
-    def _compute_cross_pattern_discrepancy(self) -> dict | None:
+    def _compute_cross_pattern_discrepancy(self) -> dict[str, Any] | None:
         """Pairwise Jaccard overlap of anomalous primary_keys across patterns
         that cover the same entity line.
 
@@ -8934,7 +9351,9 @@ class GDSNavigator:
             try:
                 version = self._resolve_version(pid)
                 tbl = self._storage.read_geometry(
-                    pid, version, columns=["primary_key", "is_anomaly"],
+                    pid,
+                    version,
+                    columns=["primary_key", "is_anomaly"],
                 )
             except _NAVIGATION_RECOVERABLE_ERRORS:
                 anom_cache[pid] = set()
@@ -8953,7 +9372,9 @@ class GDSNavigator:
             try:
                 version = self._resolve_version(pid)
                 tbl = self._storage.read_geometry(
-                    pid, version, columns=["primary_key"],
+                    pid,
+                    version,
+                    columns=["primary_key"],
                 )
             except _NAVIGATION_RECOVERABLE_ERRORS:
                 universe_cache[pid] = set()
@@ -8965,7 +9386,7 @@ class GDSNavigator:
         for shared_line, pids in groups.items():
             pids_sorted = sorted(pids)
             for i, pat_a in enumerate(pids_sorted):
-                for pat_b in pids_sorted[i + 1:]:
+                for pat_b in pids_sorted[i + 1 :]:
                     anom_a = _anom_keys(pat_a)
                     anom_b = _anom_keys(pat_b)
                     only_a = anom_a - anom_b
@@ -8979,20 +9400,22 @@ class GDSNavigator:
                         jaccard = None
                     else:
                         jaccard = round(len(both) / union_anom_size, 4)
-                    pairs.append({
-                        "pattern_a": pat_a,
-                        "pattern_b": pat_b,
-                        "shared_line": shared_line,
-                        "n_anomalous_only_in_a": len(only_a),
-                        "n_anomalous_only_in_b": len(only_b),
-                        "n_anomalous_in_both": len(both),
-                        "n_anomalous_in_neither": len(neither),
-                        "jaccard_anomaly_overlap": jaccard,
-                    })
+                    pairs.append(
+                        {
+                            "pattern_a": pat_a,
+                            "pattern_b": pat_b,
+                            "shared_line": shared_line,
+                            "n_anomalous_only_in_a": len(only_a),
+                            "n_anomalous_only_in_b": len(only_b),
+                            "n_anomalous_in_both": len(both),
+                            "n_anomalous_in_neither": len(neither),
+                            "jaccard_anomaly_overlap": jaccard,
+                        }
+                    )
 
         return {"pairs": pairs}
 
-    def _compute_event_rate_divergence(self) -> list[dict]:
+    def _compute_event_rate_divergence(self) -> list[dict[str, Any]]:
         """Find entities with high event anomaly rate but below-theta static geometry.
 
         For each (anchor, event) pattern pair sharing a line:
@@ -9012,7 +9435,7 @@ class GDSNavigator:
         _MAX_ALERTS = 20
 
         sphere = self._storage.read_sphere()
-        alerts: list[dict] = []
+        alerts: list[dict[str, Any]] = []
 
         # Build (event_pid, anchor_pid, anchor_line, anchor_idx) pairs
         pairs: list[tuple[str, str, str, int]] = []
@@ -9028,9 +9451,11 @@ class GDSNavigator:
                 relation_lines = [r.line_id for r in event_pat.relations]
                 if anchor_line not in relation_lines:
                     continue
-                pairs.append((event_pid, anchor_pid, anchor_line, relation_lines.index(anchor_line)))
+                pairs.append(
+                    (event_pid, anchor_pid, anchor_line, relation_lines.index(anchor_line))
+                )
 
-        for event_pid, anchor_pid, anchor_line, anchor_idx in pairs:
+        for event_pid, anchor_pid, _anchor_line, anchor_idx in pairs:
             anchor_pat = sphere.patterns[anchor_pid]
             theta_norm = round(float(np.linalg.norm(anchor_pat.theta)), 4)
             if theta_norm <= 0:
@@ -9045,7 +9470,8 @@ class GDSNavigator:
             # Single geometry read — consistent anom/total from same sample
             try:
                 geo = self._storage.read_geometry(
-                    event_pid, event_version,
+                    event_pid,
+                    event_version,
                     sample_size=_SAMPLE_SIZE,
                     columns=["is_anomaly", "entity_keys"],
                 )
@@ -9060,6 +9486,7 @@ class GDSNavigator:
             for ek_val, is_anom_val in zip(
                 geo["entity_keys"].to_pylist(),
                 geo["is_anomaly"].to_pylist(),
+                strict=True,
             ):
                 if not ek_val or len(ek_val) <= anchor_idx or not ek_val[anchor_idx]:
                     continue
@@ -9083,7 +9510,8 @@ class GDSNavigator:
             high_rate_keys = list(high_rate.keys())
             try:
                 geo_table = self._storage.read_geometry(
-                    anchor_pid, anchor_version,
+                    anchor_pid,
+                    anchor_version,
                     point_keys=high_rate_keys,
                     columns=["primary_key", "delta_norm", "is_anomaly"],
                 )
@@ -9097,18 +9525,20 @@ class GDSNavigator:
                 if is_anomaly:
                     continue
                 rate = high_rate.get(pk, 0.0)
-                alerts.append({
-                    "pattern_id": anchor_pid,
-                    "event_pattern_id": event_pid,
-                    "entity_key": pk,
-                    "event_anomaly_rate": rate,
-                    "delta_norm": round(delta_norm, 4),
-                    "theta_norm": theta_norm,
-                    "alert": (
-                        f"high event anomaly rate ({int(rate * 100)}%) but normal static"
-                        " geometry — investigate temporal"
-                    ),
-                })
+                alerts.append(
+                    {
+                        "pattern_id": anchor_pid,
+                        "event_pattern_id": event_pid,
+                        "entity_key": pk,
+                        "event_anomaly_rate": rate,
+                        "delta_norm": round(delta_norm, 4),
+                        "theta_norm": theta_norm,
+                        "alert": (
+                            f"high event anomaly rate ({int(rate * 100)}%) but normal static"
+                            " geometry — investigate temporal"
+                        ),
+                    }
+                )
 
         alerts.sort(key=lambda a: a["event_anomaly_rate"], reverse=True)
         return alerts[:_MAX_ALERTS]
@@ -9116,12 +9546,12 @@ class GDSNavigator:
     def _pi11_from_cache(
         self,
         pattern_id: str,
-        cached: list[dict],
+        cached: list[dict[str, Any]],
         window_a_from: str,
         window_a_to: str,
         window_b_from: str,
         window_b_to: str,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Build pi11 result from pre-computed temporal centroid cache.
 
         Note: uses entity_count-weighted mean of pre-computed window centroids —
@@ -9146,7 +9576,8 @@ class GDSNavigator:
         wb_to = _parse_ts(window_b_to)
 
         def _weighted_centroid(
-            ts_from: datetime, ts_to: datetime,
+            ts_from: datetime,
+            ts_to: datetime,
         ) -> tuple[np.ndarray | None, int]:
             """Weighted mean of cached centroids overlapping [ts_from, ts_to)."""
             total_weight = 0
@@ -9177,11 +9608,13 @@ class GDSNavigator:
                 "centroid_shift": None,
                 "warning": "one or both windows have no temporal data",
                 "window_a": {
-                    "from": window_a_from, "to": window_a_to,
+                    "from": window_a_from,
+                    "to": window_a_to,
                     "entry_count": n_a,
                 },
                 "window_b": {
-                    "from": window_b_from, "to": window_b_to,
+                    "from": window_b_from,
+                    "to": window_b_to,
                     "entry_count": n_b,
                 },
                 "cached": True,
@@ -9191,16 +9624,14 @@ class GDSNavigator:
         dim_diffs = sorted(
             [
                 {
-                    "dimension": (
-                        dim_names[i] if i < len(dim_names) else f"dim_{i}"
-                    ),
+                    "dimension": (dim_names[i] if i < len(dim_names) else f"dim_{i}"),
                     "mean_a": round(float(c_a[i]), 6),
                     "mean_b": round(float(c_b[i]), 6),
                     "diff": round(float(c_b[i] - c_a[i]), 6),
                 }
                 for i in range(n_rel)
             ],
-            key=lambda x: abs(x["diff"]),
+            key=lambda x: abs(cast(float, x["diff"])),
             reverse=True,
         )
         return {
@@ -9218,9 +9649,7 @@ class GDSNavigator:
             "centroid_shift": round(shift, 6),
             "top_changed_dimensions": dim_diffs[:5],
             "interpretation": (
-                "significant drift" if shift > 0.5
-                else "minor shift" if shift > 0.05
-                else "stable"
+                "significant drift" if shift > 0.5 else "minor shift" if shift > 0.05 else "stable"
             ),
             "cached": True,
         }
@@ -9232,7 +9661,7 @@ class GDSNavigator:
         window_a_to: str,
         window_b_from: str,
         window_b_to: str,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """π11 — Compare population geometry between two time windows.
 
         For each window, collects temporal deformation delta_snapshots and computes
@@ -9253,8 +9682,12 @@ class GDSNavigator:
         cached = self._storage.read_temporal_centroids(pattern_id)
         if cached is not None:
             return self._pi11_from_cache(
-                pattern_id, cached,
-                window_a_from, window_a_to, window_b_from, window_b_to,
+                pattern_id,
+                cached,
+                window_a_from,
+                window_a_to,
+                window_b_from,
+                window_b_to,
             )
 
         sphere = self._storage.read_sphere()
@@ -9265,6 +9698,7 @@ class GDSNavigator:
 
         def _read_window(ts_from: str, ts_to: str) -> pa.Table:
             import itertools as _itertools
+
             batch_iter = self._storage.read_temporal_batched(
                 pattern_id, timestamp_from=ts_from, timestamp_to=ts_to
             )
@@ -9274,18 +9708,19 @@ class GDSNavigator:
                 return pa.table({})
             return pa.Table.from_batches(_itertools.chain([first], batch_iter))
 
-        def _centroid_stats(tbl: pa.Table) -> tuple:
+        def _centroid_stats(tbl: pa.Table) -> tuple[Any, ...]:
             if tbl.num_rows == 0:
                 return None, 0
             if "shape_snapshot" not in tbl.schema.names:
                 raise GDSNavigationError(
                     f"Temporal data for pattern '{pattern_id}' uses legacy schema "
-                    "(delta_snapshot). Run GDSWriter.migrate_temporal_to_shape_snapshot() "
+                    "(delta_snapshot). Rebuild the sphere "
                     "to upgrade."
                 )
+            from hypertopos.engine.geometry import slice_deltas
+
             shapes = tbl["shape_snapshot"].to_pylist()
-            _sigma = np.maximum(pattern.sigma_diag, 1e-2)
-            mat = (np.array(shapes, dtype=np.float32) - pattern.mu) / _sigma
+            mat = slice_deltas(np.array(shapes, dtype=np.float32), pattern)
             centroid = mat.mean(axis=0)
             return centroid, int(tbl.num_rows)
 
@@ -9315,7 +9750,7 @@ class GDSNavigator:
                 }
                 for i in range(n_rel)
             ],
-            key=lambda x: abs(x["diff"]),
+            key=lambda x: abs(cast(float, x["diff"])),
             reverse=True,
         )
         return {
@@ -9333,15 +9768,15 @@ class GDSNavigator:
             "centroid_shift": round(shift, 6),
             "top_changed_dimensions": dim_diffs[:5],
             "interpretation": (
-                "significant drift" if shift > 0.5
-                else "minor shift" if shift > 0.05
-                else "stable"
+                "significant drift" if shift > 0.5 else "minor shift" if shift > 0.05 else "stable"
             ),
         }
 
     def detect_data_quality_issues(
-        self, pattern_id: str, sample_size: int | None = None,
-    ) -> list[dict]:
+        self,
+        pattern_id: str,
+        sample_size: int | None = None,
+    ) -> list[dict[str, Any]]:
         """Scan for data quality problems in a pattern's geometry.
 
         Checks:
@@ -9374,7 +9809,7 @@ class GDSNavigator:
                 }
             ]
 
-        findings: list[dict] = []
+        findings: list[dict[str, Any]] = []
 
         # ── 1/2. Coverage — scan edges/entity_keys and derive alive line_ids
         # When sample_size is set, read full table then sample for coverage scan.
@@ -9386,7 +9821,9 @@ class GDSNavigator:
         _scan_total = total
         if sample_size is not None and total > sample_size:
             geo_table = self._storage.read_geometry(
-                pattern_id, version, columns=_cov_cols,
+                pattern_id,
+                version,
+                columns=_cov_cols,
             )
             rng = np.random.default_rng(42)
             idx = np.sort(rng.choice(geo_table.num_rows, size=sample_size, replace=False))
@@ -9407,7 +9844,7 @@ class GDSNavigator:
                 pattern_id, version, columns=_cov_cols
             ):
                 for row_lines in _table_edge_line_ids(batch, pattern.relations):
-                    seen: set[str] = set()
+                    seen = set()
                     for lid in row_lines:
                         if lid in rel_covered and lid not in seen:
                             rel_covered[lid] += 1
@@ -9417,44 +9854,48 @@ class GDSNavigator:
             covered = rel_covered.get(rel.line_id, 0)
             pct = covered / _scan_total
             if rel.required and pct < 0.5:
-                findings.append({
-                    "issue_type": "low_coverage",
-                    "severity": "HIGH",
-                    "line_id": rel.line_id,
-                    "count": covered,
-                    "pct": round(pct, 4),
-                    "description": (
-                        f"Required line '{rel.line_id}' has only {pct:.1%} coverage "
-                        f"({covered}/{total} entities)"
-                    ),
-                })
+                findings.append(
+                    {
+                        "issue_type": "low_coverage",
+                        "severity": "HIGH",
+                        "line_id": rel.line_id,
+                        "count": covered,
+                        "pct": round(pct, 4),
+                        "description": (
+                            f"Required line '{rel.line_id}' has only {pct:.1%} coverage "
+                            f"({covered}/{total} entities)"
+                        ),
+                    }
+                )
             elif not rel.required and pct < 0.05:
-                findings.append({
-                    "issue_type": "low_coverage",
-                    "severity": "MEDIUM",
-                    "line_id": rel.line_id,
-                    "count": covered,
-                    "pct": round(pct, 4),
-                    "description": (
-                        f"Optional line '{rel.line_id}' has near-zero coverage ({pct:.1%})"
-                    ),
-                })
+                findings.append(
+                    {
+                        "issue_type": "low_coverage",
+                        "severity": "MEDIUM",
+                        "line_id": rel.line_id,
+                        "count": covered,
+                        "pct": round(pct, 4),
+                        "description": (
+                            f"Optional line '{rel.line_id}' has near-zero coverage ({pct:.1%})"
+                        ),
+                    }
+                )
 
         # ── 3. Degenerate polygons — BTREE index on delta_norm (O(log n))
-        degenerate = self._storage.count_geometry_rows(
-            pattern_id, filter="delta_norm < 0.0001"
-        )
+        degenerate = self._storage.count_geometry_rows(pattern_id, filter="delta_norm < 0.0001")
         if degenerate > 0 and degenerate / total > 0.1:
-            findings.append({
-                "issue_type": "degenerate_polygons",
-                "severity": "MEDIUM",
-                "count": degenerate,
-                "pct": round(degenerate / total, 4),
-                "description": (
-                    f"{degenerate} entities ({degenerate / total:.1%}) have delta_norm ~ 0 "
-                    "— possible zero-variance or missing data"
-                ),
-            })
+            findings.append(
+                {
+                    "issue_type": "degenerate_polygons",
+                    "severity": "MEDIUM",
+                    "count": degenerate,
+                    "pct": round(degenerate / total, 4),
+                    "description": (
+                        f"{degenerate} entities ({degenerate / total:.1%}) have delta_norm ~ 0 "
+                        "— possible zero-variance or missing data"
+                    ),
+                }
+            )
 
         # ── 4. High anomaly rate — delta_norm >= theta_norm
         theta_norm = float(np.linalg.norm(pattern.theta))
@@ -9464,30 +9905,34 @@ class GDSNavigator:
         )
         anomaly_rate = anomaly_count / total
         if anomaly_rate > 0.3:
-            findings.append({
-                "issue_type": "high_anomaly_rate",
-                "severity": "HIGH" if anomaly_rate > 0.5 else "MEDIUM",
-                "count": anomaly_count,
-                "pct": round(anomaly_rate, 4),
-                "description": (
-                    f"Anomaly rate is {anomaly_rate:.1%} — "
-                    "suggests miscalibrated theta or corrupted data"
-                ),
-            })
+            findings.append(
+                {
+                    "issue_type": "high_anomaly_rate",
+                    "severity": "HIGH" if anomaly_rate > 0.5 else "MEDIUM",
+                    "count": anomaly_count,
+                    "pct": round(anomaly_rate, 4),
+                    "description": (
+                        f"Anomaly rate is {anomaly_rate:.1%} — "
+                        "suggests miscalibrated theta or corrupted data"
+                    ),
+                }
+            )
 
         # ── 5. Zero anomaly rate on large population (theta miscalibration)
         if anomaly_count == 0 and total > 1000:
-            findings.append({
-                "issue_type": "zero_anomaly_rate",
-                "severity": "MEDIUM",
-                "count": 0,
-                "pct": 0.0,
-                "description": (
-                    f"Anomaly rate is 0% on {total} entities — "
-                    "theta may be set at population maximum, disabling anomaly detection. "
-                    "Consider recalibrating with a lower percentile cutoff."
-                ),
-            })
+            findings.append(
+                {
+                    "issue_type": "zero_anomaly_rate",
+                    "severity": "MEDIUM",
+                    "count": 0,
+                    "pct": 0.0,
+                    "description": (
+                        f"Anomaly rate is 0% on {total} entities — "
+                        "theta may be set at population maximum, disabling anomaly detection. "
+                        "Consider recalibrating with a lower percentile cutoff."
+                    ),
+                }
+            )
 
         # ── 6. Theta ceiling distribution (>50% entities massed near theta)
         theta_norm = float(np.linalg.norm(pattern.theta))
@@ -9497,17 +9942,19 @@ class GDSNavigator:
                 pattern_id, filter=f"delta_norm >= {ceiling_threshold:.6f}"
             )
             if near_ceiling / total > 0.5:
-                findings.append({
-                    "issue_type": "theta_ceiling",
-                    "severity": "MEDIUM",
-                    "count": near_ceiling,
-                    "pct": round(near_ceiling / total, 4),
-                    "description": (
-                        f"{near_ceiling / total:.1%} of entities have delta_norm >= 0.75*theta "
-                        f"({near_ceiling}/{total}) — distribution is massed against theta. "
-                        "Consider recalibrating at a lower percentile."
-                    ),
-                })
+                findings.append(
+                    {
+                        "issue_type": "theta_ceiling",
+                        "severity": "MEDIUM",
+                        "count": near_ceiling,
+                        "pct": round(near_ceiling / total, 4),
+                        "description": (
+                            f"{near_ceiling / total:.1%} of entities have delta_norm >= 0.75*theta "
+                            f"({near_ceiling}/{total}) — distribution is massed against theta. "
+                            "Consider recalibrating at a lower percentile."
+                        ),
+                    }
+                )
 
         # ── 7. Delta-norm mismatch — verify stored delta_norm == ||delta||.
         # Sample up to 10 entities; a mismatch means recompute_delta_rank_pct() was not
@@ -9519,28 +9966,30 @@ class GDSNavigator:
             None,
         )
         if first_batch is not None and first_batch.num_rows > 0:
-            for idx in range(min(_SAMPLE_SIZE, first_batch.num_rows)):
-                pk = first_batch.column("primary_key")[idx].as_py()
-                stored_norm = float(first_batch.column("delta_norm")[idx].as_py())
-                delta_vec = np.array(first_batch.column("delta")[idx].as_py(), dtype=np.float32)
+            for row_i in range(min(_SAMPLE_SIZE, first_batch.num_rows)):
+                pk = first_batch.column("primary_key")[row_i].as_py()
+                stored_norm = float(first_batch.column("delta_norm")[row_i].as_py())
+                delta_vec = np.array(first_batch.column("delta")[row_i].as_py(), dtype=np.float32)
                 actual_norm = float(np.linalg.norm(delta_vec))
                 # Threshold 0.01 is absolute (not relative): a stale delta_norm column will
                 # differ from ||delta|| by the full magnitude of the change, making relative
                 # vs absolute moot. Float32 precision errors are < 1e-4, well below this threshold.
                 if abs(actual_norm - stored_norm) > 0.01:
-                    findings.append({
-                        "issue_type": "delta_norm_mismatch",
-                        "severity": "HIGH",
-                        "entity": pk,
-                        "stored_delta_norm": round(stored_norm, 4),
-                        "actual_delta_norm": round(actual_norm, 4),
-                        "message": (
-                            f"stored delta_norm {stored_norm:.4f} does not match "
-                            f"||delta|| {actual_norm:.4f} — geometry may have been written "
-                            "without calling recompute_delta_rank_pct(). "
-                            "ANN search results will be unreliable."
-                        ),
-                    })
+                    findings.append(
+                        {
+                            "issue_type": "delta_norm_mismatch",
+                            "severity": "HIGH",
+                            "entity": pk,
+                            "stored_delta_norm": round(stored_norm, 4),
+                            "actual_delta_norm": round(actual_norm, 4),
+                            "message": (
+                                f"stored delta_norm {stored_norm:.4f} does not match "
+                                f"||delta|| {actual_norm:.4f} — geometry may have been written "
+                                "without calling recompute_delta_rank_pct(). "
+                                "ANN search results will be unreliable."
+                            ),
+                        }
+                    )
                     break  # One example is enough to flag the issue
 
         # ── 8. Zero-variance prop columns — check actual delta variance on prop dims
@@ -9552,36 +10001,43 @@ class GDSNavigator:
             _prop_sample_size = min(total, 500)
             try:
                 _prop_geo = self._storage.read_geometry(
-                    pattern_id, version, columns=["delta"],
+                    pattern_id,
+                    version,
+                    columns=["delta"],
                 )
                 if _prop_geo.num_rows > _prop_sample_size:
                     _rng = np.random.default_rng(42)
                     _idx = _rng.choice(
-                        _prop_geo.num_rows, size=_prop_sample_size, replace=False,
+                        _prop_geo.num_rows,
+                        size=_prop_sample_size,
+                        replace=False,
                     )
                     _prop_geo = _prop_geo.take(pa.array(_idx, type=pa.int64()))
                 _deltas = np.array(
-                    _prop_geo["delta"].to_pylist(), dtype=np.float32,
+                    _prop_geo["delta"].to_pylist(),
+                    dtype=np.float32,
                 )
                 for j, prop_name in enumerate(pattern.prop_columns):
                     dim_idx = n_rel + j
                     if dim_idx < _deltas.shape[1]:
                         dim_var = float(np.var(_deltas[:, dim_idx]))
                         if dim_var < 0.01:
-                            findings.append({
-                                "issue_type": "zero_variance_prop_column",
-                                "severity": "MEDIUM",
-                                "dimension": prop_name,
-                                "dim_index": dim_idx,
-                                "delta_variance": round(dim_var, 6),
-                                "description": (
-                                    f"Property column '{prop_name}' has near-zero "
-                                    f"delta variance ({dim_var:.4f}) — this dimension "
-                                    f"contributes no discriminative signal to delta "
-                                    f"vectors. Consider removing it from "
-                                    f"pattern.prop_columns to reduce noise."
-                                ),
-                            })
+                            findings.append(
+                                {
+                                    "issue_type": "zero_variance_prop_column",
+                                    "severity": "MEDIUM",
+                                    "dimension": prop_name,
+                                    "dim_index": dim_idx,
+                                    "delta_variance": round(dim_var, 6),
+                                    "description": (
+                                        f"Property column '{prop_name}' has near-zero "
+                                        f"delta variance ({dim_var:.4f}) — this dimension "
+                                        f"contributes no discriminative signal to delta "
+                                        f"vectors. Consider removing it from "
+                                        f"pattern.prop_columns to reduce noise."
+                                    ),
+                                }
+                            )
             except _NAVIGATION_RECOVERABLE_ERRORS:
                 pass
 
@@ -9610,6 +10066,10 @@ class GDSNavigator:
         the pattern's currently declared rules — surfaced as a warning,
         never raised, because the navigator is read-only and the builder
         is the authoritative re-evaluator.
+
+        The sidecar path names the session's pattern version and is written
+        only by a full build, which replaces the sphere a session reads, so
+        it needs no snapshot pin.
         """
         from hypertopos.engine.conformance import read_violations
         from hypertopos.model.sphere import compute_rule_set_hash
@@ -9624,6 +10084,7 @@ class GDSNavigator:
         base_path = self._storage._base
 
         violations, manifest = read_violations(
+            reader=self._storage,
             base_path=base_path,
             pattern_id=pattern_id,
             version=version,
@@ -9645,28 +10106,28 @@ class GDSNavigator:
             "pattern_id": pattern_id,
             "n_violations": len(violations),
             "violations": violations,
-            "rules_evaluated": [
-                r.rule_id for r in pattern.conformance_rules
-            ],
+            "rules_evaluated": [r.rule_id for r in pattern.conformance_rules],
             "manifest": manifest,
             "warnings": warnings,
             "follow_up": (
                 "Use investigate_entity(primary_key) on top violators to "
                 "drill into the geometric anomaly that may accompany the "
                 "compliance rule break."
-                if violations else None
+                if violations
+                else None
             ),
         }
 
     def _pi12_from_cache(
         self,
         pattern_id: str,
-        cached: list[dict],
+        cached: list[dict[str, Any]],
         timestamp_from: str | None,
         timestamp_to: str | None,
         n_regimes: int,
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """Build pi12 result from pre-computed temporal centroid cache."""
+
         def _parse_ts(s: str) -> datetime:
             dt = datetime.fromisoformat(s)
             if dt.tzinfo is None:
@@ -9682,13 +10143,18 @@ class GDSNavigator:
             filtered = [c for c in filtered if c["window_end"] <= dt_to]
 
         if len(filtered) < 2:
-            return []
+            msg = (
+                f"insufficient temporal data: {len(filtered)} window(s) in range "
+                "(minimum 2 required)"
+            )
+            return [{"warning": msg}]
 
         filtered.sort(key=lambda c: c["window_start"])
 
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns[pattern_id]
         n_rel = len(pattern.relations)
+        dim_names = pattern.dim_labels or [r.line_id for r in pattern.relations]
 
         shifts: list[tuple[datetime, float, np.ndarray, int]] = []
         for i in range(1, len(filtered)):
@@ -9703,40 +10169,52 @@ class GDSNavigator:
 
         mags = [s[1] for s in shifts]
         mean_m = float(np.mean(mags))
-        std_m = float(np.std(mags)) if len(mags) > 2 else mean_m * 0.5
+        std_m = float(np.std(mags))
         threshold = mean_m + 1.5 * std_m
 
         n_total = len(filtered)
         boundary_idx = {0, 1, n_total - 1, n_total - 2}
 
-        changepoints: list[dict] = []
+        changepoints: list[dict[str, Any]] = []
         for ts, mag, diff, idx in shifts:
             if mag <= threshold:
                 continue
             top_dims = sorted(
                 [
                     {
-                        "dimension": pattern.relations[j].line_id,
+                        "dimension": dim_names[j] if j < len(dim_names) else f"dim_{j}",
                         "diff": round(float(diff[j]), 6),
                     }
                     for j in range(n_rel)
                 ],
-                key=lambda d: abs(d["diff"]),
+                key=lambda d: abs(cast(float, d["diff"])),
                 reverse=True,
             )
             ts_str = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
-            changepoints.append({
-                "timestamp": ts_str,
-                "magnitude": round(mag, 6),
-                "top_changed_dimensions": top_dims[:3],
-                "description": (
-                    f"Population centroid shifted {mag:.3f} "
-                    f"(threshold {threshold:.3f})"
-                ),
-                "near_data_boundary": idx in boundary_idx,
-            })
+            changepoints.append(
+                {
+                    "timestamp": ts_str,
+                    "magnitude": round(mag, 6),
+                    "top_changed_dimensions": top_dims[:3],
+                    "description": (
+                        f"Population centroid shifted {mag:.3f} (threshold {threshold:.3f})"
+                    ),
+                    "near_data_boundary": idx in boundary_idx,
+                }
+            )
 
         changepoints.sort(key=lambda c: c["magnitude"], reverse=True)
+        if not changepoints:
+            return [
+                {
+                    "warning": (
+                        "no_regime_changes_detected: all bucket shifts fell below the detection "
+                        f"threshold (mean+1.5σ = {threshold:.4f}). Temporal data may be too sparse "  # noqa: E501
+                        "for reliable changepoint detection. Use compare_time_windows() for "
+                        "aggregate shift comparison."
+                    )
+                }
+            ]
         return changepoints[:n_regimes]
 
     def π12_attract_regime_change(
@@ -9745,7 +10223,7 @@ class GDSNavigator:
         timestamp_from: str | None = None,
         timestamp_to: str | None = None,
         n_regimes: int = 3,
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """π12 — Detect when population geometry shifted significantly (changepoint detection).
 
         Aggregates temporal deformation entries into time buckets, computes rolling
@@ -9764,15 +10242,17 @@ class GDSNavigator:
         cached = self._storage.read_temporal_centroids(pattern_id)
         if cached is not None:
             return self._pi12_from_cache(
-                pattern_id, cached, timestamp_from, timestamp_to, n_regimes,
+                pattern_id,
+                cached,
+                timestamp_from,
+                timestamp_to,
+                n_regimes,
             )
 
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns[pattern_id]
         if pattern.pattern_type == "event":
-            raise ValueError(
-                f"pi12 requires anchor pattern — '{pattern_id}' has type 'event'."
-            )
+            raise ValueError(f"pi12 requires anchor pattern — '{pattern_id}' has type 'event'.")
 
         dim_names = pattern.dim_labels or (
             [r.line_id for r in pattern.relations] + list(pattern.prop_columns)
@@ -9780,6 +10260,7 @@ class GDSNavigator:
         n_rel = len(pattern.relations)
 
         import itertools
+
         batch_iter = self._storage.read_temporal_batched(
             pattern_id,
             timestamp_from=timestamp_from,
@@ -9797,16 +10278,16 @@ class GDSNavigator:
         if "shape_snapshot" not in temporal_table.schema.names:
             raise GDSNavigationError(
                 f"Temporal data for pattern '{pattern_id}' uses legacy schema "
-                "(delta_snapshot). Run GDSWriter.migrate_temporal_to_shape_snapshot() "
+                "(delta_snapshot). Rebuild the sphere "
                 "to upgrade."
             )
 
         sorted_t = temporal_table.sort_by([("timestamp", "ascending")])
         timestamps = sorted_t["timestamp"].to_pylist()
-        _sigma = np.maximum(pattern.sigma_diag, 1e-2)
+        from hypertopos.engine.geometry import slice_deltas
+
         shapes = sorted_t["shape_snapshot"].to_pylist()
-        _shapes_mat = np.array(shapes, dtype=np.float32)  # (n, d)
-        _deltas_mat = (_shapes_mat - pattern.mu) / _sigma  # vectorised
+        _deltas_mat = slice_deltas(np.array(shapes, dtype=np.float32), pattern)
         deltas = _deltas_mat.tolist()  # list of lists for downstream code
 
         # Time-based bucketing: divide the temporal span into equal-duration intervals.
@@ -9818,7 +10299,9 @@ class GDSNavigator:
         t_min = timestamps[0].timestamp()
         t_max = timestamps[-1].timestamp()
         if t_max == t_min:
-            return [{"warning": "all temporal entries share the same timestamp — cannot detect changes"}]  # noqa: E501
+            return [
+                {"warning": "all temporal entries share the same timestamp — cannot detect changes"}
+            ]  # noqa: E501
 
         bucket_width = (t_max - t_min) / n_buckets
 
@@ -9828,7 +10311,7 @@ class GDSNavigator:
         ts_floats = np.array([ts.timestamp() for ts in timestamps], dtype=np.float64)
 
         bucket_centroids: list[np.ndarray] = []
-        bucket_timestamps: list = []
+        bucket_timestamps: list[Any] = []
         for b in range(n_buckets):
             t_start = t_min + b * bucket_width
             t_end = t_min + (b + 1) * bucket_width
@@ -9859,7 +10342,7 @@ class GDSNavigator:
         n_buckets = len(bucket_timestamps)
         boundary_idx = {0, 1, n_buckets - 1, n_buckets - 2}
 
-        changes: list[dict] = []
+        changes: list[dict[str, Any]] = []
         for i, shift in enumerate(shifts):
             if shift <= threshold:
                 continue
@@ -9872,7 +10355,7 @@ class GDSNavigator:
                     }
                     for j in range(n_rel)
                 ],
-                key=lambda x: abs(x["diff"]),
+                key=lambda x: abs(cast(float, x["diff"])),
                 reverse=True,
             )
             ts = bucket_timestamps[i + 1]
@@ -9883,8 +10366,7 @@ class GDSNavigator:
                     "magnitude": round(shift, 6),
                     "top_changed_dimensions": dim_diffs[:3],
                     "description": (
-                        f"Population centroid shifted {shift:.3f} "
-                        f"(threshold {threshold:.3f})"
+                        f"Population centroid shifted {shift:.3f} (threshold {threshold:.3f})"
                     ),
                     "near_data_boundary": (i + 1) in boundary_idx,
                 }
@@ -9892,19 +10374,24 @@ class GDSNavigator:
 
         changes.sort(key=lambda x: x["magnitude"], reverse=True)
         if not changes:
-            return [{
-                "warning": (
-                    "no_regime_changes_detected: all bucket shifts fell below the detection "
-                    f"threshold (mean+1.5\u03c3 = {threshold:.4f}). Temporal data may be too sparse "  # noqa: E501
-                    "for reliable changepoint detection. Use compare_time_windows() for "
-                    "aggregate shift comparison."
-                )
-            }]
+            return [
+                {
+                    "warning": (
+                        "no_regime_changes_detected: all bucket shifts fell below the detection "
+                        f"threshold (mean+1.5\u03c3 = {threshold:.4f}). Temporal data may be too sparse "  # noqa: E501
+                        "for reliable changepoint detection. Use compare_time_windows() for "
+                        "aggregate shift comparison."
+                    )
+                }
+            ]
         return changes[:n_regimes]
 
     def line_geometry_stats(
-        self, line_id: str, pattern_id: str, sample_size: int | None = None,
-    ) -> dict:
+        self,
+        line_id: str,
+        pattern_id: str,
+        sample_size: int | None = None,
+    ) -> dict[str, Any]:
         """Return geometric statistics for one relation line within a pattern.
 
         coverage_pct: fraction of entities with >= 1 alive edge to this line.
@@ -9917,9 +10404,7 @@ class GDSNavigator:
         pattern = sphere.patterns[pattern_id]
         rel = next((r for r in pattern.relations if r.line_id == line_id), None)
         if rel is None:
-            raise ValueError(
-                f"Line '{line_id}' is not a relation in pattern '{pattern_id}'"
-            )
+            raise ValueError(f"Line '{line_id}' is not a relation in pattern '{pattern_id}'")
         version = self._resolve_version(pattern_id)
         total = self._storage.count_geometry_rows(pattern_id)
         if total == 0:
@@ -9954,7 +10439,9 @@ class GDSNavigator:
 
         if sample_size is not None and total > sample_size:
             geo_table = self._storage.read_geometry(
-                pattern_id, version, columns=_cov_cols,
+                pattern_id,
+                version,
+                columns=_cov_cols,
             )
             rng = np.random.default_rng(42)
             idx = np.sort(rng.choice(geo_table.num_rows, size=sample_size, replace=False))
@@ -9974,9 +10461,7 @@ class GDSNavigator:
         delta_sum = 0.0
         delta_n = 0
         first_batch = next(
-            self._storage.read_geometry_batched(
-                pattern_id, version, columns=["delta"]
-            ),
+            self._storage.read_geometry_batched(pattern_id, version, columns=["delta"]),
             None,
         )
         if first_batch is not None:
@@ -10049,12 +10534,8 @@ class GDSNavigator:
         or empty, ``index_present`` is False, counts are 0, and the
         recommendation explains the absence.
         """
-        import lance as _lance_local
 
-        geo_path = (
-            self._storage._base.resolve()
-            / "geometry" / pattern_id / "data.lance"
-        )
+        geo_path = self._storage._base.resolve() / "geometry" / pattern_id / "data.lance"
         base = {
             "pattern_id": pattern_id,
             "line_id": line_id,
@@ -10071,12 +10552,11 @@ class GDSNavigator:
         }
         if not geo_path.exists():
             base["recommendation"] = (
-                f"no geometry dataset for pattern '{pattern_id}' — nothing to "
-                "index"
+                f"no geometry dataset for pattern '{pattern_id}' — nothing to index"
             )
             return base
 
-        ds = _lance_local.dataset(str(geo_path))
+        ds = self._storage.dataset(geo_path)
         total_rows = ds.count_rows()
         base["total_rows"] = total_rows
         if total_rows == 0:
@@ -10094,9 +10574,7 @@ class GDSNavigator:
                 index_type = getattr(idx, "index_type", None)
                 index_name = getattr(idx, "name", None)
                 raw_indexed = getattr(idx, "num_rows_indexed", None)
-                indexed_rows = (
-                    int(raw_indexed) if raw_indexed is not None else total_rows
-                )
+                indexed_rows = int(raw_indexed) if raw_indexed is not None else total_rows
                 break
 
         # index_statistics exposes the authoritative unindexed-row count and
@@ -10112,9 +10590,7 @@ class GDSNavigator:
                 indices_meta = stats.get("indices") or []
                 if indices_meta:
                     np_raw = indices_meta[0].get("num_partitions")
-                    num_partitions = (
-                        int(np_raw) if np_raw is not None else None
-                    )
+                    num_partitions = int(np_raw) if np_raw is not None else None
 
         # No vector index → every row is unindexed (ANN tools fall back to a
         # full scan). With an index, prefer the index_statistics unindexed
@@ -10150,25 +10626,25 @@ class GDSNavigator:
         else:
             recommendation = "index covers all rows — ANN tools see the full population"
 
-        base.update({
-            "index_present": index_present,
-            "index_type": index_type,
-            "num_indexed_rows": indexed_rows,
-            "num_unindexed_rows": unindexed_rows,
-            "indexed_fraction": indexed_fraction,
-            "num_partitions": num_partitions,
-            "is_stale": is_stale,
-            "recommendation": recommendation,
-        })
+        base.update(
+            {
+                "index_present": index_present,
+                "index_type": index_type,
+                "num_indexed_rows": indexed_rows,
+                "num_unindexed_rows": unindexed_rows,
+                "indexed_fraction": indexed_fraction,
+                "num_partitions": num_partitions,
+                "is_stale": is_stale,
+                "recommendation": recommendation,
+            }
+        )
         return base
 
     # ===================================================================
     # check_alerts — implicit geometric health checks
     # ===================================================================
 
-    def check_alerts(
-        self, pattern_id: str | None = None
-    ) -> dict[str, Any]:
+    def check_alerts(self, pattern_id: str | None = None) -> dict[str, Any]:
         """Evaluate implicit geometric health checks across patterns.
 
         Runs 6 checks per pattern and returns a sorted list of alerts
@@ -10197,9 +10673,7 @@ class GDSNavigator:
             pattern_ids = [pattern_id]
         else:
             pattern_ids = [
-                pid
-                for pid in sphere.patterns
-                if self._manifest.pattern_version(pid) is not None
+                pid for pid in sphere.patterns if self._manifest.pattern_version(pid) is not None
             ]
 
         all_alerts: list[dict[str, Any]] = []
@@ -10212,16 +10686,10 @@ class GDSNavigator:
                 continue
             prev_stats = self._storage.read_geometry_stats(pid, version - 1)
 
-            all_alerts.extend(
-                self._check_anomaly_rate_spike(pid, current_stats, prev_stats)
-            )
-            all_alerts.extend(
-                self._check_population_size_shock(pid, current_stats, prev_stats)
-            )
+            all_alerts.extend(self._check_anomaly_rate_spike(pid, current_stats, prev_stats))
+            all_alerts.extend(self._check_population_size_shock(pid, current_stats, prev_stats))
             all_alerts.extend(self._check_data_quality(pid, current_stats))
-            all_alerts.extend(
-                self._check_regime_changepoint(pid, current_stats)
-            )
+            all_alerts.extend(self._check_regime_changepoint(pid, current_stats))
             all_alerts.extend(self._check_calibration_staleness(pid))
             all_alerts.extend(self._check_stale_vector_index(pid))
 
@@ -10236,9 +10704,7 @@ class GDSNavigator:
             ],
         }
 
-    def audit_label_alignment(
-        self, pattern_id: str, *, top_n: int = 10
-    ) -> dict[str, Any]:
+    def audit_label_alignment(self, pattern_id: str, *, top_n: int = 10) -> dict[str, Any]:
         """Report Fisher LDA direction alignment as an AUROC against labels.
 
         Sibling to the MCP-only ``audit_pattern_dims`` calibration audit:
@@ -10291,10 +10757,7 @@ class GDSNavigator:
 
         lac = getattr(pattern, "label_aware_calibration", None)
         if not lac:
-            return _fallback(
-                "no label-aware calibration available — pattern was built "
-                "without the 'label_audit:' block in sphere.yaml"
-            )
+            return _fallback(label_aware_unavailable_reason(sphere, pattern_id))
 
         label_audit = getattr(sphere, "label_audit", None)
         if not isinstance(label_audit, dict):
@@ -10305,28 +10768,23 @@ class GDSNavigator:
         label_column = label_audit.get("label_column")
         label_positive_value = label_audit.get("label_positive_value")
         if not label_column or label_positive_value is None:
-            return _fallback(
-                "label_audit block missing label_column / "
-                "label_positive_value"
-            )
+            return _fallback("label_audit block missing label_column / label_positive_value")
 
         entity_line_id = pattern.entity_line_id
         if not entity_line_id:
-            return _fallback(
-                "pattern has no entity_line — cannot resolve label column"
-            )
+            return _fallback("pattern has no entity_line — cannot resolve label column")
 
         version = self._manifest.pattern_version(pattern_id)
         if version is None:
-            return _fallback(
-                f"pattern '{pattern_id}' has no active version in manifest"
-            )
+            return _fallback(f"pattern '{pattern_id}' has no active version in manifest")
 
         # Read signed projection — keep nulls so we can drop them with the
         # label-side join (patterns without label-aware calibration emit
         # all-null even when the column exists).
         geo = self._storage.read_geometry(
-            pattern_id, version, columns=["primary_key", "delta_norm_signed"],
+            pattern_id,
+            version,
+            columns=["primary_key", "delta_norm_signed"],
         )
         if "delta_norm_signed" not in geo.schema.names:
             return _fallback(
@@ -10337,7 +10795,8 @@ class GDSNavigator:
         line_version = self._manifest.line_version(entity_line_id) or 1
         try:
             points = self._storage.read_points(
-                entity_line_id, line_version,
+                entity_line_id,
+                line_version,
                 columns=["primary_key", label_column],
             )
         except (KeyError, FileNotFoundError, OSError, pa.ArrowInvalid) as exc:
@@ -10347,25 +10806,29 @@ class GDSNavigator:
             )
         if label_column not in points.schema.names:
             return _fallback(
-                f"label column '{label_column}' not found on entity line "
-                f"'{entity_line_id}'"
+                f"label column '{label_column}' not found on entity line '{entity_line_id}'"
             )
 
         # Join geometry signed projection ←→ labels on primary_key.
         joined = geo.join(
-            points, keys="primary_key", join_type="inner",
+            points,
+            keys="primary_key",
+            join_type="inner",
         )
         if joined.num_rows == 0:
-            return _fallback(
-                "no rows after joining geometry to labels on primary_key"
-            )
+            return _fallback("no rows after joining geometry to labels on primary_key")
 
         signed_arr = joined["delta_norm_signed"]
         label_arr = joined[label_column]
-        # Drop rows where either side is null (all-null signed → AUROC
-        # cannot be computed; null labels → no class to score against).
-        mask = pc.and_(
-            pc.is_valid(signed_arr), pc.is_valid(label_arr),
+        # Drop rows where either side is null or the score is NaN / inf
+        # (all-null signed → AUROC cannot be computed; null labels → no
+        # class to score against).
+        mask = pc.fill_null(
+            pc.and_(
+                pc.is_finite(signed_arr),
+                pc.is_valid(label_arr),
+            ),
+            False,
         )
         signed_arr = signed_arr.filter(mask)
         label_arr = label_arr.filter(mask)
@@ -10377,7 +10840,8 @@ class GDSNavigator:
             )
 
         signed_np = signed_arr.to_numpy(zero_copy_only=False).astype(
-            np.float64, copy=False,
+            np.float64,
+            copy=False,
         )
         # Binarize against positive value via element-wise equality.
         labels_list = label_arr.to_pylist()
@@ -10409,17 +10873,15 @@ class GDSNavigator:
             mu_neg = float(dim_cal.mu_neg)
             sigma_neg = float(dim_cal.sigma_neg)
             denom_sq = (sigma_pos * sigma_pos + sigma_neg * sigma_neg) / 2.0
-            cohens_d = (
-                abs(mu_pos - mu_neg) / math.sqrt(denom_sq)
-                if denom_sq > 0.0
-                else 0.0
+            cohens_d = abs(mu_pos - mu_neg) / math.sqrt(denom_sq) if denom_sq > 0.0 else 0.0
+            top_rows.append(
+                {
+                    "dim_label": label,
+                    "direction_component": direction,
+                    "abs_direction": abs(direction),
+                    "cohens_d_pos_neg": cohens_d,
+                }
             )
-            top_rows.append({
-                "dim_label": label,
-                "direction_component": direction,
-                "abs_direction": abs(direction),
-                "cohens_d_pos_neg": cohens_d,
-            })
         top_rows.sort(key=lambda r: r["abs_direction"], reverse=True)
         top_rows = top_rows[:top_n]
 
@@ -10438,8 +10900,8 @@ class GDSNavigator:
     def _check_anomaly_rate_spike(
         self,
         pattern_id: str,
-        current: dict,
-        prev: dict | None,
+        current: dict[str, Any],
+        prev: dict[str, Any] | None,
     ) -> list[dict[str, Any]]:
         """HIGH if anomaly rate increased > 5 pp vs previous version."""
         if prev is None:
@@ -10473,8 +10935,8 @@ class GDSNavigator:
     def _check_population_size_shock(
         self,
         pattern_id: str,
-        current: dict,
-        prev: dict | None,
+        current: dict[str, Any],
+        prev: dict[str, Any] | None,
     ) -> list[dict[str, Any]]:
         """HIGH if |population change| > 10% vs previous version."""
         if prev is None:
@@ -10505,7 +10967,7 @@ class GDSNavigator:
         return []
 
     def _check_data_quality(
-        self, pattern_id: str, current_stats: dict
+        self, pattern_id: str, current_stats: dict[str, Any]
     ) -> list[dict[str, Any]]:
         """Check geometric health using pre-computed geometry_stats.
 
@@ -10549,7 +11011,7 @@ class GDSNavigator:
         # Note: zero_anomaly_rate is only meaningful when theta>0 — if theta=0, Bug 1 fix
         # guarantees zero anomalies (is_anomaly requires theta>0), so the finding would
         # be misleading noise. The theta_miscalibration finding already covers that case.
-        theta_findings: list[dict] = []
+        theta_findings: list[dict[str, Any]] = []
         if total_entities > 1000 and total_anomalies == 0 and theta_norm > 0:
             theta_findings.append(
                 {
@@ -10592,19 +11054,16 @@ class GDSNavigator:
                     "severity": "MEDIUM",
                     "check_type": "theta_miscalibration",
                     "pattern_id": pattern_id,
-                    "message": (
-                        f"{len(theta_findings)} theta-related issue(s) detected"
-                    ),
+                    "message": (f"{len(theta_findings)} theta-related issue(s) detected"),
                     "details": {"findings": theta_findings},
                 }
             )
         return alerts
 
-
     def _check_regime_changepoint(
         self,
         pattern_id: str,
-        current: dict,
+        current: dict[str, Any],
     ) -> list[dict[str, Any]]:
         """HIGH if any regime changepoints detected in the last 90 days.
 
@@ -10615,7 +11074,10 @@ class GDSNavigator:
         cutoff = (datetime.now(UTC) - timedelta(days=90)).isoformat()
         try:
             changes = self.π12_attract_regime_change(
-                pattern_id, n_regimes=2, timestamp_from=cutoff, timestamp_to=None,
+                pattern_id,
+                n_regimes=2,
+                timestamp_from=cutoff,
+                timestamp_to=None,
             )
         except _NAVIGATION_RECOVERABLE_ERRORS:
             return []
@@ -10631,9 +11093,7 @@ class GDSNavigator:
                 "severity": "HIGH",
                 "check_type": "regime_changepoint",
                 "pattern_id": pattern_id,
-                "message": (
-                    f"{len(real_changepoints)} regime changepoint(s) detected"
-                ),
+                "message": (f"{len(real_changepoints)} regime changepoint(s) detected"),
                 "details": {"changepoints": real_changepoints},
             }
         ]
@@ -10664,7 +11124,7 @@ class GDSNavigator:
                 result.append(col_name)
         return result
 
-    def temporal_hint(self, primary_key: str, pattern_id: str) -> dict | None:
+    def temporal_hint(self, primary_key: str, pattern_id: str) -> dict[str, Any] | None:
         """Return temporal summary: num_slices, last_timestamp. None if no data."""
         temporal = self._storage.read_temporal(pattern_id, primary_key)
         if temporal is None or temporal.num_rows == 0:
@@ -10676,8 +11136,12 @@ class GDSNavigator:
         }
 
     def search_entities(
-        self, line_id: str, property_name: str, value: str, limit: int = 20,
-    ) -> dict:
+        self,
+        line_id: str,
+        property_name: str,
+        value: str,
+        limit: int = 20,
+    ) -> dict[str, Any]:
         """Search for entities by property value. Returns {total, returned, entities}."""
         sphere = self._storage.read_sphere()
         line = sphere.lines.get(line_id)
@@ -10688,8 +11152,7 @@ class GDSNavigator:
 
         if property_name not in table.column_names:
             raise GDSNavigationError(
-                f"Property '{property_name}' not found. "
-                f"Available: {table.column_names}"
+                f"Property '{property_name}' not found. Available: {table.column_names}"
             )
 
         col_type = table.schema.field(property_name).type
@@ -10703,17 +11166,19 @@ class GDSNavigator:
         filtered = table.filter(mask)
         total = len(filtered)
 
-        entities: list[dict] = []
+        entities: list[dict[str, Any]] = []
         for row in filtered.slice(0, limit).to_pylist():
             pk = row.pop("primary_key", None)
             row.pop("version", None)
             row.pop("created_at", None)
             row.pop("changed_at", None)
-            entities.append({
-                "primary_key": pk,
-                "status": row.pop("status", "active"),
-                "properties": row,
-            })
+            entities.append(
+                {
+                    "primary_key": pk,
+                    "status": row.pop("status", "active"),
+                    "properties": row,
+                }
+            )
 
         return {"total": total, "returned": len(entities), "entities": entities}
 
@@ -10732,7 +11197,8 @@ class GDSNavigator:
         return self._engine.count_inside_alias(alias, geo)
 
     def _check_calibration_staleness(
-        self, pattern_id: str,
+        self,
+        pattern_id: str,
     ) -> list[dict[str, Any]]:
         """Check if calibration drift exceeds thresholds."""
         tracker = self._storage.read_calibration_tracker(pattern_id)
@@ -10740,42 +11206,47 @@ class GDSNavigator:
             return []
         alerts: list[dict[str, Any]] = []
         if tracker.is_blocked:
-            alerts.append({
-                "severity": "HIGH",
-                "check_type": "calibration_drift",
-                "pattern_id": pattern_id,
-                "message": (
-                    f"Calibration drift {tracker.drift_pct:.1%} exceeds hard "
-                    f"threshold {tracker.hard_threshold:.1%}. Appends are "
-                    f"blocked. Call recalibrate('{pattern_id}') to fix."
-                ),
-                "details": {
-                    "drift_pct": round(tracker.drift_pct, 4),
-                    "hard_threshold": tracker.hard_threshold,
-                    "running_n": tracker.running_n,
-                    "calibrated_n": tracker.calibrated_n,
-                },
-            })
+            alerts.append(
+                {
+                    "severity": "HIGH",
+                    "check_type": "calibration_drift",
+                    "pattern_id": pattern_id,
+                    "message": (
+                        f"Calibration drift {tracker.drift_pct:.1%} exceeds hard "
+                        f"threshold {tracker.hard_threshold:.1%}. Appends are "
+                        f"blocked. Call recalibrate('{pattern_id}') to fix."
+                    ),
+                    "details": {
+                        "drift_pct": round(tracker.drift_pct, 4),
+                        "hard_threshold": tracker.hard_threshold,
+                        "running_n": tracker.running_n,
+                        "calibrated_n": tracker.calibrated_n,
+                    },
+                }
+            )
         elif tracker.is_stale:
-            alerts.append({
-                "severity": "MEDIUM",
-                "check_type": "calibration_drift",
-                "pattern_id": pattern_id,
-                "message": (
-                    f"Calibration drift {tracker.drift_pct:.1%} exceeds soft "
-                    f"threshold {tracker.soft_threshold:.1%}. Consider "
-                    f"recalibrating."
-                ),
-                "details": {
-                    "drift_pct": round(tracker.drift_pct, 4),
-                    "soft_threshold": tracker.soft_threshold,
-                    "running_n": tracker.running_n,
-                },
-            })
+            alerts.append(
+                {
+                    "severity": "MEDIUM",
+                    "check_type": "calibration_drift",
+                    "pattern_id": pattern_id,
+                    "message": (
+                        f"Calibration drift {tracker.drift_pct:.1%} exceeds soft "
+                        f"threshold {tracker.soft_threshold:.1%}. Consider "
+                        f"recalibrating."
+                    ),
+                    "details": {
+                        "drift_pct": round(tracker.drift_pct, 4),
+                        "soft_threshold": tracker.soft_threshold,
+                        "running_n": tracker.running_n,
+                    },
+                }
+            )
         return alerts
 
     def _check_stale_vector_index(
-        self, pattern_id: str,
+        self,
+        pattern_id: str,
     ) -> list[dict[str, Any]]:
         """Emit a MEDIUM alert when the geometry IVF index is stale.
 
@@ -10793,23 +11264,25 @@ class GDSNavigator:
         unindexed = health["num_unindexed_rows"]
         total = health["total_rows"]
         frac = health["num_unindexed_rows"] / total if total else 0.0
-        return [{
-            "severity": "MEDIUM",
-            "check_type": "stale_vector_index",
-            "pattern_id": pattern_id,
-            "message": (
-                f"Vector index stale: {unindexed} of {total} geometry rows "
-                f"({frac:.1%}) are outside the IVF index. ANN tools (e.g. "
-                f"pi10_attract_trajectory) miss them. Run "
-                f"incremental_update(reindex=True) or finalize_incremental()."
-            ),
-            "details": {
-                "num_unindexed_rows": unindexed,
-                "total_rows": total,
-                "indexed_fraction": round(health["indexed_fraction"], 4),
-                "stale_threshold": health["stale_threshold"],
-            },
-        }]
+        return [
+            {
+                "severity": "MEDIUM",
+                "check_type": "stale_vector_index",
+                "pattern_id": pattern_id,
+                "message": (
+                    f"Vector index stale: {unindexed} of {total} geometry rows "
+                    f"({frac:.1%}) are outside the IVF index. ANN tools (e.g. "
+                    f"pi10_attract_trajectory) miss them. Run "
+                    f"incremental_update(reindex=True) or finalize_incremental()."
+                ),
+                "details": {
+                    "num_unindexed_rows": unindexed,
+                    "total_rows": total,
+                    "indexed_fraction": round(health["indexed_fraction"], 4),
+                    "stale_threshold": health["stale_threshold"],
+                },
+            }
+        ]
 
     # ------------------------------------------------------------------
     # Aggregation (delegates to engine.aggregation)
@@ -10846,7 +11319,8 @@ class GDSNavigator:
     # ------------------------------------------------------------------
 
     def _discover_pattern_map(
-        self, home_line_id: str,
+        self,
+        home_line_id: str,
     ) -> dict[str, str]:
         """Classify each pattern as direct/composite/chain/none for this entity.
 
@@ -10889,9 +11363,7 @@ class GDSNavigator:
 
             # Check if home_line is a declared relation of this pattern
             # (entity appears as edge in event/anchor polygons)
-            has_relation = any(
-                r.line_id == home_line_id for r in pattern.relations
-            )
+            has_relation = any(r.line_id == home_line_id for r in pattern.relations)
             if has_relation:
                 result[pat_id] = "event_edge"
                 continue
@@ -10899,8 +11371,8 @@ class GDSNavigator:
             # Check chain: anchor line has chain_keys column
             line_ver = self._manifest.line_version(entity_line_id) or 1
             try:
-                pts = self._storage.read_points(entity_line_id, line_ver)
-                if "chain_keys" in pts.schema.names:
+                schema = self._storage.read_points_schema(entity_line_id, line_ver)
+                if "chain_keys" in schema.names:
                     result[pat_id] = "chain"
                     continue
             except (ValueError, FileNotFoundError):
@@ -10910,7 +11382,9 @@ class GDSNavigator:
             # contains separator (e.g. "→"), indicating composite keys
             try:
                 sample = self._storage.read_geometry(
-                    pat_id, version, columns=["primary_key"],
+                    pat_id,
+                    version,
+                    columns=["primary_key"],
                     sample_size=1,
                 )
                 if sample.num_rows > 0:
@@ -10925,7 +11399,9 @@ class GDSNavigator:
         return result
 
     def _get_chain_reverse_index(
-        self, line_id: str, version: int,
+        self,
+        line_id: str,
+        version: int,
     ) -> dict[str, list[str]]:
         """Build or return cached entity_key → [chain_pks] mapping."""
         cache_key = (line_id, version)
@@ -10949,7 +11425,7 @@ class GDSNavigator:
         primary_key: str,
         line_id: str | None = None,
         max_related: int = 5,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Gather anomaly status from all patterns this entity participates in.
 
         Returns dict with:
@@ -10963,9 +11439,7 @@ class GDSNavigator:
         """
         # Validate entity key - reject separator or SQL metacharacters
         if "\u2192" in primary_key or "'" in primary_key or "--" in primary_key:
-            raise GDSNavigationError(
-                f"Invalid characters in primary_key: {primary_key!r}"
-            )
+            raise GDSNavigationError(f"Invalid characters in primary_key: {primary_key!r}")
 
         sphere = self._storage.read_sphere()
 
@@ -10983,14 +11457,12 @@ class GDSNavigator:
                 except (ValueError, FileNotFoundError):
                     continue
             if line_id is None:
-                raise GDSEntityNotFoundError(
-                    f"Entity '{primary_key}' not found in any anchor line"
-                )
+                raise GDSEntityNotFoundError(f"Entity '{primary_key}' not found in any anchor line")
 
         # Discover which patterns this entity participates in
         pattern_map = self._discover_pattern_map(line_id)
 
-        signals: dict[str, dict] = {}
+        signals: dict[str, dict[str, Any]] = {}
         source_count = 0
 
         for pat_id, key_type in pattern_map.items():
@@ -11001,17 +11473,25 @@ class GDSNavigator:
 
             if key_type in ("direct", "sibling"):
                 signal = self._profile_direct(
-                    primary_key, pat_id, version,
+                    primary_key,
+                    pat_id,
+                    version,
                 )
                 if signal is not None:
                     signal["key_type"] = key_type
             elif key_type == "event_edge":
                 signal = self._profile_event_edge(
-                    primary_key, pat_id, version, max_related,
+                    primary_key,
+                    pat_id,
+                    version,
+                    max_related,
                 )
             elif key_type == "composite":
                 signal = self._profile_composite(
-                    primary_key, pat_id, version, max_related,
+                    primary_key,
+                    pat_id,
+                    version,
+                    max_related,
                 )
             elif key_type == "chain":
                 entity_line_id = sphere.entity_line(pat_id)
@@ -11019,8 +11499,12 @@ class GDSNavigator:
                     continue
                 line_ver = self._manifest.line_version(entity_line_id) or 1
                 signal = self._profile_chain(
-                    primary_key, pat_id, version,
-                    entity_line_id, line_ver, max_related,
+                    primary_key,
+                    pat_id,
+                    version,
+                    entity_line_id,
+                    line_ver,
+                    max_related,
                 )
             else:
                 continue
@@ -11042,7 +11526,10 @@ class GDSNavigator:
         # the direct pattern. Measures how anomalous the entity's
         # immediate network is (1-hop risk propagation).
         connected_risk = self._compute_connected_risk(
-            primary_key, line_id, signals, pattern_map,
+            primary_key,
+            line_id,
+            signals,
+            pattern_map,
         )
 
         return {
@@ -11062,7 +11549,7 @@ class GDSNavigator:
         max_related: int = 10,
         *,
         include_reliability_flags: bool = True,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Compose anomaly p-values across patterns via Wilson harmonic-mean p.
 
         Uses conformal_p from each pattern's cross_pattern_profile signal.
@@ -11074,7 +11561,7 @@ class GDSNavigator:
 
         profile = self.cross_pattern_profile(primary_key, line_id, max_related)
         p_values: dict[str, float] = {}
-        per_pattern: dict[str, dict] = {}
+        per_pattern: dict[str, dict[str, Any]] = {}
         for pat_id, signal in profile.get("signals", {}).items():
             cp = signal.get("conformal_p")
             if cp is not None and cp > 0:
@@ -11116,10 +11603,13 @@ class GDSNavigator:
         if include_reliability_flags and home_pattern_id:
             try:
                 from hypertopos.engine.geometry import compute_reliability_flags
+
                 sphere = self._storage.read_sphere()
                 home_pat = sphere.patterns.get(home_pattern_id)
                 home_poly = self._engine.build_polygon(
-                    primary_key, home_pattern_id, self._manifest,
+                    primary_key,
+                    home_pattern_id,
+                    self._manifest,
                 )
                 if home_pat is not None and home_poly is not None:
                     result["reliability_flags"] = compute_reliability_flags(
@@ -11138,7 +11628,7 @@ class GDSNavigator:
         max_keys: int = 200,
         *,
         include_reliability_flags: bool = False,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Batch composite risk — harmonic-mean p-value across patterns.
 
         Returns per-key combined_p + summary counts at p<0.10 and p<0.05.
@@ -11166,25 +11656,28 @@ class GDSNavigator:
         # the union of keys so helpers can issue a single batched read
         # on first hit instead of waiting for every key to arrive
         # individually.
-        self._batch_profile_cache = {"_batch_keys": list(keys)}
+        self._batch_profile_cache: dict[str, Any] | None = {"_batch_keys": list(keys)}
         try:
             results = []
             for key in keys:
                 try:
                     cr = self.composite_risk(
-                        key, line_id,
+                        key,
+                        line_id,
                         include_reliability_flags=include_reliability_flags,
                     )
                     if cr.get("n_patterns", 0) == 0:
                         cr["error"] = "not_found"
                     results.append(cr)
                 except _NAVIGATION_RECOVERABLE_ERRORS:
-                    results.append({
-                        "primary_key": key,
-                        "combined_p": None,
-                        "n_patterns": 0,
-                        "error": "not_found",
-                    })
+                    results.append(
+                        {
+                            "primary_key": key,
+                            "combined_p": None,
+                            "n_patterns": 0,
+                            "error": "not_found",
+                        }
+                    )
         finally:
             self._batch_profile_cache = None
         valid = [r for r in results if r.get("combined_p") is not None]
@@ -11206,13 +11699,13 @@ class GDSNavigator:
             "delta_norm",
             "neighbor_contamination",
             "segment_shift",
-            "trajectory_continuous",
             "density_gap",
         ),
         weights: dict[str, float] | None = None,
         sample_size: int | None = 10_000,
-        top_n: int = 50,
-    ) -> list[dict]:
+        top_n: int | None = 50,
+        include_keys: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Multi-detector anomaly consensus via Wilson harmonic-mean p-value.
 
         Calibrates each named detector to a per-entity p-value, combines them
@@ -11223,7 +11716,9 @@ class GDSNavigator:
             * ``delta_norm`` — population-relative geometry deviation
             * ``neighbor_contamination`` — graph-neighbour anomaly density
             * ``segment_shift`` — categorical-segment anomaly rate shift
-            * ``trajectory_continuous`` — DTW distance vs median trajectory
+            * ``trajectory_continuous`` — DTW distance vs median trajectory; opt-in
+              (pass it in ``detectors``): reads the temporal history of the
+              sampled entities, so it is not in the default set
             * ``density_gap`` — local density-gap detector q-values
 
         Detectors that fail to produce data (e.g. no temporal solid for
@@ -11241,6 +11736,8 @@ class GDSNavigator:
             sample_size: Cap on geometry rows used per detector
                 (delta_norm always honors this cap).
             top_n: Maximum entries returned in the ranked list.
+            include_keys: entities always scored, added to the random
+                sample when it missed them.
 
         Returns:
             List of ``{primary_key, hmp, p_per_detector, rank}`` ascending by
@@ -11250,10 +11747,6 @@ class GDSNavigator:
         from hypertopos.engine.composition import harmonic_mean_p
         from hypertopos.engine.p_value_calibration import (
             detector_p_value_delta_norm,
-            detector_p_value_density_gap,
-            detector_p_value_neighbor_contamination,
-            detector_p_value_segment_shift,
-            detector_p_value_trajectory_continuous,
         )
 
         version = self._resolve_version(pattern_id)
@@ -11278,15 +11771,29 @@ class GDSNavigator:
         ]
         try:
             geo = self._storage.read_geometry(
-                pattern_id, version,
+                pattern_id,
+                version,
                 columns=geo_cols,
                 sample_size=sample_size if sample_size and sample_size > 0 else None,
             )
         except TypeError:
             # Some mock storages do not accept sample_size — fall back.
             geo = self._storage.read_geometry(
-                pattern_id, version, columns=geo_cols,
+                pattern_id,
+                version,
+                columns=geo_cols,
             )
+        if include_keys:
+            missing = sorted(set(include_keys) - set(geo["primary_key"].to_pylist()))
+            if missing:
+                extra = self._storage.read_geometry(
+                    pattern_id,
+                    version,
+                    columns=geo_cols,
+                    point_keys=missing,
+                )
+                if extra.num_rows:
+                    geo = pa.concat_tables([geo, extra.select(geo.column_names)])
         if geo.num_rows == 0:
             return []
 
@@ -11296,32 +11803,28 @@ class GDSNavigator:
 
         if "delta_norm" in detectors:
             per_detector_ps["delta_norm"] = detector_p_value_delta_norm(
-                geo, primary_keys, df=df,
+                geo,
+                primary_keys,
+                df=df,
             )
 
         if "neighbor_contamination" in detectors:
-            per_detector_ps["neighbor_contamination"] = (
-                self._collect_neighbor_contamination_p(
-                    pattern_id, geo,
-                )
+            per_detector_ps["neighbor_contamination"] = self._collect_neighbor_contamination_p(
+                pattern_id,
+                geo,
             )
 
         if "segment_shift" in detectors:
-            per_detector_ps["segment_shift"] = (
-                self._collect_segment_shift_p(pattern_id)
-            )
+            per_detector_ps["segment_shift"] = self._collect_segment_shift_p(pattern_id)
 
         if "trajectory_continuous" in detectors:
-            per_detector_ps["trajectory_continuous"] = (
-                self._collect_trajectory_continuous_p(
-                    pattern_id, primary_keys,
-                )
+            per_detector_ps["trajectory_continuous"] = self._collect_trajectory_continuous_p(
+                pattern_id,
+                primary_keys,
             )
 
         if "density_gap" in detectors:
-            per_detector_ps["density_gap"] = (
-                self._collect_density_gap_p(pattern_id)
-            )
+            per_detector_ps["density_gap"] = self._collect_density_gap_p(pattern_id)
 
         # Apply a uniform lower-floor on every per-detector p before
         # combining via HMP. A single detector saturating at the
@@ -11336,12 +11839,11 @@ class GDSNavigator:
         # not by which detector saturated first.
         for det_name in per_detector_ps:
             per_detector_ps[det_name] = {
-                k: max(float(v), _HMP_INPUT_P_FLOOR)
-                for k, v in per_detector_ps[det_name].items()
+                k: max(float(v), _HMP_INPUT_P_FLOOR) for k, v in per_detector_ps[det_name].items()
             }
 
         # Combine per-entity via HMP across the detectors that produced a value.
-        combined: list[dict] = []
+        combined: list[dict[str, Any]] = []
         for pk in primary_keys:
             ps_for_entity: dict[str, float] = {}
             for det_name, det_dict in per_detector_ps.items():
@@ -11351,27 +11853,25 @@ class GDSNavigator:
                 continue
             entity_weights: dict[str, float] | None = None
             if weights is not None:
-                entity_weights = {
-                    k: float(weights.get(k, 0.0)) for k in ps_for_entity
-                }
+                entity_weights = {k: float(weights.get(k, 0.0)) for k in ps_for_entity}
                 if sum(entity_weights.values()) <= 0.0:
                     entity_weights = None
             hmp_value = float(harmonic_mean_p(ps_for_entity, weights=entity_weights))
             if not math.isfinite(hmp_value):
                 hmp_value = 1.0
-            combined.append({
-                "primary_key": pk,
-                "hmp": hmp_value,
-                # 15-decimal display covers the float64 mantissa range —
-                # matches scipy.stats convention and preserves ranking
-                # discrimination when HMP saturates near the input
-                # p-value floor (sub-1e-9 values would otherwise
-                # collapse to 0.0 under 9-decimal rounding even though
-                # the unrounded sort order is correct).
-                "p_per_detector": {
-                    k: round(float(v), 15) for k, v in ps_for_entity.items()
-                },
-            })
+            combined.append(
+                {
+                    "primary_key": pk,
+                    "hmp": hmp_value,
+                    # 15-decimal display covers the float64 mantissa range —
+                    # matches scipy.stats convention and preserves ranking
+                    # discrimination when HMP saturates near the input
+                    # p-value floor (sub-1e-9 values would otherwise
+                    # collapse to 0.0 under 9-decimal rounding even though
+                    # the unrounded sort order is correct).
+                    "p_per_detector": {k: round(float(v), 15) for k, v in ps_for_entity.items()},
+                }
+            )
 
         combined.sort(key=lambda d: d["hmp"])
         if top_n is not None and top_n > 0:
@@ -11388,11 +11888,13 @@ class GDSNavigator:
         # call abort.
         if combined:
             from hypertopos.engine.geometry import compute_reliability_flags
+
             top_keys = {entry["primary_key"] for entry in combined}
             delta_rows = None
             try:
                 delta_rows = self._storage.read_geometry(
-                    pattern_id, version,
+                    pattern_id,
+                    version,
                     columns=["primary_key", "delta", "anomaly_confidence"],
                     point_keys=list(top_keys),
                 )
@@ -11410,16 +11912,16 @@ class GDSNavigator:
                     if "anomaly_confidence" in delta_rows.schema.names
                     else [None] * len(pk_col)
                 )
-                by_key = {
-                    pk: (d, c) for pk, d, c in zip(pk_col, d_col, conf_col)
-                }
+                by_key = {pk: (d, c) for pk, d, c in zip(pk_col, d_col, conf_col, strict=True)}
                 for entry in combined:
                     pair = by_key.get(entry["primary_key"])
                     if pair is None or pair[0] is None:
                         continue
                     d, c = pair
                     entry["reliability_flags"] = compute_reliability_flags(
-                        d, pattern=pattern, anomaly_confidence=c,
+                        d,
+                        pattern=pattern,
+                        anomaly_confidence=c,
                     )
         return combined
 
@@ -11431,14 +11933,14 @@ class GDSNavigator:
             "delta_norm",
             "neighbor_contamination",
             "segment_shift",
-            "trajectory_continuous",
             "density_gap",
         ),
         sample_size: int | None = 10_000,
         top_n: int = 50,
         anomaly_threshold: float = 0.01,
         normal_threshold: float = 0.5,
-    ) -> list[dict]:
+        include_keys: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Categorical multi-detector consensus typology — investigator-actionable
         alternative to the scalar HMP ranking from `combine_anomaly_pvalues`.
 
@@ -11493,6 +11995,8 @@ class GDSNavigator:
                 cutoff prevents borderline-anomalous detectors from voting).
             normal_threshold: upper band edge. ``p > normal_threshold`` flags
                 clear normal. Default 0.5. Must be > anomaly_threshold.
+            include_keys: entities always scored (see
+                `combine_anomaly_pvalues`).
 
         Returns:
             List of `{primary_key, classification, anomalous_detectors,
@@ -11515,21 +12019,17 @@ class GDSNavigator:
             detectors=detectors,
             weights=None,
             sample_size=sample_size,
-            top_n=sample_size if sample_size and sample_size > 0 else None,
+            top_n=None,
+            include_keys=include_keys,
         )
 
-        classified: list[dict] = []
+        classified: list[dict[str, Any]] = []
         for r in full_results:
             p_per_det = r.get("p_per_detector", {}) or {}
-            anomalous = sorted(
-                d for d, p in p_per_det.items() if p < anomaly_threshold
-            )
-            normal = sorted(
-                d for d, p in p_per_det.items() if p > normal_threshold
-            )
+            anomalous = sorted(d for d, p in p_per_det.items() if p < anomaly_threshold)
+            normal = sorted(d for d, p in p_per_det.items() if p > normal_threshold)
             borderline = sorted(
-                d for d, p in p_per_det.items()
-                if anomaly_threshold <= p <= normal_threshold
+                d for d, p in p_per_det.items() if anomaly_threshold <= p <= normal_threshold
             )
             # n_detectors_fired counts every detector that returned a p-value,
             # including borderline ones (they ARE firing, just not voting).
@@ -11554,17 +12054,19 @@ class GDSNavigator:
             # key independent of the p-distribution).
             r_flags = r.get("reliability_flags") or {}
             delta_norm_for_tiebreak = float(r_flags.get("delta_norm") or 0.0)
-            classified.append({
-                "primary_key": r["primary_key"],
-                "classification": classification,
-                "anomalous_detectors": anomalous,
-                "normal_detectors": normal,
-                "borderline_detectors": borderline,
-                "n_detectors_fired": n_fired,
-                "hmp": r.get("hmp"),
-                "p_per_detector": p_per_det,
-                "_delta_norm_for_tiebreak": delta_norm_for_tiebreak,
-            })
+            classified.append(
+                {
+                    "primary_key": r["primary_key"],
+                    "classification": classification,
+                    "anomalous_detectors": anomalous,
+                    "normal_detectors": normal,
+                    "borderline_detectors": borderline,
+                    "n_detectors_fired": n_fired,
+                    "hmp": r.get("hmp"),
+                    "p_per_detector": p_per_det,
+                    "_delta_norm_for_tiebreak": delta_norm_for_tiebreak,
+                }
+            )
 
         # Classification priority — mixed_signal first, then anomalous, then
         # weaker signals, then normal, then no-data.
@@ -11577,7 +12079,7 @@ class GDSNavigator:
         }
 
         def _consensus_sort_key(
-            entry: dict,
+            entry: dict[str, Any],
         ) -> tuple[int, float, tuple[float, ...], float]:
             # Tiebreak the HMP collapse — when per-detector p-values saturate at
             # the float floor (1e-12), the HMP collapses too and the sort
@@ -11587,9 +12089,7 @@ class GDSNavigator:
             # through to ``-delta_norm`` so entities with stronger raw
             # geometric anomaly outrank ones with weaker anomaly when the
             # p-vector is identical too (the AML HI-small saturation case).
-            p_vec = tuple(sorted(
-                float(p) for p in (entry.get("p_per_detector") or {}).values()
-            ))
+            p_vec = tuple(sorted(float(p) for p in (entry.get("p_per_detector") or {}).values()))
             return (
                 priority.get(entry["classification"], 5),
                 entry.get("hmp") or 1.0,
@@ -11661,7 +12161,8 @@ class GDSNavigator:
         try:
             version = self._resolve_version(pattern_id)
             full_geo = self._storage.read_geometry(
-                pattern_id, version,
+                pattern_id,
+                version,
                 columns=["primary_key", "is_anomaly"],
             )
         except (GDSError, *_NAVIGATION_RECOVERABLE_ERRORS):
@@ -11674,8 +12175,7 @@ class GDSNavigator:
         except (KeyError, pa.ArrowInvalid):
             return {}
         anomaly_map: dict[str, bool] = {
-            str(pk): bool(ia)
-            for pk, ia in zip(full_pks, full_is_anom, strict=False)
+            str(pk): bool(ia) for pk, ia in zip(full_pks, full_is_anom, strict=False)
         }
         total_population = full_geo.num_rows
         total_anomalies = sum(1 for v in full_is_anom if v)
@@ -11717,9 +12217,7 @@ class GDSNavigator:
             k_obs = len(neighbor_keys)
             if k_obs == 0:
                 continue
-            x_obs = sum(
-                1 for nk in neighbor_keys if anomaly_map.get(nk, False)
-            )
+            x_obs = sum(1 for nk in neighbor_keys if anomaly_map.get(nk, False))
             observations[spk] = (k_obs, x_obs)
 
         if not observations:
@@ -11772,7 +12270,8 @@ class GDSNavigator:
         try:
             version = self._resolve_version(pattern_id)
             geo = self._storage.read_geometry(
-                pattern_id, version,
+                pattern_id,
+                version,
                 columns=["primary_key", "is_anomaly"],
             )
         except (GDSError, *_NAVIGATION_RECOVERABLE_ERRORS):
@@ -11799,9 +12298,9 @@ class GDSNavigator:
             return {}
 
         string_columns = [
-            col.name for col in line.columns
-            if col.type in ("string", "utf8", "str")
-            and col.name != "primary_key"
+            col.name
+            for col in line.columns
+            if col.type in ("string", "utf8", "str") and col.name != "primary_key"
         ]
         if not string_columns:
             return {}
@@ -11809,7 +12308,8 @@ class GDSNavigator:
         try:
             line_ver = self._manifest.line_version(entity_line_id) or 1
             pts = self._storage.read_points(
-                entity_line_id, line_ver,
+                entity_line_id,
+                line_ver,
                 columns=["primary_key"] + string_columns,
             )
         except (GDSError, *_NAVIGATION_RECOVERABLE_ERRORS):
@@ -11818,31 +12318,34 @@ class GDSNavigator:
             return {}
 
         # Vectorized is_anomaly mask aligned with pts.
-        anomalous_pk_arr = (
-            geo.filter(geo["is_anomaly"]).column("primary_key").combine_chunks()
-        )
+        anomalous_pk_arr = geo.filter(geo["is_anomaly"]).column("primary_key").combine_chunks()
         pts_pk_arr = pts["primary_key"].combine_chunks()
         is_anom_mask = pc.is_in(pts_pk_arr, value_set=anomalous_pk_arr)
 
         # First pass: aggregate per segment (column, value) -> (count, anom).
         # Second pass: Fisher per qualifying segment, then back-project.
         per_entity: dict[str, float] = {}
+        per_column: list[tuple[str, dict[str, float]]] = []
 
         for col_name in string_columns:
             if col_name not in pts.column_names:
                 continue
             col_arr = pts[col_name]
             not_null_mask = pc.is_valid(col_arr)
-            grp_tbl = pa.table({
-                "seg": col_arr.filter(not_null_mask),
-                "is_anom": is_anom_mask.filter(not_null_mask),
-                "_pk": pts_pk_arr.filter(not_null_mask),
-            })
+            grp_tbl = pa.table(
+                {
+                    "seg": col_arr.filter(not_null_mask),
+                    "is_anom": is_anom_mask.filter(not_null_mask),
+                    "_pk": pts_pk_arr.filter(not_null_mask),
+                }
+            )
             try:
-                agg = grp_tbl.group_by("seg").aggregate([
-                    ("_pk", "count"),
-                    ("is_anom", "sum"),
-                ])
+                agg = grp_tbl.group_by("seg").aggregate(
+                    [
+                        ("_pk", "count"),
+                        ("is_anom", "sum"),
+                    ]
+                )
             except (pa.ArrowInvalid, pa.ArrowTypeError):
                 continue
 
@@ -11868,16 +12371,18 @@ class GDSNavigator:
                 continue
 
             seg_p_values = detector_p_value_segment_shift(observations)
-            if not seg_p_values:
-                continue
+            if seg_p_values:
+                per_column.append((col_name, seg_p_values))
 
-            # Back-project: assign each entity the lowest p across its
-            # eligible segments (lower p == stronger evidence of shift).
-            # The combiner clips at ``_HMP_INPUT_P_FLOOR`` (see
-            # ``combine_anomaly_pvalues``); the back-projection here is
-            # raw to preserve the segment-level Fisher signal for callers
-            # that consume this collector outside the HMP path.
-            pk_col = pts["primary_key"].to_pylist()
+        # Each entity takes the minimum p over every segment tested on every
+        # column, so correct for the number of segments tested (Bonferroni);
+        # otherwise thousands of small segments make a tiny minimum certain.
+        # Members of a truly elevated segment still share one group-level p
+        # (clipped to ``_HMP_INPUT_P_FLOOR`` by the combiner), so this
+        # detector cannot rank entities within a segment.
+        m_tested = sum(len(p_values) for _, p_values in per_column)
+        pk_col = pts["primary_key"].to_pylist()
+        for col_name, seg_p_values in per_column:
             val_col = pts[col_name].to_pylist()
             for pk, val in zip(pk_col, val_col, strict=False):
                 if pk is None or val is None:
@@ -11885,10 +12390,11 @@ class GDSNavigator:
                 p = seg_p_values.get(str(val))
                 if p is None:
                     continue
+                p_adj = min(1.0, float(p) * m_tested)
                 spk = str(pk)
                 prev = per_entity.get(spk)
-                if prev is None or float(p) < prev:
-                    per_entity[spk] = float(p)
+                if prev is None or p_adj < prev:
+                    per_entity[spk] = p_adj
 
         return per_entity
 
@@ -11898,20 +12404,43 @@ class GDSNavigator:
         primary_keys: list[str],
     ) -> dict[str, float]:
         """Best-effort trajectory DTW p-values keyed by primary_key."""
+        from hypertopos.engine.geometry import slice_deltas
         from hypertopos.engine.p_value_calibration import (
             detector_p_value_trajectory_continuous,
         )
         from hypertopos.engine.topology import trajectory_continuous_score
 
-        # Read solid table if available — best-effort.
+        # Temporal slices of the requested entities, as time-ordered deltas.
+        pattern = self._storage.read_sphere().patterns[pattern_id]
         try:
-            solid_tbl = self._storage.read_solid_table(pattern_id)  # type: ignore[attr-defined]
-        except (AttributeError, NotImplementedError):
-            return {}
+            batches = list(
+                self._storage.read_temporal_batched(
+                    pattern_id,
+                    keys=primary_keys,
+                    columns=["primary_key", "timestamp", "shape_snapshot"],
+                )
+            )
         except (GDSError, *_NAVIGATION_RECOVERABLE_ERRORS):
             return {}
-        if solid_tbl is None or solid_tbl.num_rows == 0:
+        if not batches:
             return {}
+        slices = pa.Table.from_batches(batches).sort_by(
+            [("primary_key", "ascending"), ("timestamp", "ascending")]
+        )
+        if slices.num_rows == 0:
+            return {}
+        shapes = np.asarray(
+            slices["shape_snapshot"].combine_chunks().flatten(), dtype=np.float32
+        ).reshape(slices.num_rows, -1)
+        deltas = slice_deltas(shapes, pattern)
+        solid_tbl = pa.table(
+            {
+                "primary_key": slices["primary_key"],
+                "delta_snapshot": pa.FixedSizeListArray.from_arrays(
+                    pa.array(deltas.ravel(), type=pa.float32()), deltas.shape[1]
+                ),
+            }
+        )
         try:
             scores = trajectory_continuous_score(solid_tbl)
         except (ValueError, KeyError):
@@ -11941,7 +12470,7 @@ class GDSNavigator:
         self,
         primary_key: str,
         line_id: str,
-        signals: dict[str, dict],
+        signals: dict[str, dict[str, Any]],
         pattern_map: dict[str, str],
     ) -> float | None:
         """Compute mean delta_rank_pct of counterparties (1-hop risk).
@@ -11975,7 +12504,7 @@ class GDSNavigator:
             return None
 
         # Sample up to 50 counterparties for efficiency
-        sample = list(counterparty_keys)[:50]
+        sample = sorted(counterparty_keys)[:50]
         try:
             self._resolve_version(direct_pat_id)
         except GDSNavigationError:
@@ -11995,12 +12524,18 @@ class GDSNavigator:
         return float(np.mean(ranks))
 
     def _profile_direct(
-        self, primary_key: str, pattern_id: str, version: int,
-    ) -> dict | None:
+        self,
+        primary_key: str,
+        pattern_id: str,
+        version: int,
+    ) -> dict[str, Any] | None:
         """Profile entity in a direct pattern (same key space)."""
         cols = ["delta_norm", "is_anomaly", "delta_rank_pct", "conformal_p"]
         geo = self._storage.read_geometry(
-            pattern_id, version, primary_key=primary_key, columns=cols,
+            pattern_id,
+            version,
+            primary_key=primary_key,
+            columns=cols,
         )
         if geo.num_rows == 0:
             return None
@@ -12024,9 +12559,12 @@ class GDSNavigator:
         return result
 
     def _profile_event_edge(
-        self, entity_key: str, pattern_id: str, version: int,
+        self,
+        entity_key: str,
+        pattern_id: str,
+        version: int,
         max_related: int,
-    ) -> dict | None:
+    ) -> dict[str, Any] | None:
         """Profile entity via edge lookup in an event/anchor pattern.
 
         Uses point_keys (LABEL_LIST index) to find polygons referencing this entity.
@@ -12053,8 +12591,10 @@ class GDSNavigator:
                     batch_keys.append(entity_key)
                 cols = ["primary_key", "is_anomaly", "delta_norm", "entity_keys"]
                 geo = self._storage.read_geometry(
-                    pattern_id, version,
-                    point_keys=batch_keys, columns=cols,
+                    pattern_id,
+                    version,
+                    point_keys=batch_keys,
+                    columns=cols,
                 )
                 # Vectorised attribution: flatten the entity_keys list
                 # column, compute per-target masks via pyarrow compute,
@@ -12078,7 +12618,8 @@ class GDSNavigator:
                 bucket: dict[str, dict[str, Any]] = {}
                 for k in batch_keys:
                     flat_mask = pc.equal(
-                        flat_values, pa.scalar(k),
+                        flat_values,
+                        pa.scalar(k),
                     ).to_numpy(zero_copy_only=False)
                     matched_rows = np.unique(parent_indices[flat_mask])
                     related = int(matched_rows.size)
@@ -12105,7 +12646,10 @@ class GDSNavigator:
 
         cols = ["primary_key", "is_anomaly", "delta_norm"]
         geo = self._storage.read_geometry(
-            pattern_id, version, point_keys=[entity_key], columns=cols,
+            pattern_id,
+            version,
+            point_keys=[entity_key],
+            columns=cols,
         )
         if geo.num_rows == 0:
             return None
@@ -12124,9 +12668,12 @@ class GDSNavigator:
         }
 
     def _profile_composite(
-        self, entity_key: str, pattern_id: str, version: int,
+        self,
+        entity_key: str,
+        pattern_id: str,
+        version: int,
         max_related: int,
-    ) -> dict | None:
+    ) -> dict[str, Any] | None:
         """Profile entity in a composite pattern (e.g. pair_pattern).
 
         Two-pass approach for performance:
@@ -12136,13 +12683,14 @@ class GDSNavigator:
         ek_esc = entity_key.replace("'", "''")
         sep = "\u2192"
         base_filt = (
-            f"starts_with(primary_key, '{ek_esc}{sep}') "
-            f"OR ends_with(primary_key, '{sep}{ek_esc}')"
+            f"starts_with(primary_key, '{ek_esc}{sep}') OR ends_with(primary_key, '{sep}{ek_esc}')"
         )
 
         # Pass 1: count total (lightweight — primary_key column only)
         total_geo = self._storage.read_geometry(
-            pattern_id, version, columns=["primary_key"],
+            pattern_id,
+            version,
+            columns=["primary_key"],
             filter=base_filt,
         )
         total = total_geo.num_rows
@@ -12152,7 +12700,8 @@ class GDSNavigator:
         # Pass 2: read only anomalous rows (much fewer)
         anom_filt = f"({base_filt}) AND is_anomaly = true"
         anom_geo = self._storage.read_geometry(
-            pattern_id, version,
+            pattern_id,
+            version,
             columns=["primary_key", "delta_norm"],
             filter=anom_filt,
         )
@@ -12175,10 +12724,14 @@ class GDSNavigator:
         }
 
     def _profile_chain(
-        self, entity_key: str, pattern_id: str, version: int,
-        chain_line_id: str, chain_line_version: int,
+        self,
+        entity_key: str,
+        pattern_id: str,
+        version: int,
+        chain_line_id: str,
+        chain_line_version: int,
         max_related: int,
-    ) -> dict | None:
+    ) -> dict[str, Any] | None:
         """Profile entity in a chain pattern.
 
         Uses reverse index (entity→chain_pks) then reads anomaly status
@@ -12192,7 +12745,8 @@ class GDSNavigator:
         unchanged.
         """
         rev_idx = self._get_chain_reverse_index(
-            chain_line_id, chain_line_version,
+            chain_line_id,
+            chain_line_version,
         )
         chain_pks = rev_idx.get(entity_key, [])
         if not chain_pks:
@@ -12210,7 +12764,8 @@ class GDSNavigator:
             cached_columns = cache.get(cache_key)
             if cached_columns is None:
                 geo = self._storage.read_geometry(
-                    pattern_id, version,
+                    pattern_id,
+                    version,
                     columns=["primary_key", "is_anomaly", "delta_norm"],
                 )
                 cached_columns = (
@@ -12221,7 +12776,8 @@ class GDSNavigator:
                 cache[cache_key] = cached_columns
         if cached_columns is None:
             geo = self._storage.read_geometry(
-                pattern_id, version,
+                pattern_id,
+                version,
                 columns=["primary_key", "is_anomaly", "delta_norm"],
             )
             pks = geo["primary_key"].to_pylist()
@@ -12258,138 +12814,6 @@ class GDSNavigator:
             "anomalous_keys": anom_keys,
         }
 
-    def find_neighborhood(
-        self,
-        primary_key: str,
-        pattern_id: str,
-        max_hops: int = 2,
-        max_entities: int = 100,
-    ) -> dict[str, Any]:
-        """BFS from entity through jumpable polygon edges. Returns reachable entities.
-
-        Only works for patterns with jumpable edges (binary FK mode).
-        Continuous-mode patterns have point_key="" — not jumpable.
-        For continuous mode, use find_counterparties instead.
-        """
-        version = self._resolve_version(pattern_id)
-
-        sphere = self._storage.read_sphere()
-        _pat = sphere.patterns[pattern_id]
-
-        if _pat.is_continuous:
-            raise GDSNavigationError(
-                f"find_neighborhood requires binary FK mode. "
-                f"Pattern '{pattern_id}' uses continuous edge encoding "
-                f"(edge_max={_pat.edge_max}). "
-                f"Use find_counterparties instead."
-            )
-
-        visited: set[str] = {primary_key}
-        entities: list[dict[str, Any]] = []
-        queue: deque[tuple[str, int]] = deque()
-
-        # Seed BFS from center entity
-        center_geo = self._storage.read_geometry(
-            pattern_id, version, primary_key=primary_key,
-            columns=["primary_key", "edges", "entity_keys"],
-        )
-        if center_geo.num_rows == 0:
-            return {
-                "center": primary_key,
-                "pattern_id": pattern_id,
-                "max_hops": max_hops,
-                "entities": [],
-                "summary": {
-                    "total": 0,
-                    "anomalous": 0,
-                    "max_hop_reached": 0,
-                    "capped": False,
-                },
-            }
-
-        center_row = {c: center_geo[c][0].as_py() for c in center_geo.schema.names}
-        center_edge_objs = _reconstruct_edges_from_row(center_row, _pat.relations)
-        for edge in center_edge_objs:
-            pk = edge.point_key
-            if edge.is_alive() and pk and pk not in visited:
-                visited.add(pk)
-                queue.append((pk, 1))
-
-        max_hop_reached = 0
-        capped = False
-
-        while queue and not capped:
-            entity_key, hop = queue.popleft()
-            if hop > max_hops:
-                continue
-
-            if hop > max_hop_reached:
-                max_hop_reached = hop
-
-            # Read geometry for this entity to get edges/entity_keys + anomaly info
-            geo = self._storage.read_geometry(
-                pattern_id, version, primary_key=entity_key,
-                columns=["primary_key", "edges", "entity_keys", "is_anomaly", "delta_rank_pct"],
-            )
-            if geo.num_rows == 0:
-                # Entity has no geometry row in this pattern — record with
-                # unknown anomaly status but do not expand further.
-                entities.append({
-                    "key": entity_key,
-                    "hop": hop,
-                    "is_anomaly": None,
-                    "delta_rank_pct": None,
-                })
-                if len(entities) >= max_entities:
-                    capped = True
-                continue
-
-            is_anomaly = bool(geo["is_anomaly"][0].as_py())
-            rank_val = geo["delta_rank_pct"][0].as_py()
-            delta_rank_pct = (
-                round(float(rank_val), 2) if rank_val is not None else None
-            )
-
-            entities.append({
-                "key": entity_key,
-                "hop": hop,
-                "is_anomaly": is_anomaly,
-                "delta_rank_pct": delta_rank_pct,
-            })
-
-            if len(entities) >= max_entities:
-                capped = True
-                break
-
-            # Expand neighbors if we haven't hit max_hops
-            if hop < max_hops:
-                row = {c: geo[c][0].as_py() for c in geo.schema.names}
-                row_edge_objs = _reconstruct_edges_from_row(row, _pat.relations)
-                for edge in row_edge_objs:
-                    pk = edge.point_key
-                    if (
-                        edge.is_alive()
-                        and pk
-                        and pk not in visited
-                    ):
-                        visited.add(pk)
-                        queue.append((pk, hop + 1))
-
-        return {
-            "center": primary_key,
-            "pattern_id": pattern_id,
-            "max_hops": max_hops,
-            "entities": entities,
-            "summary": {
-                "total": len(entities),
-                "anomalous": sum(
-                    1 for e in entities if e.get("is_anomaly") is True
-                ),
-                "max_hop_reached": max_hop_reached,
-                "capped": capped,
-            },
-        }
-
     def find_chains_for_entity(
         self,
         primary_key: str,
@@ -12412,9 +12836,7 @@ class GDSNavigator:
         sphere = self._storage.read_sphere()
         entity_line_id = sphere.entity_line(pattern_id)
         if entity_line_id is None:
-            raise GDSNavigationError(
-                f"No anchor line found for pattern '{pattern_id}'"
-            )
+            raise GDSNavigationError(f"No anchor line found for pattern '{pattern_id}'")
 
         line_ver = self._manifest.line_version(entity_line_id) or 1
 
@@ -12448,10 +12870,10 @@ class GDSNavigator:
 
         # Read geometry with anomaly columns, push-down filter via point_keys
         geo = self._storage.read_geometry(
-            pattern_id, version,
+            pattern_id,
+            version,
             point_keys=chain_pks,
-            columns=["primary_key", "is_anomaly", "delta_norm",
-                     "delta_rank_pct"],
+            columns=["primary_key", "is_anomaly", "delta_norm", "delta_rank_pct"],
         )
 
         pks = geo["primary_key"].to_pylist()
@@ -12463,27 +12885,28 @@ class GDSNavigator:
         for pk, anom, norm, rank in zip(pks, anoms, norms, ranks, strict=False):
             if pk not in chain_pk_set:
                 continue
-            chains.append({
-                "chain_id": pk,
-                "is_anomaly": bool(anom),
-                "delta_norm": round(float(norm), 4) if norm is not None else 0.0,
-                "delta_rank_pct": (
-                    round(float(rank), 2) if rank is not None else None
-                ),
-            })
+            chains.append(
+                {
+                    "chain_id": pk,
+                    "is_anomaly": bool(anom),
+                    "delta_norm": round(float(norm), 4) if norm is not None else 0.0,
+                    "delta_rank_pct": (round(float(rank), 2) if rank is not None else None),
+                }
+            )
 
-        # Sort by delta_norm descending, limit to top_n
-        chains.sort(key=lambda c: c["delta_norm"], reverse=True)
-        chains = chains[:top_n]
-
+        # The summary counts every chain of the entity, not just the top_n.
+        total = len(chains)
         anomalous = sum(1 for c in chains if c["is_anomaly"])
+        # delta_norm descending, ties by chain_id, then top_n.
+        chains.sort(key=lambda c: (-c["delta_norm"], c["chain_id"]))
+        chains = chains[:top_n]
 
         return {
             "primary_key": primary_key,
             "pattern_id": pattern_id,
             "chains": chains,
             "summary": {
-                "total": len(chains),
+                "total": total,
                 "anomalous": anomalous,
             },
         }
@@ -12523,12 +12946,12 @@ class GDSNavigator:
         Sorting: (run_length DESC, max_delta_norm DESC).
         """
         import time as _time
+
         t0 = _time.perf_counter()
 
         if min_hops < 2:
             raise ValueError(
-                f"min_hops must be >= 2 (coherence undefined for single "
-                f"hop); got {min_hops}",
+                f"min_hops must be >= 2 (coherence undefined for single hop); got {min_hops}",
             )
         if max_results < 0:
             raise ValueError(f"max_results must be >= 0; got {max_results}")
@@ -12564,7 +12987,8 @@ class GDSNavigator:
             )
         chain_line_ver = self._manifest.line_version(chain_line_id) or 1
         pts = self._storage.read_points(
-            chain_line_id, chain_line_ver,
+            chain_line_id,
+            chain_line_ver,
             columns=["primary_key", "chain_keys"],
         )
         if "chain_keys" not in pts.schema.names:
@@ -12582,7 +13006,8 @@ class GDSNavigator:
         anchor_version = self._resolve_version(anchor_pattern_id)
         try:
             anchor_geo = self._storage.read_geometry(
-                anchor_pattern_id, anchor_version,
+                anchor_pattern_id,
+                anchor_version,
                 columns=["primary_key", "is_anomaly", "delta", "delta_norm"],
             )
         except (KeyError, ValueError) as exc:
@@ -12600,14 +13025,16 @@ class GDSNavigator:
                 "diagnostics": _empty_coherent_diagnostics(
                     n_chains_total=n_chains_total,
                     elapsed_ms=round(
-                        (_time.perf_counter() - t0) * 1000.0, 2,
+                        (_time.perf_counter() - t0) * 1000.0,
+                        2,
                     ),
                 ),
             }
 
         pks_arr = anchor_geo["primary_key"].to_pylist()
         is_anom_arr = np.asarray(
-            anchor_geo["is_anomaly"].to_pylist(), dtype=bool,
+            anchor_geo["is_anomaly"].to_pylist(),
+            dtype=bool,
         )
         delta_norm_arr = anchor_geo["delta_norm"].to_pylist()
         delta_2d = delta_matrix_from_arrow(anchor_geo)
@@ -12615,8 +13042,8 @@ class GDSNavigator:
 
         dim_labels = (
             list(anchor_pat.dim_labels)
-            if anchor_pat.dim_labels else
-            [f"dim_{i}" for i in range(n_dims)]
+            if anchor_pat.dim_labels
+            else [f"dim_{i}" for i in range(n_dims)]
         )
 
         sigma = getattr(anchor_pat, "sigma", None)
@@ -12639,7 +13066,8 @@ class GDSNavigator:
                 "diagnostics": _empty_coherent_diagnostics(
                     n_chains_total=n_chains_total,
                     elapsed_ms=round(
-                        (_time.perf_counter() - t0) * 1000.0, 2,
+                        (_time.perf_counter() - t0) * 1000.0,
+                        2,
                     ),
                 ),
             }
@@ -12649,10 +13077,10 @@ class GDSNavigator:
         top_idxs = np.argmax(normalized, axis=1)
         anomaly_top_dim: dict[str, str] = {}
         pk_to_norm: dict[str, float] = {}
-        for j, i in enumerate(anom_idxs):
-            pk = pks_arr[i]
-            anomaly_top_dim[pk] = dim_labels[int(top_idxs[j])]
-            n_val = delta_norm_arr[i]
+        for pos, row_i in enumerate(anom_idxs):
+            pk = pks_arr[row_i]
+            anomaly_top_dim[pk] = dim_labels[int(top_idxs[pos])]
+            n_val = delta_norm_arr[row_i]
             pk_to_norm[pk] = float(n_val) if n_val is not None else 0.0
 
         chain_pks = pts["primary_key"].to_pylist()
@@ -12683,19 +13111,21 @@ class GDSNavigator:
                     best_dim = td
                 i = j
             if best_len >= min_hops and max_results > 0:
-                run_keys = keys[best_start:best_start + best_len]
+                run_keys = keys[best_start : best_start + best_len]
                 max_norm = max(
                     (pk_to_norm.get(k, 0.0) for k in run_keys),
                     default=0.0,
                 )
-                runs.append({
-                    "chain_id": chain_pk,
-                    "run_start_idx": best_start,
-                    "run_length": best_len,
-                    "top_dim": best_dim,
-                    "run_keys": run_keys,
-                    "max_delta_norm": round(max_norm, 4),
-                })
+                runs.append(
+                    {
+                        "chain_id": chain_pk,
+                        "run_start_idx": best_start,
+                        "run_length": best_len,
+                        "top_dim": best_dim,
+                        "run_keys": run_keys,
+                        "max_delta_norm": round(max_norm, 4),
+                    }
+                )
 
         # Compute population aggregates BEFORE sorting + truncating runs[]
         # so that downstream summarisers (e.g. chain_investigation_summary)
@@ -12703,6 +13133,7 @@ class GDSNavigator:
         # runs and dominant top_dim labels. The runs[] field stays
         # truncated for callers that just want the headline list.
         from collections import Counter as _Counter
+
         n_runs_total_pre_truncation = len(runs)
         top_dim_counts_full: dict[str, int] = dict(
             _Counter(r["top_dim"] for r in runs if r.get("top_dim"))
@@ -12710,7 +13141,8 @@ class GDSNavigator:
         if runs:
             run_lengths_arr = np.fromiter(
                 (int(r["run_length"]) for r in runs),
-                dtype=np.int32, count=len(runs),
+                dtype=np.int32,
+                count=len(runs),
             )
             run_length_distribution_full: dict[str, float] = {
                 "min": int(run_lengths_arr.min()),
@@ -12720,12 +13152,17 @@ class GDSNavigator:
                 "max": int(run_lengths_arr.max()),
                 "mean": round(float(run_lengths_arr.mean()), 2),
             }
-            all_coherent_chain_ids: set[str] = {r["chain_id"] for r in runs}
+            all_coherent_chain_ids: list[str] = sorted({r["chain_id"] for r in runs})
         else:
             run_length_distribution_full = {
-                "min": 0, "p50": 0, "p75": 0, "p90": 0, "max": 0, "mean": 0.0,
+                "min": 0,
+                "p50": 0,
+                "p75": 0,
+                "p90": 0,
+                "max": 0,
+                "mean": 0.0,
             }
-            all_coherent_chain_ids = set()
+            all_coherent_chain_ids = []
 
         runs.sort(
             key=lambda r: (r["run_length"], r["max_delta_norm"]),
@@ -12749,6 +13186,31 @@ class GDSNavigator:
                 "elapsed_ms": round(elapsed_ms, 2),
             },
         }
+
+    @staticmethod
+    def _ambiguous_chain_message(pts: pa.Table, chain_id: str, pattern_id: str) -> str | None:
+        """Error text when several chain rows share ``chain_id``.
+
+        A builder-side chain_id collision leaves rows with identical
+        primary_key but distinct chain_keys. Every chain inspector must
+        refuse such an id rather than silently use one variant's members.
+        """
+        if pts.num_rows <= 1:
+            return None
+        distinct_keys = {
+            str(pts["chain_keys"][i].as_py())
+            for i in range(pts.num_rows)
+            if pts["chain_keys"][i].as_py()
+        }
+        return (
+            f"ambiguous chain_id {chain_id!r} in pattern "
+            f"{pattern_id!r}: {pts.num_rows} rows share this id with "
+            f"{len(distinct_keys)} distinct chain_keys variants. "
+            f"Chain extraction prior to the parallel-worker id "
+            f"collision fix produced colliding chain_ids; rebuild "
+            f"this sphere's chain pattern to restore primary_key "
+            f"uniqueness, then retry the inspector."
+        )
 
     def anomaly_propagation_in_chain(
         self,
@@ -12791,6 +13253,7 @@ class GDSNavigator:
         """
         import time as _time
         from collections import Counter
+
         t0 = _time.perf_counter()
 
         sphere = self._storage.read_sphere()
@@ -12825,7 +13288,8 @@ class GDSNavigator:
         chain_line_ver = self._manifest.line_version(chain_line_id) or 1
 
         pts = self._storage.read_points(
-            chain_line_id, chain_line_ver,
+            chain_line_id,
+            chain_line_ver,
             columns=["primary_key", "chain_keys"],
             primary_key=chain_id,
         )
@@ -12838,26 +13302,9 @@ class GDSNavigator:
                 f"line {chain_line_id!r} has no chain_keys column — "
                 f"pattern {pattern_id!r} is not a chain pattern",
             )
-        # Defend against a builder-side chain_id collision: multiple chain
-        # rows with identical primary_key but distinct chain_keys. Until the
-        # extractor guarantees uniqueness, a duplicate is ambiguous and we
-        # cannot pick the "correct" chain — raise rather than silently
-        # return one variant's hops.
-        if pts.num_rows > 1:
-            distinct_keys = sorted({
-                str(pts["chain_keys"][i].as_py())
-                for i in range(pts.num_rows)
-                if pts["chain_keys"][i].as_py()
-            })
-            raise GDSNavigationError(
-                f"ambiguous chain_id {chain_id!r} in pattern "
-                f"{pattern_id!r}: {pts.num_rows} rows share this id with "
-                f"{len(distinct_keys)} distinct chain_keys variants. "
-                f"Chain extraction prior to the parallel-worker id "
-                f"collision fix produced colliding chain_ids; rebuild "
-                f"this sphere's chain pattern to restore primary_key "
-                f"uniqueness, then retry the inspector.",
-            )
+        ambiguous = self._ambiguous_chain_message(pts, chain_id, pattern_id)
+        if ambiguous:
+            raise GDSNavigationError(ambiguous)
         ck = pts["chain_keys"][0].as_py()
         if not ck:
             return {
@@ -12872,7 +13319,8 @@ class GDSNavigator:
                     "dominant_top_dim": None,
                 },
                 "elapsed_ms": round(
-                    (_time.perf_counter() - t0) * 1000.0, 2,
+                    (_time.perf_counter() - t0) * 1000.0,
+                    2,
                 ),
             }
         keys = ck.split(",")
@@ -12880,9 +13328,9 @@ class GDSNavigator:
         anchor_version = self._resolve_version(anchor_pattern_id)
         try:
             anchor_geo = self._storage.read_geometry(
-                anchor_pattern_id, anchor_version,
-                columns=["primary_key", "is_anomaly", "delta",
-                         "delta_norm", "delta_rank_pct"],
+                anchor_pattern_id,
+                anchor_version,
+                columns=["primary_key", "is_anomaly", "delta", "delta_norm", "delta_rank_pct"],
                 point_keys=keys,
             )
         except (KeyError, ValueError) as exc:
@@ -12902,8 +13350,8 @@ class GDSNavigator:
 
             dim_labels = (
                 list(anchor_pat.dim_labels)
-                if anchor_pat.dim_labels else
-                [f"dim_{i}" for i in range(n_dims)]
+                if anchor_pat.dim_labels
+                else [f"dim_{i}" for i in range(n_dims)]
             )
 
             sigma = getattr(anchor_pat, "sigma", None)
@@ -12913,7 +13361,9 @@ class GDSNavigator:
                     sigma_safe = np.ones(n_dims, dtype=np.float32)
                 else:
                     sigma_safe = np.where(
-                        sigma_arr > 1e-12, sigma_arr, 1.0,
+                        sigma_arr > 1e-12,
+                        sigma_arr,
+                        1.0,
                     )
             else:
                 sigma_safe = np.ones(n_dims, dtype=np.float32)
@@ -12923,19 +13373,13 @@ class GDSNavigator:
 
             for i, pk in enumerate(pks_arr):
                 is_anom = bool(is_anom_arr[i])
-                top_dim = (
-                    dim_labels[int(top_idxs[i])] if is_anom else None
-                )
+                top_dim = dim_labels[int(top_idxs[i])] if is_anom else None
                 entity_info[pk] = {
                     "is_anomaly": is_anom,
-                    "delta_norm": (
-                        round(float(dn_arr[i]), 4)
-                        if dn_arr[i] is not None else 0.0
-                    ),
+                    "delta_norm": (round(float(dn_arr[i]), 4) if dn_arr[i] is not None else 0.0),
                     "top_dim": top_dim,
                     "delta_rank_pct": (
-                        round(float(drp_arr[i]), 2)
-                        if drp_arr[i] is not None else None
+                        round(float(drp_arr[i]), 2) if drp_arr[i] is not None else None
                     ),
                 }
 
@@ -12943,14 +13387,16 @@ class GDSNavigator:
         for i, key in enumerate(keys):
             info = entity_info.get(key)
             if info is None:
-                hops.append({
-                    "hop_idx": i,
-                    "primary_key": key,
-                    "is_anomaly": False,
-                    "delta_norm": 0.0,
-                    "top_dim": None,
-                    "delta_rank_pct": None,
-                })
+                hops.append(
+                    {
+                        "hop_idx": i,
+                        "primary_key": key,
+                        "is_anomaly": False,
+                        "delta_norm": 0.0,
+                        "top_dim": None,
+                        "delta_rank_pct": None,
+                    }
+                )
             else:
                 hops.append({"hop_idx": i, "primary_key": key, **info})
 
@@ -12959,10 +13405,7 @@ class GDSNavigator:
         cur_run = 0
         cur_dim: str | None = None
         for h in hops:
-            if (
-                h["is_anomaly"] and h["top_dim"] is not None
-                and h["top_dim"] == cur_dim
-            ):
+            if h["is_anomaly"] and h["top_dim"] is not None and h["top_dim"] == cur_dim:
                 cur_run += 1
             elif h["is_anomaly"]:
                 cur_dim = h["top_dim"]
@@ -12974,8 +13417,7 @@ class GDSNavigator:
                 max_run = cur_run
 
         dim_counter: Counter[str] = Counter(
-            h["top_dim"] for h in hops
-            if h["is_anomaly"] and h["top_dim"] is not None
+            h["top_dim"] for h in hops if h["is_anomaly"] and h["top_dim"] is not None
         )
         dominant = dim_counter.most_common(1)[0][0] if dim_counter else None
 
@@ -12991,7 +13433,8 @@ class GDSNavigator:
                 "dominant_top_dim": dominant,
             },
             "elapsed_ms": round(
-                (_time.perf_counter() - t0) * 1000.0, 2,
+                (_time.perf_counter() - t0) * 1000.0,
+                2,
             ),
         }
 
@@ -13062,7 +13505,8 @@ class GDSNavigator:
         chain_line_ver = self._manifest.line_version(chain_line_id) or 1
 
         pts = self._storage.read_points(
-            chain_line_id, chain_line_ver,
+            chain_line_id,
+            chain_line_ver,
             columns=["primary_key", "chain_keys"],
             primary_key=chain_id,
         )
@@ -13073,9 +13517,11 @@ class GDSNavigator:
             )
         if pts.num_rows == 0:
             raise ValueError(
-                f"chain not found: {chain_id!r} in pattern "
-                f"{chain_pattern!r}",
+                f"chain not found: {chain_id!r} in pattern {chain_pattern!r}",
             )
+        ambiguous = self._ambiguous_chain_message(pts, chain_id, chain_pattern)
+        if ambiguous:
+            raise ValueError(ambiguous)
 
         ck = pts["chain_keys"][0].as_py() or ""
         raw_keys = [k.strip() for k in ck.split(",") if k.strip()]
@@ -13088,7 +13534,8 @@ class GDSNavigator:
         for key in unique_members:
             try:
                 explanation = self.explain_anomaly(
-                    key, pattern_id=member_pattern,
+                    key,
+                    pattern_id=member_pattern,
                 )
             except (GDSError, ValueError):
                 n_skipped += 1
@@ -13096,16 +13543,16 @@ class GDSNavigator:
             top_dims_raw = explanation.get("top_dimensions", []) or []
             labels: list[str] = []
             for entry in top_dims_raw[:top_k_witness]:
-                # Legacy GDSEngine.anomaly_dimensions emits {"dim": int,
-                # "label": str, ...}; Bregman path emits {"dim": str,
-                # "kind": str, ...}. Prefer "label", fall back to "dim".
-                lbl = entry.get("label") or entry.get("dim")
+                # Entries are {"dim": label, ...}.
+                lbl = entry.get("dim")
                 if isinstance(lbl, str) and lbl:
                     labels.append(lbl)
-            per_member.append({
-                "primary_key": key,
-                "top_dims": labels,
-            })
+            per_member.append(
+                {
+                    "primary_key": key,
+                    "top_dims": labels,
+                }
+            )
 
         n_explained = len(per_member)
         if n_explained < 2:
@@ -13115,9 +13562,15 @@ class GDSNavigator:
                 f"({n_skipped} skipped) — cannot compute pairwise jaccard",
             )
 
-        member_sets = [set(m["top_dims"]) for m in per_member]
+        # A member with no witness dims (not anomalous) has no mechanism to
+        # compare; counting its empty set would drag every pair to 0 and
+        # report "disjoint mechanisms" for members that agree.
+        member_sets = [set(m["top_dims"]) for m in per_member if m["top_dims"]]
+        n_without_witness = n_explained - len(member_sets)
         union_dims: set[str] = set().union(*member_sets)
-        intersect_dims: set[str] = set(member_sets[0]).intersection(*member_sets[1:])
+        intersect_dims: set[str] = (
+            set(member_sets[0]).intersection(*member_sets[1:]) if member_sets else set()
+        )
 
         # Mean pairwise jaccard over all unordered pairs. Empty-union pair
         # contributes 0.0 (no signal), keeping the metric in [0, 1].
@@ -13142,9 +13595,7 @@ class GDSNavigator:
             else:
                 mean_jaccard = round(raw_mean, 4)
 
-        coordinated = (
-            mean_jaccard is not None and mean_jaccard >= min_jaccard
-        )
+        coordinated = mean_jaccard is not None and mean_jaccard >= min_jaccard
 
         intersected_sorted = sorted(intersect_dims)
         union_sorted = sorted(union_dims)
@@ -13164,12 +13615,16 @@ class GDSNavigator:
                     f"member's top-{top_k_witness}"
                 )
             )
+        elif mean_jaccard is None:
+            interpretation = (
+                f"Only {len(member_sets)} of {n_explained} members carry witness "
+                f"dims — no pair of anomalous members to compare"
+            )
         else:
-            jval = mean_jaccard if mean_jaccard is not None else 0.0
             interpretation = (
                 f"Disjoint witness mechanisms — chain members anomalous "
                 f"via independent dim sets (mean pairwise jaccard "
-                f"{jval:.2f})"
+                f"{mean_jaccard:.2f})"
             )
 
         return {
@@ -13178,6 +13633,7 @@ class GDSNavigator:
             "member_pattern": member_pattern,
             "n_members": len(unique_members),
             "n_members_explained": n_explained,
+            "n_members_without_witness": n_without_witness,
             "n_members_skipped": n_skipped,
             "intersected_witness_dims": intersected_sorted,
             "union_witness_dims": union_sorted,
@@ -13265,7 +13721,8 @@ class GDSNavigator:
         chain_line_ver = self._manifest.line_version(chain_line_id) or 1
 
         pts = self._storage.read_points(
-            chain_line_id, chain_line_ver,
+            chain_line_id,
+            chain_line_ver,
             columns=["primary_key", "chain_keys"],
             primary_key=chain_id,
         )
@@ -13276,9 +13733,11 @@ class GDSNavigator:
             )
         if pts.num_rows == 0:
             raise ValueError(
-                f"chain not found: {chain_id!r} in pattern "
-                f"{chain_pattern!r}",
+                f"chain not found: {chain_id!r} in pattern {chain_pattern!r}",
             )
+        ambiguous = self._ambiguous_chain_message(pts, chain_id, chain_pattern)
+        if ambiguous:
+            raise ValueError(ambiguous)
 
         ck = pts["chain_keys"][0].as_py() or ""
         raw_keys = [k.strip() for k in ck.split(",") if k.strip()]
@@ -13320,14 +13779,22 @@ class GDSNavigator:
         # flags + signed-confidence triad.
         anchor_version = self._resolve_version(anchor_pattern)
         light_cols = [
-            "primary_key", "scale", "delta", "delta_norm",
-            "delta_rank_pct", "is_anomaly",
-            "last_refresh_at", "updated_at",
-            "bregman_divergence", "anomaly_confidence",
-            "edges", "entity_keys",
+            "primary_key",
+            "scale",
+            "delta",
+            "delta_norm",
+            "delta_rank_pct",
+            "is_anomaly",
+            "last_refresh_at",
+            "updated_at",
+            "bregman_divergence",
+            "anomaly_confidence",
+            "edges",
+            "entity_keys",
         ]
         geo = self._storage.read_geometry(
-            anchor_pattern, anchor_version,
+            anchor_pattern,
+            anchor_version,
             point_keys=unique_members,
             columns=light_cols,
         )
@@ -13364,18 +13831,16 @@ class GDSNavigator:
                 "chain_confidence_verdict": None,
             }
 
-        scores = [
-            float(getattr(p, "signed_confidence_score", 0.0) or 0.0)
-            for p in polygons
-        ]
+        scores = [float(getattr(p, "signed_confidence_score", 0.0) or 0.0) for p in polygons]
         n_low_conf = sum(
-            1 for p in polygons
-            if float(getattr(p, "reliability_penalty", 0.0) or 0.0) >= 0.5
+            1 for p in polygons if float(getattr(p, "reliability_penalty", 0.0) or 0.0) >= 0.5
         )
         n_single_dim = sum(
-            1 for p in polygons
+            1
+            for p in polygons
             if (getattr(p, "reliability_flags", None) or {}).get(
-                "single_dim_driven", False,
+                "single_dim_driven",
+                False,
             )
         )
         mean_signed = sum(scores) / float(n_resolved)
@@ -13498,7 +13963,8 @@ class GDSNavigator:
         chain_line_ver = self._manifest.line_version(chain_line_id) or 1
 
         pts = self._storage.read_points(
-            chain_line_id, chain_line_ver,
+            chain_line_id,
+            chain_line_ver,
             columns=["primary_key", "chain_keys"],
             primary_key=chain_id,
         )
@@ -13509,9 +13975,11 @@ class GDSNavigator:
             )
         if pts.num_rows == 0:
             raise ValueError(
-                f"chain not found: {chain_id!r} in pattern "
-                f"{chain_pattern!r}",
+                f"chain not found: {chain_id!r} in pattern {chain_pattern!r}",
             )
+        ambiguous = self._ambiguous_chain_message(pts, chain_id, chain_pattern)
+        if ambiguous:
+            raise ValueError(ambiguous)
 
         ck = pts["chain_keys"][0].as_py() or ""
         raw_keys = [k.strip() for k in ck.split(",") if k.strip()]
@@ -13527,7 +13995,9 @@ class GDSNavigator:
         for position, key in enumerate(unique_members):
             try:
                 solid = self._engine.build_solid(
-                    key, member_pattern, self._manifest,
+                    key,
+                    member_pattern,
+                    self._manifest,
                 )
             except (GDSError, ValueError, KeyError):
                 n_skipped += 1
@@ -13569,15 +14039,17 @@ class GDSNavigator:
             else:
                 regime = "neutral"
 
-            per_position.append({
-                "position": position,
-                "member_key": key,
-                "delta_norms_over_time": [
-                    None if v is None else round(v, 6) for v in window_means
-                ],
-                "slope": None if slope is None else round(slope, 6),
-                "regime": regime,
-            })
+            per_position.append(
+                {
+                    "position": position,
+                    "member_key": key,
+                    "delta_norms_over_time": [
+                        None if v is None else round(v, 6) for v in window_means
+                    ],
+                    "slope": None if slope is None else round(slope, 6),
+                    "regime": regime,
+                }
+            )
 
         n_with_history = len(per_position)
         if n_with_history < 1:
@@ -13604,8 +14076,9 @@ class GDSNavigator:
         # (clipped to >= 0). When all weights are zero or all slopes
         # are None, fall back to uniform mean over finite |slope|s.
         finite_entries = [
-            e for e in per_position if e["slope"] is not None
-            and e["delta_norms_over_time"][-1] is not None
+            e
+            for e in per_position
+            if e["slope"] is not None and e["delta_norms_over_time"][-1] is not None
         ]
         if not finite_entries:
             chain_drift_score: float | None = None
@@ -13613,15 +14086,12 @@ class GDSNavigator:
             weights = [max(0.0, e["delta_norms_over_time"][-1]) for e in finite_entries]
             abs_slopes = [abs(e["slope"]) for e in finite_entries]
             if sum(weights) > 0.0:
-                raw_score = (
-                    sum(s * w for s, w in zip(abs_slopes, weights, strict=True))
-                    / sum(weights)
+                raw_score = sum(s * w for s, w in zip(abs_slopes, weights, strict=True)) / sum(
+                    weights
                 )
             else:
                 raw_score = sum(abs_slopes) / len(abs_slopes)
-            chain_drift_score = (
-                round(raw_score, 6) if math.isfinite(raw_score) else None
-            )
+            chain_drift_score = round(raw_score, 6) if math.isfinite(raw_score) else None
 
         return {
             "chain_id": chain_id,
@@ -13665,10 +14135,13 @@ class GDSNavigator:
         `find_chains_with_coherent_anomaly`'s breakpoint analysis.
         """
         import time as _time
+
         t0 = _time.perf_counter()
 
         trace = self.anomaly_propagation_in_chain(
-            chain_id, pattern_id, anchor_pattern_id=anchor_pattern_id,
+            chain_id,
+            pattern_id,
+            anchor_pattern_id=anchor_pattern_id,
         )
         hops = trace["hops"]
         n_hops = len(hops)
@@ -13714,7 +14187,8 @@ class GDSNavigator:
                     "run_top_dim": None,
                 },
                 "elapsed_ms": round(
-                    (_time.perf_counter() - t0) * 1000.0, 2,
+                    (_time.perf_counter() - t0) * 1000.0,
+                    2,
                 ),
             }
 
@@ -13785,24 +14259,16 @@ class GDSNavigator:
                 return "median"
             return "low"
 
-        pre_run_rank = (
-            hops[run_start - 1].get("delta_rank_pct")
-            if run_start > 0 else None
-        )
+        pre_run_rank = hops[run_start - 1].get("delta_rank_pct") if run_start > 0 else None
         breakpoint_rank = (
-            hops[run_end_excl].get("delta_rank_pct")
-            if run_end_excl < n_hops else None
+            hops[run_end_excl].get("delta_rank_pct") if run_end_excl < n_hops else None
         )
-        pre_run_bucket = (
-            _bucket(pre_run_rank) if run_start > 0 else "no-pre-run"
-        )
-        breakpoint_bucket = (
-            _bucket(breakpoint_rank)
-            if run_end_excl < n_hops else "no-breakpoint"
-        )
+        pre_run_bucket = _bucket(pre_run_rank) if run_start > 0 else "no-pre-run"
+        breakpoint_bucket = _bucket(breakpoint_rank) if run_end_excl < n_hops else "no-breakpoint"
         backward_signal = pre_run_bucket in ("elevated", "borderline-anomalous")
         forward_signal = breakpoint_bucket in (
-            "elevated", "borderline-anomalous",
+            "elevated",
+            "borderline-anomalous",
         )
 
         return {
@@ -13825,7 +14291,8 @@ class GDSNavigator:
                 "run_top_dim": run_top_dim,
             },
             "elapsed_ms": round(
-                (_time.perf_counter() - t0) * 1000.0, 2,
+                (_time.perf_counter() - t0) * 1000.0,
+                2,
             ),
         }
 
@@ -13868,12 +14335,12 @@ class GDSNavigator:
         """
         import time as _time
         from collections import Counter
+
         t0 = _time.perf_counter()
 
         if min_hops < 2:
             raise ValueError(
-                f"min_hops must be >= 2 (coherence undefined for single "
-                f"hop); got {min_hops}",
+                f"min_hops must be >= 2 (coherence undefined for single hop); got {min_hops}",
             )
         if max_runs < 0:
             raise ValueError(f"max_runs must be >= 0; got {max_runs}")
@@ -13901,17 +14368,18 @@ class GDSNavigator:
         # distribution. The sweep sorts (run_length DESC, max_delta_norm
         # DESC) before truncating, so reading aggregates from chains[]
         # would bias every metric toward long-run / high-delta tails.
-        n_coherent = int(diag["n_runs_total_pre_truncation"])
-        coherent_run_rate = (
-            round(n_coherent / n_chains_total, 6)
-            if n_chains_total > 0 else 0.0
-        )
+        n_coherent_runs = int(diag["n_runs_total_pre_truncation"])
         coh_pks: set[str] = set(diag["all_coherent_chain_ids"])
+        # Chains, not runs: one chain can carry several coherent runs, and the
+        # overlap block below counts distinct chains.
+        n_coherent = len(coh_pks)
+        coherent_run_rate = round(n_coherent / n_chains_total, 6) if n_chains_total > 0 else 0.0
 
         chain_version = self._resolve_version(chain_pattern_id)
         try:
             chain_geo = self._storage.read_geometry(
-                chain_pattern_id, chain_version,
+                chain_pattern_id,
+                chain_version,
                 columns=["primary_key", "is_anomaly"],
             )
         except (KeyError, ValueError):
@@ -13920,25 +14388,18 @@ class GDSNavigator:
             chain_geo_pks = chain_geo["primary_key"].to_pylist()
             chain_geo_anoms = chain_geo["is_anomaly"].to_pylist()
             chain_anom_pks = {
-                pk for pk, a in zip(chain_geo_pks, chain_geo_anoms, strict=False)
-                if a
+                pk for pk, a in zip(chain_geo_pks, chain_geo_anoms, strict=False) if a
             }
 
         n_shape = len(chain_anom_pks)
-        shape_anomaly_rate = (
-            round(n_shape / n_chains_total, 6)
-            if n_chains_total > 0 else 0.0
-        )
+        shape_anomaly_rate = round(n_shape / n_chains_total, 6) if n_chains_total > 0 else 0.0
 
         intersect = coh_pks & chain_anom_pks
         union = coh_pks | chain_anom_pks
         jaccard = round(len(intersect) / len(union), 6) if union else 0.0
 
         top_dim_counts: Counter[str] = Counter(diag["top_dim_counts_full"])
-        top_dims = [
-            {"top_dim": d, "count": c}
-            for d, c in top_dim_counts.most_common(10)
-        ]
+        top_dims = [{"top_dim": d, "count": c} for d, c in top_dim_counts.most_common(10)]
 
         run_length_distribution = dict(diag["run_length_distribution_full"])
         if n_coherent >= 50:
@@ -13955,6 +14416,7 @@ class GDSNavigator:
             "anchor_pattern_id": anchor_pattern_id,
             "n_chains_total": n_chains_total,
             "n_chains_with_coherent_anomaly_run": n_coherent,
+            "n_coherent_runs": n_coherent_runs,
             "coherent_run_rate": coherent_run_rate,
             "n_chains_with_shape_anomaly": n_shape,
             "shape_anomaly_rate": shape_anomaly_rate,
@@ -13991,29 +14453,33 @@ class GDSNavigator:
         Backward: same logic at the run's start, returning entities
         that PRECEDE the boundary entity in other chains.
 
+        The chain's own next (forward) / previous (backward) hop is never
+        a candidate; another member of the chain can be (a ring closing).
+
         Returns dict with `boundary_key`, `boundary_position`
         (start/end of run within original chain), `candidates[]`
         (entity_key, is_anomaly, delta_norm, delta_rank_pct,
-        source_chain_id), and `summary` (`n_candidates`,
+        source_chain_ids), and `summary` (`n_candidates`,
         `n_anomalous_candidates`, `n_unique_keys`).
         """
         import time as _time
         from collections import defaultdict
+
         t0 = _time.perf_counter()
 
         if direction not in ("forward", "backward"):
             raise ValueError(
-                f"direction must be 'forward' or 'backward'; "
-                f"got {direction!r}",
+                f"direction must be 'forward' or 'backward'; got {direction!r}",
             )
         if max_results < 0:
             raise ValueError(f"max_results must be >= 0; got {max_results}")
 
         trace = self.anomaly_propagation_in_chain(
-            chain_id, pattern_id, anchor_pattern_id=anchor_pattern_id,
+            chain_id,
+            pattern_id,
+            anchor_pattern_id=anchor_pattern_id,
         )
         hops = trace["hops"]
-        n_hops = len(hops)
 
         # Locate boundary: end of the longest anomalous-same-top-dim run
         # for forward, start for backward.
@@ -14054,7 +14520,8 @@ class GDSNavigator:
                     "n_unique_keys": 0,
                 },
                 "elapsed_ms": round(
-                    (_time.perf_counter() - t0) * 1000.0, 2,
+                    (_time.perf_counter() - t0) * 1000.0,
+                    2,
                 ),
             }
 
@@ -14062,10 +14529,15 @@ class GDSNavigator:
             boundary_idx = run_end_excl - 1
             boundary_key = hops[boundary_idx]["primary_key"]
             boundary_position = "run-end"
+            own_idx = boundary_idx + 1
         else:
             boundary_idx = run_start
             boundary_key = hops[boundary_idx]["primary_key"]
             boundary_position = "run-start"
+            own_idx = boundary_idx - 1
+        # The chain's own neighbour of the boundary is already in the trace,
+        # so it is not an extension.
+        own_neighbour = hops[own_idx]["primary_key"] if 0 <= own_idx < len(hops) else None
 
         # Use the chain reverse index to find OTHER chains containing
         # the boundary key. Then walk those chains to extract the
@@ -14073,6 +14545,10 @@ class GDSNavigator:
         # entity keys.
         sphere = self._storage.read_sphere()
         chain_line_id = sphere.entity_line(pattern_id)
+        if chain_line_id is None:
+            raise GDSNavigationError(
+                f"chain pattern {pattern_id!r} has no entity_line",
+            )
         chain_line_ver = self._manifest.line_version(chain_line_id) or 1
 
         # Read full chain points (filtered to chains containing
@@ -14094,7 +14570,8 @@ class GDSNavigator:
                     "n_unique_keys": 0,
                 },
                 "elapsed_ms": round(
-                    (_time.perf_counter() - t0) * 1000.0, 2,
+                    (_time.perf_counter() - t0) * 1000.0,
+                    2,
                 ),
             }
 
@@ -14104,7 +14581,8 @@ class GDSNavigator:
         # 290 k+ string columns and dominates wall-clock at ~700 ms warm.
         # read_points_batch uses BTREE-pushed equality scans, sub-100 ms.
         pts = self._storage.read_points_batch(
-            chain_line_id, chain_line_ver,
+            chain_line_id,
+            chain_line_ver,
             primary_keys=sorted(set(chain_pks_with_boundary)),
             columns=["primary_key", "chain_keys"],
         )
@@ -14121,9 +14599,13 @@ class GDSNavigator:
                 if k != boundary_key:
                     continue
                 if direction == "forward" and j + 1 < len(keys):
-                    candidate_to_sources[keys[j + 1]].append(pk)
+                    neighbour = keys[j + 1]
                 elif direction == "backward" and j > 0:
-                    candidate_to_sources[keys[j - 1]].append(pk)
+                    neighbour = keys[j - 1]
+                else:
+                    continue
+                if neighbour != own_neighbour:
+                    candidate_to_sources[neighbour].append(pk)
 
         if not candidate_to_sources:
             return {
@@ -14140,7 +14622,8 @@ class GDSNavigator:
                     "n_unique_keys": 0,
                 },
                 "elapsed_ms": round(
-                    (_time.perf_counter() - t0) * 1000.0, 2,
+                    (_time.perf_counter() - t0) * 1000.0,
+                    2,
                 ),
             }
 
@@ -14150,9 +14633,9 @@ class GDSNavigator:
         anchor_version = self._resolve_version(anchor_pattern_id)
         try:
             anchor_geo = self._storage.read_geometry(
-                anchor_pattern_id, anchor_version,
-                columns=["primary_key", "is_anomaly", "delta_norm",
-                         "delta_rank_pct"],
+                anchor_pattern_id,
+                anchor_version,
+                columns=["primary_key", "is_anomaly", "delta_norm", "delta_rank_pct"],
                 point_keys=candidate_keys,
             )
         except (KeyError, ValueError) as exc:
@@ -14175,9 +14658,8 @@ class GDSNavigator:
                     ),
                     "delta_rank_pct": (
                         round(
-                            float(
-                                anchor_geo["delta_rank_pct"][i].as_py()
-                            ), 2,
+                            float(anchor_geo["delta_rank_pct"][i].as_py()),
+                            2,
                         )
                         if anchor_geo["delta_rank_pct"][i].as_py() is not None
                         else None
@@ -14186,19 +14668,24 @@ class GDSNavigator:
 
         candidates: list[dict[str, Any]] = []
         for k, sources in candidate_to_sources.items():
-            info = info_by_key.get(k, {
-                "is_anomaly": False,
-                "delta_norm": 0.0,
-                "delta_rank_pct": None,
-            })
-            candidates.append({
-                "entity_key": k,
-                "is_anomaly": info["is_anomaly"],
-                "delta_norm": info["delta_norm"],
-                "delta_rank_pct": info["delta_rank_pct"],
-                "n_source_chains": len(sources),
-                "source_chain_ids": sources[:5],
-            })
+            info = info_by_key.get(
+                k,
+                {
+                    "is_anomaly": False,
+                    "delta_norm": 0.0,
+                    "delta_rank_pct": None,
+                },
+            )
+            candidates.append(
+                {
+                    "entity_key": k,
+                    "is_anomaly": info["is_anomaly"],
+                    "delta_norm": info["delta_norm"],
+                    "delta_rank_pct": info["delta_rank_pct"],
+                    "n_source_chains": len(sources),
+                    "source_chain_ids": sources[:5],
+                }
+            )
 
         candidates.sort(
             key=lambda c: (
@@ -14225,7 +14712,8 @@ class GDSNavigator:
                 "n_unique_keys": len(candidate_to_sources),
             },
             "elapsed_ms": round(
-                (_time.perf_counter() - t0) * 1000.0, 2,
+                (_time.perf_counter() - t0) * 1000.0,
+                2,
             ),
         }
 
@@ -14268,6 +14756,7 @@ class GDSNavigator:
         extension_backward, summary, elapsed_ms.
         """
         import time as _time
+
         t0 = _time.perf_counter()
 
         sphere = self._storage.read_sphere()
@@ -14278,64 +14767,88 @@ class GDSNavigator:
                 f"anchor pattern not found: {anchor_pattern_id!r}",
             )
 
-        def _safe(call):
+        def _safe(call: Callable[[], Any]) -> dict[str, Any]:
             try:
                 return {"ok": True, "data": call()}
             except (GDSNavigationError, ValueError, KeyError) as e:
                 return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-        trace_block = _safe(lambda: self.anomaly_propagation_in_chain(
-            chain_id, pattern_id, anchor_pattern_id=anchor_pattern_id,
-        ))
-        typology_block = _safe(lambda: self.classify_chain_typology(
-            chain_id, pattern_id, anchor_pattern_id=anchor_pattern_id,
-        ))
+        trace_block = _safe(
+            lambda: self.anomaly_propagation_in_chain(
+                chain_id,
+                pattern_id,
+                anchor_pattern_id=anchor_pattern_id,
+            )
+        )
+        typology_block = _safe(
+            lambda: self.classify_chain_typology(
+                chain_id,
+                pattern_id,
+                anchor_pattern_id=anchor_pattern_id,
+            )
+        )
 
         chain_version = self._resolve_version(pattern_id)
 
         def _shape_lookup() -> dict[str, Any]:
             chain_geo = self._storage.read_geometry(
-                pattern_id, chain_version,
+                pattern_id,
+                chain_version,
                 point_keys=[chain_id],
-                columns=["primary_key", "is_anomaly", "delta_norm",
-                         "delta_rank_pct"],
+                columns=["primary_key", "is_anomaly", "delta_norm", "delta_rank_pct"],
             )
             if chain_geo.num_rows == 0:
                 raise GDSNavigationError(
-                    f"chain_id {chain_id!r} not found in "
-                    f"{pattern_id!r} geometry"
+                    f"chain_id {chain_id!r} not found in {pattern_id!r} geometry"
                 )
             return {
                 "chain_id": chain_id,
                 "is_anomaly": bool(chain_geo["is_anomaly"][0].as_py()),
                 "delta_norm": (
-                    None if chain_geo["delta_norm"][0].as_py() is None
+                    None
+                    if chain_geo["delta_norm"][0].as_py() is None
                     else round(
-                        float(chain_geo["delta_norm"][0].as_py()), 4,
+                        float(chain_geo["delta_norm"][0].as_py()),
+                        4,
                     )
                 ),
                 "delta_rank_pct": (
-                    None if chain_geo["delta_rank_pct"][0].as_py() is None
+                    None
+                    if chain_geo["delta_rank_pct"][0].as_py() is None
                     else round(
-                        float(chain_geo["delta_rank_pct"][0].as_py()), 2,
+                        float(chain_geo["delta_rank_pct"][0].as_py()),
+                        2,
                     )
                 ),
             }
 
         shape_anomaly = _safe(_shape_lookup)
 
-        extension_forward = _safe(lambda: self.extend_chain(
-            chain_id, pattern_id, anchor_pattern_id=anchor_pattern_id,
-            direction="forward", max_results=extension_max_results,
-        ))
-        extension_backward = _safe(lambda: self.extend_chain(
-            chain_id, pattern_id, anchor_pattern_id=anchor_pattern_id,
-            direction="backward", max_results=extension_max_results,
-        ))
+        extension_forward = _safe(
+            lambda: self.extend_chain(
+                chain_id,
+                pattern_id,
+                anchor_pattern_id=anchor_pattern_id,
+                direction="forward",
+                max_results=extension_max_results,
+            )
+        )
+        extension_backward = _safe(
+            lambda: self.extend_chain(
+                chain_id,
+                pattern_id,
+                anchor_pattern_id=anchor_pattern_id,
+                direction="backward",
+                max_results=extension_max_results,
+            )
+        )
 
         summary = self._derive_investigation_summary(
-            trace_block, typology_block, shape_anomaly,
-            extension_forward, extension_backward,
+            trace_block,
+            typology_block,
+            shape_anomaly,
+            extension_forward,
+            extension_backward,
         )
 
         elapsed_ms = round((_time.perf_counter() - t0) * 1000.0, 2)
@@ -14354,11 +14867,11 @@ class GDSNavigator:
 
     @staticmethod
     def _derive_investigation_summary(
-        trace_block: dict,
-        typology_block: dict,
-        shape_anomaly: dict,
-        extension_forward: dict,
-        extension_backward: dict,
+        trace_block: dict[str, Any],
+        typology_block: dict[str, Any],
+        shape_anomaly: dict[str, Any],
+        extension_forward: dict[str, Any],
+        extension_backward: dict[str, Any],
     ) -> dict[str, Any]:
         """Aggregate per-step outcomes into a coarse triage signal.
 
@@ -14371,7 +14884,9 @@ class GDSNavigator:
 
         Strength buckets: 3-4 = strong → escalate to SAR;
         2 = moderate → continue investigation; 0-1 = weak →
-        false-positive candidate.
+        false-positive candidate. When scored steps failed and their
+        missing points could change the bucket, strength is
+        ``inconclusive`` and ``failed_steps`` names them.
 
         ``shape_anomaly`` is intentionally NOT in the score. R9's value
         proposition is catching what ``find_anomalies(<chain_pattern>)``
@@ -14390,16 +14905,16 @@ class GDSNavigator:
 
         if trace_block.get("ok"):
             t = trace_block["data"]
-            run_len = int(t.get("summary", {}).get(
-                "max_run_length_same_top_dim", 0,
-            ))
+            run_len = int(
+                t.get("summary", {}).get(
+                    "max_run_length_same_top_dim",
+                    0,
+                )
+            )
             top_dim = t.get("summary", {}).get("dominant_top_dim")
             if run_len >= 3:
                 score += 1
-                signals.append(
-                    f"Coherent anomaly run of length {run_len} on "
-                    f"`{top_dim}`."
-                )
+                signals.append(f"Coherent anomaly run of length {run_len} on `{top_dim}`.")
 
         if typology_block.get("ok"):
             ty = typology_block["data"].get("typology", {})
@@ -14407,9 +14922,7 @@ class GDSNavigator:
             shape_label = ty.get("shape")
             if position and position != "no-run":
                 score += 1
-                signals.append(
-                    f"Typology: {shape_label} run in {position} position."
-                )
+                signals.append(f"Typology: {shape_label} run in {position} position.")
 
         if extension_forward.get("ok"):
             ef = extension_forward["data"].get("summary", {})
@@ -14435,31 +14948,47 @@ class GDSNavigator:
         # to the score (see docstring).
         if shape_anomaly.get("ok") and shape_anomaly["data"].get("is_anomaly"):
             rank = shape_anomaly["data"].get("delta_rank_pct")
-            signals.append(
-                f"Chain-shape anomaly also flags "
-                f"(delta_rank_pct={rank})."
-            )
+            signals.append(f"Chain-shape anomaly also flags (delta_rank_pct={rank}).")
 
-        if score >= 3:
-            strength = "strong"
-            action = "escalate to SAR"
-        elif score >= 2:
-            strength = "moderate"
-            action = "continue investigation"
-        else:
-            strength = "weak"
-            action = "false-positive candidate"
+        failed_steps = [
+            name
+            for name, block in (
+                ("trace", trace_block),
+                ("typology", typology_block),
+                ("extension_forward", extension_forward),
+                ("extension_backward", extension_backward),
+            )
+            if not block.get("ok")
+        ]
+
+        def _bucket(s: int) -> tuple[str, str]:
+            if s >= 3:
+                return "strong", "escalate to SAR"
+            if s >= 2:
+                return "moderate", "continue investigation"
+            return "weak", "false-positive candidate"
+
+        strength, action = _bucket(score)
+        # A step that errored is missing evidence, not negative evidence: when
+        # the failed steps could still move the verdict, do not render one.
+        if failed_steps and _bucket(score + len(failed_steps))[0] != strength:
+            strength = "inconclusive"
+            action = "resolve the failed steps before deciding"
 
         rationale = (
-            " ".join(signals) if signals else
-            "No coherent investigative signal across the R9 surfaces."
+            " ".join(signals)
+            if signals
+            else "No coherent investigative signal across the R9 surfaces."
         )
-        return {
+        result: dict[str, Any] = {
             "investigation_strength": strength,
             "recommended_action": action,
             "score": score,
             "rationale": rationale,
         }
+        if failed_steps:
+            result["failed_steps"] = failed_steps
+        return result
 
     def generate_sar_rationale(
         self,
@@ -14497,11 +15026,13 @@ class GDSNavigator:
         starting point for the investigator's draft, not a final verdict.
         """
         import time as _time
+
         t0 = _time.perf_counter()
 
         if evidence is None:
             evidence = self.investigate_chain(
-                chain_id, pattern_id,
+                chain_id,
+                pattern_id,
                 anchor_pattern_id=anchor_pattern_id,
             )
 
@@ -14514,7 +15045,10 @@ class GDSNavigator:
             )
 
         narrative, anchors = self._compose_sar_narrative(
-            chain_id, pattern_id, anchor_pattern_id, evidence,
+            chain_id,
+            pattern_id,
+            anchor_pattern_id,
+            evidence,
         )
         confidence = self._derive_sar_confidence(evidence)
 
@@ -14631,9 +15165,7 @@ class GDSNavigator:
                 ext_anchors[direction] = None
         anchors["boundary_extensions"] = ext_anchors
         if ext_pieces:
-            paragraphs.append(
-                "Boundary analysis: " + "; ".join(ext_pieces) + "."
-            )
+            paragraphs.append("Boundary analysis: " + "; ".join(ext_pieces) + ".")
 
         # P4 — chain-shape corroboration.
         shape_block = evidence.get("shape_anomaly", {})
@@ -14678,8 +15210,14 @@ class GDSNavigator:
         # cannot paste "false-positive" on a chain that was never
         # actually checked.
         ok_count = sum(
-            1 for k in ("trace", "typology", "shape_anomaly",
-                        "extension_forward", "extension_backward")
+            1
+            for k in (
+                "trace",
+                "typology",
+                "shape_anomaly",
+                "extension_forward",
+                "extension_backward",
+            )
             if evidence.get(k, {}).get("ok")
         )
         summary_block = evidence.get("summary")
@@ -14702,7 +15240,8 @@ class GDSNavigator:
             else:
                 strength = summary_block.get("investigation_strength", "weak")
                 action = summary_block.get(
-                    "recommended_action", "false-positive candidate",
+                    "recommended_action",
+                    "false-positive candidate",
                 )
                 score = int(summary_block.get("score", 0))
                 rationale = summary_block.get("rationale", "")
@@ -14744,8 +15283,14 @@ class GDSNavigator:
         summary = evidence.get("summary", {})
         strength = summary.get("investigation_strength", "weak")
         ok_count = sum(
-            1 for k in ("trace", "typology", "shape_anomaly",
-                        "extension_forward", "extension_backward")
+            1
+            for k in (
+                "trace",
+                "typology",
+                "shape_anomaly",
+                "extension_forward",
+                "extension_backward",
+            )
             if evidence.get(k, {}).get("ok")
         )
         if strength == "strong" and ok_count == 5:
@@ -14804,7 +15349,6 @@ class GDSNavigator:
         self._anchor_pattern_cache[event_pattern_id] = None
         return None
 
-
     def _get_cached_delta(
         self,
         primary_key: str,
@@ -14818,7 +15362,9 @@ class GDSNavigator:
             return self._delta_cache[cache_key]
         version = self._resolve_version(pattern_id)
         geo = self._storage.read_geometry(
-            pattern_id, version, primary_key=primary_key,
+            pattern_id,
+            version,
+            primary_key=primary_key,
             columns=["primary_key", "delta"],
         )
         if geo.num_rows == 0:
@@ -14840,7 +15386,8 @@ class GDSNavigator:
             return
         version = self._resolve_version(pattern_id)
         geo = self._storage.read_geometry(
-            pattern_id, version,
+            pattern_id,
+            version,
             point_keys=missing,
             columns=["primary_key", "delta"],
         )
@@ -14921,11 +15468,17 @@ class GDSNavigator:
             amount = 0.0
             if scoring == "amount" and adj_index is not None:
                 amount = self._lookup_edge_amount(
-                    adj_index, path_keys[i], path_keys[i + 1],
+                    adj_index,
+                    path_keys[i],
+                    path_keys[i + 1],
                 )
             total += self._score_hop(
-                path_keys[i], path_keys[i + 1], pattern_id, scoring,
-                amount=amount, max_amount=max_amount,
+                path_keys[i],
+                path_keys[i + 1],
+                pattern_id,
+                scoring,
+                amount=amount,
+                max_amount=max_amount,
             )
         return total
 
@@ -14933,10 +15486,10 @@ class GDSNavigator:
     def _lookup_edge_amount(adj_index: Any, from_key: str, to_key: str) -> float:
         for tgt, _ts, amt, _ek in adj_index.neighbors_out(from_key):
             if tgt == to_key:
-                return amt
+                return cast(float, amt)
         for src, _ts, amt, _ek in adj_index.neighbors_in(from_key):
             if src == to_key:
-                return amt
+                return cast(float, amt)
         return 0.0
 
     @staticmethod
@@ -14969,7 +15522,10 @@ class GDSNavigator:
         """Find paths between two entities scored by geometric coherence.
 
         Uses bidirectional BFS for reliable path finding, then scores
-        found paths by geometric coherence post-hoc.
+        found paths by geometric coherence post-hoc. The search ignores
+        edge direction (a path may follow a transaction against its flow);
+        frontiers expand in sorted key order, so the same inputs return the
+        same paths in every process.
 
         Args:
             from_key: Source entity primary key.
@@ -14983,8 +15539,7 @@ class GDSNavigator:
         """
         if not self._storage.has_edge_table(pattern_id):
             raise GDSNavigationError(
-                f"Pattern '{pattern_id}' has no edge table. "
-                "Rebuild sphere with edge table support."
+                f"Pattern '{pattern_id}' has no edge table. Rebuild sphere with edge table support."
             )
         scoring_pattern = self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
         adj_index = self._storage.get_adjacency(pattern_id)
@@ -15000,7 +15555,7 @@ class GDSNavigator:
         half = (max_depth + 1) // 2
         for d in range(1, half + 1):
             new_fwd: set[str] = set()
-            for node in fwd_frontier:
+            for node in sorted(fwd_frontier):
                 for tgt, _ts, _amt, _ek in adj_index.neighbors_out(node):
                     if tgt != node and tgt not in fwd_parent:
                         fwd_parent[tgt] = node
@@ -15014,7 +15569,7 @@ class GDSNavigator:
             fwd_frontier = new_fwd
 
             new_bwd: set[str] = set()
-            for node in bwd_frontier:
+            for node in sorted(bwd_frontier):
                 for tgt, _ts, _amt, _ek in adj_index.neighbors_out(node):
                     if tgt != node and tgt not in bwd_parent:
                         bwd_parent[tgt] = node
@@ -15030,16 +15585,22 @@ class GDSNavigator:
         # Phase 2: Find valid meeting points (0 < total hops ≤ max_depth)
         meetings = fwd_parent.keys() & bwd_parent.keys()
         valid = sorted(
-            ((fwd_depth[m] + bwd_depth[m], m) for m in meetings
-             if 0 < fwd_depth[m] + bwd_depth[m] <= max_depth),
+            (
+                (fwd_depth[m] + bwd_depth[m], m)
+                for m in meetings
+                if 0 < fwd_depth[m] + bwd_depth[m] <= max_depth
+            ),
         )
         valid = valid[:1000]
 
-        # Phase 3: Reconstruct paths, reject cycles
+        # Phase 3: Reconstruct paths, reject cycles. Every node on a path can
+        # be its meeting point, so the same path comes back once per node.
         raw_paths: list[list[str]] = []
+        seen_paths: set[tuple[str, ...]] = set()
         for _, m in valid:
             path = self._reconstruct_bidir_path(fwd_parent, bwd_parent, m)
-            if len(path) == len(set(path)):
+            if len(path) == len(set(path)) and tuple(path) not in seen_paths:
+                seen_paths.add(tuple(path))
                 raw_paths.append(path)
 
         # Phase 4: Score paths
@@ -15070,11 +15631,13 @@ class GDSNavigator:
         # Format results
         paths = []
         for path_keys, score in scored:
-            paths.append({
-                "keys": path_keys,
-                "hops": len(path_keys) - 1,
-                "geometric_score": round(score, 4),
-            })
+            paths.append(
+                {
+                    "keys": path_keys,
+                    "hops": len(path_keys) - 1,
+                    "geometric_score": round(score, 4),
+                }
+            )
 
         return {
             "from_key": from_key,
@@ -15084,12 +15647,13 @@ class GDSNavigator:
             "paths": paths,
             "summary": {
                 "paths_found": len(paths),
-                "best_score": round(paths[0]["geometric_score"], 4) if paths else 0.0,
+                "best_score": round(cast(float, paths[0]["geometric_score"]), 4) if paths else 0.0,
                 "max_depth": max_depth,
                 "beam_width": beam_width,
                 "score_interpretation": (
                     "geometric: 0=no coherence, 1=perfect alignment. "
-                    "Components: delta alignment (40%), witness overlap (30%), anomaly preservation (30%)"
+                    "Components: delta alignment (40%), witness overlap (30%), "
+                    "anomaly preservation (30%)"
                     if scoring == "geometric"
                     else "amount: geometric score modulated by log(amount). "
                     "Higher = geometrically coherent path through high-value transactions"
@@ -15101,188 +15665,11 @@ class GDSNavigator:
             },
         }
 
-    def discover_chains(
-        self,
-        primary_key: str,
-        pattern_id: str,
-        time_window_hours: int = 168,
-        max_hops: int = 10,
-        min_hops: int = 2,
-        max_chains: int = 100,
-        direction: str = "forward",
-    ) -> dict[str, Any]:
-        """Discover transaction chains from entity via temporal BFS on edge table.
-
-        Unlike find_chains_for_entity() which looks up pre-computed chains,
-        this performs runtime BFS — works without build-time chain extraction.
-
-        **Note:** total_amount is the sum of hop amounts, not a tracked money flow.
-        See "Chain Interpretation" in concepts.md for details.
-
-        Args:
-            primary_key: Starting entity.
-            pattern_id: Event pattern with edge table.
-            time_window_hours: Max gap between consecutive hops.
-            max_hops: Maximum chain length.
-            min_hops: Minimum chain length (filter shorter).
-            max_chains: Output cap.
-            direction: "forward" | "backward" | "both".
-
-        Returns dict with chains, each scored by geometric coherence.
-        """
-        if not self._storage.has_edge_table(pattern_id):
-            raise GDSNavigationError(
-                f"Pattern '{pattern_id}' has no edge table."
-            )
-        window_secs = time_window_hours * 3600.0
-
-        adj_index = self._storage.get_adjacency(pattern_id)
-
-        def _load_temporal_adj(keys: list[str]) -> tuple[dict, dict]:
-            fwd_adj: dict[str, list[tuple[str, float, float]]] = defaultdict(list)
-            bwd_adj: dict[str, list[tuple[str, float, float]]] = defaultdict(list)
-            for k in keys:
-                fwd_adj[k] = [
-                    (tgt, ts, amt) for tgt, ts, amt, _ek in adj_index.neighbors_out(k) if tgt != k
-                ]
-                bwd_adj[k] = [
-                    (src, ts, amt) for src, ts, amt, _ek in adj_index.neighbors_in(k) if src != k
-                ]
-            return fwd_adj, bwd_adj
-
-        fwd, bwd = _load_temporal_adj([primary_key])
-
-        _QUEUE_CAP = 500_000  # prevent unbounded memory on dense graphs
-
-        chains: list[dict[str, Any]] = []
-        chain_id_counter = 0
-
-        expanded_keys: set[str] = set()
-        seen_chains: set[tuple[str, ...]] = set()
-
-        def _bfs(is_forward: bool, start: str) -> None:
-            nonlocal chain_id_counter
-            adj = fwd if is_forward else bwd
-            # Queue: (current_key, path_keys, first_timestamp, last_timestamp, total_amount)
-            queue: deque[tuple[str, list[str], float, float, float]] = deque()
-            for neighbor, ts, amt in adj.get(start, []):
-                queue.append((neighbor, [start, neighbor], ts, ts, amt))
-
-            while queue and len(chains) < max_chains and len(queue) < _QUEUE_CAP:
-                current, path, first_ts, last_ts, total_amt = queue.popleft()
-                # Record if >= min_hops
-                if len(path) - 1 >= min_hops:
-                    chain_key = tuple(path)
-                    if chain_key in seen_chains:
-                        continue
-                    seen_chains.add(chain_key)
-                    chain_id_counter += 1
-                    is_cyclic = path[-1] == path[0]
-                    time_span = last_ts - first_ts
-                    chains.append({
-                        "chain_id": f"chain_{chain_id_counter:05d}",
-                        "keys": list(path),
-                        "hop_count": len(path) - 1,
-                        "is_cyclic": is_cyclic,
-                        "time_span_hours": round(time_span / 3600.0, 2) if time_span else 0.0,
-                        "total_amount": round(total_amt, 2),
-                    })
-                # Expand if under max_hops — lazy load adjacency for new keys
-                if len(path) - 1 < max_hops:
-                    if current not in expanded_keys:
-                        expanded_keys.add(current)
-                        new_fwd, new_bwd = _load_temporal_adj([current])
-                        for k, v in new_fwd.items():
-                            fwd[k].extend(v)
-                            fwd[k].sort(key=lambda x: x[1])
-                        for k, v in new_bwd.items():
-                            bwd[k].extend(v)
-                            bwd[k].sort(key=lambda x: x[1])
-                    for neighbor, ts, amt in adj.get(current, []):
-                        if ts >= last_ts and ts <= last_ts + window_secs:
-                            if neighbor == path[0]:
-                                # Cycle closes back to the origin (A→…→A round
-                                # trip — a core AML typology). Emit the closed
-                                # chain as a TERMINAL node: it returns to start,
-                                # so it must not be re-queued (the revisit guard
-                                # below would block it anyway, and re-queuing
-                                # would loop forever). Mirrors the build-time
-                                # extractor's to_key==start branch in
-                                # engine/chains.py. Honour the same min_hops /
-                                # seen_chains / max_chains gates as the main
-                                # recording path above.
-                                closed = path + [neighbor]
-                                if len(closed) - 1 >= min_hops and len(chains) < max_chains:
-                                    closed_key = tuple(closed)
-                                    if closed_key not in seen_chains:
-                                        seen_chains.add(closed_key)
-                                        chain_id_counter += 1
-                                        cyc_span = ts - first_ts
-                                        chains.append({
-                                            "chain_id": f"chain_{chain_id_counter:05d}",
-                                            "keys": closed,
-                                            "hop_count": len(closed) - 1,
-                                            "is_cyclic": True,
-                                            "time_span_hours": (
-                                                round(cyc_span / 3600.0, 2)
-                                                if cyc_span else 0.0
-                                            ),
-                                            "total_amount": round(total_amt + amt, 2),
-                                        })
-                            elif neighbor not in set(path):  # no revisit
-                                queue.append((
-                                    neighbor,
-                                    path + [neighbor],
-                                    first_ts,
-                                    ts,
-                                    total_amt + amt,
-                                ))
-
-        if direction in ("forward", "both"):
-            _bfs(True, primary_key)
-        if direction in ("backward", "both"):
-            _bfs(False, primary_key)
-
-        # Score chains geometrically — resolve anchor pattern for delta lookups
-        scoring_pattern = self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
-        if chains:
-            all_keys = set()
-            for c in chains:
-                all_keys.update(c["keys"])
-            self._prefetch_deltas(all_keys, scoring_pattern)
-            for c in chains:
-                keys = c["keys"]
-                if len(keys) < 2:
-                    c["geometric_score"] = 0.0
-                    continue
-                total = 0.0
-                for i in range(len(keys) - 1):
-                    total += self._score_hop(keys[i], keys[i + 1], scoring_pattern, "geometric")
-                c["geometric_score"] = round(total / (len(keys) - 1), 4)
-
-        # Sort by geometric_score desc
-        chains.sort(key=lambda c: c.get("geometric_score", 0.0), reverse=True)
-        chains = chains[:max_chains]
-
-        return {
-            "primary_key": primary_key,
-            "pattern_id": pattern_id,
-            "chains": chains,
-            "summary": {
-                "total": len(chains),
-                "cyclic": sum(1 for c in chains if c["is_cyclic"]),
-                "avg_hops": (
-                    round(sum(c["hop_count"] for c in chains) / len(chains), 1)
-                    if chains else 0.0
-                ),
-            },
-        }
-
     def explain_anomaly(
         self,
         primary_key: str,
         pattern_id: str,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Structured investigation explanation for an anomalous entity.
 
         Combines: severity, witness set, repair set, top dimensions,
@@ -15300,7 +15687,8 @@ class GDSNavigator:
         try:
             version = self._resolve_version(pattern_id)
             geo_row = self._storage.read_geometry(
-                pattern_id, version,
+                pattern_id,
+                version,
                 primary_key=primary_key,
                 columns=["conformal_p"],
             )
@@ -15329,9 +15717,6 @@ class GDSNavigator:
             temporal_slices=temporal_slices,
             reputation=reputation,
             dimension_kinds=pattern.dimension_kinds,
-            sigma=pattern.sigma_diag,
-            mu=pattern.mu,
-            dimension_weights=pattern.dimension_weights,
         )
         explanation["primary_key"] = primary_key
         explanation["pattern_id"] = pattern_id
@@ -15340,6 +15725,7 @@ class GDSNavigator:
         # using the same per-dim contribution machinery that top_dimensions
         # routes through, so dominant_dim agrees with explain output.
         from hypertopos.engine.geometry import compute_reliability_flags
+
         explanation["reliability_flags"] = compute_reliability_flags(
             polygon.delta,
             pattern=pattern,
@@ -15376,8 +15762,8 @@ class GDSNavigator:
         a small set of dimensions that jointly explain at least
         ``min_contribution_pct`` of the entity's anomaly mass.
 
-        Where ``explain_anomaly`` ranks every dim by Bregman
-        contribution and returns the full ordered list,
+        Where ``explain_anomaly`` ranks every dim by its share of
+        ``delta_norm²`` and returns the full ordered list,
         ``find_diverse_explanations`` partitions the contribution
         budget into ``n_hypotheses`` strictly disjoint subsets via a
         greedy max-K cover. Useful when the investigator wants several
@@ -15471,11 +15857,7 @@ class GDSNavigator:
 
         delta_arr = np.asarray(tbl["delta"][0].as_py(), dtype=np.float64)
         delta_norm = float(tbl["delta_norm"][0].as_py())
-        theta_norm = (
-            float(np.linalg.norm(pattern.theta))
-            if pattern.theta is not None
-            else 0.0
-        )
+        theta_norm = float(np.linalg.norm(pattern.theta)) if pattern.theta is not None else 0.0
 
         n_hypotheses_original = n_hypotheses
         n_dims = len(pattern.dim_labels)
@@ -15484,13 +15866,7 @@ class GDSNavigator:
             n_hypotheses = n_dims
             cap_degraded_reason = "capped_to_dim_count"
 
-        contributions = _per_dim_anomaly_contributions(
-            delta_arr,
-            dimension_kinds=pattern.dimension_kinds,
-            sigma=pattern.sigma_diag,
-            mu=pattern.mu,
-            dimension_weights=pattern.dimension_weights,
-        )
+        contributions = _per_dim_anomaly_contributions(delta_arr)
 
         dim_sets, alg_degraded_reason = submodular_diverse_cover(
             contributions,
@@ -15518,14 +15894,11 @@ class GDSNavigator:
         #     separate, more upstream problem)
         #   * at least one dim outside the primary carries positive mass
         diversity_unavailable_secondary: dict[str, Any] | None = None
-        if (
-            len(dim_sets) == 1
-            and n_hypotheses >= 2
-            and cap_degraded_reason is None
-        ):
+        if len(dim_sets) == 1 and n_hypotheses >= 2 and cap_degraded_reason is None:
             primary_dims = dim_sets[0]
             remaining = [
-                d for d in range(len(contributions))
+                d
+                for d in range(len(contributions))
                 if d not in primary_dims and contributions[d] > 0.0
             ]
             if remaining:
@@ -15542,7 +15915,7 @@ class GDSNavigator:
         # would apply — the user asked for more hypotheses than dims,
         # which is the more upstream problem to flag.
         if cap_degraded_reason is not None:
-            degraded_reason = cap_degraded_reason
+            degraded_reason: str | None = cap_degraded_reason
         else:
             degraded_reason = alg_degraded_reason
 
@@ -15554,8 +15927,7 @@ class GDSNavigator:
             joint_pct = round(100.0 * joint_mass / total_mass, 4)
             labels = [pattern.dim_labels[i] for i in indices]
             top_2_labels = [
-                pattern.dim_labels[i]
-                for i in sorted(indices, key=lambda j: -contributions[j])[:2]
+                pattern.dim_labels[i] for i in sorted(indices, key=lambda j: -contributions[j])[:2]
             ]
             narrative = f"driven by {', '.join(top_2_labels)}"
             entry: dict[str, Any] = {
@@ -15572,10 +15944,7 @@ class GDSNavigator:
                 # primary_key is not the line_id we expect), so we
                 # catch narrowly and attach the error string rather
                 # than letting it sink the whole response.
-                set_dim = {
-                    pattern.dim_labels[i]: float(pattern.mu[i])
-                    for i in indices
-                }
+                set_dim = {pattern.dim_labels[i]: float(pattern.mu[i]) for i in indices}
                 try:
                     sim = self.simulate_dimension_change(
                         primary_key,
@@ -15614,17 +15983,14 @@ class GDSNavigator:
                 "is_degraded": True,
             }
             hypotheses.append(sec_entry)
-            # Mirror the secondary dim into ``dim_sets`` so the
-            # diversity_score branch below treats it as a real
-            # hypothesis for pair-distance accounting.
-            dim_sets = list(dim_sets) + [{dim_idx}]
 
-        # Diversity score = mean pairwise (1 − Jaccard) over the
-        # emitted dim sets. With fewer than two hypotheses there is no
-        # pair to compare, so we return ``None`` rather than a numeric
-        # default — 0.0 would falsely imply "perfectly identical" and
-        # 1.0 would falsely imply "maximally diverse", both lies about
-        # a degenerate single-hypothesis case.
+        # Diversity score = mean pairwise (1 − Jaccard) over the primary
+        # cover. The degraded secondary is below the floor — it is not a
+        # diverse explanation, so it does not count. With fewer than two
+        # primary hypotheses there is no pair to compare, so we return
+        # ``None`` rather than a numeric default — 0.0 would falsely imply
+        # "perfectly identical" and 1.0 would falsely imply "maximally
+        # diverse", both lies about a degenerate single-hypothesis case.
         if len(dim_sets) < 2:
             diversity_score: float | None = None
         else:
@@ -15702,6 +16068,39 @@ class GDSNavigator:
                 "truncated": bool,
             }
         """
+        # Each node's motif checks share one seed-scoped adjacency.
+        prev_memo = getattr(self, "_seed_adjacency_memo", None)
+        self._seed_adjacency_memo: dict[tuple[str, str], AdjacencyIndex] | None = {}
+        try:
+            return self._trace_root_cause(
+                primary_key,
+                pattern_id,
+                max_depth,
+                max_branches,
+                hub_pop_limit=hub_pop_limit,
+                contagion_min_threshold=contagion_min_threshold,
+                contagion_min_counterparties=contagion_min_counterparties,
+                max_total_nodes=max_total_nodes,
+                edge_counterparty_top_n=edge_counterparty_top_n,
+                branches_enabled=branches_enabled,
+            )
+        finally:
+            self._seed_adjacency_memo = prev_memo
+
+    def _trace_root_cause(
+        self,
+        primary_key: str,
+        pattern_id: str,
+        max_depth: int,
+        max_branches: int,
+        *,
+        hub_pop_limit: int,
+        contagion_min_threshold: float,
+        contagion_min_counterparties: int,
+        max_total_nodes: int,
+        edge_counterparty_top_n: int,
+        branches_enabled: list[str] | None,
+    ) -> dict[str, Any]:
         sphere = self._storage.read_sphere()
         if pattern_id not in sphere.patterns:
             raise GDSNavigationError(f"Pattern '{pattern_id}' not found in sphere.")
@@ -15759,9 +16158,9 @@ class GDSNavigator:
             # Cross-call ledger: entity_key -> set of entity_keys that listed it
             # as an anomalous counterparty in their trace. Exposes inter-call
             # clique signals without requiring the agent to diff multiple trees.
-            self._trace_cp_ledger: dict[tuple[str, int, str], set[str]] = {}
+            self._trace_cp_ledger: dict[tuple[str | None, int, str], set[str]] = {}
 
-        def _lru_put(cache: dict, key: Any, value: Any) -> None:
+        def _lru_put(cache: dict[Any, Any], key: Any, value: Any) -> None:
             if key in cache:
                 return  # already present
             if len(cache) >= _LRU_MAX:
@@ -15902,9 +16301,8 @@ class GDSNavigator:
                                 top_n=50,
                             )
                             if isinstance(cp_result, dict):
-                                raw_cps = (
-                                    list(cp_result.get("outgoing") or [])
-                                    + list(cp_result.get("incoming") or [])
+                                raw_cps = list(cp_result.get("outgoing") or []) + list(
+                                    cp_result.get("incoming") or []
                                 )
                                 seen_keys: set[str] = set()
                                 merged: list[dict[str, Any]] = []
@@ -15923,27 +16321,24 @@ class GDSNavigator:
                     # — the flag is already an account-level signal, not TX-level,
                     # so no second-pass enrichment is needed.
 
-            if (
-                contagion_data is not None
-                and "neighbor_contamination" in _enabled_branches
-            ):
+            if contagion_data is not None and "neighbor_contamination" in _enabled_branches:
                 cscore = float(contagion_data.get("score", 0.0) or 0.0)
                 total_cp = int(contagion_data.get("total_counterparties") or 0)
                 c_severity = _grade_contagion(cscore)
                 # Small-N guard: a score of 1.0 from 1/1 counterparty is statistical
                 # noise, not a meaningful contamination signal. Require a minimum
                 # counterparty pool before attaching the branch.
-                if (
-                    total_cp >= contagion_min_counterparties
-                    and c_severity is not None
-                ):
+                if total_cp >= contagion_min_counterparties and c_severity is not None:
                     # Populate anomalous_cp_keys from the counterparty list —
                     # saves the agent a follow-up call.
-                    anom_keys = [
-                        c.get("primary_key") or c.get("key")
-                        for c in cps_data
-                        if c.get("is_anomaly") and (c.get("primary_key") or c.get("key"))
-                    ]
+                    anom_keys = cast(
+                        "list[str]",  # falsy keys are filtered out below
+                        [
+                            c.get("primary_key") or c.get("key")
+                            for c in cps_data
+                            if c.get("is_anomaly") and (c.get("primary_key") or c.get("key"))
+                        ],
+                    )
                     # Update session-scope ledger: record that `entity_key` listed
                     # each anom_key as its anomalous counterparty. Read back when
                     # building other branches to surface inter-call clique signals.
@@ -15990,7 +16385,9 @@ class GDSNavigator:
                             children=[],
                         )
 
-                    candidates.append((_SEVERITY_STRENGTH.get(c_severity_final, 0), _build_contagion))
+                    candidates.append(
+                        (_SEVERITY_STRENGTH.get(c_severity_final, 0), _build_contagion)
+                    )
 
             # --- Candidate(s): edge_counterparty (sort-by-anomaly, not volume) ---
             # Each anomalous counterparty up to edge_counterparty_top_n becomes a
@@ -16039,7 +16436,10 @@ class GDSNavigator:
                         # Only score / delta_distance / pair_tx_count are consumed
                         # below, so skip the full-population ranking pass.
                         edge_pot_evidence = self.edge_potential(
-                            entity_key, cp_key, pattern_id, include_ranking=False,
+                            entity_key,
+                            cp_key,
+                            pattern_id,
+                            include_ranking=False,
                         )
                     except (*_NAVIGATION_RECOVERABLE_ERRORS, GDSError):
                         edge_pot_evidence = None
@@ -16059,7 +16459,9 @@ class GDSNavigator:
                     for mt in ("cycle_2", "cycle_3", "fan_out"):
                         try:
                             scored = self.score_motif(
-                                entity_key, motif_type=mt, pattern_id=pattern_id,
+                                entity_key,
+                                motif_type=mt,
+                                pattern_id=pattern_id,
                             )
                         except (*_NAVIGATION_RECOVERABLE_ERRORS, GDSError):
                             continue
@@ -16070,14 +16472,22 @@ class GDSNavigator:
                         }:
                             continue
                         if mt in {"cycle_2", "cycle_3"} and cp_key not in scored.get(
-                            "ring", [scored.get("counterparty")],
+                            "ring",
+                            [scored.get("counterparty")],
                         ):
                             continue
-                        if best_motif is None or scored["score"] > best_motif["score"]:
+                        # Rank by log_score: products past the float range are
+                        # clamped to one ceiling value, so their raw scores tie.
+                        log_score = scored.get("log_score")
+                        rank_value = log_score if log_score is not None else scored["score"]
+                        if best_motif is None or rank_value > best_motif["_rank"]:
                             best_motif = {
                                 "motif_type": mt,
                                 "score": scored["score"],
+                                "log_score": log_score,
+                                "score_clamped": bool(scored.get("score_clamped", False)),
                                 "time_window_hours": scored.get("time_window_hours"),
+                                "_rank": rank_value,
                             }
                             if mt == "cycle_3":
                                 best_motif["ring"] = scored.get("ring")
@@ -16086,10 +16496,11 @@ class GDSNavigator:
                             elif mt == "fan_out":
                                 best_motif["k"] = scored.get("k")
                     if best_motif is not None:
+                        best_motif.pop("_rank")
                         inherited["motif_potential"] = best_motif
 
                     def _build_edge_cp(
-                        _key: str = cp_key,
+                        _key: str = cast(str, cp_key),  # falsy cp_key skipped above
                         _depth: int = depth_remaining - 1,
                         _inh: dict[str, Any] = inherited,
                     ) -> RootCauseNode:
@@ -16110,15 +16521,15 @@ class GDSNavigator:
             if pop_size <= hub_pop_limit and "hub" in _enabled_branches:
                 if not hasattr(self, "_trace_hub_cache"):
                     self._trace_hub_cache: dict[tuple[str, int], set[str]] = {}
-                cache_key = (pattern_id, pattern_version)
-                hub_keys = self._trace_hub_cache.get(cache_key)
+                hub_cache_key = (pattern_id, pattern_version)
+                hub_keys = self._trace_hub_cache.get(hub_cache_key)
                 if hub_keys is None:
                     try:
                         hubs = self.π7_attract_hub(pattern_id, top_n=20)
                         hub_keys = {h[0] for h in hubs}
                     except (*_NAVIGATION_RECOVERABLE_ERRORS, GDSError):
                         hub_keys = set()
-                    self._trace_hub_cache[cache_key] = hub_keys
+                    self._trace_hub_cache[hub_cache_key] = hub_keys
                 if entity_key in hub_keys:
                     hub_severity_final = severity  # inherit root anomaly severity
                     hub_entity_final = entity_key
@@ -16176,11 +16587,13 @@ class GDSNavigator:
             # Walk the whole tree to collect the set of branch roles actually
             # emitted — saves the agent a traversal pass.
             found_roles: list[str] = []
+
             def _collect_roles(node: RootCauseNode) -> None:
                 for c in node.children:
                     if c.role not in found_roles:
                         found_roles.append(c.role)
                     _collect_roles(c)
+
             _collect_roles(root_node)
             roles_str = ", ".join(found_roles) if found_roles else "none"
 
@@ -16225,27 +16638,24 @@ class GDSNavigator:
         sphere = self._storage.read_sphere()
         if line_id not in sphere.lines:
             raise GDSNavigationError(
-                f"Line '{line_id}' not found in sphere. "
-                f"Available: {sorted(sphere.lines)}"
+                f"Line '{line_id}' not found in sphere. Available: {sorted(sphere.lines)}"
             )
         version = self._manifest.line_version(line_id) or 1
         table = self._storage.read_points(line_id, version)
 
         # -- resolve available columns (sphere metadata, not raw Lance) ----
         _line_meta = sphere.lines[line_id]
-        _meta_cols = (
-            [c.name for c in _line_meta.columns] if _line_meta.columns else []
-        )
+        _meta_cols = [c.name for c in _line_meta.columns] if _line_meta.columns else []
         _available = _meta_cols or [
-            n for n in table.schema.names
+            n
+            for n in table.schema.names
             if n not in {"version", "status", "created_at", "changed_at"}
         ]
 
         # -- resolve property column -------------------------------------
         if property_name not in table.schema.names:
             raise GDSNavigationError(
-                f"Property '{property_name}' not found in line '{line_id}'. "
-                f"Available: {_available}"
+                f"Property '{property_name}' not found in line '{line_id}'. Available: {_available}"
             )
         col = table[property_name]
         col_type = col.type
@@ -16258,8 +16668,9 @@ class GDSNavigator:
                     f"'{line_id}'. Available: {_available}"
                 )
             gb_type = table.schema.field(group_by).type
-            if not (pat.is_string(gb_type) or pat.is_large_string(gb_type)
-                    or pat.is_boolean(gb_type)):
+            if not (
+                pat.is_string(gb_type) or pat.is_large_string(gb_type) or pat.is_boolean(gb_type)
+            ):
                 raise GDSNavigationError(
                     f"group_by column '{group_by}' must be categorical "
                     f"(string or bool), got {gb_type}"
@@ -16327,9 +16738,16 @@ class GDSNavigator:
         valid = pc.drop_null(col)
         if len(valid) == 0:
             return {
-                "type": "numeric", "total": total, "null_count": null_count,
-                "min": None, "max": None, "mean": None, "std": None,
-                "median": None, "p25": None, "p75": None,
+                "type": "numeric",
+                "total": total,
+                "null_count": null_count,
+                "min": None,
+                "max": None,
+                "mean": None,
+                "std": None,
+                "median": None,
+                "p25": None,
+                "p75": None,
             }
         quantiles = pc.quantile(valid, q=[0.25, 0.5, 0.75]).to_pylist()
         return {
@@ -16375,24 +16793,34 @@ class GDSNavigator:
             valid = pc.drop_null(subset)
             count = len(valid)
             if count == 0:
-                groups_out.append({
-                    "group": gval, "count": 0,
-                    "min": None, "max": None, "mean": None, "std": None,
-                    "median": None, "p25": None, "p75": None,
-                })
+                groups_out.append(
+                    {
+                        "group": gval,
+                        "count": 0,
+                        "min": None,
+                        "max": None,
+                        "mean": None,
+                        "std": None,
+                        "median": None,
+                        "p25": None,
+                        "p75": None,
+                    }
+                )
                 continue
             quantiles = pc.quantile(valid, q=[0.25, 0.5, 0.75]).to_pylist()
-            groups_out.append({
-                "group": gval,
-                "count": count,
-                "min": pc.min(valid).as_py(),
-                "max": pc.max(valid).as_py(),
-                "mean": pc.mean(valid).as_py(),
-                "std": pc.stddev(valid).as_py(),
-                "median": quantiles[1],
-                "p25": quantiles[0],
-                "p75": quantiles[2],
-            })
+            groups_out.append(
+                {
+                    "group": gval,
+                    "count": count,
+                    "min": pc.min(valid).as_py(),
+                    "max": pc.max(valid).as_py(),
+                    "mean": pc.mean(valid).as_py(),
+                    "std": pc.stddev(valid).as_py(),
+                    "median": quantiles[1],
+                    "p25": quantiles[0],
+                    "p75": quantiles[2],
+                }
+            )
         return {
             "type": "numeric_grouped",
             "total": total,
@@ -16408,7 +16836,7 @@ class GDSNavigator:
         self,
         entity_line: str,
         top_n: int = 50,
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """Find entities anomalous in exactly one pattern but normal elsewhere.
 
         Uses PassiveScanner to screen the population, then cross_pattern_profile
@@ -16441,12 +16869,13 @@ class GDSNavigator:
         single_source_hits.sort(key=lambda h: h.weighted_score, reverse=True)
         single_source_hits = single_source_hits[:top_n]
 
-        output: list[dict] = []
+        output: list[dict[str, Any]] = []
         skipped_errors = 0
         for hit in single_source_hits:
             try:
                 profile = self.cross_pattern_profile(
-                    hit.primary_key, line_id=entity_line,
+                    hit.primary_key,
+                    line_id=entity_line,
                 )
             except (GDSNavigationError, GDSEntityNotFoundError, KeyError):
                 skipped_errors += 1
@@ -16475,14 +16904,16 @@ class GDSNavigator:
                 f"rank_pct={delta_rank_pct_anomalous:.1f}%) but normal in "
                 f"{len(normal_patterns)} other pattern(s)."
             )
-            output.append({
-                "entity_key": hit.primary_key,
-                "anomalous_pattern": anomalous_pattern,
-                "normal_patterns": normal_patterns,
-                "delta_norm_anomalous": delta_norm_anomalous,
-                "delta_rank_pct_anomalous": delta_rank_pct_anomalous,
-                "interpretation": interpretation,
-            })
+            output.append(
+                {
+                    "entity_key": hit.primary_key,
+                    "anomalous_pattern": anomalous_pattern,
+                    "normal_patterns": normal_patterns,
+                    "delta_norm_anomalous": delta_norm_anomalous,
+                    "delta_rank_pct_anomalous": delta_rank_pct_anomalous,
+                    "interpretation": interpretation,
+                }
+            )
 
         output.sort(key=lambda d: d["delta_norm_anomalous"], reverse=True)
         results = output[:top_n]
@@ -16496,7 +16927,7 @@ class GDSNavigator:
         k: int = 10,
         sample_size: int = 20,
         contamination_threshold: float = 0.5,
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """Find normal entities whose geometric neighborhood is dominated by anomalies.
 
         Inverted search: starts from anomalous entities, finds their normal neighbors,
@@ -16508,7 +16939,8 @@ class GDSNavigator:
 
         version = self._resolve_version(pattern_id)
         geo = self._storage.read_geometry(
-            pattern_id, version,
+            pattern_id,
+            version,
             columns=["primary_key", "is_anomaly"],
         )
         if geo.num_rows == 0:
@@ -16516,14 +16948,18 @@ class GDSNavigator:
 
         pks_list = geo["primary_key"].to_pylist()
         is_anom_list = geo["is_anomaly"].to_pylist()
-        anomaly_map: dict[str, bool] = {pk: bool(ia) for pk, ia in zip(pks_list, is_anom_list)}
-        anomalous_keys: list[str] = [pk for pk, ia in zip(pks_list, is_anom_list) if ia]
+        anomaly_map: dict[str, bool] = {
+            pk: bool(ia) for pk, ia in zip(pks_list, is_anom_list, strict=True)
+        }
+        anomalous_keys: list[str] = [
+            pk for pk, ia in zip(pks_list, is_anom_list, strict=True) if ia
+        ]
 
         if not anomalous_keys:
             return []
 
         # Phase 1: Sample anomalous entities, find their neighbors
-        anom_sample = random.sample(anomalous_keys, min(sample_size, len(anomalous_keys)))
+        anom_sample = random.Random(0).sample(anomalous_keys, min(sample_size, len(anomalous_keys)))
         normal_candidates: set[str] = set()
         for key in anom_sample:
             try:
@@ -16538,7 +16974,7 @@ class GDSNavigator:
             return []
 
         # Phase 2: For each normal candidate, check ITS neighborhood contamination
-        output: list[dict] = []
+        output: list[dict[str, Any]] = []
         for target_key in normal_candidates:
             try:
                 neighbors = self.find_similar_entities(target_key, pattern_id, top_n=k)
@@ -16552,30 +16988,60 @@ class GDSNavigator:
             unknown = [nk for nk in nkeys if nk not in anomaly_map]
             if unknown:
                 unk_geo = self._storage.read_geometry(
-                    pattern_id, version,
+                    pattern_id,
+                    version,
                     point_keys=unknown,
                     columns=["primary_key", "is_anomaly"],
                 )
                 for unk_pk, unk_ia in zip(
                     unk_geo["primary_key"].to_pylist(),
                     unk_geo["is_anomaly"].to_pylist(),
+                    strict=True,
                 ):
                     anomaly_map[unk_pk] = bool(unk_ia)
 
             anomalous_count = sum(1 for nk in nkeys if anomaly_map.get(nk, False))
             rate = anomalous_count / len(nkeys)
             if rate >= contamination_threshold:
-                output.append({
-                    "target_key": target_key,
-                    "is_anomaly_target": False,
-                    "contamination_rate": round(rate, 3),
-                    "anomalous_neighbor_count": anomalous_count,
-                    "total_neighbors": len(nkeys),
-                    "neighbor_keys": nkeys,
-                })
+                output.append(
+                    {
+                        "target_key": target_key,
+                        "is_anomaly_target": False,
+                        "contamination_rate": round(rate, 3),
+                        "anomalous_neighbor_count": anomalous_count,
+                        "total_neighbors": len(nkeys),
+                        "neighbor_keys": nkeys,
+                    }
+                )
 
         output.sort(key=lambda d: d["contamination_rate"], reverse=True)
         return output
+
+    def _sample_temporal_keys(
+        self,
+        pattern_id: str,
+        sample_size: int | None,
+        include: str | None = None,
+    ) -> list[str] | None:
+        """Seeded key sample for a temporal scan, or ``None`` to read everything.
+
+        Sampling keys (instead of stopping after the first ``sample_size``
+        entities in file order) gives a reproducible random sample and keeps
+        each sampled entity's whole trajectory. ``include`` is always kept.
+        """
+        import random
+
+        if sample_size is None:
+            return None
+        version = self._resolve_version(pattern_id)
+        geo = self._storage.read_geometry(pattern_id, version, columns=["primary_key"])
+        keys = geo["primary_key"].to_pylist()
+        if sample_size >= len(keys):
+            return None
+        sample = set(random.Random(0).sample(sorted(keys), sample_size))
+        if include is not None:
+            sample.add(include)
+        return sorted(sample)
 
     def detect_trajectory_anomaly(
         self,
@@ -16583,7 +17049,7 @@ class GDSNavigator:
         displacement_ranks: list[int] | None = None,
         top_n_per_range: int = 5,
         sample_size: int = 10_000,
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """Find entities with unusual temporal trajectory shapes.
 
         Classifies every entity's trajectory shape (arch, v_shape,
@@ -16602,9 +17068,7 @@ class GDSNavigator:
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns.get(pattern_id)
         if pattern is None:
-            raise GDSNavigationError(
-                f"Pattern '{pattern_id}' not found in sphere."
-            )
+            raise GDSNavigationError(f"Pattern '{pattern_id}' not found in sphere.")
         if pattern.pattern_type == "event":
             raise ValueError(
                 f"detect_trajectory_anomaly requires anchor pattern — "
@@ -16616,10 +17080,11 @@ class GDSNavigator:
         n_rel = len(pattern.relations)
         top_n = top_n_per_range  # repurposed
 
-        # Phase 1: Full temporal scan — stream all data, group by entity
-        entity_slices: dict[str, list[tuple]] = defaultdict(list)
+        # Phase 1: temporal scan of a seeded key sample (whole trajectories)
+        entity_slices: dict[str, list[tuple[Any, ...]]] = defaultdict(list[Any])
+        sample_keys = self._sample_temporal_keys(pattern_id, sample_size)
         try:
-            for batch in self._storage.read_temporal_batched(pattern_id):
+            for batch in self._storage.read_temporal_batched(pattern_id, keys=sample_keys):
                 table = pa.Table.from_batches([batch])
                 if "shape_snapshot" not in table.schema.names:
                     continue
@@ -16628,8 +17093,6 @@ class GDSNavigator:
                 timestamps = pc.cast(table["timestamp"], pa.int64()).to_pylist()
                 for pk, snap, ts in zip(pks, snapshots, timestamps, strict=True):
                     entity_slices[pk].append((ts, snap))
-                if sample_size is not None and len(entity_slices) >= sample_size:
-                    break
         except StopIteration:
             return []
 
@@ -16637,25 +17100,20 @@ class GDSNavigator:
             return []
 
         # Phase 2: Classify every entity's trajectory
-        candidates: list[dict] = []
+        from hypertopos.engine.geometry import slice_deltas
+
+        candidates: list[dict[str, Any]] = []
         for entity_key, slices in entity_slices.items():
             if len(slices) < 3:
                 continue
             slices.sort(key=lambda x: x[0])  # sort by timestamp
             shapes_arr = np.array([s[1] for s in slices], dtype=np.float32)
-            # Temporal shape_snapshot carries structural dims only; aggregated
-            # edge_dim dims have no temporal history. Slice calibration arrays
-            # to the snapshot width before the broadcast.
             if pattern.sigma_diag is not None:
-                _w = shapes_arr.shape[-1]
-                _sigma = np.maximum(pattern.sigma_diag[:_w], 1e-2)
-                deltas = (shapes_arr - pattern.mu[:_w]) / _sigma
+                deltas = slice_deltas(shapes_arr, pattern)
             else:
                 deltas = shapes_arr
             rel_deltas = deltas[:, :n_rel]
-            delta_norms = np.sqrt(
-                np.einsum("ij,ij->i", rel_deltas, rel_deltas)
-            ).tolist()
+            delta_norms = np.sqrt(np.einsum("ij,ij->i", rel_deltas, rel_deltas)).tolist()
 
             shape = _classify_trajectory(delta_norms)
             if shape not in _interesting:
@@ -16673,16 +17131,18 @@ class GDSNavigator:
             # Arch (path=10, disp=1) → wasted=9.  Flat (path=1, disp=0.5) → wasted=0.5.
             wasted_motion = path_length - displacement
 
-            candidates.append({
-                "entity_key": entity_key,
-                "trajectory_shape": shape,
-                "displacement": round(displacement, 3),
-                "path_length": round(path_length, 3),
-                "wasted_motion": round(wasted_motion, 3),
-                "num_slices": len(slices),
-                "first_timestamp": first_ts,
-                "last_timestamp": last_ts,
-            })
+            candidates.append(
+                {
+                    "entity_key": entity_key,
+                    "trajectory_shape": shape,
+                    "displacement": round(displacement, 3),
+                    "path_length": round(path_length, 3),
+                    "wasted_motion": round(wasted_motion, 3),
+                    "num_slices": len(slices),
+                    "first_timestamp": first_ts,
+                    "last_timestamp": last_ts,
+                }
+            )
 
         # Sort by wasted_motion descending — most non-linear trajectories first
         candidates.sort(key=lambda d: d["wasted_motion"], reverse=True)
@@ -16692,8 +17152,10 @@ class GDSNavigator:
         for entry in results:
             cohort_keys: list[str] = []
             try:
-                similar = self.find_drifting_similar(
-                    entry["entity_key"], pattern_id, top_n=20,
+                similar = self.π10_attract_trajectory(
+                    entry["entity_key"],
+                    pattern_id,
+                    top_n=20,
                 )
                 cohort_keys = [s["primary_key"] for s in similar]
             except (ValueError, GDSNavigationError):
@@ -16706,8 +17168,7 @@ class GDSNavigator:
             )
             if cohort_keys:
                 interpretation += (
-                    f"Cohort of {len(cohort_keys)} entities share a similar "
-                    f"temporal trajectory."
+                    f"Cohort of {len(cohort_keys)} entities share a similar temporal trajectory."
                 )
 
             entry["cohort_size"] = len(cohort_keys)
@@ -16747,9 +17208,7 @@ class GDSNavigator:
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns.get(pattern_id)
         if pattern is None:
-            raise GDSNavigationError(
-                f"Pattern '{pattern_id}' not found in sphere."
-            )
+            raise GDSNavigationError(f"Pattern '{pattern_id}' not found in sphere.")
         if pattern.pattern_type == "event":
             raise ValueError(
                 f"classify_trajectory requires anchor pattern — "
@@ -16760,8 +17219,9 @@ class GDSNavigator:
         # Stream temporal data, convert shape_snapshot to delta_snapshot via
         # pattern calibration (same path as detect_trajectory_anomaly).
         entity_slices: dict[str, list[tuple[int, list[float]]]] = defaultdict(list)
+        sample_keys = self._sample_temporal_keys(pattern_id, sample_size, include=primary_key)
         try:
-            for batch in self._storage.read_temporal_batched(pattern_id):
+            for batch in self._storage.read_temporal_batched(pattern_id, keys=sample_keys):
                 table = pa.Table.from_batches([batch])
                 if "shape_snapshot" not in table.schema.names:
                     continue
@@ -16772,8 +17232,6 @@ class GDSNavigator:
                     if pk is None or snap is None:
                         continue
                     entity_slices[pk].append((ts, snap))
-                if len(entity_slices) >= sample_size:
-                    break
         except StopIteration:
             pass
 
@@ -16785,12 +17243,8 @@ class GDSNavigator:
                 "category_evidence": 0.0,
             }
 
-        # Convert shape_snapshot → delta_snapshot via pattern (mu, sigma_diag).
-        sigma = (
-            np.maximum(pattern.sigma_diag, 1e-2)
-            if pattern.sigma_diag is not None else None
-        )
-        mu = pattern.mu
+        # Convert shape_snapshot → delta_snapshot in the pattern's stored metric.
+        from hypertopos.engine.geometry import slice_deltas
 
         pks_flat: list[str] = []
         snaps_flat: list[list[float]] = []
@@ -16798,18 +17252,19 @@ class GDSNavigator:
             slices.sort(key=lambda x: x[0])
             for _ts, snap in slices:
                 arr = np.asarray(snap, dtype=np.float32)
-                if sigma is not None:
-                    w = arr.shape[0]
-                    delta = ((arr - mu[:w]) / sigma[:w]).astype(np.float32)
+                if pattern.sigma_diag is not None:
+                    delta = slice_deltas(arr[None, :], pattern)[0].astype(np.float32)
                 else:
                     delta = arr
                 pks_flat.append(pk)
                 snaps_flat.append(delta.tolist())
 
-        solid_tbl = pa.table({
-            "primary_key": pks_flat,
-            "delta_snapshot": snaps_flat,
-        })
+        solid_tbl = pa.table(
+            {
+                "primary_key": pks_flat,
+                "delta_snapshot": snaps_flat,
+            }
+        )
         results = _engine_classify_trajectory(solid_tbl, sample_size=sample_size)
         for entry in results:
             if entry["primary_key"] == primary_key:
@@ -16827,7 +17282,7 @@ class GDSNavigator:
         max_cardinality: int = 50,
         min_shift_ratio: float = 2.0,
         top_n: int = 20,
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """Find entity segments with disproportionate anomaly rates.
 
         Scans string-type columns on the entity line, computes per-value anomaly
@@ -16837,20 +17292,17 @@ class GDSNavigator:
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns.get(pattern_id)
         if pattern is None:
-            raise GDSNavigationError(
-                f"Pattern '{pattern_id}' not found in sphere."
-            )
+            raise GDSNavigationError(f"Pattern '{pattern_id}' not found in sphere.")
 
         entity_line_id = sphere.entity_line(pattern_id)
         if not entity_line_id:
-            raise GDSNavigationError(
-                f"No entity line found for pattern '{pattern_id}'."
-            )
+            raise GDSNavigationError(f"No entity line found for pattern '{pattern_id}'.")
 
         # Population anomaly rate
         version = self._resolve_version(pattern_id)
         geo = self._storage.read_geometry(
-            pattern_id, version,
+            pattern_id,
+            version,
             columns=["primary_key", "is_anomaly"],
         )
         if geo.num_rows == 0:
@@ -16869,9 +17321,9 @@ class GDSNavigator:
             return []
 
         string_columns = [
-            col.name for col in line.columns
-            if col.type in ("string", "utf8", "str")
-            and col.name != "primary_key"
+            col.name
+            for col in line.columns
+            if col.type in ("string", "utf8", "str") and col.name != "primary_key"
         ]
         if not string_columns:
             return []
@@ -16879,18 +17331,17 @@ class GDSNavigator:
         # Read entity points for the string columns
         line_ver = self._manifest.line_version(entity_line_id) or 1
         pts = self._storage.read_points(
-            entity_line_id, line_ver,
+            entity_line_id,
+            line_ver,
             columns=["primary_key"] + string_columns,
         )
 
         # Vectorized is_anomaly mask aligned with pts — single pc.is_in pass
-        anomalous_pk_arr = (
-            geo.filter(geo["is_anomaly"]).column("primary_key").combine_chunks()
-        )
+        anomalous_pk_arr = geo.filter(geo["is_anomaly"]).column("primary_key").combine_chunks()
         pts_pk_arr = pts["primary_key"].combine_chunks()
         is_anom_mask = pc.is_in(pts_pk_arr, value_set=anomalous_pk_arr)
 
-        output: list[dict] = []
+        output: list[dict[str, Any]] = []
 
         for col_name in string_columns:
             if col_name not in pts.column_names:
@@ -16905,15 +17356,19 @@ class GDSNavigator:
 
             # Vectorized groupby: total and anomaly count per segment value
             not_null_mask = pc.is_valid(col_arr)
-            grp_tbl = pa.table({
-                "seg": col_arr.filter(not_null_mask),
-                "is_anomaly": is_anom_mask.filter(not_null_mask),
-                "_pk": pts_pk_arr.filter(not_null_mask),
-            })
-            agg = grp_tbl.group_by("seg").aggregate([
-                ("_pk", "count"),
-                ("is_anomaly", "sum"),
-            ])
+            grp_tbl = pa.table(
+                {
+                    "seg": col_arr.filter(not_null_mask),
+                    "is_anomaly": is_anom_mask.filter(not_null_mask),
+                    "_pk": pts_pk_arr.filter(not_null_mask),
+                }
+            )
+            agg = grp_tbl.group_by("seg").aggregate(
+                [
+                    ("_pk", "count"),
+                    ("is_anomaly", "sum"),
+                ]
+            )
 
             for i in range(agg.num_rows):
                 val = agg["seg"][i].as_py()
@@ -16927,22 +17382,24 @@ class GDSNavigator:
                 if shift_ratio < min_shift_ratio:
                     continue
 
-                output.append({
-                    "segment_property": col_name,
-                    "segment_value": str(val),
-                    "anomaly_rate": round(anomaly_rate, 4),
-                    "population_rate": round(population_rate, 4),
-                    "shift_ratio": round(shift_ratio, 2),
-                    "entity_count": entity_count,
-                    "anomalous_count": anomalous_count,
-                    "interpretation": (
-                        f"Segment {col_name}='{val}' has anomaly rate "
-                        f"{anomaly_rate:.1%} vs population {population_rate:.1%} "
-                        f"({shift_ratio:.1f}x overrepresented)."
-                    ),
-                })
+                output.append(
+                    {
+                        "segment_property": col_name,
+                        "segment_value": str(val),
+                        "anomaly_rate": round(anomaly_rate, 4),
+                        "population_rate": round(population_rate, 4),
+                        "shift_ratio": round(shift_ratio, 2),
+                        "entity_count": entity_count,
+                        "anomalous_count": anomalous_count,
+                        "interpretation": (
+                            f"Segment {col_name}='{val}' has anomaly rate "
+                            f"{anomaly_rate:.1%} vs population {population_rate:.1%} "
+                            f"({shift_ratio:.1f}x overrepresented)."
+                        ),
+                    }
+                )
 
-        output.sort(key=lambda d: d["shift_ratio"], reverse=True)
+        output.sort(key=lambda d: (-d["shift_ratio"], d["segment_property"], d["segment_value"]))
         return output[:top_n]
 
     # ------------------------------------------------------------------
@@ -16966,13 +17423,12 @@ class GDSNavigator:
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns.get(pattern_id)
         if pattern is None:
-            raise GDSNavigationError(
-                f"Pattern '{pattern_id}' not found in sphere."
-            )
+            raise GDSNavigationError(f"Pattern '{pattern_id}' not found in sphere.")
 
         version = self._resolve_version(pattern_id)
         geo = self._storage.read_geometry(
-            pattern_id, version,
+            pattern_id,
+            version,
             primary_key=primary_key,
             columns=["primary_key", "delta_norm", "is_anomaly"],
         )
@@ -16983,10 +17439,7 @@ class GDSNavigator:
 
         delta_norm = float(geo["delta_norm"][0].as_py())
         is_anomaly = bool(geo["is_anomaly"][0].as_py())
-        theta_norm = (
-            float(np.linalg.norm(pattern.theta))
-            if pattern.theta is not None else 0.0
-        )
+        theta_norm = float(np.linalg.norm(pattern.theta)) if pattern.theta is not None else 0.0
 
         if not is_anomaly:
             return {
@@ -16998,7 +17451,8 @@ class GDSNavigator:
             }
 
         margin = delta_norm - theta_norm
-        rng = np.random.default_rng()
+        # Fixed seed: the same entity gets the same verdict on every call.
+        rng = np.random.default_rng(42)
         offsets = rng.uniform(-perturbation_pct, perturbation_pct, size=n_perturbations)
         perturbed_thetas = theta_norm * (1.0 + offsets)
         flips = int(np.sum(delta_norm < perturbed_thetas))
@@ -17047,13 +17501,10 @@ class GDSNavigator:
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns.get(pattern_id)
         if pattern is None:
-            raise GDSNavigationError(
-                f"Pattern '{pattern_id}' not found in sphere."
-            )
+            raise GDSNavigationError(f"Pattern '{pattern_id}' not found in sphere.")
         if pattern.pattern_type != "anchor":
             raise ValueError(
-                f"detect_event_rate_anomaly requires anchor pattern, "
-                f"got '{pattern.pattern_type}'."
+                f"detect_event_rate_anomaly requires anchor pattern, got '{pattern.pattern_type}'."
             )
 
         anchor_line = sphere.entity_line(pattern_id)
@@ -17080,7 +17531,8 @@ class GDSNavigator:
             try:
                 event_version = self._resolve_version(event_pid)
                 geo = self._storage.read_geometry(
-                    event_pid, event_version,
+                    event_pid,
+                    event_version,
                     sample_size=sample_size,
                     columns=["is_anomaly", "entity_keys"],
                 )
@@ -17102,7 +17554,8 @@ class GDSNavigator:
                     anom_counts[key] = anom_counts.get(key, 0) + 1
 
             high_rate_keys = [
-                k for k, total in total_counts.items()
+                k
+                for k, total in total_counts.items()
                 if total >= min_events and anom_counts.get(k, 0) / total > threshold
             ]
             if not high_rate_keys:
@@ -17111,7 +17564,8 @@ class GDSNavigator:
             # Cross-reference with anchor geometry
             try:
                 anchor_geo = self._storage.read_geometry(
-                    pattern_id, anchor_version,
+                    pattern_id,
+                    anchor_version,
                     point_keys=high_rate_keys,
                     columns=["primary_key", "delta_norm", "is_anomaly"],
                 )
@@ -17132,16 +17586,18 @@ class GDSNavigator:
                     f"but normal in anchor (delta_norm={delta_norm:.4f} < "
                     f"theta={theta_norm:.4f})."
                 )
-                alerts.append({
-                    "entity_key": pk,
-                    "event_pattern_id": event_pid,
-                    "event_anomaly_rate": round(rate, 4),
-                    "event_total": total,
-                    "event_anomalous": anom_counts.get(pk, 0),
-                    "anchor_delta_norm": round(delta_norm, 4),
-                    "theta_norm": round(theta_norm, 4),
-                    "interpretation": interpretation,
-                })
+                alerts.append(
+                    {
+                        "entity_key": pk,
+                        "event_pattern_id": event_pid,
+                        "event_anomaly_rate": round(rate, 4),
+                        "event_total": total,
+                        "event_anomalous": anom_counts.get(pk, 0),
+                        "anchor_delta_norm": round(delta_norm, 4),
+                        "theta_norm": round(theta_norm, 4),
+                        "interpretation": interpretation,
+                    }
+                )
 
         alerts.sort(key=lambda d: d["event_anomaly_rate"], reverse=True)
         return alerts[:top_n]
@@ -17169,19 +17625,25 @@ class GDSNavigator:
 
         # Preload anomaly map
         geo = self._storage.read_geometry(
-            pattern_id, version,
+            pattern_id,
+            version,
             columns=["primary_key", "is_anomaly"],
         )
-        anomaly_map = dict(zip(
-            geo["primary_key"].to_pylist(),
-            [bool(v) for v in geo["is_anomaly"].to_pylist()],
-        ))
+        anomaly_map = dict(
+            zip(
+                geo["primary_key"].to_pylist(),
+                [bool(v) for v in geo["is_anomaly"].to_pylist()],
+                strict=True,
+            )
+        )
 
         output: list[dict[str, Any]] = []
         for pk, edge_count, hub_score in hubs:
             try:
                 neighbors = self.find_similar_entities(
-                    pk, pattern_id, top_n=neighbor_k,
+                    pk,
+                    pattern_id,
+                    top_n=neighbor_k,
                 )
             except (GDSNavigationError, GDSEntityNotFoundError, KeyError):
                 continue
@@ -17202,16 +17664,18 @@ class GDSNavigator:
                 f"{anom_count}/{len(nkeys)} neighbors anomalous ({ratio:.0%}). "
                 f"Hub itself {'IS' if is_hub_anomaly else 'is NOT'} anomalous."
             )
-            output.append({
-                "hub_key": pk,
-                "hub_score": round(hub_score, 4),
-                "edge_count": edge_count,
-                "is_hub_anomaly": is_hub_anomaly,
-                "neighbor_anomaly_ratio": round(ratio, 4),
-                "anomalous_neighbor_count": anom_count,
-                "total_neighbors": len(nkeys),
-                "interpretation": interpretation,
-            })
+            output.append(
+                {
+                    "hub_key": pk,
+                    "hub_score": round(hub_score, 4),
+                    "edge_count": edge_count,
+                    "is_hub_anomaly": is_hub_anomaly,
+                    "neighbor_anomaly_ratio": round(ratio, 4),
+                    "anomalous_neighbor_count": anom_count,
+                    "total_neighbors": len(nkeys),
+                    "interpretation": interpretation,
+                }
+            )
 
         output.sort(key=lambda d: d["neighbor_anomaly_ratio"], reverse=True)
         return output[:top_n]
@@ -17236,9 +17700,9 @@ class GDSNavigator:
 
         # Find anchor patterns for this entity line
         anchor_pids = [
-            pid for pid, pat in sphere.patterns.items()
-            if pat.pattern_type == "anchor"
-            and sphere.entity_line(pid) == entity_line
+            pid
+            for pid, pat in sphere.patterns.items()
+            if pat.pattern_type == "anchor" and sphere.entity_line(pid) == entity_line
         ]
         if not anchor_pids:
             return []
@@ -17246,7 +17710,8 @@ class GDSNavigator:
         # Use first anchor for grouping
         anchor_pid = anchor_pids[0]
         agg = self.aggregate_anomalies(
-            anchor_pid, group_by,
+            anchor_pid,
+            group_by,
             include_keys=True,
             keys_per_group=sample_per_group,
         )
@@ -17258,14 +17723,17 @@ class GDSNavigator:
         # Population baseline — sample random keys for composite risk
         version = self._resolve_version(anchor_pid)
         geo = self._storage.read_geometry(
-            anchor_pid, version, columns=["primary_key"],
+            anchor_pid,
+            version,
+            columns=["primary_key"],
             sample_size=min(sample_per_group * 20, 1000),
         )
         all_keys = geo["primary_key"].to_pylist()
-        pop_sample = random.sample(all_keys, min(sample_per_group * 10, len(all_keys)))
+        pop_sample = random.Random(0).sample(all_keys, min(sample_per_group * 10, len(all_keys)))
         pop_risk = self.composite_risk_batch(pop_sample, line_id=entity_line)
         pop_scores = [
-            v["combined_p"] for v in pop_risk.get("results", [])
+            v["combined_p"]
+            for v in pop_risk.get("results", [])
             if isinstance(v, dict) and v.get("combined_p") is not None
         ]
         pop_mean = float(np.mean(pop_scores)) if pop_scores else 0.5
@@ -17278,13 +17746,15 @@ class GDSNavigator:
             sample_keys = keys[:sample_per_group]
             try:
                 grp_risk = self.composite_risk_batch(
-                    sample_keys, line_id=entity_line,
+                    sample_keys,
+                    line_id=entity_line,
                 )
             except (GDSNavigationError, ValueError):
                 continue
 
             grp_scores = [
-                v["combined_p"] for v in grp_risk.get("results", [])
+                v["combined_p"]
+                for v in grp_risk.get("results", [])
                 if isinstance(v, dict) and v.get("combined_p") is not None
             ]
             if not grp_scores:
@@ -17303,16 +17773,18 @@ class GDSNavigator:
                 f"({inflation:.1f}x inflation). "
                 f"Sampled {len(sample_keys)} of {grp.get('count', len(keys))} entities."
             )
-            output.append({
-                "group_value": grp.get("value"),
-                "group_count": grp.get("count", len(keys)),
-                "group_anomaly_count": grp.get("anomaly_count", 0),
-                "group_mean_p": round(grp_mean, 4),
-                "population_mean_p": round(pop_mean, 4),
-                "inflation_ratio": round(inflation, 2),
-                "sampled_keys": len(sample_keys),
-                "interpretation": interpretation,
-            })
+            output.append(
+                {
+                    "group_value": grp.get("value"),
+                    "group_count": grp.get("count", len(keys)),
+                    "group_anomaly_count": grp.get("anomaly_count", 0),
+                    "group_mean_p": round(grp_mean, 4),
+                    "population_mean_p": round(pop_mean, 4),
+                    "inflation_ratio": round(inflation, 2),
+                    "sampled_keys": len(sample_keys),
+                    "interpretation": interpretation,
+                }
+            )
 
         output.sort(key=lambda d: d["inflation_ratio"], reverse=True)
         return output[:top_n]
@@ -17336,9 +17808,7 @@ class GDSNavigator:
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns.get(pattern_id)
         if pattern is None:
-            raise GDSNavigationError(
-                f"Pattern '{pattern_id}' not found in sphere."
-            )
+            raise GDSNavigationError(f"Pattern '{pattern_id}' not found in sphere.")
         if pattern.pattern_type == "event":
             raise ValueError(
                 "detect_collective_drift requires anchor pattern — "
@@ -17347,7 +17817,9 @@ class GDSNavigator:
 
         # Over-fetch to get enough drift data for clustering
         drift_results = self.π9_attract_drift(
-            pattern_id, top_n=sample_size, sample_size=sample_size,
+            pattern_id,
+            top_n=sample_size,
+            sample_size=sample_size,
         )
         if len(drift_results) < min_cluster_size:
             return []
@@ -17378,22 +17850,23 @@ class GDSNavigator:
         k = min(n_clusters, n)
         # K-means++ init
         centers = np.empty((k, unit_mat.shape[1]), dtype=np.float64)
-        idx = rng.integers(0, n)
+        idx = int(rng.integers(0, n))
         centers[0] = unit_mat[idx]
         for c in range(1, k):
             dists = np.min(
                 np.array([np.sum((unit_mat - centers[j]) ** 2, axis=1) for j in range(c)]),
                 axis=0,
             )
-            probs = dists / (dists.sum() + 1e-12)
-            idx = rng.choice(n, p=probs)
+            total = float(dists.sum())
+            # Every point already coincides with a centre: seed uniformly.
+            idx = int(rng.choice(n, p=dists / total)) if total > 0 else int(rng.integers(0, n))
             centers[c] = unit_mat[idx]
 
         # Iterate
         for _ in range(50):
-            dists_all = np.array([
-                np.sum((unit_mat - centers[j]) ** 2, axis=1) for j in range(k)
-            ])  # shape (k, n)
+            dists_all = np.array(
+                [np.sum((unit_mat - centers[j]) ** 2, axis=1) for j in range(k)]
+            )  # shape (k, n)
             labels = np.argmin(dists_all, axis=0)
             new_centers = np.empty_like(centers)
             for j in range(k):
@@ -17424,8 +17897,7 @@ class GDSNavigator:
 
             cluster_keys = [keys[i] for i in range(n) if labels[i] == j]
             drift_direction = {
-                dim_keys[d]: round(float(centroid[d]), 4)
-                for d in range(len(dim_keys))
+                dim_keys[d]: round(float(centroid[d]), 4) for d in range(len(dim_keys))
             }
 
             interpretation = (
@@ -17433,18 +17905,22 @@ class GDSNavigator:
                 f"direction (mean cosine={mean_cosine:.3f}). "
                 f"Dominant drift dimensions: "
                 + ", ".join(
-                    f"{d}={v:+.3f}" for d, v in
-                    sorted(drift_direction.items(), key=lambda x: abs(x[1]), reverse=True)[:3]
+                    f"{d}={v:+.3f}"
+                    for d, v in sorted(
+                        drift_direction.items(), key=lambda x: abs(x[1]), reverse=True
+                    )[:3]
                 )
             )
-            output.append({
-                "cluster_id": j,
-                "cluster_size": cluster_size,
-                "mean_cosine_similarity": round(mean_cosine, 4),
-                "drift_direction": drift_direction,
-                "entity_keys": cluster_keys[:50],
-                "interpretation": interpretation,
-            })
+            output.append(
+                {
+                    "cluster_id": j,
+                    "cluster_size": cluster_size,
+                    "mean_cosine_similarity": round(mean_cosine, 4),
+                    "drift_direction": drift_direction,
+                    "entity_keys": cluster_keys[:50],
+                    "interpretation": interpretation,
+                }
+            )
 
         output.sort(key=lambda d: d["cluster_size"], reverse=True)
         return output[:top_n]
@@ -17466,18 +17942,16 @@ class GDSNavigator:
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns.get(pattern_id)
         if pattern is None:
-            raise GDSNavigationError(
-                f"Pattern '{pattern_id}' not found in sphere."
-            )
+            raise GDSNavigationError(f"Pattern '{pattern_id}' not found in sphere.")
         if pattern.pattern_type != "event":
             raise ValueError(
-                f"detect_temporal_burst requires event pattern, "
-                f"got '{pattern.pattern_type}'."
+                f"detect_temporal_burst requires event pattern, got '{pattern.pattern_type}'."
             )
 
         version = self._resolve_version(pattern_id)
         geo = self._storage.read_geometry(
-            pattern_id, version,
+            pattern_id,
+            version,
             sample_size=sample_size,
             columns=["primary_key", "entity_keys"],
         )
@@ -17494,7 +17968,9 @@ class GDSNavigator:
         # Probe schema for timestamp columns (no data read)
         ts_col = None
         schema = self._storage.read_geometry(
-            pattern_id, version, sample_size=0,
+            pattern_id,
+            version,
+            sample_size=0,
         ).schema
         for col_name in ("timestamp", "event_timestamp"):
             if col_name in schema.names:
@@ -17502,7 +17978,8 @@ class GDSNavigator:
                 break
         if ts_col:
             geo = self._storage.read_geometry(
-                pattern_id, version,
+                pattern_id,
+                version,
                 sample_size=sample_size,
                 columns=["entity_keys", ts_col],
             )
@@ -17535,14 +18012,16 @@ class GDSNavigator:
                     f"mean={mean_count:.1f}, std={std_count:.1f}). "
                     f"Burst detected via event count z-score."
                 )
-                output.append({
-                    "entity_key": key,
-                    "event_count": count,
-                    "z_score": round(z, 4),
-                    "population_mean": round(mean_count, 2),
-                    "population_std": round(std_count, 2),
-                    "interpretation": interpretation,
-                })
+                output.append(
+                    {
+                        "entity_key": key,
+                        "event_count": count,
+                        "z_score": round(z, 4),
+                        "population_mean": round(mean_count, 2),
+                        "population_std": round(std_count, 2),
+                        "interpretation": interpretation,
+                    }
+                )
             output.sort(key=lambda d: d["z_score"], reverse=True)
             return output[:top_n]
 
@@ -17596,16 +18075,18 @@ class GDSNavigator:
                 f"(z={z:.2f}, mean={mean_peak:.1f}, std={std_peak:.1f}). "
                 f"Temporal burst detected."
             )
-            output.append({
-                "entity_key": key,
-                "peak_window_count": peak,
-                "window_days": window_days,
-                "total_events": len(entity_timestamps[key]),
-                "z_score": round(z, 4),
-                "population_mean": round(mean_peak, 2),
-                "population_std": round(std_peak, 2),
-                "interpretation": interpretation,
-            })
+            output.append(
+                {
+                    "entity_key": key,
+                    "peak_window_count": peak,
+                    "window_days": window_days,
+                    "total_events": len(entity_timestamps[key]),
+                    "z_score": round(z, 4),
+                    "population_mean": round(mean_peak, 2),
+                    "population_std": round(std_peak, 2),
+                    "interpretation": interpretation,
+                }
+            )
 
         output.sort(key=lambda d: d["z_score"], reverse=True)
         return output[:top_n]
@@ -17660,7 +18141,10 @@ class GDSNavigator:
         )
         scanner.auto_discover(home_line_id)
         result = scanner.scan(
-            home_line_id, scoring="count", threshold=threshold, top_n=top_n,
+            home_line_id,
+            scoring="count",
+            threshold=threshold,
+            top_n=top_n,
         )
         return {
             "total_flagged": result.total_flagged,
@@ -17672,14 +18156,16 @@ class GDSNavigator:
                 }
                 for h in result.hits
             ],
-            "interpretation": f"Passive scan flagged {result.total_flagged} entities at threshold={threshold}.",
+            "interpretation": (
+                f"Passive scan flagged {result.total_flagged} entities at threshold={threshold}."
+            ),
         }
 
     def extract_chains(
         self,
         event_pattern_id: str,
-        from_col: str,
-        to_col: str,
+        from_col: str | None = None,
+        to_col: str | None = None,
         time_col: str | None = None,
         category_col: str | None = None,
         amount_col: str | None = None,
@@ -17692,26 +18178,48 @@ class GDSNavigator:
         max_chains: int = 100_000,
         seed_nodes: list[str] | None = None,
         bidirectional: bool = False,
+        anchor_pattern_id: str | None = None,
     ) -> dict[str, Any]:
         """Extract transaction chains by following from_col->to_col links.
 
-        Reads the event points table, builds adjacency from from_col/to_col,
-        then delegates to :func:`hypertopos.engine.chains.extract_chains`.
+        Reads the event points table (``event_pattern_id`` may be a pattern or
+        a line id), then delegates to
+        :func:`hypertopos.engine.chains.extract_chains`. When
+        ``anchor_pattern_id`` names an anchor pattern over the entities in
+        from_col/to_col, each returned chain carries per-hop
+        ``edge_potentials`` (distance between consecutive entities' delta
+        vectors); otherwise ``edge_potentials`` is a list of nulls.
+
+        Columns not given default to the event pattern's edge table
+        (``from_col``, ``to_col``, ``timestamp_col``, ``amount_col``), and the
+        time column to the pattern's ``timestamp_col``, so hops follow time.
+        With ``seed_nodes`` every event is used (no subsampling), so the
+        chains from those entities are exact.
+
+        Raises GDSNavigationError for an unknown pattern/line, a missing
+        from_col/to_col, or an unknown anchor pattern.
         """
         sphere = self._storage.read_sphere()
+        if event_pattern_id in sphere.patterns:
+            edge_cfg = self._storage.edge_table_config(event_pattern_id) or {}
+            from_col = from_col or edge_cfg.get("from_col")
+            to_col = to_col or edge_cfg.get("to_col")
+            amount_col = amount_col or edge_cfg.get("amount_col")
+            time_col = (
+                time_col
+                or edge_cfg.get("timestamp_col")
+                or sphere.patterns[event_pattern_id].timestamp_col
+            )
+        if not from_col or not to_col:
+            raise GDSNavigationError(
+                f"'{event_pattern_id}' has no edge table to take the chain columns from; "
+                "pass from_col and to_col"
+            )
 
-        # Resolve to points table
         if event_pattern_id in sphere.patterns:
             version = self._resolve_version(event_pattern_id)
-            line_id = sphere.entity_line(event_pattern_id)
-            if not line_id:
-                line_id = sphere.event_line(event_pattern_id)
-            if not line_id:
-                raise GDSNavigationError(
-                    f"Cannot resolve line for pattern '{event_pattern_id}'. "
-                    f"Available lines: {sorted(sphere.lines)}"
-                )
-            points_table = self._storage.read_points(line_id, version)
+            entity_type = sphere.patterns[event_pattern_id].entity_type
+            points_table = self._storage.read_points(entity_type, version)
         elif event_pattern_id in sphere.lines:
             line = sphere.lines[event_pattern_id]
             version = line.versions[-1] if line.versions else 1
@@ -17723,7 +18231,6 @@ class GDSNavigator:
                 f"lines: {sorted(sphere.lines)}"
             )
 
-        # Validate required columns
         schema_names = {col.name for col in points_table.schema}
         for col_name, col_label in [(from_col, "from_col"), (to_col, "to_col")]:
             if col_name not in schema_names:
@@ -17732,7 +18239,7 @@ class GDSNavigator:
                     f"Available columns: {sorted(schema_names)}"
                 )
 
-        # Select only needed columns
+        # Select only needed columns to reduce downstream memory
         needed_cols = ["primary_key", from_col, to_col]
         if time_col and time_col in points_table.schema.names:
             needed_cols.append(time_col)
@@ -17741,6 +18248,35 @@ class GDSNavigator:
         if amount_col and amount_col in points_table.schema.names:
             needed_cols.append(amount_col)
         points_table = points_table.select(needed_cols)
+
+        # Seeded runs only ever walk events reachable from the seeds within
+        # max_hops, so cut the table to those before materialising it in
+        # Python — one column-level membership pass per hop.
+        seeded_subset = False
+        if seed_nodes:
+            src_col = points_table[from_col]
+            dst_col = points_table[to_col]
+            columns_overlap = bool(
+                pc.any(pc.is_in(src_col, value_set=pc.unique(dst_col.drop_null()))).as_py()
+            )
+            frontier = pa.array(list(dict.fromkeys(seed_nodes)), type=src_col.type)
+            reached = pc.is_in(src_col, value_set=frontier)
+            if bidirectional:
+                reached = pc.or_(reached, pc.is_in(dst_col, value_set=frontier))
+            for _ in range(max_hops - 1):
+                nxt = pc.unique(dst_col.filter(reached).drop_null())
+                if bidirectional:
+                    nxt = pc.unique(
+                        pa.concat_arrays([nxt, pc.unique(src_col.filter(reached).drop_null())])
+                    )
+                grown = pc.or_(reached, pc.is_in(src_col, value_set=nxt))
+                if bidirectional:
+                    grown = pc.or_(grown, pc.is_in(dst_col, value_set=nxt))
+                if pc.sum(grown).as_py() == pc.sum(reached).as_py():
+                    break
+                reached = grown
+            points_table = points_table.filter(reached)
+            seeded_subset = columns_overlap
 
         from_keys = points_table[from_col].to_pylist()
         to_keys = points_table[to_col].to_pylist()
@@ -17760,8 +18296,7 @@ class GDSNavigator:
         amounts = None
         if amount_col and amount_col in points_table.schema.names:
             amounts = [
-                float(v) if v is not None else 0.0
-                for v in points_table[amount_col].to_pylist()
+                float(v) if v is not None else 0.0 for v in points_table[amount_col].to_pylist()
             ]
 
         from hypertopos.engine.chains import extract_chains as _core_extract
@@ -17782,13 +18317,38 @@ class GDSNavigator:
             bidirectional=bidirectional,
         )
 
-        # Sort
         if sort_by == "hop_count":
             chains.sort(key=lambda c: c.hop_count, reverse=True)
         elif sort_by == "amount_decay":
             chains.sort(key=lambda c: c.amount_decay)
 
-        result_chains = [c.to_dict() for c in chains[:top_n]]
+        # One batch read of the delta vectors for every key in the returned
+        # chains: O(unique keys), not O(hops x chains).
+        delta_by_key: dict[str, np.ndarray] | None = None
+        if anchor_pattern_id is not None and chains:
+            if anchor_pattern_id not in sphere.patterns:
+                raise GDSNavigationError(
+                    f"anchor_pattern_id='{anchor_pattern_id}' not found. "
+                    f"Available patterns: {sorted(sphere.patterns)}"
+                )
+            unique_keys: set[str] = set()
+            for c in chains[:top_n]:
+                unique_keys.update(c.keys)
+            geo = self._storage.read_geometry(
+                anchor_pattern_id,
+                self._resolve_version(anchor_pattern_id),
+                point_keys=list(unique_keys),
+                columns=["primary_key", "delta"],
+            )
+            delta_by_key = {
+                pk: np.asarray(d, dtype=np.float32)
+                for pk, d in zip(
+                    geo["primary_key"].to_pylist(), geo["delta"].to_pylist(), strict=False
+                )
+                if pk is not None and d is not None
+            }
+
+        result_chains = [c.to_dict(delta_by_key=delta_by_key) for c in chains[:top_n]]
 
         resp: dict[str, Any] = {
             "event_pattern_id": event_pattern_id,
@@ -17797,21 +18357,20 @@ class GDSNavigator:
             "sort_by": sort_by,
             "chains": result_chains,
         }
+        hint = getattr(chains, "hint", None)
+        # The disjoint-columns hint judges the column choice; on a seeded run
+        # whose full table overlaps it would only describe the seeds' subset.
+        if hint and not seeded_subset:
+            resp["hint"] = hint
 
         if chains:
             hops = [c.hop_count for c in chains]
-            cyclic_count = sum(1 for c in chains if c.is_cyclic)
             resp["summary"] = {
                 "total_chains": len(chains),
-                "cyclic_chains": cyclic_count,
+                "cyclic_chains": sum(1 for c in chains if c.is_cyclic),
                 "hop_count_mean": round(float(np.mean(hops)), 1),
                 "hop_count_max": max(hops),
             }
-
-        resp["interpretation"] = (
-            f"Extracted {len(chains)} chains ({len(result_chains)} returned), "
-            f"max_hops={max_hops}, min_hops={min_hops}."
-        )
 
         return resp
 
@@ -17825,7 +18384,7 @@ class GDSNavigator:
         top_n: int = 10,
         *,
         sample_size: int = 5000,
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """Find entities whose geometry diverges most from their graph neighbors.
 
         For each entity the *expected* delta is the mean of its neighbors'
@@ -17867,14 +18426,13 @@ class GDSNavigator:
         )
 
         # Resolve anchor pattern that holds entity geometry
-        scoring_pattern = (
-            self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
-        )
+        scoring_pattern = self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
         version = self._resolve_version(scoring_pattern)
 
         # Load geometry (sampled if large)
         geo = self._storage.read_geometry(
-            scoring_pattern, version,
+            scoring_pattern,
+            version,
             columns=["primary_key", "delta"],
             sample_size=sample_size,
         )
@@ -17891,8 +18449,6 @@ class GDSNavigator:
 
         if not delta_lookup:
             return []
-
-        entity_keys = set(delta_lookup.keys())
 
         # Build adjacency for sampled entities
         adj_index = self._storage.get_adjacency(pattern_id)
@@ -17973,26 +18529,31 @@ class GDSNavigator:
             write_cache,
         )
 
-        scoring_pattern = (
-            self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
-        )
+        scoring_pattern = self._resolve_anchor_pattern_for_scoring(pattern_id) or pattern_id
         version = self._resolve_version(scoring_pattern)
         cpath = cache_path(
-            self._storage._base, "anomalies", scoring_pattern, version,
+            self._storage.meta_root,
+            "anomalies",
+            scoring_pattern,
+            version,
             anomalies_params_key(
-                k_neighbors=k_neighbors, pca_dim=pca_dim,
-                sample_size=sample_size, homology_dim=homology_dim,
+                k_neighbors=k_neighbors,
+                pca_dim=pca_dim,
+                sample_size=sample_size,
+                homology_dim=homology_dim,
             ),
         )
 
         if not force:
-            cached = read_cache(cpath)
+            cached = read_cache(cpath, self._storage)
             if cached is not None and cached.num_rows >= top_n:
                 sorted_tbl = cached.sort_by([("h1_max_persistence", "descending")])
-                return sorted_tbl.slice(0, top_n).to_pylist()
+                cached_rows: list[dict[str, Any]] = sorted_tbl.slice(0, top_n).to_pylist()
+                return cached_rows
 
         geo = self._storage.read_geometry(
-            scoring_pattern, version,
+            scoring_pattern,
+            version,
             columns=["primary_key", "delta"],
             sample_size=sample_size,
         )
@@ -18065,7 +18626,8 @@ class GDSNavigator:
 
         version = self._resolve_version(pattern_id)
         tbl = self._storage.read_geometry(
-            pattern_id, version,
+            pattern_id,
+            version,
             primary_key=primary_key,
             columns=["primary_key", "delta", "delta_norm"],
         )
@@ -18079,10 +18641,12 @@ class GDSNavigator:
 
         relations_for_engine: list[dict[str, Any]] = []
         for rel in pattern.relations:
-            relations_for_engine.append({
-                "line_id": rel.line_id,
-                "direction": rel.direction,
-            })
+            relations_for_engine.append(
+                {
+                    "line_id": rel.line_id,
+                    "direction": rel.direction,
+                }
+            )
 
         # Recover full shape vector from delta + mu + sigma_diag.
         if delta.shape[0] != len(pattern.mu):
@@ -18091,18 +18655,17 @@ class GDSNavigator:
                 f"pattern mu length {len(pattern.mu)}; "
                 "geometry may be corrupted or pattern version mismatched",
             )
-        delta_full = delta.astype(np.float64)
+        from hypertopos.engine.geometry import shapes_from_deltas
+
         mu_full = np.asarray(pattern.mu, dtype=np.float64)
         sigma_full = np.asarray(pattern.sigma_diag, dtype=np.float64)
-        shape_full = delta_full * sigma_full + mu_full
+        shape_full = shapes_from_deltas(delta.astype(np.float64), pattern)
 
         # Load entity's events from event-pattern edge table + edge_features
         # sidecar for the edge_dim_aggregations dispatch.
         edge_agg_specs: list[tuple[str, str]] = []
         edge_agg_dim_offset = (
-            len(pattern.relations)
-            + len(pattern.event_dimensions)
-            + len(pattern.prop_columns)
+            len(pattern.relations) + len(pattern.event_dimensions) + len(pattern.prop_columns)
         )
         event_source_values: dict[str, dict[str, float]] = {}
         edges_for_engine: list[dict[str, Any]] = []
@@ -18116,7 +18679,7 @@ class GDSNavigator:
             agg = pattern.edge_dim_aggregations
             event_pattern_id = agg.from_event_pattern
             per_dim = agg.aggregates_per_dim or {}
-            for source_dim in (agg.dims or ()):
+            for source_dim in agg.dims or ():
                 for agg_kind in per_dim.get(source_dim, ()):
                     edge_agg_specs.append((source_dim, agg_kind))
 
@@ -18128,27 +18691,33 @@ class GDSNavigator:
                     for edge_tuple in event_adj.neighbors_out(primary_key):
                         partner = str(edge_tuple[0])
                         event_key = (
-                            str(edge_tuple[3]) if len(edge_tuple) >= 4
+                            str(edge_tuple[3])
+                            if len(edge_tuple) >= 4
                             else f"{primary_key}->{partner}"
                         )
-                        edges_for_engine.append({
-                            "edge_id": event_key,
-                            "partner_key": partner,
-                            "direction": "out",
-                            "line_id": event_pattern_id,
-                        })
+                        edges_for_engine.append(
+                            {
+                                "edge_id": event_key,
+                                "partner_key": partner,
+                                "direction": "out",
+                                "line_id": event_pattern_id,
+                            }
+                        )
                     for edge_tuple in event_adj.neighbors_in(primary_key):
                         partner = str(edge_tuple[0])
                         event_key = (
-                            str(edge_tuple[3]) if len(edge_tuple) >= 4
+                            str(edge_tuple[3])
+                            if len(edge_tuple) >= 4
                             else f"{partner}->{primary_key}"
                         )
-                        edges_for_engine.append({
-                            "edge_id": event_key,
-                            "partner_key": partner,
-                            "direction": "in",
-                            "line_id": event_pattern_id,
-                        })
+                        edges_for_engine.append(
+                            {
+                                "edge_id": event_key,
+                                "partner_key": partner,
+                                "direction": "in",
+                                "line_id": event_pattern_id,
+                            }
+                        )
                 except Exception:  # noqa: BLE001
                     edges_for_engine = []
 
@@ -18168,17 +18737,19 @@ class GDSNavigator:
             if edges_for_engine and (agg.dims or ()):
                 try:
                     sidecar_path = (
-                        self._storage._base / "_gds_meta" / "edge_features"
-                        / event_pattern_id / "data.lance"
+                        self._storage._base
+                        / "_gds_meta"
+                        / "edge_features"
+                        / event_pattern_id
+                        / "data.lance"
                     )
                     if sidecar_path.exists():
-                        import lance as _lance_local
                         import pyarrow.compute as _pc_local
-                        ds = _lance_local.dataset(str(sidecar_path))
+
+                        ds = self._storage.dataset(sidecar_path)
                         event_keys = [e["edge_id"] for e in edges_for_engine]
                         escaped = ", ".join(
-                            f"'{k.replace(chr(39), chr(39)*2)}'"
-                            for k in event_keys
+                            f"'{k.replace(chr(39), chr(39) * 2)}'" for k in event_keys
                         )
                         cols = ["event_key", *agg.dims]
                         scanner = ds.scanner(
@@ -18189,8 +18760,7 @@ class GDSNavigator:
                         for i in range(sidecar_tbl.num_rows):
                             ek = sidecar_tbl["event_key"][i].as_py()
                             event_source_values[ek] = {
-                                d: float(sidecar_tbl[d][i].as_py() or 0.0)
-                                for d in agg.dims
+                                d: float(sidecar_tbl[d][i].as_py() or 0.0) for d in agg.dims
                             }
 
                         # Joint cache: per-event-pattern p95 thresholds AND
@@ -18198,7 +18768,8 @@ class GDSNavigator:
                         # p-values. One full-column scan per source_dim
                         # amortised across both downstream consumers.
                         cache = self.__dict__.setdefault(
-                            "_counterfactual_population_cache", {},
+                            "_counterfactual_population_cache",
+                            {},
                         )
                         if event_pattern_id not in cache:
                             per_dim_thresholds: dict[str, float] = {}
@@ -18209,9 +18780,7 @@ class GDSNavigator:
                                 # Threshold via pc.quantile (exact).
                                 q_arr = _pc_local.quantile(col, q=0.95)
                                 raw = (
-                                    q_arr.as_py()
-                                    if hasattr(q_arr, "as_py")
-                                    else q_arr.to_pylist()
+                                    q_arr.as_py() if hasattr(q_arr, "as_py") else q_arr.to_pylist()
                                 )
                                 q = raw[0] if isinstance(raw, list) else raw
                                 if q is not None:
@@ -18225,7 +18794,9 @@ class GDSNavigator:
                                 if col_np.size > 100_000:
                                     rng = np.random.default_rng(seed=0)
                                     col_np = rng.choice(
-                                        col_np, size=100_000, replace=False,
+                                        col_np,
+                                        size=100_000,
+                                        replace=False,
                                     )
                                 per_dim_ecdfs[source_dim] = np.sort(col_np)
                             cache[event_pattern_id] = {
@@ -18256,27 +18827,29 @@ class GDSNavigator:
             for edge_tuple in adj.neighbors_out(primary_key):
                 partner = str(edge_tuple[0])
                 event_key = (
-                    str(edge_tuple[3]) if len(edge_tuple) >= 4
-                    else f"{primary_key}->{partner}"
+                    str(edge_tuple[3]) if len(edge_tuple) >= 4 else f"{primary_key}->{partner}"
                 )
-                edges_for_engine.append({
-                    "edge_id": event_key,
-                    "partner_key": partner,
-                    "direction": "out",
-                    "line_id": line_id,
-                })
+                edges_for_engine.append(
+                    {
+                        "edge_id": event_key,
+                        "partner_key": partner,
+                        "direction": "out",
+                        "line_id": line_id,
+                    }
+                )
             for edge_tuple in adj.neighbors_in(primary_key):
                 partner = str(edge_tuple[0])
                 event_key = (
-                    str(edge_tuple[3]) if len(edge_tuple) >= 4
-                    else f"{partner}->{primary_key}"
+                    str(edge_tuple[3]) if len(edge_tuple) >= 4 else f"{partner}->{primary_key}"
                 )
-                edges_for_engine.append({
-                    "edge_id": event_key,
-                    "partner_key": partner,
-                    "direction": "in",
-                    "line_id": line_id,
-                })
+                edges_for_engine.append(
+                    {
+                        "edge_id": event_key,
+                        "partner_key": partner,
+                        "direction": "in",
+                        "line_id": line_id,
+                    }
+                )
 
         # Hard cap on candidate edges to keep per-call latency bounded on
         # hub entities (single accounts can have hundreds of thousands of
@@ -18312,6 +18885,8 @@ class GDSNavigator:
             candidate_edge_ids=edge_ids,
             top_n=10**9,
             thresholds=thresholds_for_engine,
+            cholesky_inv=pattern.cholesky_inv,
+            dimension_weights=pattern.dimension_weights,
         )
 
         # Attach dim_label for dominant_dim_idx.
@@ -18334,6 +18909,7 @@ class GDSNavigator:
             from hypertopos.engine.counterfactual import (
                 compute_per_edge_source_value_pvalues,
             )
+
             source_dims = list(pattern.edge_dim_aggregations.dims or ())
             pvalues_by_edge = compute_per_edge_source_value_pvalues(
                 edges=edges_for_engine,
@@ -18342,15 +18918,11 @@ class GDSNavigator:
                 source_dims=source_dims,
             )
             for row in rows:
-                pdata = pvalues_by_edge.get(row.get("edge_id"))
+                pdata = pvalues_by_edge.get(row.get("edge_id"))  # type: ignore[arg-type]  # None key -> None
                 if pdata is not None:
-                    row["source_value_pvalues"] = {
-                        d: pdata[d] for d in source_dims
-                    }
+                    row["source_value_pvalues"] = {d: pdata[d] for d in source_dims}
                     row["min_pvalue"] = pdata["min_pvalue"]
-                    row["dominant_significance_dim"] = pdata[
-                        "dominant_significance_dim"
-                    ]
+                    row["dominant_significance_dim"] = pdata["dominant_significance_dim"]
                 else:
                     row["source_value_pvalues"] = None
                     row["min_pvalue"] = None
@@ -18372,7 +18944,7 @@ class GDSNavigator:
         # counterfactual impact AND extreme source values vs population.
         # Fallback when p-values unavailable: pure |drop_pct| desc.
         def _composite_score(r: dict[str, Any]) -> float:
-            abs_drop = abs(r.get("drop_pct", 0.0))
+            abs_drop: float = abs(r.get("drop_pct", 0.0))
             mp = r.get("min_pvalue")
             if mp is None:
                 return -abs_drop
@@ -18383,6 +18955,7 @@ class GDSNavigator:
             if abs_drop <= 0.0 or extremeness <= 0.0:
                 return -abs_drop  # one factor zero → fall back to drop only
             return -2.0 * abs_drop * extremeness / (abs_drop + extremeness)
+
         rows.sort(key=_composite_score)
         ranked = rows[:top_n]
         return {
@@ -18419,6 +18992,7 @@ class GDSNavigator:
         per-dim before/after audit row for every override key.
         """
         from hypertopos.engine.geometry import GDSEngine as _GE
+        from hypertopos.engine.geometry import shapes_from_deltas
 
         sphere = self._storage.read_sphere()
         if pattern_id not in sphere.patterns:
@@ -18427,7 +19001,8 @@ class GDSNavigator:
 
         version = self._resolve_version(pattern_id)
         tbl = self._storage.read_geometry(
-            pattern_id, version,
+            pattern_id,
+            version,
             primary_key=primary_key,
             columns=["primary_key", "delta", "delta_norm", "is_anomaly"],
         )
@@ -18442,8 +19017,7 @@ class GDSNavigator:
 
         if not set_dimension:
             raise GDSNavigationError(
-                "set_dimension is empty — supply at least one "
-                "{dim_label: value} entry to override",
+                "set_dimension is empty — supply at least one {dim_label: value} entry to override",
             )
 
         # Validate dim labels (raise GDSNavigationError listing available
@@ -18467,54 +19041,14 @@ class GDSNavigator:
             if not math.isfinite(float(value))
         ]
         if bad_values:
-            offenders = ", ".join(
-                f"{label}={value!r}" for label, value in bad_values
-            )
+            offenders = ", ".join(f"{label}={value!r}" for label, value in bad_values)
             raise GDSNavigationError(
                 f"set_dimension contains non-finite value(s): {offenders}",
             )
 
         # Reconstruct shape-space vector that produced delta_before.
-        # ``compute_delta`` (engine/geometry.py) is the inverse target;
-        # we mirror its two paths.
         mu = np.asarray(pattern.mu, dtype=np.float64)
-        if pattern.cholesky_inv is not None:
-            # cholesky path: delta = L_inv @ (shape - mu)  ⇒
-            # shape = mu + inv(L_inv) @ delta. Reverse dimension_weights
-            # first if present (compute_delta multiplies after the
-            # whitening) so we recover the pre-weighting delta.
-            unweighted_delta = delta_before.copy()
-            if pattern.dimension_weights is not None:
-                weights = np.asarray(
-                    pattern.dimension_weights, dtype=np.float64,
-                )
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    unweighted_delta = np.where(
-                        weights != 0.0,
-                        delta_before / weights,
-                        0.0,
-                    )
-            cholesky_forward = np.linalg.inv(
-                np.asarray(pattern.cholesky_inv, dtype=np.float64),
-            )
-            shape_before = mu + cholesky_forward @ unweighted_delta
-        else:
-            sigma = np.maximum(
-                np.asarray(pattern.sigma_diag, dtype=np.float64),
-                _GE.SIGMA_EPSILON,
-            )
-            unweighted_delta = delta_before.copy()
-            if pattern.dimension_weights is not None:
-                weights = np.asarray(
-                    pattern.dimension_weights, dtype=np.float64,
-                )
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    unweighted_delta = np.where(
-                        weights != 0.0,
-                        delta_before / weights,
-                        0.0,
-                    )
-            shape_before = unweighted_delta * sigma + mu
+        shape_before = shapes_from_deltas(delta_before, pattern)
 
         shape_after = shape_before.copy()
         for label, value in set_dimension.items():
@@ -18523,7 +19057,8 @@ class GDSNavigator:
         # Recompute delta_after via the exact compute_delta formula.
         if pattern.cholesky_inv is not None:
             delta_after = np.asarray(
-                pattern.cholesky_inv, dtype=np.float64,
+                pattern.cholesky_inv,
+                dtype=np.float64,
             ) @ (shape_after - mu)
         else:
             sigma = np.maximum(
@@ -18533,7 +19068,8 @@ class GDSNavigator:
             delta_after = (shape_after - mu) / sigma
         if pattern.dimension_weights is not None:
             delta_after = delta_after * np.asarray(
-                pattern.dimension_weights, dtype=np.float64,
+                pattern.dimension_weights,
+                dtype=np.float64,
             )
 
         delta_norm_after = float(np.linalg.norm(delta_after))
@@ -18548,35 +19084,39 @@ class GDSNavigator:
             pct_change = float("inf") if delta_norm_after > 0.0 else 0.0
 
         # Top witness dims after, ranked by squared-delta contribution.
-        delta_sq = delta_after ** 2
+        delta_sq = delta_after**2
         total = float(delta_sq.sum())
         order = np.argsort(-delta_sq)[: max(0, int(top_n))]
         dim_labels = pattern.dim_labels
         top_witness_dims_after: list[dict[str, Any]] = []
         for i in order:
             idx = int(i)
-            top_witness_dims_after.append({
-                "dim_label": dim_labels[idx],
-                "dim_index": idx,
-                "contribution_pct": round(
-                    float(delta_sq[idx]) / max(total, 1e-12) * 100.0,
-                    4,
-                ),
-                "delta": round(float(delta_after[idx]), 4),
-            })
+            top_witness_dims_after.append(
+                {
+                    "dim_label": dim_labels[idx],
+                    "dim_index": idx,
+                    "contribution_pct": round(
+                        float(delta_sq[idx]) / max(total, 1e-12) * 100.0,
+                        4,
+                    ),
+                    "delta": round(float(delta_after[idx]), 4),
+                }
+            )
 
         # Audit row for each overridden dim, in original key order.
         dimensions_overridden: list[dict[str, Any]] = []
         for label, value in set_dimension.items():
             idx = resolved_indices[label]
-            dimensions_overridden.append({
-                "dim_label": label,
-                "dim_index": idx,
-                "old_value": round(float(shape_before[idx]), 4),
-                "new_value": round(float(value), 4),
-                "old_delta": round(float(delta_before[idx]), 4),
-                "new_delta": round(float(delta_after[idx]), 4),
-            })
+            dimensions_overridden.append(
+                {
+                    "dim_label": label,
+                    "dim_index": idx,
+                    "old_value": round(float(shape_before[idx]), 4),
+                    "new_value": round(float(value), 4),
+                    "old_delta": round(float(delta_before[idx]), 4),
+                    "new_delta": round(float(delta_after[idx]), 4),
+                }
+            )
 
         return {
             "primary_key": primary_key,
@@ -18641,7 +19181,8 @@ class GDSNavigator:
         pattern = sphere.patterns[pattern_id]
         version = self._resolve_version(pattern_id)
         tbl = self._storage.read_geometry(
-            pattern_id, version,
+            pattern_id,
+            version,
             primary_key=primary_key,
             columns=["primary_key", "delta", "delta_norm"],
         )
@@ -18651,19 +19192,18 @@ class GDSNavigator:
             )
         delta = np.asarray(tbl["delta"][0].as_py(), dtype=np.float32)
         delta_norm = float(tbl["delta_norm"][0].as_py())
+        from hypertopos.engine.geometry import shapes_from_deltas
+
         mu_full = np.asarray(pattern.mu, dtype=np.float64)
         sigma_full = np.asarray(pattern.sigma_diag, dtype=np.float64)
-        shape_full = delta.astype(np.float64) * sigma_full + mu_full
+        shape_full = shapes_from_deltas(delta.astype(np.float64), pattern)
 
         relations_for_engine: list[dict[str, Any]] = [
-            {"line_id": rel.line_id, "direction": rel.direction}
-            for rel in pattern.relations
+            {"line_id": rel.line_id, "direction": rel.direction} for rel in pattern.relations
         ]
         edge_agg_specs: list[tuple[str, str]] = []
         edge_agg_dim_offset = (
-            len(pattern.relations)
-            + len(pattern.event_dimensions)
-            + len(pattern.prop_columns)
+            len(pattern.relations) + len(pattern.event_dimensions) + len(pattern.prop_columns)
         )
         event_source_values: dict[str, dict[str, float]] = {}
         thresholds_for_engine: dict[str, float] = {}
@@ -18688,7 +19228,7 @@ class GDSNavigator:
             agg = pattern.edge_dim_aggregations
             event_pattern_id = agg.from_event_pattern
             per_dim = agg.aggregates_per_dim or {}
-            for source_dim in (agg.dims or ()):
+            for source_dim in agg.dims or ():
                 for agg_kind in per_dim.get(source_dim, ()):
                     edge_agg_specs.append((source_dim, agg_kind))
             cache = self.__dict__.get("_counterfactual_population_cache", {})
@@ -18699,36 +19239,37 @@ class GDSNavigator:
                 event_adj = self._storage.get_adjacency(event_pattern_id)
                 for et in event_adj.neighbors_out(primary_key):
                     partner = str(et[0])
-                    ek = (
-                        str(et[3]) if len(et) >= 4
-                        else f"{primary_key}->{partner}"
+                    ek = str(et[3]) if len(et) >= 4 else f"{primary_key}->{partner}"
+                    edges_for_engine.append(
+                        {
+                            "edge_id": ek,
+                            "partner_key": partner,
+                            "direction": "out",
+                            "line_id": event_pattern_id,
+                        }
                     )
-                    edges_for_engine.append({
-                        "edge_id": ek, "partner_key": partner,
-                        "direction": "out", "line_id": event_pattern_id,
-                    })
                 for et in event_adj.neighbors_in(primary_key):
                     partner = str(et[0])
-                    ek = (
-                        str(et[3]) if len(et) >= 4
-                        else f"{partner}->{primary_key}"
+                    ek = str(et[3]) if len(et) >= 4 else f"{partner}->{primary_key}"
+                    edges_for_engine.append(
+                        {
+                            "edge_id": ek,
+                            "partner_key": partner,
+                            "direction": "in",
+                            "line_id": event_pattern_id,
+                        }
                     )
-                    edges_for_engine.append({
-                        "edge_id": ek, "partner_key": partner,
-                        "direction": "in", "line_id": event_pattern_id,
-                    })
                 sidecar_path = (
-                    self._storage._base / "_gds_meta" / "edge_features"
-                    / event_pattern_id / "data.lance"
+                    self._storage._base
+                    / "_gds_meta"
+                    / "edge_features"
+                    / event_pattern_id
+                    / "data.lance"
                 )
                 if sidecar_path.exists() and edges_for_engine and agg.dims:
-                    import lance as _lance_local
-                    ds = _lance_local.dataset(str(sidecar_path))
+                    ds = self._storage.dataset(sidecar_path)
                     event_keys = [e["edge_id"] for e in edges_for_engine]
-                    escaped = ", ".join(
-                        f"'{k.replace(chr(39), chr(39)*2)}'"
-                        for k in event_keys
-                    )
+                    escaped = ", ".join(f"'{k.replace(chr(39), chr(39) * 2)}'" for k in event_keys)
                     sidecar_tbl = ds.scanner(
                         columns=["event_key", *agg.dims],
                         filter=f"event_key IN ({escaped})",
@@ -18736,8 +19277,7 @@ class GDSNavigator:
                     for i in range(sidecar_tbl.num_rows):
                         ek = sidecar_tbl["event_key"][i].as_py()
                         event_source_values[ek] = {
-                            d: float(sidecar_tbl[d][i].as_py() or 0.0)
-                            for d in agg.dims
+                            d: float(sidecar_tbl[d][i].as_py() or 0.0) for d in agg.dims
                         }
             except Exception:  # noqa: BLE001
                 pass
@@ -18747,17 +19287,25 @@ class GDSNavigator:
             for et in adj.neighbors_out(primary_key):
                 partner = str(et[0])
                 ek = str(et[3]) if len(et) >= 4 else f"{primary_key}->{partner}"
-                edges_for_engine.append({
-                    "edge_id": ek, "partner_key": partner,
-                    "direction": "out", "line_id": line_id,
-                })
+                edges_for_engine.append(
+                    {
+                        "edge_id": ek,
+                        "partner_key": partner,
+                        "direction": "out",
+                        "line_id": line_id,
+                    }
+                )
             for et in adj.neighbors_in(primary_key):
                 partner = str(et[0])
                 ek = str(et[3]) if len(et) >= 4 else f"{partner}->{primary_key}"
-                edges_for_engine.append({
-                    "edge_id": ek, "partner_key": partner,
-                    "direction": "in", "line_id": line_id,
-                })
+                edges_for_engine.append(
+                    {
+                        "edge_id": ek,
+                        "partner_key": partner,
+                        "direction": "in",
+                        "line_id": line_id,
+                    }
+                )
 
         n_candidates_seen = len(edges_for_engine)
         candidates_truncated = n_candidates_seen > max_candidates
@@ -18765,7 +19313,9 @@ class GDSNavigator:
             edges_for_engine = edges_for_engine[:max_candidates]
 
         result = select_minimal_joint_removal(
-            shape=shape_full, mu=mu_full, sigma_diag=sigma_full,
+            shape=shape_full,
+            mu=mu_full,
+            sigma_diag=sigma_full,
             delta_norm=delta_norm,
             candidate_edges=edges_for_engine,
             relations=relations_for_engine,
@@ -18775,6 +19325,8 @@ class GDSNavigator:
             target_drop_pct=target_drop_pct,
             k_max=k_max,
             thresholds=thresholds_for_engine,
+            cholesky_inv=pattern.cholesky_inv,
+            dimension_weights=pattern.dimension_weights,
         )
         result["primary_key"] = primary_key
         result["delta_norm_before"] = delta_norm
@@ -18820,6 +19372,7 @@ class GDSNavigator:
         from hypertopos.engine.counterfactual import (
             aggregate_edge_removals_by_counterparty,
         )
+
         per_edge = self.simulate_edge_removal(
             primary_key,
             pattern_id=pattern_id,
@@ -18868,11 +19421,11 @@ class GDSNavigator:
             k_geometric``.
         """
         similar = self.find_similar_entities(
-            primary_key, pattern_id, top_n=k_geometric,
+            primary_key,
+            pattern_id,
+            top_n=k_geometric,
         )
-        behav_neighbors: dict[str, float] = {
-            str(pk): float(dist) for pk, dist in similar
-        }
+        behav_neighbors: dict[str, float] = {str(pk): float(dist) for pk, dist in similar}
 
         adj = self._storage.get_adjacency(line_id)
         edge_counts: dict[str, int] = {}
@@ -18887,11 +19440,13 @@ class GDSNavigator:
         for nb_key, dist in behav_neighbors.items():
             if nb_key == primary_key or nb_key in edge_counts:
                 continue
-            hidden_cluster.append({
-                "neighbor_key": nb_key,
-                "geometric_distance": dist,
-                "edge_present": False,
-            })
+            hidden_cluster.append(
+                {
+                    "neighbor_key": nb_key,
+                    "geometric_distance": dist,
+                    "edge_present": False,
+                }
+            )
         n_hidden_total = len(hidden_cluster)
         hidden_cluster.sort(key=lambda r: r["geometric_distance"])
         hidden_cluster = hidden_cluster[:top_n_hidden]
@@ -18900,12 +19455,14 @@ class GDSNavigator:
         for nb_key, n_edges in edge_counts.items():
             if nb_key == primary_key or nb_key in behav_neighbors:
                 continue
-            suspicious_links.append({
-                "neighbor_key": nb_key,
-                "geometric_distance": float("inf"),
-                "edge_present": True,
-                "edge_count": int(n_edges),
-            })
+            suspicious_links.append(
+                {
+                    "neighbor_key": nb_key,
+                    "geometric_distance": float("inf"),
+                    "edge_present": True,
+                    "edge_count": int(n_edges),
+                }
+            )
         n_suspicious_total = len(suspicious_links)
         suspicious_links.sort(key=lambda r: -r["edge_count"])
         suspicious_links = suspicious_links[:top_n_suspicious]
@@ -18964,12 +19521,8 @@ class GDSNavigator:
                 lookup; when omitted the chains block reports
                 ``skipped: no chain_pattern_id provided``.
             include_*: per-step opt-in flags.
-            include_per_edge_counterfactual: opt-in for the M1.2 C3
-                counterfactual block. The underlying ``simulate_edge_removal``
-                primitive is not yet shipped, so when this flag is True the
-                block reports ``ok: False`` with an
-                ``"simulate_edge_removal not yet available"`` error rather
-                than crashing.
+            include_per_edge_counterfactual: opt-in per-edge counterfactual
+                block, computed with ``simulate_edge_removal``.
 
         Returns:
             Dict with one block per included step plus ``primary_key``,
@@ -18977,6 +19530,7 @@ class GDSNavigator:
             to ``{ok, error}``, and ``elapsed_ms``.
         """
         import time as _time
+
         t0 = _time.perf_counter()
 
         steps_status: dict[str, dict[str, Any]] = {}
@@ -18988,7 +19542,7 @@ class GDSNavigator:
 
         import dataclasses as _dc
 
-        def _safe(name: str, fn):
+        def _safe(name: str, fn: Callable[[], Any]) -> Any:
             try:
                 data = fn()
                 # Unwrap dataclass instances → dict so downstream JSON
@@ -18999,31 +19553,41 @@ class GDSNavigator:
                     data = _dc.asdict(data)
                 steps_status[name] = {"ok": True, "error": None}
                 return data
-            except (GDSNavigationError, ValueError, KeyError, AttributeError,
-                    NotImplementedError) as exc:
+            except (
+                GDSError,
+                ValueError,
+                KeyError,
+                AttributeError,
+                NotImplementedError,
+                TypeError,
+            ) as exc:
                 steps_status[name] = {
-                    "ok": False, "error": f"{type(exc).__name__}: {exc}",
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
                 }
                 return None
 
         if include_polygon:
+
             def _polygon_lookup() -> dict[str, Any]:
                 version = self._resolve_version(pattern_id)
                 tbl = self._storage.read_geometry(
-                    pattern_id, version,
+                    pattern_id,
+                    version,
                     primary_key=primary_key,
-                    columns=["primary_key", "delta_norm", "is_anomaly",
-                             "delta_rank_pct"],
+                    columns=["primary_key", "delta_norm", "is_anomaly", "delta_rank_pct"],
                 )
                 if tbl.num_rows == 0:
                     raise KeyError(
                         f"entity {primary_key!r} not found in {pattern_id!r}",
                     )
+                rank = tbl["delta_rank_pct"][0].as_py()
                 return {
                     "delta_norm": float(tbl["delta_norm"][0].as_py()),
                     "is_anomaly": bool(tbl["is_anomaly"][0].as_py()),
-                    "delta_rank_pct": float(tbl["delta_rank_pct"][0].as_py()),
+                    "delta_rank_pct": float(rank) if rank is not None else None,
                 }
+
             out["polygon"] = _safe("polygon", _polygon_lookup)
 
         # Reliability flags — independent step (not gated on include_explain
@@ -19034,22 +19598,28 @@ class GDSNavigator:
         # build cost matters and the polygon block (which carries the
         # already-cheap delta_norm/is_anomaly summary) is enough.
         if include_reliability_flags:
+
             def _reliability_flags_lookup() -> dict[str, Any]:
                 from hypertopos.engine.geometry import compute_reliability_flags
+
                 sphere = self._storage.read_sphere()
                 pat = sphere.patterns.get(pattern_id)
                 if pat is None:
                     raise KeyError(f"pattern {pattern_id!r} not in sphere")
                 poly = self._engine.build_polygon(
-                    primary_key, pattern_id, self._manifest,
+                    primary_key,
+                    pattern_id,
+                    self._manifest,
                 )
                 return compute_reliability_flags(
                     poly.delta,
                     pattern=pat,
                     anomaly_confidence=poly.anomaly_confidence,
                 )
+
             out["reliability_flags"] = _safe(
-                "reliability_flags", _reliability_flags_lookup,
+                "reliability_flags",
+                _reliability_flags_lookup,
             )
 
         if include_explain:
@@ -19062,7 +19632,9 @@ class GDSNavigator:
             out["witness_cohort"] = _safe(
                 "witness_cohort",
                 lambda: self.find_witness_cohort(
-                    primary_key, pattern_id, top_n=top_n_witnesses,
+                    primary_key,
+                    pattern_id,
+                    top_n=top_n_witnesses,
                 ),
             )
 
@@ -19078,7 +19650,9 @@ class GDSNavigator:
                 out["chains"] = _safe(
                     "chains",
                     lambda: self.find_chains_for_entity(
-                        primary_key, chain_pattern_id, top_n=top_n_chains,
+                        primary_key,
+                        chain_pattern_id,
+                        top_n=top_n_chains,
                     ).get("chains", []),
                 )
 
@@ -19093,7 +19667,8 @@ class GDSNavigator:
                 "graph_geometry_tension",
                 lambda: self.find_graph_geometry_tension(
                     primary_key,
-                    pattern_id=pattern_id, line_id=line_id,
+                    pattern_id=pattern_id,
+                    line_id=line_id,
                 ),
             )
 
@@ -19101,7 +19676,9 @@ class GDSNavigator:
             out["per_edge_counterfactual"] = _safe(
                 "per_edge_counterfactual",
                 lambda: self.simulate_edge_removal(
-                    primary_key, pattern_id=pattern_id, line_id=line_id,
+                    primary_key,
+                    pattern_id=pattern_id,
+                    line_id=line_id,
                     top_n=top_n_edges,
                 )["edges"],
             )
@@ -19109,6 +19686,156 @@ class GDSNavigator:
         out["steps_status"] = steps_status
         out["elapsed_ms"] = (_time.perf_counter() - t0) * 1000.0
         return out
+
+    def compare_branches(
+        self,
+        pattern_id: str,
+        branch: str,
+        other: str | None = None,
+        top_n: int = 20,
+    ) -> BranchDiffReport:
+        """Compare one pattern between ``branch`` and main (or branch ``other``).
+
+        Each side is read at its current state: the entity scores
+        (``delta_norm``, ``is_anomaly``, ``delta_rank_pct``) joined on
+        ``primary_key``, and the two current calibration fits.
+        """
+        from hypertopos.storage import _lance_branches
+        from hypertopos.storage.reader import GDSReader
+
+        base = self._storage._base
+
+        # Both refs are checked before any geometry is read.
+        recipes = {
+            ref: _lance_branches.verify_branch(base, ref)["recipes"]
+            for ref in (other, branch)
+            if ref is not None
+        }
+
+        def side(
+            ref: str | None,
+        ) -> tuple[pa.Table, CalibrationFit, float, list[dict[str, Any]]]:
+            recipe = recipes.get(ref, []) if ref is not None else []
+            reader = GDSReader(str(base), branch=ref)
+            reader.take_snapshot()
+            sphere = reader.read_sphere()
+            if pattern_id not in sphere.patterns:
+                raise GDSError(f"unknown pattern '{pattern_id}' on {ref or 'main'}")
+            table = reader.read_geometry(
+                pattern_id,
+                sphere.patterns[pattern_id].version,
+                columns=["primary_key", "delta_norm", "delta_rank_pct"],
+            )
+            if "delta_rank_pct" not in table.column_names:
+                table = table.append_column(
+                    "delta_rank_pct", pa.nulls(table.num_rows, type=pa.float32())
+                )
+            # One row per key (an interrupted incremental update can leave
+            # duplicates): keep the highest delta_norm, as anomaly scans do.
+            # The sort only runs when there are duplicates.
+            if pa.compute.count_distinct(table["primary_key"]).as_py() < table.num_rows:
+                order = pa.compute.sort_indices(
+                    table, sort_keys=[("primary_key", "ascending"), ("delta_norm", "descending")]
+                )
+                table = table.take(order)
+                keys = table["primary_key"].to_numpy(zero_copy_only=False)
+                first = np.ones(len(keys), dtype=bool)
+                first[1:] = keys[1:] != keys[:-1]
+                table = table.filter(pa.array(first))
+            # Anomalous = delta_norm at or above the global threshold, the rule
+            # anomaly_summary and find_anomalies count by (the stored
+            # is_anomaly column may use per-group thresholds).
+            theta_norm = float(np.linalg.norm(sphere.patterns[pattern_id].theta))
+            dn = table["delta_norm"].to_numpy(zero_copy_only=False)
+            table = table.append_column(
+                "is_anomaly", pa.array((theta_norm > 0.0) & (dn >= theta_norm))
+            )
+            return table, reader.read_calibration_fit(pattern_id), theta_norm, recipe
+
+        t_from, fit_from, theta_from, _ = side(other)
+        t_to, fit_to, theta_to, recipe = side(branch)
+
+        # Key order: the stable sorts below break equal changes by key, not by
+        # the join's (call-dependent) row order.
+        joined = t_from.join(
+            t_to, "primary_key", join_type="inner", left_suffix="_from", right_suffix="_to"
+        ).sort_by("primary_key")
+        an_from = np.asarray(joined["is_anomaly_from"].to_numpy(zero_copy_only=False), dtype=bool)
+        an_to = np.asarray(joined["is_anomaly_to"].to_numpy(zero_copy_only=False), dtype=bool)
+        anomalies_from = int(pa.compute.sum(t_from["is_anomaly"]).as_py() or 0)
+        anomalies_to = int(pa.compute.sum(t_to["is_anomaly"]).as_py() or 0)
+        both = int(np.count_nonzero(an_from & an_to))
+        union = anomalies_from + anomalies_to - both
+        dn_from = joined["delta_norm_from"].to_numpy(zero_copy_only=False).astype(np.float64)
+        dn_to = joined["delta_norm_to"].to_numpy(zero_copy_only=False).astype(np.float64)
+        rel_change = np.abs(dn_to - dn_from) / np.maximum(np.abs(dn_from), 1e-12)
+
+        # Why an entity flipped: the threshold moved past its old score, its
+        # score moved past the old threshold, or only both moves together.
+        old_side = dn_from >= theta_from
+        by_threshold = (dn_from >= theta_to) != old_side
+        by_score = (dn_to >= theta_from) != old_side
+        causes = np.where(
+            by_threshold & ~by_score,
+            "threshold",
+            np.where(by_score & ~by_threshold, "score", "both"),
+        )
+
+        def rows(index: np.ndarray, with_cause: bool = False) -> list[dict[str, Any]]:
+            picked = joined.take(pa.array(index, type=pa.int64())).to_pylist()
+            return [
+                {
+                    **({"cause": str(causes[i])} if with_cause else {}),
+                    "primary_key": row["primary_key"],
+                    "delta_norm_from": row["delta_norm_from"],
+                    "delta_norm_to": row["delta_norm_to"],
+                    "relative_change": float(rel_change[i]),
+                    "is_anomaly_from": row["is_anomaly_from"],
+                    "is_anomaly_to": row["is_anomaly_to"],
+                    "rank_pct_from": row["delta_rank_pct_from"],
+                    "rank_pct_to": row["delta_rank_pct_to"],
+                }
+                for i, row in zip(index.tolist(), picked, strict=True)
+            ]
+
+        def most_past_threshold(mask: np.ndarray, margin: np.ndarray) -> np.ndarray:
+            idx = np.flatnonzero(mask)
+            return idx[np.argsort(-margin[idx], kind="stable")][:top_n]
+
+        top_movers = rows(np.argsort(-rel_change, kind="stable")[:top_n])
+        flipped_in_top = rows(
+            most_past_threshold(~an_from & an_to, dn_to / max(theta_to, 1e-12)), with_cause=True
+        )
+        flipped_out_top = rows(
+            most_past_threshold(an_from & ~an_to, dn_from / max(theta_from, 1e-12)),
+            with_cause=True,
+        )
+        drift = (
+            _compute_calibration_drift(fit_from, fit_to, top_n=top_n, verbose=False)
+            if fit_from.schema_hash == fit_to.schema_hash
+            else None
+        )
+        return BranchDiffReport(
+            pattern_id=pattern_id,
+            from_ref=other or "main",
+            to_ref=branch,
+            n_from=t_from.num_rows,
+            n_to=t_to.num_rows,
+            theta_from=theta_from,
+            theta_to=theta_to,
+            anomalies_from=anomalies_from,
+            anomalies_to=anomalies_to,
+            flipped_in=int(np.count_nonzero(~an_from & an_to)),
+            flipped_out=int(np.count_nonzero(an_from & ~an_to)),
+            jaccard=1.0 if union == 0 else both / union,
+            top_movers=top_movers,
+            flipped_in_top=flipped_in_top,
+            flipped_out_top=flipped_out_top,
+            only_in_from=t_from.num_rows - joined.num_rows,
+            only_in_to=t_to.num_rows - joined.num_rows,
+            calibration_drift=drift,
+            recipe=recipe,
+        )
 
     def compare_calibrations(
         self,
@@ -19145,14 +19872,10 @@ class GDSNavigator:
                 )
             v_to = versions[-1]
         elif v_from is None:
-            raise ValueError(
-                "compare_calibrations: v_from cannot be None when v_to is explicit"
-            )
+            raise ValueError("compare_calibrations: v_from cannot be None when v_to is explicit")
 
         if v_from == v_to:
-            raise ValueError(
-                f"compare_calibrations: v_from and v_to must differ (both={v_from})"
-            )
+            raise ValueError(f"compare_calibrations: v_from and v_to must differ (both={v_from})")
 
         fit_from = reader.read_calibration_fit(pattern_id, version=v_from)
         fit_to = reader.read_calibration_fit(pattern_id, version=v_to)
@@ -19171,7 +19894,7 @@ class GDSNavigator:
         self,
         pattern_id: str,
         version: int | None = None,
-    ) -> "ThetaSensitivityReport":
+    ) -> ThetaSensitivityReport:
         """Calibration-quality diagnostic surfacing `theta_sensitivity` for one
         pattern epoch.
 
@@ -19202,8 +19925,7 @@ class GDSNavigator:
             versions = reader.list_calibration_versions(pattern_id)
             if not versions:
                 raise ValueError(
-                    f"theta_sensitivity: no calibration epochs on disk for "
-                    f"pattern={pattern_id!r}"
+                    f"theta_sensitivity: no calibration epochs on disk for pattern={pattern_id!r}"
                 )
             version = versions[-1]
 
@@ -19216,7 +19938,7 @@ class GDSNavigator:
                 f"populate the field."
             )
 
-        derived = derive_stable_band_and_cliffs(fit.theta_sensitivity)
+        derived: dict[str, Any] = derive_stable_band_and_cliffs(fit.theta_sensitivity)
         return ThetaSensitivityReport(
             pattern_id=fit.pattern_id,
             calibration_epoch=fit.calibration_epoch,
@@ -19285,19 +20007,13 @@ class GDSNavigator:
             v_to = versions[-1]
         elif v_to is None:
             if not versions:
-                raise ValueError(
-                    f"decompose_drift: no epochs on disk for pattern={pattern_id!r}"
-                )
+                raise ValueError(f"decompose_drift: no epochs on disk for pattern={pattern_id!r}")
             v_to = versions[-1]
         elif v_from is None:
-            raise ValueError(
-                "decompose_drift: v_from cannot be None when v_to is explicit"
-            )
+            raise ValueError("decompose_drift: v_from cannot be None when v_to is explicit")
 
         if v_from == v_to:
-            raise ValueError(
-                f"decompose_drift: v_from and v_to must differ (both={v_from})"
-            )
+            raise ValueError(f"decompose_drift: v_from and v_to must differ (both={v_from})")
 
         fit_v1 = reader.read_calibration_fit(pattern_id, version=v_from)
         fit_v2 = reader.read_calibration_fit(pattern_id, version=v_to)
@@ -19311,7 +20027,9 @@ class GDSNavigator:
             )
 
         table = reader.read_temporal(
-            pattern_id, entity_key, agent_id=self._manifest.agent_id,
+            pattern_id,
+            entity_key,
+            agent_id=self._manifest.agent_id,
         )
         if table.num_rows == 0:
             raise ValueError(
@@ -19321,7 +20039,7 @@ class GDSNavigator:
 
         timestamps = table["timestamp"].to_pylist()
         shapes = table["shape_snapshot"].to_pylist()
-        rows = sorted(zip(timestamps, shapes), key=lambda r: r[0])
+        rows = sorted(zip(timestamps, shapes, strict=True), key=lambda r: r[0])
 
         if timestamp_from is not None:
             rows = [r for r in rows if r[0] >= timestamp_from]
@@ -19341,12 +20059,17 @@ class GDSNavigator:
         shape_b = np.asarray(shape_b_list, dtype=np.float32)
 
         return _compute_intrinsic_extrinsic_decomposition(
-            shape_a=shape_a, shape_b=shape_b,
-            fit_v1=fit_v1, fit_v2=fit_v2,
-            entity_key=entity_key, pattern_id=pattern_id,
-            timestamp_from=ts_a, timestamp_to=ts_b,
+            shape_a=shape_a,
+            shape_b=shape_b,
+            fit_v1=fit_v1,
+            fit_v2=fit_v2,
+            entity_key=entity_key,
+            pattern_id=pattern_id,
+            timestamp_from=ts_a,
+            timestamp_to=ts_b,
             dim_labels=pattern.dim_labels,
-            top_n=top_n, verbose=verbose,
+            top_n=top_n,
+            verbose=verbose,
         )
 
     def find_calibration_influencers(
@@ -19360,7 +20083,7 @@ class GDSNavigator:
         *,
         auto_discover: bool = False,
         auto_k: int = 10,
-    ):
+    ) -> InfluenceReport:
         """M4: find entities with high influence on coordinate system calibration.
 
         Default mode scans every entity in the pattern with leave-one-out and
@@ -19404,14 +20127,10 @@ class GDSNavigator:
                 f"in (0, 100); got {high_threshold_pct}"
             )
         if top_n < 1 or top_n > 50:
-            raise ValueError(
-                f"find_calibration_influencers: top_n must be in [1, 50]; "
-                f"got {top_n}"
-            )
+            raise ValueError(f"find_calibration_influencers: top_n must be in [1, 50]; got {top_n}")
         if auto_discover and (auto_k < 1 or auto_k > 50):
             raise ValueError(
-                f"find_calibration_influencers: auto_k must be in [1, 50]; "
-                f"got {auto_k}"
+                f"find_calibration_influencers: auto_k must be in [1, 50]; got {auto_k}"
             )
 
         sphere = self._storage.read_sphere()
@@ -19425,7 +20144,8 @@ class GDSNavigator:
 
         version = self._manifest.pattern_versions[pattern_id]
         geo_table = self._storage.read_geometry(
-            pattern_id, version,
+            pattern_id,
+            version,
             columns=["primary_key", "delta"],
             sample_size=sample_size,
         )
@@ -19442,10 +20162,9 @@ class GDSNavigator:
         deltas = delta_matrix_from_arrow(geo_table).astype(np.float64)
         pk_col = geo_table["primary_key"].to_pylist()
 
-        sigma_diag = np.asarray(pattern.sigma_diag, dtype=np.float64)
-        mu = np.asarray(pattern.mu, dtype=np.float64)
-        sigma_floor = np.maximum(sigma_diag, 1e-2)
-        shapes = deltas * sigma_floor + mu
+        from hypertopos.engine.geometry import shapes_from_deltas
+
+        shapes = shapes_from_deltas(deltas, pattern)
         N, D = shapes.shape
 
         mu_full = shapes.mean(axis=0)
@@ -19454,10 +20173,15 @@ class GDSNavigator:
         theta_norm = float(pattern.theta_norm)
 
         mu_imp, sigma_imp, total_imp, contrib = _compute_leave_one_out_impact(
-            shapes, mu_full, sigma_full,
+            shapes,
+            mu_full,
+            sigma_full,
         )
         classes = _classify_influence(
-            total_imp, delta_norm, theta_norm, high_threshold_pct=high_threshold_pct,
+            total_imp,
+            delta_norm,
+            theta_norm,
+            high_threshold_pct=high_threshold_pct,
         )
         impact_threshold = float(np.percentile(total_imp, high_threshold_pct))
 
@@ -19494,9 +20218,7 @@ class GDSNavigator:
                 cluster_centroid_distance_by_idx[rep_global] = float(dists[rep_local])
             candidates = representatives
             if classify != "all":
-                candidates = [
-                    i for i in candidates if classes[i] == classify
-                ]
+                candidates = [i for i in candidates if classes[i] == classify]
             candidates.sort(key=lambda i: total_imp[i], reverse=True)
             top_candidates = candidates[:top_n]
         else:
@@ -19508,7 +20230,7 @@ class GDSNavigator:
             top_candidates = candidates[:top_n]
 
         sum_s = shapes.sum(axis=0)
-        sum_s_sq = (shapes ** 2).sum(axis=0)
+        sum_s_sq = (shapes**2).sum(axis=0)
         sigma_full_safe = np.maximum(sigma_full, 1e-12)
         if verbose:
             is_anom_full = delta_norm >= theta_norm
@@ -19521,7 +20243,7 @@ class GDSNavigator:
             contrib_i = contrib[i]
             ranked_dim_idx = np.argsort(-np.abs(contrib_i))[: min(5, D)]
             mu_without_i = (sum_s - shapes[i]) / (N - 1)
-            var_without_i = (sum_s_sq - shapes[i] ** 2) / (N - 1) - mu_without_i ** 2
+            var_without_i = (sum_s_sq - shapes[i] ** 2) / (N - 1) - mu_without_i**2
             var_without_i = np.maximum(var_without_i, 0.0)
             sigma_without_i = np.sqrt(var_without_i)
             mu_shift_i = (mu_full - mu_without_i) / sigma_full_safe
@@ -19530,13 +20252,11 @@ class GDSNavigator:
             top_contribs = [
                 DimensionContribution(
                     dim_index=int(d),
-                    dim_kind=(
-                        kinds_v[d]
-                        if kinds_v is not None and d < len(kinds_v) else None
-                    ),
+                    dim_kind=(kinds_v[d] if kinds_v is not None and d < len(kinds_v) else None),
                     dim_label=(
                         dim_labels_v[d]
-                        if dim_labels_v is not None and d < len(dim_labels_v) else None
+                        if dim_labels_v is not None and d < len(dim_labels_v)
+                        else None
                     ),
                     mu_shift=float(mu_shift_i[d]),
                     sigma_shift=float(sigma_shift_i[d]),
@@ -19557,18 +20277,20 @@ class GDSNavigator:
                     theta_norm=theta_norm,
                 )
 
-            entries.append(InfluenceEntry(
-                entity_key=pk_col[i],
-                mu_impact=float(mu_imp[i]),
-                sigma_impact=float(sigma_imp[i]),
-                total_impact=float(total_imp[i]),
-                delta_norm=float(delta_norm[i]),
-                classification=classes[i],
-                top_dim_contributions=top_contribs,
-                cascading_flip_count=cascading,
-                cluster_size=cluster_size_by_idx.get(i),
-                cluster_centroid_distance=cluster_centroid_distance_by_idx.get(i),
-            ))
+            entries.append(
+                InfluenceEntry(
+                    entity_key=pk_col[i],
+                    mu_impact=float(mu_imp[i]),
+                    sigma_impact=float(sigma_imp[i]),
+                    total_impact=float(total_imp[i]),
+                    delta_norm=float(delta_norm[i]),
+                    classification=classes[i],
+                    top_dim_contributions=top_contribs,
+                    cascading_flip_count=cascading,
+                    cluster_size=cluster_size_by_idx.get(i),
+                    cluster_centroid_distance=cluster_centroid_distance_by_idx.get(i),
+                )
+            )
 
         # Write-through cache: upsert each surfaced entity's (epoch,
         # mu_impact, delta_norm) into its per-influencer history file so
@@ -19579,7 +20301,7 @@ class GDSNavigator:
             calibrated_at_iso = fit.last_calibrated_at.isoformat()
             for entry in entries:
                 upsert_influencer_history_entry(
-                    self._storage._base,
+                    self._storage.meta_root,
                     pattern_id,
                     entry.entity_key,
                     epoch=int(version),
@@ -19615,7 +20337,7 @@ class GDSNavigator:
         primary_key: str,
         *,
         pattern_id: str,
-    ):
+    ) -> InfluencerHistoryReport:
         """Return chronological per-epoch μ-impact for a known influencer.
 
         Reads ``_gds_meta/calibration_history/<pattern_id>/influencer_<pk>.json``,
@@ -19641,7 +20363,9 @@ class GDSNavigator:
             )
 
         records = read_influencer_history(
-            self._storage._base, pattern_id, primary_key,
+            self._storage.meta_root,
+            pattern_id,
+            primary_key,
         )
         entries = [
             InfluencerHistoryEntry(
@@ -19675,7 +20399,7 @@ class GDSNavigator:
         self,
         pattern_id: str,
         groups: list[list[str]],
-    ):
+    ) -> list[GroupInfluenceReport]:
         """Caller-supplied per-group leave-set-out impact +
         reinforcing/canceling factor."""
         from hypertopos.engine.geometry import (
@@ -19689,9 +20413,7 @@ class GDSNavigator:
         from hypertopos.utils.arrow import delta_matrix_from_arrow
 
         if len(groups) == 0:
-            raise ValueError(
-                "find_group_influence: groups list must be non-empty"
-            )
+            raise ValueError("find_group_influence: groups list must be non-empty")
 
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns[pattern_id]
@@ -19715,16 +20437,17 @@ class GDSNavigator:
         deltas = delta_matrix_from_arrow(geo_table).astype(np.float64)
         pk_col = geo_table["primary_key"].to_pylist()
         pk_to_idx = {pk: i for i, pk in enumerate(pk_col)}
-        sigma_diag = np.asarray(pattern.sigma_diag, dtype=np.float64)
-        mu = np.asarray(pattern.mu, dtype=np.float64)
-        sigma_floor = np.maximum(sigma_diag, 1e-2)
-        shapes = deltas * sigma_floor + mu
+        from hypertopos.engine.geometry import shapes_from_deltas
+
+        shapes = shapes_from_deltas(deltas, pattern)
 
         mu_full = shapes.mean(axis=0)
         sigma_full = shapes.std(axis=0, ddof=0)
 
         _, _, total_imp_per_entity, _ = _compute_leave_one_out_impact(
-            shapes, mu_full, sigma_full,
+            shapes,
+            mu_full,
+            sigma_full,
         )
 
         sigma_full_safe = np.maximum(sigma_full, 1e-12)
@@ -19760,13 +20483,11 @@ class GDSNavigator:
                 members_idx_list.append(pk_to_idx[key])
             members_idx = np.asarray(members_idx_list, dtype=np.int64)
 
-            mu_imp_set, sigma_imp_set, total_imp_set, contributions = (
-                _compute_leave_set_out_impact(
-                    shapes=shapes,
-                    members_idx=members_idx,
-                    mu_full=mu_full,
-                    sigma_full=sigma_full,
-                )
+            mu_imp_set, sigma_imp_set, total_imp_set, contributions = _compute_leave_set_out_impact(
+                shapes=shapes,
+                members_idx=members_idx,
+                mu_full=mu_full,
+                sigma_full=sigma_full,
             )
 
             sum_individual = float(total_imp_per_entity[members_idx].sum())
@@ -19782,12 +20503,9 @@ class GDSNavigator:
             ranked_dim_idx = np.argsort(-np.abs(contributions))[: min(5, D)]
             set_shapes = shapes[members_idx]
             set_sum = set_shapes.sum(axis=0)
-            set_sum_sq = (set_shapes ** 2).sum(axis=0)
+            set_sum_sq = (set_shapes**2).sum(axis=0)
             mu_without_set = (shapes.sum(axis=0) - set_sum) / (N - k)
-            var_without_set = (
-                ((shapes ** 2).sum(axis=0) - set_sum_sq) / (N - k)
-                - mu_without_set ** 2
-            )
+            var_without_set = ((shapes**2).sum(axis=0) - set_sum_sq) / (N - k) - mu_without_set**2
             var_without_set = np.maximum(var_without_set, 0.0)
             sigma_without_set = np.sqrt(var_without_set)
             mu_shift = (mu_full - mu_without_set) / sigma_full_safe
@@ -19796,13 +20514,11 @@ class GDSNavigator:
             top_contribs = [
                 DimensionContribution(
                     dim_index=int(d),
-                    dim_kind=(
-                        kinds_v[d]
-                        if kinds_v is not None and d < len(kinds_v) else None
-                    ),
+                    dim_kind=(kinds_v[d] if kinds_v is not None and d < len(kinds_v) else None),
                     dim_label=(
                         dim_labels_v[d]
-                        if dim_labels_v is not None and d < len(dim_labels_v) else None
+                        if dim_labels_v is not None and d < len(dim_labels_v)
+                        else None
                     ),
                     mu_shift=float(mu_shift[d]),
                     sigma_shift=float(sigma_shift[d]),
@@ -19811,19 +20527,21 @@ class GDSNavigator:
                 for d in ranked_dim_idx
             ]
 
-            reports.append(GroupInfluenceReport(
-                pattern_id=pattern_id,
-                pattern_version=version,
-                group_index=g_idx,
-                member_count=k,
-                members=list(group),
-                mu_impact_set=mu_imp_set,
-                sigma_impact_set=sigma_imp_set,
-                total_impact_set=total_imp_set,
-                sum_individual_impacts=sum_individual,
-                reinforcing_factor=reinforcing,
-                top_dim_contributions=top_contribs,
-            ))
+            reports.append(
+                GroupInfluenceReport(
+                    pattern_id=pattern_id,
+                    pattern_version=version,
+                    group_index=g_idx,
+                    member_count=k,
+                    members=list(group),
+                    mu_impact_set=mu_imp_set,
+                    sigma_impact_set=sigma_imp_set,
+                    total_impact_set=total_imp_set,
+                    sum_individual_impacts=sum_individual,
+                    reinforcing_factor=reinforcing,
+                    top_dim_contributions=top_contribs,
+                )
+            )
 
         return reports
 
@@ -19841,7 +20559,7 @@ class GDSNavigator:
         fdr_method: str = "storey",
         verbose: bool = False,
         entity_key: str | None = None,
-    ):
+    ) -> LeadLagReport:
         """M5: cross-pattern temporal lead-lag in population-relative coordinates.
 
         Both patterns must be ``pattern_type='anchor'``. Time alignment uses
@@ -19865,9 +20583,7 @@ class GDSNavigator:
 
         # ── 1. Validation ─────────────────────────────────────────────
         if cohort not in ("fixed", "all"):
-            raise ValueError(
-                f"find_lead_lag: cohort must be 'fixed' or 'all'; got {cohort!r}"
-            )
+            raise ValueError(f"find_lead_lag: cohort must be 'fixed' or 'all'; got {cohort!r}")
         if fdr_method not in ("bh", "storey"):
             raise ValueError(
                 f"find_lead_lag: fdr_method must be 'bh' or 'storey'; got {fdr_method!r}"
@@ -19877,13 +20593,9 @@ class GDSNavigator:
                 f"find_lead_lag: pattern_a and pattern_b must differ (both={pattern_a!r})"
             )
         if min_epochs < 4:
-            raise ValueError(
-                f"find_lead_lag: min_epochs must be >= 4; got {min_epochs}"
-            )
+            raise ValueError(f"find_lead_lag: min_epochs must be >= 4; got {min_epochs}")
         if not 0.0 < fdr_alpha < 1.0:
-            raise ValueError(
-                f"find_lead_lag: fdr_alpha must be in (0, 1); got {fdr_alpha}"
-            )
+            raise ValueError(f"find_lead_lag: fdr_alpha must be in (0, 1); got {fdr_alpha}")
 
         sphere = self._storage.read_sphere()
         if pattern_a not in sphere.patterns:
@@ -19902,7 +20614,6 @@ class GDSNavigator:
                 f"find_lead_lag requires anchor patterns; got pattern_type="
                 f"{pat_b.pattern_type!r} for {pattern_b!r}"
             )
-
         # ── 2. Preflight cohort-size budget via geometry count ────────
         # Geometry has one row per entity for anchor patterns (Lance
         # count_rows is metadata-only, no scan). Lets us reject huge
@@ -19912,15 +20623,12 @@ class GDSNavigator:
         _budget_bytes = 1_000_000_000  # 1 GB total across both tensors
         if entity_key is None:
             try:
-                ver_a = self._manifest.pattern_versions[pattern_a]
-                ver_b = self._manifest.pattern_versions[pattern_b]
+                self._manifest.pattern_versions[pattern_a]
+                self._manifest.pattern_versions[pattern_b]
                 n_ent_a = self._storage.count_geometry_rows(pattern_a)
                 n_ent_b = self._storage.count_geometry_rows(pattern_b)
                 # cohort='all' upper bound = union; cohort='fixed' ≤ min.
-                cohort_upper = (
-                    n_ent_a + n_ent_b if cohort == "all"
-                    else min(n_ent_a, n_ent_b)
-                )
+                cohort_upper = n_ent_a + n_ent_b if cohort == "all" else min(n_ent_a, n_ent_b)
                 # Use min_epochs as a conservative N (real N may be larger;
                 # if it isn't, the call would fail elsewhere on min_epochs).
                 bound_bytes = 4 * min_epochs * cohort_upper * (D_a_pre + D_b_pre)
@@ -19931,12 +20639,15 @@ class GDSNavigator:
                         f"(pattern_a entities={n_ent_a}, pattern_b entities="
                         f"{n_ent_b}, D_a={D_a_pre}, D_b={D_b_pre}, "
                         f"min_epochs={min_epochs}); budget is "
-                        f"{_budget_bytes / 1e9:.1f} GB. Patterns are likely "
-                        f"over disjoint entity_lines — cross-pattern lead-lag "
-                        f"requires shared entity space. Try cohort='fixed' "
-                        f"(panel-clean intersection), rebuild the sphere with "
-                        f"both patterns over the same entity_line, or pass "
-                        f"entity_key=<id> for per-entity drill-down."
+                        f"{_budget_bytes / 1e9:.1f} GB. The patterns may track "
+                        f"different entities (lead-lag needs a shared entity "
+                        f"space). "
+                        + (
+                            "Try cohort='fixed' (panel-clean intersection), "
+                            if cohort == "all"
+                            else ""
+                        )
+                        + "narrow the time window, or drill down on one entity."
                     )
             except (KeyError, OSError, FileNotFoundError):
                 # Geometry not available — fall through to temporal scan.
@@ -19948,13 +20659,15 @@ class GDSNavigator:
         keys_filter = [entity_key] if entity_key is not None else None
 
         def _read_meta_table(pid: str) -> pa.Table:
-            batches = list(self._storage.read_temporal_batched(
-                pid,
-                timestamp_from=timestamp_from,
-                timestamp_to=timestamp_to,
-                keys=keys_filter,
-                columns=["primary_key", "timestamp"],
-            ))
+            batches = list(
+                self._storage.read_temporal_batched(
+                    pid,
+                    timestamp_from=timestamp_from,
+                    timestamp_to=timestamp_to,
+                    keys=keys_filter,
+                    columns=["primary_key", "timestamp"],
+                )
+            )
             if not batches:
                 return pa.table({})
             return pa.Table.from_batches(batches)
@@ -20030,41 +20743,32 @@ class GDSNavigator:
             # |T_common| (pk, t) rows after the T_common filter (and at least
             # one if rows are duplicated, which builder writes never produce).
             n_common = len(T_common)
-            counts_a = ta_meta.group_by("primary_key").aggregate(
-                [("timestamp", "count")]
-            )
-            counts_b = tb_meta.group_by("primary_key").aggregate(
-                [("timestamp", "count")]
-            )
+            counts_a = ta_meta.group_by("primary_key").aggregate([("timestamp", "count")])
+            counts_b = tb_meta.group_by("primary_key").aggregate([("timestamp", "count")])
             full_in_a = set(
-                counts_a.filter(
-                    pc.equal(counts_a["timestamp_count"], n_common)
-                )["primary_key"].to_pylist()
+                counts_a.filter(pc.equal(counts_a["timestamp_count"], n_common))[
+                    "primary_key"
+                ].to_pylist()
             )
             full_in_b = set(
-                counts_b.filter(
-                    pc.equal(counts_b["timestamp_count"], n_common)
-                )["primary_key"].to_pylist()
+                counts_b.filter(pc.equal(counts_b["timestamp_count"], n_common))[
+                    "primary_key"
+                ].to_pylist()
             )
             cohort_E_set = full_in_a & full_in_b
             if not cohort_E_set:
                 raise ValueError(
                     "find_lead_lag: cohort='fixed' produced empty cohort "
                     "(no entities present at every epoch in both patterns). "
-                    "If both patterns track different entity populations "
-                    "(e.g. accounts vs account_pairs), cross-pattern lead-lag "
-                    "is not applicable — there are no shared entities. "
-                    "Otherwise try cohort='all', entity_key=<id> for per-entity "
-                    "drill-down, or shorten the time window."
+                    "If the patterns track different entities, lead-lag does "
+                    "not apply; otherwise try cohort='all', drill down on one "
+                    "entity, or shorten the time window."
                 )
             cohort_E = sorted(cohort_E_set)
-            cohort_dropped = (
-                (counts_a.num_rows + counts_b.num_rows) // 2 - len(cohort_E)
-            )
+            cohort_dropped = (counts_a.num_rows + counts_b.num_rows) // 2 - len(cohort_E)
         else:
             cohort_E = sorted(
-                set(ta_meta["primary_key"].to_pylist())
-                | set(tb_meta["primary_key"].to_pylist())
+                set(ta_meta["primary_key"].to_pylist()) | set(tb_meta["primary_key"].to_pylist())
             )
             cohort_dropped = None
 
@@ -20084,12 +20788,10 @@ class GDSNavigator:
                 f"find_lead_lag: cohort would build "
                 f"{_tensor_bytes / 1e9:.2f} GB of shape tensors "
                 f"(cohort={len(cohort_E)}, N={N}, D_a={D_a}, D_b={D_b}); "
-                f"budget is {_budget_bytes / 1e9:.1f} GB. Patterns are "
-                f"likely over disjoint entity_lines — cross-pattern "
-                f"lead-lag requires shared entity space. Try cohort='fixed' "
-                f"(panel-clean intersection) or rebuild the sphere with "
-                f"both patterns over the same entity_line. For per-entity "
-                f"drill-down, pass entity_key=<id>."
+                f"budget is {_budget_bytes / 1e9:.1f} GB. The patterns may track "
+                f"different entities (lead-lag needs a shared entity space). "
+                + ("Try cohort='fixed' (panel-clean intersection), " if cohort == "all" else "")
+                + "narrow the time window, or drill down on one entity."
             )
 
         # ── 6. Phase 2 scan — full read, filter in memory ────────────
@@ -20099,17 +20801,18 @@ class GDSNavigator:
         # we DO push down — that's the fast point lookup path.
         cohort_pa_arr = pa.array(cohort_E)
         push_keys = (
-            [entity_key] if entity_key is not None
-            else (cohort_E if len(cohort_E) <= 64 else None)
+            [entity_key] if entity_key is not None else (cohort_E if len(cohort_E) <= 64 else None)
         )
 
         def _read_full_table(pid: str, keys: list[str] | None) -> pa.Table:
-            batches = list(self._storage.read_temporal_batched(
-                pid,
-                timestamp_from=timestamp_from,
-                timestamp_to=timestamp_to,
-                keys=keys,
-            ))
+            batches = list(
+                self._storage.read_temporal_batched(
+                    pid,
+                    timestamp_from=timestamp_from,
+                    timestamp_to=timestamp_to,
+                    keys=keys,
+                )
+            )
             if not batches:
                 return pa.table({})
             return pa.Table.from_batches(batches)
@@ -20154,17 +20857,28 @@ class GDSNavigator:
             if not pc.any(keep_mask).as_py():
                 return tens
             kept_table = table.filter(keep_mask)
-            kept_pk_idx = pc.index_in(
-                kept_table["primary_key"], value_set=cohort_pa_arr,
-            ).to_numpy(zero_copy_only=False).astype(np.int64)
-            kept_ts_idx = pc.index_in(
-                kept_table["timestamp"], value_set=T_common_pa_arr,
-            ).to_numpy(zero_copy_only=False).astype(np.int64)
+            kept_pk_idx = (
+                pc.index_in(
+                    kept_table["primary_key"],
+                    value_set=cohort_pa_arr,
+                )
+                .to_numpy(zero_copy_only=False)
+                .astype(np.int64)
+            )
+            kept_ts_idx = (
+                pc.index_in(
+                    kept_table["timestamp"],
+                    value_set=T_common_pa_arr,
+                )
+                .to_numpy(zero_copy_only=False)
+                .astype(np.int64)
+            )
             # Flatten shape_snapshot list column → contiguous float32 (n_kept, D_actual).
             shape_chunked = kept_table["shape_snapshot"]
             shape_arr = (
                 shape_chunked.combine_chunks()
-                if hasattr(shape_chunked, "combine_chunks") else shape_chunked
+                if hasattr(shape_chunked, "combine_chunks")
+                else shape_chunked
             )
             flat_vals = shape_arr.values.to_numpy(zero_copy_only=False).astype(np.float32)
             n_kept = kept_table.num_rows
@@ -20187,20 +20901,19 @@ class GDSNavigator:
         def _impute_to_present_mean(tens: np.ndarray) -> np.ndarray:
             mask = ~np.isnan(tens)
             sums = np.where(mask, tens, np.float32(0.0)).sum(
-                axis=1, dtype=np.float32,
+                axis=1,
+                dtype=np.float32,
             )
             counts = mask.sum(axis=1).astype(np.float32)
             counts_safe = np.where(counts > 0, counts, np.float32(1.0))
             mean_per_td = (sums / counts_safe).astype(np.float32, copy=False)
             return np.where(
-                mask, tens, mean_per_td[:, None, :],
+                mask,
+                tens,
+                mean_per_td[:, None, :],
             ).astype(np.float32, copy=False)
 
-        _has_missing = (
-            cohort == "all"
-            or np.isnan(shapes_a).any()
-            or np.isnan(shapes_b).any()
-        )
+        _has_missing = cohort == "all" or np.isnan(shapes_a).any() or np.isnan(shapes_b).any()
         if entity_key is None and _has_missing:
             shapes_a = _impute_to_present_mean(shapes_a)
             shapes_b = _impute_to_present_mean(shapes_b)
@@ -20269,9 +20982,9 @@ class GDSNavigator:
 
     def _attach_influence_fields_to_anomaly_entries(
         self,
-        entries: list[dict],
+        entries: list[dict[str, Any]],
         pattern_id: str,
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """M4 additive: attach total_impact + classification per π5 entry.
 
         Resolves to None per-entry when pattern is event-type, N<2, or storage
@@ -20291,8 +21004,17 @@ class GDSNavigator:
             return entries
 
         version = self._manifest.pattern_versions[pattern_id]
+        cached = self._influence_cache.get((pattern_id, version))
+        if cached is not None:
+            for e in entries:
+                hit = cached.get(e.get("primary_key"))  # type: ignore[arg-type]
+                e["total_impact"] = hit[0] if hit else None
+                e["classification"] = hit[1] if hit else None
+            return entries
         try:
-            geo_table = self._storage.read_geometry(pattern_id, version)
+            geo_table = self._storage.read_geometry(
+                pattern_id, version, columns=["primary_key", "delta"]
+            )
         except (KeyError, OSError, ValueError):
             for e in entries:
                 e["total_impact"] = None
@@ -20309,10 +21031,9 @@ class GDSNavigator:
         deltas = delta_matrix_from_arrow(geo_table).astype(np.float64)
         pk_col = geo_table["primary_key"].to_pylist()
         pk_to_idx = {pk: i for i, pk in enumerate(pk_col)}
-        sigma_diag = np.asarray(pattern.sigma_diag, dtype=np.float64)
-        mu = np.asarray(pattern.mu, dtype=np.float64)
-        sigma_floor = np.maximum(sigma_diag, 1e-2)
-        shapes = deltas * sigma_floor + mu
+        from hypertopos.engine.geometry import shapes_from_deltas
+
+        shapes = shapes_from_deltas(deltas, pattern)
         mu_full = shapes.mean(axis=0)
         sigma_full = shapes.std(axis=0, ddof=0)
         delta_norm = np.linalg.norm(deltas, axis=1)
@@ -20320,10 +21041,15 @@ class GDSNavigator:
 
         try:
             _, _, total_imp, _ = _compute_leave_one_out_impact(
-                shapes, mu_full, sigma_full,
+                shapes,
+                mu_full,
+                sigma_full,
             )
             classes = _classify_influence(
-                total_imp, delta_norm, theta_norm, high_threshold_pct=90.0,
+                total_imp,
+                delta_norm,
+                theta_norm,
+                high_threshold_pct=90.0,
             )
         except (ValueError, FloatingPointError):
             for e in entries:
@@ -20331,15 +21057,14 @@ class GDSNavigator:
                 e["classification"] = None
             return entries
 
+        # Full precision: on a large population every single-entity impact is
+        # far below 1e-4, and rounding to 4 decimals reported them all as 0.0.
+        by_key = {pk: (float(total_imp[i]), classes[i]) for pk, i in pk_to_idx.items()}
+        self._influence_cache[(pattern_id, version)] = by_key
         for e in entries:
-            ekey = e.get("primary_key")
-            if ekey is None or ekey not in pk_to_idx:
-                e["total_impact"] = None
-                e["classification"] = None
-                continue
-            i = pk_to_idx[ekey]
-            e["total_impact"] = float(round(total_imp[i], 4))
-            e["classification"] = classes[i]
+            hit = by_key.get(e.get("primary_key"))
+            e["total_impact"] = hit[0] if hit else None
+            e["classification"] = hit[1] if hit else None
         return entries
 
     def find_density_gaps(
@@ -20398,15 +21123,15 @@ class GDSNavigator:
         pattern = sphere.patterns[pattern_id]
         version = self._manifest.pattern_versions.get(pattern_id, 1)
         geo = self._storage.read_geometry(
-            pattern_id, version,
+            pattern_id,
+            version,
             columns=["delta"],
             sample_size=sample_size if sample_size is not None else None,
         )
         n = geo.num_rows
         if n < 100:
             raise GDSNavigationError(
-                f"pattern too small for density gap detection "
-                f"(need >= 100, got {n})",
+                f"pattern too small for density gap detection (need >= 100, got {n})",
             )
 
         flat = geo["delta"].combine_chunks().values.to_numpy(zero_copy_only=False)
@@ -20443,29 +21168,31 @@ class GDSNavigator:
         )
 
         if dim_pairs is not None:
-            label_to_local = {
-                dim_labels[i]: idx for idx, i in enumerate(usable_idx)
-            }
-            unknown = [
-                name for pair in dim_pairs for name in pair
-                if name not in label_to_local
-            ]
+            label_to_local = {dim_labels[i]: idx for idx, i in enumerate(usable_idx)}
+            unknown = [name for pair in dim_pairs for name in pair if name not in label_to_local]
             if unknown:
                 raise GDSNavigationError(
-                    f"unknown dim names in dim_pairs: "
-                    f"{sorted(set(unknown))}",
+                    f"unknown dim names in dim_pairs: {sorted(set(unknown))}",
                 )
             pair_local: list[tuple[int, int, float]] = []
-            for (a, b) in dim_pairs:
+            for a, b in dim_pairs:
                 la, lb = label_to_local[a], label_to_local[b]
-                r = float(abs(np.corrcoef(
-                    u_matrix[:, la], u_matrix[:, lb],
-                )[0, 1]))
+                r = float(
+                    abs(
+                        np.corrcoef(
+                            u_matrix[:, la],
+                            u_matrix[:, lb],
+                        )[0, 1]
+                    )
+                )
                 pair_local.append((la, lb, r))
         else:
             corr = np.corrcoef(u_matrix.T)
             pair_local = select_pairs_by_corr(
-                corr, r_min=r_min, r_max=r_max, top_k=20,
+                corr,
+                r_min=r_min,
+                r_max=r_max,
+                top_k=20,
             )
 
         if not pair_local:
@@ -20479,12 +21206,15 @@ class GDSNavigator:
             }
 
         all_cells: list[dict[str, Any]] = []
-        for (i_local, j_local, r) in pair_local:
+        for i_local, j_local, r in pair_local:
             i_global = usable_idx[i_local]
             j_global = usable_idx[j_local]
             cells = compute_density_gaps_for_pair(
-                u_matrix[:, i_local], u_matrix[:, j_local],
-                n=n, bins=bins, alpha=alpha,
+                u_matrix[:, i_local],
+                u_matrix[:, j_local],
+                n=n,
+                bins=bins,
+                alpha=alpha,
             )
             for c in cells:
                 if not c["is_gap"]:
@@ -20495,25 +21225,31 @@ class GDSNavigator:
                 delta_lo_j, delta_hi_j = ecdf_cache[j_global].inverse(
                     np.array(c["u_range_j"]),
                 )
+                # An empty cell gets a continuity-corrected ratio: finite
+                # (infinity serialises as null) and still above any cell with
+                # the same expectation and at least one observation.
                 ratio = (
-                    float(c["expected"] / max(c["observed"], 1e-9))
-                    if c["observed"] > 0 else float("inf")
+                    float(c["expected"] / c["observed"])
+                    if c["observed"] > 0
+                    else float((c["expected"] + 0.5) / 0.5)
                 )
-                all_cells.append({
-                    "dim_i": dim_labels[i_global],
-                    "dim_j": dim_labels[j_global],
-                    "u_range_i": list(c["u_range_i"]),
-                    "u_range_j": list(c["u_range_j"]),
-                    "delta_range_i": [float(delta_lo_i), float(delta_hi_i)],
-                    "delta_range_j": [float(delta_lo_j), float(delta_hi_j)],
-                    "observed": c["observed"],
-                    "expected": c["expected"],
-                    "ratio": ratio,
-                    "p_value": c["p_value"],
-                    "q_value": c["q_value"],
-                    "is_gap": True,
-                    "correlation": float(r),
-                })
+                all_cells.append(
+                    {
+                        "dim_i": dim_labels[i_global],
+                        "dim_j": dim_labels[j_global],
+                        "u_range_i": list(c["u_range_i"]),
+                        "u_range_j": list(c["u_range_j"]),
+                        "delta_range_i": [float(delta_lo_i), float(delta_hi_i)],
+                        "delta_range_j": [float(delta_lo_j), float(delta_hi_j)],
+                        "observed": c["observed"],
+                        "expected": c["expected"],
+                        "ratio": ratio,
+                        "p_value": c["p_value"],
+                        "q_value": c["q_value"],
+                        "is_gap": True,
+                        "correlation": float(r),
+                    }
+                )
 
         all_cells.sort(key=lambda c: -c["ratio"])
         return {
@@ -20635,9 +21371,7 @@ class GDSNavigator:
         # list. Captured for the diagnostics block.
         seed_filter_summary: dict[str, Any] | None = None
         if anomaly_seed_filter:
-            anchor_pid = (
-                self._resolve_anchor_pattern_for_scoring(pattern_id)
-            )
+            anchor_pid = self._resolve_anchor_pattern_for_scoring(pattern_id)
             if anchor_pid is None or anchor_pid == pattern_id:
                 raise GDSNavigationError(
                     f"anomaly_seed_filter requires an anchor companion "
@@ -20647,7 +21381,8 @@ class GDSNavigator:
             anchor_version = self._resolve_version(anchor_pid)
             try:
                 anom_geo = self._storage.read_geometry(
-                    anchor_pid, anchor_version,
+                    anchor_pid,
+                    anchor_version,
                     columns=["primary_key", "is_anomaly"],
                     filter="is_anomaly = true",
                 )
@@ -20658,9 +21393,7 @@ class GDSNavigator:
                 ) from exc
             anom_keys = anom_geo["primary_key"].to_pylist()
             anom_set = set(anom_keys)
-            requested = (
-                len(seed_keys) if seed_keys is not None else None
-            )
+            requested = len(seed_keys) if seed_keys is not None else None
             if seed_keys is None:
                 # sorted() — list(set) ordering is nondeterministic across
                 # processes (PYTHONHASHSEED randomises string hashing) and
@@ -20696,13 +21429,8 @@ class GDSNavigator:
 
         # edge_features sidecar — only loaded when at least one hop
         # references edge_dim_predicates.
-        needs_features = any(
-            bool(getattr(h, "edge_dim_predicates", {})) for h in hops
-        )
-        edge_features = (
-            self._storage.read_edge_features(pattern_id)
-            if needs_features else None
-        )
+        needs_features = any(bool(getattr(h, "edge_dim_predicates", {})) for h in hops)
+        edge_features = self._storage.read_edge_features(pattern_id) if needs_features else None
         if needs_features and (edge_features is None or edge_features.num_rows == 0):
             raise GDSNavigationError(
                 f"edge_dim_predicates require an edge_features sidecar; "
@@ -20715,7 +21443,9 @@ class GDSNavigator:
                 adj._out,
                 adj._in,
                 hops=hops,
-                seed_keys=seed_keys,
+                # All from-keys in sorted order, cached on the index: sorting
+                # them on every call dominated warm latency.
+                seed_keys=seed_keys if seed_keys is not None else adj.sorted_out_keys(),
                 max_results=max_results,
                 edge_features=edge_features,
                 time_window_hours=time_window_hours,
@@ -20730,33 +21460,24 @@ class GDSNavigator:
         # post-filter count. `max_results` applies AFTER this filter; if
         # the filter is restrictive the call returns fewer than
         # max_results motifs.
-        require_flags = [
-            bool(getattr(h, "require_anomalous_entity", False))
-            for h in hops
-        ]
+        require_flags = [bool(getattr(h, "require_anomalous_entity", False)) for h in hops]
         if instances and any(require_flags):
-            anchor_pid_for_filter = (
-                self._resolve_anchor_pattern_for_scoring(pattern_id)
-            )
-            if (
-                anchor_pid_for_filter is None
-                or anchor_pid_for_filter == pattern_id
-            ):
+            anchor_pid_for_filter = self._resolve_anchor_pattern_for_scoring(pattern_id)
+            if anchor_pid_for_filter is None or anchor_pid_for_filter == pattern_id:
                 raise GDSNavigationError(
                     f"require_anomalous_entity requires an anchor "
                     f"pattern whose entity_line covers edge endpoints "
                     f"of {pattern_id!r}; none found.",
                 )
-            flagged_hop_indices = [
-                i for i, f in enumerate(require_flags) if f
-            ]
+            flagged_hop_indices = [i for i, f in enumerate(require_flags) if f]
             candidate_keys: set[str] = set()
             for inst in instances:
                 for i in flagged_hop_indices:
                     candidate_keys.add(inst["nodes"][i + 1])
             anchor_version = self._resolve_version(anchor_pid_for_filter)
             geo = self._storage.read_geometry(
-                anchor_pid_for_filter, anchor_version,
+                anchor_pid_for_filter,
+                anchor_version,
                 point_keys=list(candidate_keys),
                 columns=["primary_key", "is_anomaly"],
             )
@@ -20774,8 +21495,7 @@ class GDSNavigator:
             filtered: list[dict[str, Any]] = []
             for inst in instances:
                 if all(
-                    is_anomaly_map.get(inst["nodes"][i + 1], False)
-                    for i in flagged_hop_indices
+                    is_anomaly_map.get(inst["nodes"][i + 1], False) for i in flagged_hop_indices
                 ):
                     filtered.append(inst)
             instances = filtered
@@ -20812,11 +21532,15 @@ class GDSNavigator:
                 all_event_keys.update(inst["edges"])
             anchor_version = self._resolve_version(anchor_pid)
             anchor_delta_map = self._batch_read_deltas(
-                anchor_pid, anchor_version, all_anchor_keys,
+                anchor_pid,
+                anchor_version,
+                all_anchor_keys,
             )
             event_version = self._resolve_version(pattern_id)
             event_delta_map = self._batch_read_deltas(
-                pattern_id, event_version, all_event_keys,
+                pattern_id,
+                event_version,
+                all_event_keys,
             )
             graph_pid = self._resolve_motif_graph_pid(anchor_pid)
             anchor_adj = self._storage.get_adjacency(graph_pid)
@@ -20825,18 +21549,18 @@ class GDSNavigator:
             scored: list[dict[str, Any]] = []
             for inst in instances:
                 edge_pairs = [
-                    (inst["nodes"][i], inst["nodes"][i + 1])
-                    for i in range(len(inst["edges"]))
+                    (inst["nodes"][i], inst["nodes"][i + 1]) for i in range(len(inst["edges"]))
                 ]
                 event_factors_for_motif: list[float] = []
                 for ek in inst["edges"]:
                     ed = event_delta_map.get(ek)
                     event_factors_for_motif.append(
-                        1.0 if ed is None
-                        else 1.0 + float(np.linalg.norm(ed)),
+                        1.0 if ed is None else 1.0 + float(np.linalg.norm(ed)),
                     )
                 score_result = self._lean_score_motif(
-                    edge_pairs, anchor_delta_map, pair_counts,
+                    edge_pairs,
+                    anchor_delta_map,
+                    pair_counts,
                     event_factors=event_factors_for_motif,
                 )
                 if score_result is None:
@@ -20846,7 +21570,8 @@ class GDSNavigator:
                 inst_with_score = dict(inst)
                 inst_with_score["score"] = score_result.get("score", 0.0)
                 inst_with_score["score_breakdown"] = score_result.get(
-                    "breakdown", [],
+                    "breakdown",
+                    [],
                 )
                 inst_with_score["anchor_pattern_id"] = anchor_pid
                 scored.append(inst_with_score)
@@ -20861,4 +21586,3 @@ class GDSNavigator:
         if seed_filter_summary is not None:
             result["seed_filter_summary"] = seed_filter_summary
         return result
-

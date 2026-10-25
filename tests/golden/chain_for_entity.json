@@ -1,0 +1,88 @@
+{
+  "A1": {
+    "chains": [
+      {
+        "chain_id": "CH-009",
+        "delta_norm": 3.3541,
+        "delta_rank_pct": 100.0,
+        "is_anomaly": false
+      },
+      {
+        "chain_id": "CH-011",
+        "delta_norm": 3.3541,
+        "delta_rank_pct": 100.0,
+        "is_anomaly": false
+      },
+      {
+        "chain_id": "CH-001",
+        "delta_norm": 2.0616,
+        "delta_rank_pct": 83.33,
+        "is_anomaly": false
+      },
+      {
+        "chain_id": "CH-012",
+        "delta_norm": 2.0616,
+        "delta_rank_pct": 83.33,
+        "is_anomaly": false
+      },
+      {
+        "chain_id": "CH-005",
+        "delta_norm": 1.5,
+        "delta_rank_pct": 66.67,
+        "is_anomaly": false
+      },
+      {
+        "chain_id": "CH-008",
+        "delta_norm": 1.5,
+        "delta_rank_pct": 66.67,
+        "is_anomaly": false
+      },
+      {
+        "chain_id": "CH-002",
+        "delta_norm": 1.118,
+        "delta_rank_pct": 33.33,
+        "is_anomaly": false
+      },
+      {
+        "chain_id": "CH-004",
+        "delta_norm": 1.118,
+        "delta_rank_pct": 33.33,
+        "is_anomaly": false
+      },
+      {
+        "chain_id": "CH-006",
+        "delta_norm": 1.118,
+        "delta_rank_pct": 33.33,
+        "is_anomaly": false
+      }
+    ],
+    "pattern_id": "chain_pattern",
+    "primary_key": "A1",
+    "summary": {
+      "anomalous": 0,
+      "total": 9
+    }
+  },
+  "B3": {
+    "chains": [
+      {
+        "chain_id": "CH-010",
+        "delta_norm": 1.5,
+        "delta_rank_pct": 66.67,
+        "is_anomaly": false
+      },
+      {
+        "chain_id": "CH-003",
+        "delta_norm": 1.118,
+        "delta_rank_pct": 33.33,
+        "is_anomaly": false
+      }
+    ],
+    "pattern_id": "chain_pattern",
+    "primary_key": "B3",
+    "summary": {
+      "anomalous": 0,
+      "total": 2
+    }
+  }
+}

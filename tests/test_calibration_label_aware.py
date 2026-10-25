@@ -3,10 +3,12 @@
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
 """Label-aware per-dim calibration — hand-verified math + acceptance test."""
+
 from __future__ import annotations
 
 import numpy as np
 import pytest
+
 from hypertopos.engine.calibration_label_aware import (
     CalibrationResult,
     DimCalibration,
@@ -22,14 +24,18 @@ def _synthetic_two_class(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build a 2-D 2-class case: dim 0 separates, dim 1 is noise."""
     rng = np.random.RandomState(seed)
-    pos = np.column_stack([
-        rng.normal(sep_mean, 1.0, n_per_class),  # separating dim
-        rng.normal(0.0, 1.0, n_per_class),       # noise dim
-    ])
-    neg = np.column_stack([
-        rng.normal(0.0, 1.0, n_per_class),
-        rng.normal(0.0, 1.0, n_per_class),
-    ])
+    pos = np.column_stack(
+        [
+            rng.normal(sep_mean, 1.0, n_per_class),  # separating dim
+            rng.normal(0.0, 1.0, n_per_class),  # noise dim
+        ]
+    )
+    neg = np.column_stack(
+        [
+            rng.normal(0.0, 1.0, n_per_class),
+            rng.normal(0.0, 1.0, n_per_class),
+        ]
+    )
     deltas = np.vstack([pos, neg]).astype(np.float32)
     labels = np.array([1] * n_per_class + [0] * n_per_class)
     return deltas, labels
@@ -53,10 +59,13 @@ def test_synthetic_two_class_separating_dim_aligned_noise_dim_suppressed():
     # O(1/sqrt(n)) ≈ 0.022, and the unit-normalised LDA direction
     # component on the noise dim is well below 0.05.
     deltas, labels = _synthetic_two_class(
-        sep_mean=5.0, n_per_class=2000, seed=42,
+        sep_mean=5.0,
+        n_per_class=2000,
+        seed=42,
     )
     result = calibrate_label_aware(
-        deltas=deltas, labels=labels,
+        deltas=deltas,
+        labels=labels,
         dim_labels=["separating", "noise"],
     )
 
@@ -72,19 +81,21 @@ def test_synthetic_two_class_separating_dim_aligned_noise_dim_suppressed():
     # Plan-mandated threshold: noise dim's direction component <0.05.
     noise_cal = result.per_dim["noise"]
     assert abs(noise_cal.direction) < 0.05, (
-        f"noise dim direction must be < 0.05, got "
-        f"{noise_cal.direction:.4f}"
+        f"noise dim direction must be < 0.05, got {noise_cal.direction:.4f}"
     )
 
     # The full unit-norm vector is consistent with both per-dim entries.
     assert np.linalg.norm(result.signed_direction_vector) == pytest.approx(
-        1.0, abs=1e-6,
+        1.0,
+        abs=1e-6,
     )
     assert result.signed_direction_vector[0] == pytest.approx(
-        sep_cal.direction, abs=1e-6,
+        sep_cal.direction,
+        abs=1e-6,
     )
     assert result.signed_direction_vector[1] == pytest.approx(
-        noise_cal.direction, abs=1e-6,
+        noise_cal.direction,
+        abs=1e-6,
     )
 
 
@@ -109,11 +120,13 @@ def test_per_dim_moments_match_numpy_groupby_means_and_stds():
         cal = result.per_dim[name]
         assert cal.mu_pos == pytest.approx(float(expected_mu_pos[i]), abs=1e-5)
         assert cal.sigma_pos == pytest.approx(
-            float(expected_sigma_pos[i]), abs=1e-5,
+            float(expected_sigma_pos[i]),
+            abs=1e-5,
         )
         assert cal.mu_neg == pytest.approx(float(expected_mu_neg[i]), abs=1e-5)
         assert cal.sigma_neg == pytest.approx(
-            float(expected_sigma_neg[i]), abs=1e-5,
+            float(expected_sigma_neg[i]),
+            abs=1e-5,
         )
 
 
@@ -136,7 +149,8 @@ def test_dim_labels_custom_preserved():
     """Custom ``dim_labels`` keys are preserved in iteration order."""
     deltas, labels = _synthetic_two_class(seed=3)
     result = calibrate_label_aware(
-        deltas=deltas, labels=labels,
+        deltas=deltas,
+        labels=labels,
         dim_labels=["my_sep", "my_noise"],
     )
     assert list(result.per_dim.keys()) == ["my_sep", "my_noise"]
@@ -199,7 +213,8 @@ def test_rejects_dim_labels_length_mismatch():
     deltas, labels = _synthetic_two_class(seed=5)
     with pytest.raises(ValueError, match="dim_labels length"):
         calibrate_label_aware(
-            deltas=deltas, labels=labels,
+            deltas=deltas,
+            labels=labels,
             dim_labels=["only_one"],  # n_dims is 2
         )
 
@@ -218,7 +233,8 @@ def test_deterministic():
     r1 = calibrate_label_aware(deltas=deltas, labels=labels)
     r2 = calibrate_label_aware(deltas=deltas, labels=labels)
     np.testing.assert_array_equal(
-        r1.signed_direction_vector, r2.signed_direction_vector,
+        r1.signed_direction_vector,
+        r2.signed_direction_vector,
     )
     assert r1.fisher_score == r2.fisher_score
     for name in r1.per_dim:

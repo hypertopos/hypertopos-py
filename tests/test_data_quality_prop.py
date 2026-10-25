@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pyarrow as pa
+
 from hypertopos.model.manifest import Manifest
 from hypertopos.model.sphere import Pattern, RelationDef
 from hypertopos.navigation.navigator import GDSNavigator
@@ -84,9 +85,7 @@ def _make_dqi_navigator(
 
     storage.read_sphere.return_value = sphere
     storage.read_geometry_stats.return_value = None
-    storage.count_geometry_rows.side_effect = lambda pid, filter=None: (
-        0 if filter else geo_rows
-    )
+    storage.count_geometry_rows.side_effect = lambda pid, filter=None: 0 if filter else geo_rows
 
     manifest = Manifest(
         manifest_id=str(uuid.uuid4()),

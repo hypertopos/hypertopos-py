@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timezone
 import numpy as np
 import pyarrow as pa
 import pytest
+
 from hypertopos.engine.geometry import GDSEngine
 from hypertopos.model.manifest import Manifest
 from hypertopos.model.objects import Edge, Polygon, Solid
@@ -358,6 +359,7 @@ def test_build_solid_sorts_by_timestamp_not_slice_index():
     from unittest.mock import MagicMock
 
     import pyarrow as pa
+
     from hypertopos.model.sphere import Pattern, RelationDef, Sphere
 
     # Arrange: two slices where slice_index=0 has a LATER timestamp than slice_index=1
@@ -456,6 +458,7 @@ def test_build_solid_filters_slices_by_timestamp():
     from unittest.mock import MagicMock
 
     import pyarrow as pa
+
     from hypertopos.model.sphere import Pattern, RelationDef, Sphere
 
     ts_early = datetime(2022, 1, 1, tzinfo=UTC)
@@ -1179,6 +1182,66 @@ def test_centroid_map_empty_raises():
 
     with pytest.raises(ValueError, match="empty"):
         engine.compute_centroid_map(delta_matrix, [])
+
+
+def _reference_group_stats(delta_matrix: np.ndarray, labels: list[str]) -> dict:
+    norms = np.sqrt(np.einsum("ij,ij->i", delta_matrix, delta_matrix))
+    arr = np.array(labels, dtype=object)
+    out = {}
+    for label in sorted(set(labels)):
+        mask = arr == label
+        out[label] = (
+            delta_matrix[mask].mean(axis=0).tolist(),
+            round(float(norms[mask].mean()), 6),
+            round(float(norms[mask].std()), 6),
+            int(mask.sum()),
+        )
+    return out
+
+
+def test_centroid_map_group_stats_bit_identical_to_per_group_masks():
+    rng = np.random.default_rng(7)
+    delta_matrix = rng.normal(size=(400, 5)).astype(np.float32)
+    labels = [f"G{int(i)}" for i in rng.integers(0, 23, size=400)]
+    engine = GDSEngine(storage=None, cache=None)
+
+    result = engine.compute_centroid_map(delta_matrix, labels)
+
+    ref = _reference_group_stats(delta_matrix, labels)
+    got = {
+        g["key"]: (g["vector"], g["radius"], g["spread"], g["count"])
+        for g in result["group_centroids"]
+    }
+    assert got == ref
+    assert [g["key"] for g in result["group_centroids"]] == sorted(ref)
+
+
+def test_centroid_map_max_groups_keeps_largest_plus_outlier():
+    engine = GDSEngine(storage=None, cache=None)
+    delta_matrix = np.array(
+        [[0.0, 0.0]] * 5 + [[0.1, 0.0]] * 4 + [[0.0, 0.1]] * 3 + [[9.0, 9.0]],
+        dtype=np.float32,
+    )
+    labels = ["A"] * 5 + ["B"] * 4 + ["C"] * 3 + ["Z"]
+
+    result = engine.compute_centroid_map(delta_matrix, labels, max_groups=2)
+
+    assert [g["key"] for g in result["group_centroids"]] == ["A", "Z"]
+    assert result["n_groups_total"] == 4
+    assert result["structural_outlier"]["key"] == "Z"
+    assert [d["pair"] for d in result["inter_centroid_distances"]] == [["A", "Z"]]
+
+
+def test_centroid_map_max_groups_above_cardinality_changes_nothing():
+    engine = GDSEngine(storage=None, cache=None)
+    delta_matrix = np.array([[1.0, 0.0], [0.0, 1.0], [3.0, 3.0]], dtype=np.float32)
+    labels = ["A", "B", "C"]
+
+    capped = engine.compute_centroid_map(delta_matrix, labels, max_groups=10)
+    plain = engine.compute_centroid_map(delta_matrix, labels)
+
+    assert capped == plain
+    assert "n_groups_total" not in capped
 
 
 def test_build_polygon_includes_delta_rank_pct(sphere_path):

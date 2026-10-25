@@ -14,6 +14,7 @@ and fill-indicator (m) blocks:
 All normalization uses empirical mu/sigma z-scoring.  For semantic blocks
 PCA is applied first (pure numpy, no sklearn).
 """
+
 from __future__ import annotations
 
 import numpy as np

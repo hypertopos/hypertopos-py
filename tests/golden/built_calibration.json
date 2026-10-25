@@ -1,0 +1,77 @@
+{
+  "account_pattern": {
+    "mu": [
+      0.6953489184,
+      0.111992538,
+      0.7999998927,
+      0.2291666269
+    ],
+    "pattern_type": "anchor",
+    "population_size": 40,
+    "relations": [
+      {
+        "direction": "out",
+        "display_name": "tx_count",
+        "edge_max": 43,
+        "line_id": "_d_tx_count",
+        "required": false
+      },
+      {
+        "direction": "out",
+        "display_name": "amount_sum",
+        "edge_max": 116440,
+        "line_id": "_d_amount_sum",
+        "required": false
+      },
+      {
+        "direction": "out",
+        "display_name": "n_cpty",
+        "edge_max": 26,
+        "line_id": "_d_n_cpty",
+        "required": false
+      },
+      {
+        "direction": "out",
+        "display_name": "burst_7d",
+        "edge_max": 30,
+        "line_id": "_d_burst_7d",
+        "required": false
+      }
+    ],
+    "sigma_diag": [
+      0.1347834468,
+      0.2118017077,
+      0.1088536233,
+      0.1959573925
+    ],
+    "theta": [
+      1.968618751,
+      1.968618751,
+      1.968618751,
+      1.968618751
+    ]
+  },
+  "tx_pattern": {
+    "mu": [
+      1.0,
+      0.071516186
+    ],
+    "pattern_type": "event",
+    "population_size": 1200,
+    "relations": [
+      {
+        "direction": "in",
+        "line_id": "accounts",
+        "required": true
+      }
+    ],
+    "sigma_diag": [
+      0.009999999776,
+      0.1961663365
+    ],
+    "theta": [
+      0.8041213155,
+      0.8041213155
+    ]
+  }
+}

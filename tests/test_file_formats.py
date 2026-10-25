@@ -6,6 +6,7 @@ Pins the contract that fixes the dotted-stem bug (``q1.2024.parquet`` was
 rejected because ``"".join(Path.suffixes)`` returned ``.2024.parquet``) while
 preserving the legitimate ``.csv.gz`` compound.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -49,8 +50,15 @@ def test_normalized_suffix(name: str, expected: str) -> None:
 @pytest.mark.parametrize(
     "name",
     [
-        "data.parquet", "data.pq", "data.csv", "data.csv.gz", "data.arrow",
-        "data.arrows", "data.ipc", "data.feather", "data.tsv",
+        "data.parquet",
+        "data.pq",
+        "data.csv",
+        "data.csv.gz",
+        "data.arrow",
+        "data.arrows",
+        "data.ipc",
+        "data.feather",
+        "data.tsv",
     ],
 )
 def test_no_regression_vs_old_join_suffixes(name: str) -> None:

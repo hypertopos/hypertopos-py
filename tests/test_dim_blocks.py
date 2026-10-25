@@ -3,11 +3,10 @@
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
 """Tests for generalized dimension blocks (g/t/s)."""
+
 from __future__ import annotations
 
 import numpy as np
-import pytest
-
 
 # ── Sub-task 2a: PatternConfig fields ──────────────────────────────
 
@@ -105,7 +104,8 @@ class TestNormalizeSemanticBlock:
         values = rng.normal(0, 1, size=(500, 128)).astype(np.float32)
 
         normalized, mu, sigma, pca_components = normalize_semantic_block(
-            values, n_components=8,
+            values,
+            n_components=8,
         )
 
         assert normalized.shape == (500, 8)
@@ -122,7 +122,8 @@ class TestNormalizeSemanticBlock:
         values = rng.normal(0, 1, size=(100, 5)).astype(np.float32)
 
         normalized, mu, sigma, pca_components = normalize_semantic_block(
-            values, n_components=10,
+            values,
+            n_components=10,
         )
 
         assert normalized.shape == (100, 5)
@@ -146,28 +147,39 @@ class TestBuilderDimBlockIntegration:
         )
 
         # Create a simple anchor line with numeric columns
-        table = pa.table({
-            "primary_key": [f"e{i}" for i in range(50)],
-            "balance": np.random.default_rng(1).normal(1000, 200, 50).tolist(),
-            "income": np.random.default_rng(2).normal(5000, 1000, 50).tolist(),
-        })
+        table = pa.table(
+            {
+                "primary_key": [f"e{i}" for i in range(50)],
+                "balance": np.random.default_rng(1).normal(1000, 200, 50).tolist(),
+                "income": np.random.default_rng(2).normal(5000, 1000, 50).tolist(),
+            }
+        )
         builder.add_line(
-            "accounts", table, key_col="primary_key",
-            source_id="s1", role="anchor",
+            "accounts",
+            table,
+            key_col="primary_key",
+            source_id="s1",
+            role="anchor",
         )
 
         # Create a minimal event line for a relation
-        event_table = pa.table({
-            "primary_key": [f"t{i}" for i in range(100)],
-            "account_id": [f"e{i % 50}" for i in range(100)],
-        })
+        event_table = pa.table(
+            {
+                "primary_key": [f"t{i}" for i in range(100)],
+                "account_id": [f"e{i % 50}" for i in range(100)],
+            }
+        )
         builder.add_line(
-            "txns", event_table, key_col="primary_key",
-            source_id="s2", role="event",
+            "txns",
+            event_table,
+            key_col="primary_key",
+            source_id="s2",
+            role="event",
         )
 
         # Count FK on entity table for the relation
         from collections import Counter
+
         fk_counts = Counter(f"e{i % 50}" for i in range(100))
         count_col = [fk_counts.get(f"e{i}", 0) for i in range(50)]
         table = table.append_column(
@@ -203,7 +215,7 @@ class TestBuilderDimBlockIntegration:
     def test_builder_includes_geo_dims_in_shape_vector(self, tmp_path):
         import pyarrow as pa
 
-        from hypertopos.builder.builder import GDSBuilder, RelationSpec
+        from hypertopos.builder.builder import GDSBuilder
 
         builder = GDSBuilder(
             sphere_id="test_geo_blocks",
@@ -211,14 +223,19 @@ class TestBuilderDimBlockIntegration:
         )
 
         rng = np.random.default_rng(42)
-        table = pa.table({
-            "primary_key": [f"e{i}" for i in range(50)],
-            "lat": rng.uniform(40, 50, 50).tolist(),
-            "lon": rng.uniform(-5, 5, 50).tolist(),
-        })
+        table = pa.table(
+            {
+                "primary_key": [f"e{i}" for i in range(50)],
+                "lat": rng.uniform(40, 50, 50).tolist(),
+                "lon": rng.uniform(-5, 5, 50).tolist(),
+            }
+        )
         builder.add_line(
-            "places", table, key_col="primary_key",
-            source_id="s1", role="anchor",
+            "places",
+            table,
+            key_col="primary_key",
+            source_id="s1",
+            role="anchor",
         )
 
         builder.add_pattern(
@@ -240,7 +257,7 @@ class TestBuilderDimBlockIntegration:
     def test_builder_includes_semantic_dims_in_shape_vector(self, tmp_path):
         import pyarrow as pa
 
-        from hypertopos.builder.builder import GDSBuilder, RelationSpec
+        from hypertopos.builder.builder import GDSBuilder
 
         builder = GDSBuilder(
             sphere_id="test_sem_blocks",
@@ -257,8 +274,11 @@ class TestBuilderDimBlockIntegration:
 
         table = pa.table(cols)
         builder.add_line(
-            "docs", table, key_col="primary_key",
-            source_id="s1", role="anchor",
+            "docs",
+            table,
+            key_col="primary_key",
+            source_id="s1",
+            role="anchor",
         )
 
         builder.add_pattern(
@@ -287,33 +307,38 @@ class TestBuilderDimBlockIntegration:
         from hypertopos.cli.schema import parse_config
 
         cfg_path = tmp_path / "sphere.yaml"
-        cfg_path.write_text(yaml.dump({
-            "sphere_id": "test_blocks",
-            "format_version": "3.0",
-            "version": "0.1.0",
-            "sources": {
-                "s1": {"path": "dummy.csv"},
-            },
-            "lines": {
-                "accounts": {
-                    "source": "s1",
-                    "key": "id",
-                    "role": "anchor",
-                },
-            },
-            "patterns": {
-                "p_accounts": {
-                    "type": "anchor",
-                    "entity_line": "accounts",
-                    "geo_properties": ["lat", "lon"],
-                    "metric_properties": ["balance"],
-                    "semantic_dim": {
-                        "columns": ["emb_0", "emb_1"],
-                        "n_components": 2,
+        cfg_path.write_text(
+            yaml.dump(
+                {
+                    "sphere_id": "test_blocks",
+                    "format_version": "3.0",
+                    "version": "0.1.0",
+                    "sources": {
+                        "s1": {"path": "dummy.csv"},
                     },
-                },
-            },
-        }), encoding="utf-8")
+                    "lines": {
+                        "accounts": {
+                            "source": "s1",
+                            "key": "id",
+                            "role": "anchor",
+                        },
+                    },
+                    "patterns": {
+                        "p_accounts": {
+                            "type": "anchor",
+                            "entity_line": "accounts",
+                            "geo_properties": ["lat", "lon"],
+                            "metric_properties": ["balance"],
+                            "semantic_dim": {
+                                "columns": ["emb_0", "emb_1"],
+                                "n_components": 2,
+                            },
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
 
         cfg = parse_config(str(cfg_path))
         pat = cfg.patterns["p_accounts"]

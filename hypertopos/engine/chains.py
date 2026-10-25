@@ -7,20 +7,40 @@
 Finds sequences of linked events (A→B→C→D) within a time window.
 Used for: money laundering chain detection, supply chain path analysis.
 """
+
 from __future__ import annotations
 
-import contextlib
 import math
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
+from typing import Any, cast
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.compute as pc
+
+from hypertopos.utils.gc_pause import without_cyclic_gc
+from hypertopos.utils.time import to_epoch_seconds
 
 _DEDUP_CAP = 500_000  # max entries in visited set to prevent unbounded memory
 
+# DFS stack frame: (current, path_keys, path_keys_set, path_events,
+# path_events_set, path_categories, path_amounts, first_ts, last_ts)
+_DfsFrame = tuple[
+    int,
+    tuple[int, ...],
+    set[int],
+    tuple[int, ...],
+    set[int],
+    tuple[Any, ...],
+    tuple[Any, ...],
+    float | None,
+    float | None,
+]
 
-class ChainResult(list):
+
+class ChainResult(list["Chain"]):
     """List[Chain] subclass carrying an optional *hint* for the caller.
 
     Behaves exactly like ``list`` (len, iteration, indexing, slicing …)
@@ -31,98 +51,38 @@ class ChainResult(list):
 
     hint: str | None
 
-    def __init__(self, chains: list | None = None, *, hint: str | None = None):
+    def __init__(self, chains: list[Chain] | None = None, *, hint: str | None = None):
         super().__init__(chains or [])
         self.hint = hint
 
 
-def parse_timestamps_to_epoch(ts_list: list) -> list[float]:
-    """Convert a list of mixed-type timestamps to epoch seconds.
+def _scalar_to_epoch(value: Any) -> float:
+    """Per-value fallback; naive datetimes are UTC, unparseable values 0.0."""
+    if value is None:
+        return 0.0
+    if isinstance(value, datetime):
+        aware = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        return aware.timestamp()
+    if isinstance(value, (int, float)):
+        return float(value)
+    parsed = to_epoch_seconds(pa.array([str(value)]), errors="null")[0].as_py()
+    return 0.0 if parsed is None else float(parsed)
 
-    Vectorised through pyarrow whenever the inferred type is one of:
-    timestamp, integer, floating, or string (parsed via `pc.strptime` over
-    a small set of canonical formats). Falls back to per-row Python only
-    when none of the formats match — rare in practice.
+
+def parse_timestamps_to_epoch(ts_list: list[Any]) -> list[float]:
+    """Convert a list of timestamps to epoch seconds (naive = UTC, null or unparseable = 0.0).
+
+    Vectorised through :func:`hypertopos.utils.time.to_epoch_seconds`; only a
+    list that pyarrow cannot type as one column (e.g. mixed datetimes and
+    strings) falls back to per-value conversion.
     """
     if not ts_list:
         return []
-    import pyarrow as pa
-    import pyarrow.compute as pc
-
     try:
-        arr = pa.array(ts_list)
-    except Exception:
-        arr = None
-
-    if arr is not None:
-        if pa.types.is_timestamp(arr.type):
-            epoch_int = pc.cast(arr, pa.int64())
-            unit = arr.type.unit
-            divisors = {"s": 1.0, "ms": 1e3, "us": 1e6, "ns": 1e9}
-            d = divisors.get(unit, 1e6)
-            return (
-                epoch_int.to_numpy(zero_copy_only=False).astype(np.float64)
-                / d
-            ).tolist()
-        if pa.types.is_floating(arr.type) or pa.types.is_integer(arr.type):
-            return pc.cast(
-                arr, pa.float64(),
-            ).to_numpy(zero_copy_only=False).tolist()
-        if pa.types.is_string(arr.type):
-            # Try canonical strptime formats; each runs C-native over the
-            # whole array, no per-row Python.
-            for fmt in (
-                "%Y-%m-%d %H:%M:%S",
-                "%Y-%m-%dT%H:%M:%S",
-                "%Y-%m-%dT%H:%M:%S.%f",
-                "%Y-%m-%dT%H:%M:%S.%fZ",
-                "%Y-%m-%d",
-                "%Y/%m/%d %H:%M:%S",
-                "%Y/%m/%d",
-            ):
-                try:
-                    parsed = pc.strptime(arr, format=fmt, unit="us")
-                except Exception:
-                    continue
-                if pc.sum(pc.is_null(parsed)).as_py() == 0:
-                    epoch_int = pc.cast(parsed, pa.int64())
-                    return (
-                        epoch_int.to_numpy(zero_copy_only=False)
-                        .astype(np.float64) / 1e6
-                    ).tolist()
-            # If no format matched all rows, try replacing '/' → '-' once.
-            try:
-                normalised = pc.replace_substring(arr, "/", "-")
-                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-                    try:
-                        parsed = pc.strptime(
-                            normalised, format=fmt, unit="us",
-                        )
-                    except Exception:
-                        continue
-                    if pc.sum(pc.is_null(parsed)).as_py() == 0:
-                        epoch_int = pc.cast(parsed, pa.int64())
-                        return (
-                            epoch_int.to_numpy(zero_copy_only=False)
-                            .astype(np.float64) / 1e6
-                        ).tolist()
-            except Exception:
-                pass
-
-    # Per-row Python fallback — only hits exotic / mixed inputs.
-    result = []
-    for t in ts_list:
-        if hasattr(t, "timestamp"):
-            result.append(t.timestamp())
-        elif isinstance(t, (int, float)):
-            result.append(float(t))
-        else:
-            try:
-                dt = datetime.fromisoformat(str(t).replace("/", "-"))
-                result.append(dt.timestamp())
-            except Exception:
-                result.append(0.0)
-    return result
+        epochs = to_epoch_seconds(pa.array(ts_list), errors="null")
+    except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError):
+        return [_scalar_to_epoch(v) for v in ts_list]
+    return cast("list[float]", pc.fill_null(epochs, 0.0).to_pylist())
 
 
 @dataclass
@@ -130,14 +90,14 @@ class Chain:
     """A sequence of linked entities with temporal ordering."""
 
     chain_id: str
-    keys: list[str]        # entity keys in order [A, B, C, D]
+    keys: list[str]  # entity keys in order [A, B, C, D]
     event_keys: list[str]  # event PKs per hop
     hop_count: int
-    is_cyclic: bool        # last key == first key
+    is_cyclic: bool  # last key == first key
     time_span_hours: float
     categories: list[str]  # per-hop categorical values (e.g. currency, type)
-    amounts: list[float]   # per-hop numeric values
-    amount_decay: float    # last_amount / first_amount (0 if first=0)
+    amounts: list[float]  # per-hop numeric values
+    amount_decay: float  # last_amount / first_amount (0 if first=0)
     # Per-hop bank pair (from_bank, to_bank). Empty when bank data is
     # not available at extraction time. Populated by callers passing
     # `event_banks=[(from_bank, to_bank), ...]` to extract_chains.
@@ -154,7 +114,7 @@ class Chain:
         jurisdictional layering — textbook AML indicator."""
         if not self.banks:
             return 0
-        seen: set = set()
+        seen: set[str] = set()
         for fb, tb in self.banks:
             seen.add(fb)
             seen.add(tb)
@@ -169,16 +129,13 @@ class Chain:
         is_cyclic to keep the flag meaning specific to layering."""
         if self.is_cyclic or len(self.amounts) < 2:
             return False
-        return all(
-            self.amounts[i + 1] < self.amounts[i]
-            for i in range(len(self.amounts) - 1)
-        )
+        return all(self.amounts[i + 1] < self.amounts[i] for i in range(len(self.amounts) - 1))
 
     def to_dict(
         self,
         *,
         delta_by_key: dict[str, np.ndarray] | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Serialise the chain to a JSON-safe dict.
 
         ``delta_by_key`` is an optional pre-fetched mapping from entity key
@@ -201,7 +158,7 @@ class Chain:
             "is_cyclic": self.is_cyclic,
             "time_span_hours": self.time_span_hours,
             "n_distinct_categories": len(set(self.categories)),
-            "categories": list(set(self.categories)),
+            "categories": sorted(set(self.categories)),
             "amount_decay": self.amount_decay,
             "total_amount": sum(self.amounts),
             "amount_std": amt_std,
@@ -210,11 +167,10 @@ class Chain:
             "amount_min": min(self.amounts) if self.amounts else 0.0,
             "n_unique_keys": len(set(self.keys)),
             "cross_bank_count": self.cross_bank_count(),
-            "amount_monotone_decreasing": (
-                self.amount_monotone_decreasing()
-            ),
+            "amount_monotone_decreasing": (self.amount_monotone_decreasing()),
             "edge_potentials": _compute_edge_potentials(
-                self.keys, delta_by_key,
+                self.keys,
+                delta_by_key,
             ),
         }
 
@@ -258,6 +214,7 @@ def _compute_edge_potentials(
     return out
 
 
+@without_cyclic_gc
 def extract_chains(
     from_keys: list[str],
     to_keys: list[str],
@@ -308,7 +265,8 @@ def extract_chains(
 
     # If sample_size is set, subsample events to bound adjacency memory.
     # Factor of 20 allows enough events per starting node for multi-hop chains.
-    if sample_size is not None:
+    # Seeded runs keep every event: a dropped event would cut a seed's chain.
+    if sample_size is not None and not seed_nodes:
         max_events = sample_size * 20
         if n > max_events:
             rng = np.random.default_rng(42)
@@ -338,7 +296,7 @@ def extract_chains(
             _id_to_key.append(k)
         return kid
 
-    adj: dict[int, list[tuple]] = defaultdict(list)
+    adj: dict[int, list[tuple[Any, ...]]] = defaultdict(list)
     for i in range(n):
         fk = from_keys[i]
         tk = to_keys[i]
@@ -359,14 +317,16 @@ def extract_chains(
     from_set = {fk for fk in from_keys if fk is not None}
     to_set = {tk for tk in to_keys if tk is not None}
     if not (from_set & to_set):
-        return ChainResult(hint=(
-            "No chains possible: from_col and to_col value sets "
-            "are completely disjoint (no overlap). Chains require "
-            "a to_key in one event to appear as a from_key in "
-            "another event. Check that from_col and to_col are "
-            "correct — they should represent the same entity "
-            "namespace (e.g. both are account IDs)."
-        ))
+        return ChainResult(
+            hint=(
+                "No chains possible: from_col and to_col value sets "
+                "are completely disjoint (no overlap). Chains require "
+                "a to_key in one event to appear as a from_key in "
+                "another event. Check that from_col and to_col are "
+                "correct — they should represent the same entity "
+                "namespace (e.g. both are account IDs)."
+            )
+        )
 
     # Sort adjacency lists by timestamp
     if timestamps:
@@ -376,8 +336,7 @@ def extract_chains(
     # Select starting nodes (as integer IDs)
     if seed_nodes is not None:
         start_nodes = [
-            _key_to_id[k] for k in seed_nodes
-            if k in _key_to_id and _key_to_id[k] in adj
+            _key_to_id[k] for k in seed_nodes if k in _key_to_id and _key_to_id[k] in adj
         ]
     else:
         start_nodes = list(adj.keys())
@@ -391,27 +350,28 @@ def extract_chains(
     # with a minimum of 3 per seed.
     per_seed_budget = max(3, max_chains // max(len(start_nodes), 1))
 
-    n_workers = min(4, max(1, len(start_nodes) // 100))
     has_ts = bool(timestamps)
-
-    if n_workers <= 1 or len(start_nodes) < 400:
-        chains = _bfs_seed_batch(
-            start_nodes, adj, max_hops, min_hops,
-            window_secs, has_ts, per_seed_budget, max_chains,
-        )
-    else:
-        chains = _parallel_bfs(
-            start_nodes, adj, max_hops, min_hops,
-            window_secs, has_ts, per_seed_budget, max_chains,
-            n_workers,
-        )
+    chains = _bfs_seed_batch(
+        start_nodes,
+        adj,
+        max_hops,
+        min_hops,
+        window_secs,
+        has_ts,
+        per_seed_budget,
+        max_chains,
+    )
+    # Drop chains whose entity path is a strict prefix of a longer chain
+    # (investigatively redundant); chain_ids are reassigned in the new order.
+    chains, _ = _dedup_strict_prefixes(chains, max_chains=max_chains)
 
     # Translate int IDs back to string keys. Capture raw event indices
     # BEFORE event_keys translation so per-event bank lookup works on
     # the integer indices.
     for chain in chains:
-        raw_event_indices = chain.event_keys  # still ints at this stage
-        chain.keys = [_id_to_key[k] for k in chain.keys]
+        # keys / event_keys still hold int IDs at this stage (see _emit_chain)
+        raw_event_indices = cast("list[int]", chain.event_keys)
+        chain.keys = [_id_to_key[k] for k in cast("list[int]", chain.keys)]
         chain.event_keys = [event_pks[i] for i in raw_event_indices]
         if event_banks is not None:
             chain.banks = [event_banks[i] for i in raw_event_indices]
@@ -421,138 +381,9 @@ def extract_chains(
     return ChainResult(chains[:max_chains])
 
 
-def _worker_fn(args: tuple) -> list[Chain]:
-    """Multiprocessing worker — loads adj from disk, runs BFS on seed chunk."""
-    (adj_path, seeds, max_hops, min_hops,
-     window_secs, has_ts, per_seed_budget, chunk_budget) = args
-    import pickle
-    with open(adj_path, "rb") as f:
-        adj = pickle.load(f)
-    return _bfs_seed_batch(
-        seeds, adj, max_hops, min_hops,
-        window_secs, has_ts, per_seed_budget, chunk_budget,
-    )
-
-
-def _parallel_bfs(
-    start_nodes: list[int],
-    adj: dict[int, list[tuple]],
-    max_hops: int,
-    min_hops: int,
-    window_secs: float,
-    has_ts: bool,
-    per_seed_budget: int,
-    max_chains: int,
-    n_workers: int,
-) -> list[Chain]:
-    """Disk-based parallel BFS — pickle adj once, workers load from file.
-
-    Each worker loads adj from a temp file (avoids pickle-through-pipe overhead).
-    Post-merge dedup ensures correctness across worker boundaries.
-    """
-    import pickle
-    import tempfile
-    import warnings
-    from concurrent.futures import ProcessPoolExecutor
-    from concurrent.futures.process import BrokenProcessPool
-
-    # Serialize adj to temp file (one write, N reads)
-    tmp_path: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as tmp:
-            pickle.dump(adj, tmp)
-            adj_path = tmp.name
-            tmp_path = tmp.name
-
-        chunk_size = (len(start_nodes) + n_workers - 1) // n_workers
-        chunk_budget = max_chains // n_workers + 1
-        tasks = [
-            (adj_path, start_nodes[i:i + chunk_size], max_hops, min_hops,
-             window_secs, has_ts, per_seed_budget, chunk_budget)
-            for i in range(0, len(start_nodes), chunk_size)
-        ]
-
-        chains: list[Chain] = []
-        # ProcessPoolExecutor can fail to start on some Windows environments
-        # (for example, restricted handle creation under pytest). Fall back to
-        # the serial BFS path instead of failing the whole extraction.
-        try:
-            with ProcessPoolExecutor(max_workers=n_workers) as pool:
-                for batch in pool.map(_worker_fn, tasks):
-                    chains.extend(batch)
-        except (OSError, BrokenProcessPool):
-            return _bfs_seed_batch(
-                start_nodes, adj, max_hops, min_hops,
-                window_secs, has_ts, per_seed_budget, max_chains,
-            )
-
-        # Post-merge dedup pass 1: frozenset(event_keys) — collapses
-        # permutation duplicates (different traversal orders visiting
-        # the same edge set). Required across the parallel pool's
-        # per-worker dedup caps.
-        # Pass 2: strict ordered prefix subsumption. Refactored into
-        # a separate testable function — see _dedup_strict_prefixes.
-        # Empirical observation on AML HI-small: ~ 0.59 % of chains
-        # are strict-prefix-subsumed (1 721 of 290 784); low-rate but
-        # non-zero, so worth removing as investigative noise.
-        seen: set[frozenset] = set()
-        unique_chains: list[Chain] = []
-        pre_dedup = len(chains)
-        for c in chains:
-            sig = frozenset(c.event_keys)
-            if sig not in seen:
-                seen.add(sig)
-                unique_chains.append(c)
-
-        deduped, prefix_dedup_removed = _dedup_strict_prefixes(
-            unique_chains, max_chains=max_chains,
-        )
-
-        if pre_dedup - len(deduped) > pre_dedup * 0.1:
-            warnings.warn(
-                f"Chain dedup removed {pre_dedup - len(deduped)} "
-                f"duplicates ({(pre_dedup - len(deduped)) / pre_dedup:.0%}) "
-                f"across workers — {prefix_dedup_removed} via sub-chain "
-                f"prefix subsumption.", stacklevel=2,
-            )
-
-        # Safety net: post-dedup chain_ids MUST be unique. Earlier
-        # parallel-pool merge collision (each worker restarting its
-        # local len(chains) counter at 0) silently produced
-        # ~75% colliding ids on AML HI-small. Reassignment from global
-        # dedup index restores uniqueness — assert that here so any
-        # future regression in the merge logic fails loudly at build
-        # time instead of silently corrupting the chain pattern points
-        # table.
-        chain_ids = [c.chain_id for c in deduped]
-        if len(set(chain_ids)) != len(chain_ids):
-            from collections import Counter
-            collisions = {
-                cid: count for cid, count in Counter(chain_ids).items()
-                if count > 1
-            }
-            raise RuntimeError(
-                f"chain extraction (or external import) produced "
-                f"{len(collisions)} colliding chain_ids across "
-                f"{len(chain_ids)} chains ({sum(collisions.values())} "
-                f"total colliding rows). primary_key uniqueness must "
-                f"be guaranteed for the chain pattern points table — "
-                f"either fix the parallel-worker id reassignment path "
-                f"or, if the chains came from external import, ensure "
-                f"upstream id uniqueness. First few collisions: "
-                f"{list(collisions.items())[:5]}",
-            )
-        return deduped
-    finally:
-        import os
-        if tmp_path is not None:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path)
-
-
 def _bfs_seed_batch(
     start_nodes: list[int],
-    adj: dict[int, list[tuple]],
+    adj: dict[int, list[tuple[Any, ...]]],
     max_hops: int,
     min_hops: int,
     window_secs: float,
@@ -560,56 +391,115 @@ def _bfs_seed_batch(
     per_seed_budget: int,
     max_chains: int,
 ) -> list[Chain]:
-    """Run DFS from a batch of seed nodes. Designed for multiprocessing."""
+    """Run DFS from a batch of seed nodes.
+
+    The stack holds one cursor per expanded node, ``[frame, neighbors, i]``,
+    not one built frame per child: the per-seed budget usually ends a seed
+    long before its children are visited, so a child's path tuples and sets
+    are built only when the cursor reaches it. Cursors walk their neighbors
+    from the last to the first, which is the order a stack of pushed children
+    would pop them in.
+    """
     from hypertopos.engine.adjacency import temporal_bisect
+
     chains: list[Chain] = []
-    visited_chains: set[frozenset] = set()
+    visited_chains: set[frozenset[int]] = set()
 
     for start in start_nodes:
         seed_start_count = len(chains)
-        stack = [(start, (start,), {start}, (), set(), (), (), None, None)]
+        stack: list[list[Any]] = []
+        frame: _DfsFrame | None = (start, (start,), {start}, (), set(), (), (), None, None)
 
-        while stack:
-            (current, path_keys, path_keys_set,
-             path_events, path_events_set,
-             path_categories, path_amounts,
-             first_ts, last_ts) = stack.pop()
+        while True:
+            if frame is None:
+                # Next unvisited child of the innermost node that has one.
+                while stack:
+                    cursor = stack[-1]
+                    parent, neighbors, i = cursor
+                    keys_set, events_set = parent[2], parent[4]
+                    while i >= 0:
+                        to_key, _ts, epk, _cur, _amt = neighbors[i]
+                        if epk not in events_set and to_key not in keys_set:
+                            break
+                        i -= 1
+                    if i < 0:
+                        stack.pop()
+                        continue
+                    cursor[2] = i - 1
+                    to_key, ts, epk, cur, amt = neighbors[i]
+                    frame = (
+                        to_key,
+                        parent[1] + (to_key,),
+                        keys_set | {to_key},
+                        parent[3] + (epk,),
+                        events_set | {epk},
+                        parent[5] + (cur,),
+                        parent[6] + (amt,),
+                        parent[7] if parent[7] is not None else ts,
+                        ts,
+                    )
+                    break
+                if frame is None:
+                    break
+
+            (
+                current,
+                path_keys,
+                path_keys_set,
+                path_events,
+                path_events_set,
+                path_categories,
+                path_amounts,
+                first_ts,
+                last_ts,
+            ) = expanding = frame
+            frame = None
 
             if len(path_keys) - 1 >= max_hops:
                 _emit_chain(
-                    chains, len(chains), path_keys, path_events,
-                    path_categories, path_amounts, visited_chains,
-                    min_hops, first_ts, last_ts,
+                    chains,
+                    len(chains),
+                    path_keys,
+                    path_events,
+                    path_categories,
+                    path_amounts,
+                    visited_chains,
+                    min_hops,
+                    first_ts,
+                    last_ts,
                 )
-                if (len(chains) >= max_chains
-                        or len(chains) - seed_start_count >= per_seed_budget):
+                if len(chains) >= max_chains or len(chains) - seed_start_count >= per_seed_budget:
                     break
                 continue
 
             extended = False
+            has_child = False
             neighbors = adj.get(current, [])
             if has_timestamps and last_ts is not None and neighbors:
-                neighbors = temporal_bisect(neighbors, ts_from=last_ts, ts_to=last_ts + window_secs, ts_index=1)
+                neighbors = temporal_bisect(
+                    neighbors, ts_from=last_ts, ts_to=last_ts + window_secs, ts_index=1
+                )
             for to_key, ts, epk, cur, amt in neighbors:
-
                 if epk in path_events_set:
                     continue
 
-                new_keys = path_keys + (to_key,)
-                new_events = path_events + (epk,)
-                new_categories = path_categories + (cur,)
-                new_amounts = path_amounts + (amt,)
-                new_first_ts = first_ts if first_ts is not None else ts
-                new_last_ts = ts
-
-                if to_key == start and len(new_keys) >= min_hops + 1:
+                if to_key == start and len(path_keys) >= min_hops:
                     _emit_chain(
-                        chains, len(chains), new_keys, new_events,
-                        new_categories, new_amounts, visited_chains,
-                        min_hops, new_first_ts, new_last_ts,
+                        chains,
+                        len(chains),
+                        path_keys + (to_key,),
+                        path_events + (epk,),
+                        path_categories + (cur,),
+                        path_amounts + (amt,),
+                        visited_chains,
+                        min_hops,
+                        first_ts if first_ts is not None else ts,
+                        ts,
                     )
-                    if (len(chains) >= max_chains
-                            or len(chains) - seed_start_count >= per_seed_budget):
+                    if (
+                        len(chains) >= max_chains
+                        or len(chains) - seed_start_count >= per_seed_budget
+                    ):
                         break
                     extended = True
                     continue
@@ -617,27 +507,28 @@ def _bfs_seed_batch(
                 if to_key in path_keys_set:
                     continue
 
-                new_keys_set = path_keys_set | {to_key}
-                new_events_set = path_events_set | {epk}
-                stack.append((
-                    to_key, new_keys, new_keys_set, new_events,
-                    new_events_set, new_categories, new_amounts,
-                    new_first_ts, new_last_ts,
-                ))
-                extended = True
+                extended = has_child = True
 
-            if (len(chains) >= max_chains
-                    or len(chains) - seed_start_count >= per_seed_budget):
+            if len(chains) >= max_chains or len(chains) - seed_start_count >= per_seed_budget:
                 break
+
+            if has_child:
+                stack.append([expanding, neighbors, len(neighbors) - 1])
 
             if not extended and len(path_keys) - 1 >= min_hops:
                 _emit_chain(
-                    chains, len(chains), path_keys, path_events,
-                    path_categories, path_amounts, visited_chains,
-                    min_hops, first_ts, last_ts,
+                    chains,
+                    len(chains),
+                    path_keys,
+                    path_events,
+                    path_categories,
+                    path_amounts,
+                    visited_chains,
+                    min_hops,
+                    first_ts,
+                    last_ts,
                 )
-                if (len(chains) >= max_chains
-                        or len(chains) - seed_start_count >= per_seed_budget):
+                if len(chains) >= max_chains or len(chains) - seed_start_count >= per_seed_budget:
                     break
         if len(chains) >= max_chains:
             break
@@ -683,7 +574,7 @@ def _dedup_strict_prefixes(
     # shorter chain reaches the dedup check.
     sorted_chains = sorted(chains, key=lambda c: -len(c.keys))
 
-    extended_prefixes: set[tuple] = set()
+    extended_prefixes: set[tuple[str, ...]] = set()
     deduped: list[Chain] = []
     removed = 0
     for c in sorted_chains:
@@ -693,7 +584,8 @@ def _dedup_strict_prefixes(
             continue
         deduped.append(
             dataclasses.replace(
-                c, chain_id=f"CHAIN-{len(deduped):06d}",
+                c,
+                chain_id=f"CHAIN-{len(deduped):06d}",
             ),
         )
         if len(deduped) >= max_chains:
@@ -706,11 +598,11 @@ def _dedup_strict_prefixes(
 def _emit_chain(
     chains: list[Chain],
     counter: int,
-    keys: tuple,
-    events: tuple,
-    categories: tuple,
-    amounts: tuple,
-    visited: set[frozenset],
+    keys: tuple[Any, ...],
+    events: tuple[Any, ...],
+    categories: tuple[Any, ...],
+    amounts: tuple[Any, ...],
+    visited: set[frozenset[int]],
     min_hops: int,
     first_ts: float | None = None,
     last_ts: float | None = None,
@@ -730,6 +622,14 @@ def _emit_chain(
         if event_sig in visited:
             return
         visited.add(event_sig)
+        if len(visited) == _DEDUP_CAP:
+            import warnings
+
+            warnings.warn(
+                f"chain dedup stopped after {_DEDUP_CAP} distinct event sequences; "
+                "later chains may repeat an earlier one",
+                stacklevel=2,
+            )
 
     is_cyclic = keys[-1] == keys[0] if len(keys) >= 3 else False
     if first_ts is not None and last_ts is not None:
@@ -739,14 +639,16 @@ def _emit_chain(
 
     amount_decay = amounts[-1] / amounts[0] if amounts and amounts[0] != 0 else 0.0
 
-    chains.append(Chain(
-        chain_id=f"CHAIN-{counter:06d}",
-        keys=list(keys),
-        event_keys=list(events),
-        hop_count=hop_count,
-        is_cyclic=is_cyclic,
-        time_span_hours=time_span,
-        categories=list(categories),
-        amounts=list(amounts),
-        amount_decay=amount_decay,
-    ))
+    chains.append(
+        Chain(
+            chain_id=f"CHAIN-{counter:06d}",
+            keys=list(keys),
+            event_keys=list(events),
+            hop_count=hop_count,
+            is_cyclic=is_cyclic,
+            time_span_hours=time_span,
+            categories=list(categories),
+            amounts=list(amounts),
+            amount_decay=amount_decay,
+        )
+    )

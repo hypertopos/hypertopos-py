@@ -5,6 +5,7 @@
 """Tests for witness_set and anti_witness."""
 
 import numpy as np
+
 from hypertopos.engine.geometry import GDSEngine
 
 

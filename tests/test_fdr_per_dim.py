@@ -10,10 +10,12 @@ BH/Storey applied PER DIM (each dim gets its own correction; no global pool).
 Replaces the entity-level single-FDR with per-dim independence: a dim
 driving many anomalies cannot inflate the global FDR for other dims.
 """
+
 from __future__ import annotations
 
 import numpy as np
 import pytest
+
 from hypertopos.engine.fdr import (
     fdr_per_dimension,
     per_dim_p_values_chi2_univariate,
@@ -28,10 +30,12 @@ def test_per_dim_pvalues_chi2_under_null():
     For delta = 1.96 → p ≈ 0.05 (the two-sided critical value).
     For delta = 2.58 → p ≈ 0.01.
     """
-    deltas = np.array([
-        [0.0,  1.96, 2.58],
-        [1.96, 2.58, 0.0],
-    ])
+    deltas = np.array(
+        [
+            [0.0, 1.96, 2.58],
+            [1.96, 2.58, 0.0],
+        ]
+    )
     p = per_dim_p_values_chi2_univariate(deltas)
     assert p.shape == (2, 3)
     np.testing.assert_allclose(p[0, 0], 1.0, atol=1e-6)
@@ -68,16 +72,18 @@ def test_fdr_per_dim_each_dim_corrected_independently():
             After right-to-left min: 0.067, 0.067, 0.067, 0.5, 0.5
             Rejected at α=0.10: entities 0, 1, 2 (the three small p-values).
     """
-    p_matrix = np.array([
-        # entity 0 has dim 0 strong AND dim 2 mid
-        [0.01, 0.5, 0.04],
-        # entity 1 has dim 2 mid
-        [0.5,  0.5, 0.03],
-        # entity 2 has dim 2 mid
-        [0.5,  0.5, 0.02],
-        [0.5,  0.5, 0.5],
-        [0.5,  0.5, 0.5],
-    ])
+    p_matrix = np.array(
+        [
+            # entity 0 has dim 0 strong AND dim 2 mid
+            [0.01, 0.5, 0.04],
+            # entity 1 has dim 2 mid
+            [0.5, 0.5, 0.03],
+            # entity 2 has dim 2 mid
+            [0.5, 0.5, 0.02],
+            [0.5, 0.5, 0.5],
+            [0.5, 0.5, 0.5],
+        ]
+    )
     rejected, q_values = fdr_per_dimension(p_matrix, alpha=0.10, method="bh")
     # Shape preserved
     assert rejected.shape == (5, 3)
@@ -127,10 +133,12 @@ def test_fdr_per_dim_storey_method():
     """
     rng = np.random.RandomState(0)
     # Build a single dim with 90% true nulls (uniform p) + 10% small p
-    p_dim = np.concatenate([
-        rng.uniform(0, 1, 90),    # nulls
-        rng.uniform(0, 0.01, 10),  # signals
-    ])
+    p_dim = np.concatenate(
+        [
+            rng.uniform(0, 1, 90),  # nulls
+            rng.uniform(0, 0.01, 10),  # signals
+        ]
+    )
     p_matrix = p_dim.reshape(-1, 1)
     _, q_bh = fdr_per_dimension(p_matrix, alpha=0.05, method="bh")
     _, q_storey = fdr_per_dimension(p_matrix, alpha=0.05, method="storey")
@@ -171,13 +179,15 @@ def test_per_dim_pvalues_pipeline_with_fdr_per_dim():
 
     Expected: entity 0 rejected on dim 0, entity 1 rejected on dim 1.
     """
-    deltas = np.array([
-        [3.0, 0.1],
-        [0.1, 3.0],
-        [0.1, 0.1],
-        [0.1, 0.1],
-        [0.1, 0.1],
-    ])
+    deltas = np.array(
+        [
+            [3.0, 0.1],
+            [0.1, 3.0],
+            [0.1, 0.1],
+            [0.1, 0.1],
+            [0.1, 0.1],
+        ]
+    )
     p = per_dim_p_values_chi2_univariate(deltas)
     rejected, q = fdr_per_dimension(p, alpha=0.10, method="bh")
     assert rejected[0, 0]
@@ -246,6 +256,7 @@ def test_apply_fdr_attaches_per_dim_attrs_with_engineered_distinct_dims():
         p_value_method="chi2",
         pattern_df=3,
         fdr_axis="per_dim",
+        n_tests=len(polys),
     )
     assert len(out) == 3, "all three engineered anomalies must survive"
     for poly in out:
@@ -261,9 +272,7 @@ def test_apply_fdr_attaches_per_dim_attrs_with_engineered_distinct_dims():
     assert by_key["e2"].dominant_q_dim_idx == 2
     # Discriminator: q-value vectors are NOT identical across entities
     q_vectors = [tuple(p.q_values_per_dim) for p in out]
-    assert len(set(q_vectors)) == 3, (
-        f"per-dim q-values collapsed across entities: {q_vectors}"
-    )
+    assert len(set(q_vectors)) == 3, f"per-dim q-values collapsed across entities: {q_vectors}"
 
 
 def test_apply_fdr_per_dim_min_q_supports_rank_by_min_q_sort():
@@ -299,16 +308,18 @@ def test_apply_fdr_per_dim_min_q_supports_rank_by_min_q_sort():
         p_value_method="chi2",
         pattern_df=3,
         fdr_axis="per_dim",
+        n_tests=len(polys),
     )
     # Default ranking after FDR is by delta_norm desc (caller sorts; here we
     # just verify the asymmetry between the two ranking keys).
     by_key = {p.primary_key: p for p in out}
-    assert by_key["strong_norm_weak_signal"].delta_norm > by_key[
-        "weak_norm_strong_signal"
-    ].delta_norm
-    assert by_key["weak_norm_strong_signal"].min_q_per_dim < by_key[
-        "strong_norm_weak_signal"
-    ].min_q_per_dim
+    assert (
+        by_key["strong_norm_weak_signal"].delta_norm > by_key["weak_norm_strong_signal"].delta_norm
+    )
+    assert (
+        by_key["weak_norm_strong_signal"].min_q_per_dim
+        < by_key["strong_norm_weak_signal"].min_q_per_dim
+    )
     # Simulate the rank_by='min_q_per_dim' sort step
     sorted_by_min_q = sorted(out, key=lambda p: p.min_q_per_dim)
     assert sorted_by_min_q[0].primary_key == "weak_norm_strong_signal", (

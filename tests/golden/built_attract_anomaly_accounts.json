@@ -1,0 +1,124 @@
+{
+  "clusters": null,
+  "meta": null,
+  "ranking": [
+    {
+      "anomaly_confidence": 0.9150000215,
+      "delta": [
+        0.879963696,
+        4.192636013,
+        1.130665541,
+        3.933678389
+      ],
+      "delta_norm": 5.924927235,
+      "delta_rank_pct": 97.5,
+      "is_anomaly": true,
+      "primary_key": "A029"
+    },
+    {
+      "anomaly_confidence": 0.6750000119,
+      "delta": [
+        0.01725341938,
+        3.929642439,
+        -0.2826650143,
+        3.933678389
+      ],
+      "delta_norm": 5.567415237,
+      "delta_rank_pct": 95.0,
+      "is_anomaly": true,
+      "primary_key": "A003"
+    },
+    {
+      "anomaly_confidence": 0.4250000119,
+      "delta": [
+        -1.708166957,
+        2.013632298,
+        -1.69599545,
+        2.232628584
+      ],
+      "delta_norm": 3.851438761,
+      "delta_rank_pct": 92.5,
+      "is_anomaly": false,
+      "primary_key": "A017"
+    },
+    {
+      "anomaly_confidence": 0.01999999955,
+      "delta": [
+        2.260300398,
+        -0.1505839974,
+        1.837330699,
+        -0.1488416642
+      ],
+      "delta_norm": 2.920542955,
+      "delta_rank_pct": 90.0,
+      "is_anomaly": false,
+      "primary_key": "A027"
+    },
+    {
+      "anomaly_confidence": 0.07500000298,
+      "delta": [
+        -1.880709052,
+        -0.353343755,
+        -1.69599545,
+        -0.48905164
+      ],
+      "delta_norm": 2.603361368,
+      "delta_rank_pct": 87.5,
+      "is_anomaly": false,
+      "primary_key": "A026"
+    },
+    {
+      "anomaly_confidence": 0.009999999776,
+      "delta": [
+        -1.708166957,
+        -0.3024017811,
+        -1.69599545,
+        -0.48905164
+      ],
+      "delta_norm": 2.474843979,
+      "delta_rank_pct": 85.0,
+      "is_anomaly": false,
+      "primary_key": "A007"
+    },
+    {
+      "anomaly_confidence": 0.009999999776,
+      "delta": [
+        1.39759016,
+        -0.1698158681,
+        1.837330699,
+        -0.3189466596
+      ],
+      "delta_norm": 2.336580276,
+      "delta_rank_pct": 82.5,
+      "is_anomaly": false,
+      "primary_key": "A014"
+    },
+    {
+      "anomaly_confidence": 0.0,
+      "delta": [
+        1.570132256,
+        -0.1955690533,
+        1.483997822,
+        0.1913684011
+      ],
+      "delta_norm": 2.177712917,
+      "delta_rank_pct": 80.0,
+      "is_anomaly": false,
+      "primary_key": "A028"
+    },
+    {
+      "anomaly_confidence": 0.02999999933,
+      "delta": [
+        -1.535624981,
+        -0.3808579445,
+        -1.342663169,
+        -0.48905164
+      ],
+      "delta_norm": 2.131927013,
+      "delta_rank_pct": 77.5,
+      "is_anomaly": false,
+      "primary_key": "A009"
+    }
+  ],
+  "total_found": 9
+}

@@ -3,6 +3,7 @@
 Verifies the new pyarrow group_by + lazy materialization implementation produces
 identical observable output to the legacy from_edge_lists Python-loop path.
 """
+
 from __future__ import annotations
 
 from hypertopos.engine.adjacency import AdjacencyIndex
@@ -130,7 +131,10 @@ def test_pair_counts_simple():
 def test_pair_counts_with_duplicate_pair():
     """Two edges with same (from, to) but different timestamps → pair count = 2."""
     adj = AdjacencyIndex.from_edge_lists(
-        ["A", "A", "B"], ["B", "B", "C"], [1.0, 2.0, 3.0], [10.0, 20.0, 30.0],
+        ["A", "A", "B"],
+        ["B", "B", "C"],
+        [1.0, 2.0, 3.0],
+        [10.0, 20.0, 30.0],
         ["e1", "e2", "e3"],
     )
     pc = adj.pair_counts()
@@ -151,6 +155,7 @@ def test_caching_pair_counts():
 def _build_random_fixture(n: int = 200, seed: int = 42):
     """Build a deterministic random edge fixture with overlapping pairs and ties."""
     import random
+
     rng = random.Random(seed)
     nodes = [f"N{i}" for i in range(20)]
     fk = [rng.choice(nodes) for _ in range(n)]

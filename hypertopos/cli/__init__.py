@@ -4,11 +4,7 @@
 # See LICENSE.md in the repository root for full terms.
 """hypertopos CLI package.
 
-Re-exports ``main`` for backward compatibility:
-    from hypertopos.cli import main
+The entry point lives in ``hypertopos.cli.main`` (console script
+``hypertopos = hypertopos.cli.main:main``). The package does not import it,
+so ``python -m hypertopos.cli.main`` runs without a runpy warning.
 """
-from __future__ import annotations
-
-from hypertopos.cli.main import main
-
-__all__ = ["main"]

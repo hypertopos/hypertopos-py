@@ -13,9 +13,11 @@ Adapter contract:
     Input shape: detector-specific (Arrow table / dict / list).
     Output: dict[primary_key] -> p in (0, 1], deterministic, no NaN/inf.
 """
+
 from __future__ import annotations
 
-from typing import Mapping
+from collections.abc import Mapping
+from typing import Any
 
 import numpy as np
 import pyarrow as pa
@@ -76,10 +78,9 @@ def detector_p_value_delta_norm(
         pk_to_idx.setdefault(pk, i)
 
     delta_norm = geo_table["delta_norm"]
-    has_conf = (
-        use_anomaly_confidence and "anomaly_confidence" in geo_table.schema.names
-    )
-    conf_col = geo_table["anomaly_confidence"] if has_conf else None
+    has_conf = use_anomaly_confidence and "anomaly_confidence" in geo_table.schema.names
+    # Any (not Optional): only indexed under `if has_conf`, where it is set.
+    conf_col: Any = geo_table["anomaly_confidence"] if has_conf else None
 
     out: dict[str, float] = {}
     for pk in primary_keys:
@@ -152,14 +153,16 @@ def detector_p_value_neighbor_contamination(
 def detector_p_value_segment_shift(
     observations: Mapping[str, Mapping[str, int]],
 ) -> dict[str, float]:
-    """Fisher's exact 2x2 p-value for "anomaly rate differs by segment".
+    """Fisher's exact 2x2 p-value for "anomaly rate is elevated in segment".
 
     For each segment id S, ``observations[S]`` is a mapping with keys:
         - in_segment_anomalous, in_segment_total
         - out_segment_anomalous, out_segment_total
 
-    Returns the two-sided Fisher exact p-value comparing in-segment anomaly
-    rate against out-segment anomaly rate.
+    Returns the one-sided (``greater``) Fisher exact p-value: small only when
+    the in-segment anomaly rate is higher than the out-of-segment rate. A
+    segment with a lower anomaly rate is no evidence that its members are
+    anomalous, so it gets a p-value near 1.
     """
     if not observations:
         return {}
@@ -178,7 +181,7 @@ def detector_p_value_segment_shift(
         # 2x2: rows = segment / not segment, cols = anomaly / not
         table = [[in_a, in_n], [out_a, out_n]]
         try:
-            _odds, p_value = fisher_exact(table, alternative="two-sided")
+            _odds, p_value = fisher_exact(table, alternative="greater")
         except (ValueError, ZeroDivisionError):
             p_value = _P_CEIL
         out[segment] = _clip_p(float(p_value))
@@ -225,9 +228,10 @@ def detector_p_value_trajectory_continuous(
 ) -> dict[str, float]:
     """ECDF-based p-value for a continuous trajectory anomaly score.
 
-    Higher score = more anomalous. We map score to ``p = 1 - F_n(score) + 1/(n+1)``
-    so the largest score maps to ``1/(n+1)`` (smallest p, never exactly 0)
-    and the smallest score maps to 1.0.
+    Higher score = more anomalous. With average ranks ``r`` (1 = smallest
+    score), ``p = (n - r + 1) / (n + 1)``: the largest score maps to
+    ``1/(n+1)`` (smallest p, never exactly 0) and the smallest to
+    ``n/(n+1)``. Non-finite scores take the median before ranking.
     """
     if not scores:
         return {}
@@ -238,10 +242,7 @@ def detector_p_value_trajectory_continuous(
     # nor vanish when ranking.
     finite_mask = np.isfinite(values)
     if not finite_mask.all():
-        if finite_mask.any():
-            fill = float(np.median(values[finite_mask]))
-        else:
-            fill = 0.0
+        fill = float(np.median(values[finite_mask])) if finite_mask.any() else 0.0
         values = np.where(finite_mask, values, fill)
     n = values.shape[0]
     # rankdata-equivalent (average ranks for ties)
@@ -249,7 +250,6 @@ def detector_p_value_trajectory_continuous(
     ranks = np.empty(n, dtype=np.float64)
     sorted_vals = values[order]
     i = 0
-    rank_so_far = 0.0
     while i < n:
         j = i
         while j < n and sorted_vals[j] == sorted_vals[i]:
@@ -259,8 +259,6 @@ def detector_p_value_trajectory_continuous(
         for kk in range(i, j):
             ranks[order[kk]] = avg_rank
         i = j
-        rank_so_far = avg_rank
-    _ = rank_so_far
     # p = (n - rank + 1) / (n + 1) — survival of the empirical CDF.
     ps = (n - ranks + 1.0) / (n + 1.0)
     return {keys[i]: _clip_p(float(ps[i])) for i in range(n)}

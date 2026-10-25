@@ -3,9 +3,8 @@
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
 """Tests for adaptive chunk sizing and memory detection."""
-from __future__ import annotations
 
-import pytest
+from __future__ import annotations
 
 from hypertopos.builder.builder import GDSBuilder
 
@@ -13,21 +12,27 @@ from hypertopos.builder.builder import GDSBuilder
 class TestChunkSizing:
     def test_small_sphere_no_chunking(self):
         chunk = GDSBuilder._compute_chunk_size(
-            n_entities=1000, n_buckets=50, n_dims=10,
+            n_entities=1000,
+            n_buckets=50,
+            n_dims=10,
             memory_budget_bytes=4 * 1024**3,
         )
         assert chunk == 1000
 
     def test_large_sphere_chunks(self):
         chunk = GDSBuilder._compute_chunk_size(
-            n_entities=500_000, n_buckets=500, n_dims=28,
+            n_entities=500_000,
+            n_buckets=500,
+            n_dims=28,
             memory_budget_bytes=4 * 1024**3,
         )
         assert 1000 <= chunk < 500_000
 
     def test_minimum_chunk_floor(self):
         chunk = GDSBuilder._compute_chunk_size(
-            n_entities=500_000, n_buckets=500, n_dims=28,
+            n_entities=500_000,
+            n_buckets=500,
+            n_dims=28,
             memory_budget_bytes=1 * 1024**2,
         )
         assert chunk == 1000
@@ -35,14 +40,18 @@ class TestChunkSizing:
     def test_small_population_capped_at_n(self):
         # Population smaller than floor — returns n_entities (not floor)
         chunk = GDSBuilder._compute_chunk_size(
-            n_entities=500, n_buckets=10, n_dims=5,
+            n_entities=500,
+            n_buckets=10,
+            n_dims=5,
             memory_budget_bytes=100 * 1024**2,
         )
         assert chunk == 500
 
     def test_very_wide_dims(self):
         chunk = GDSBuilder._compute_chunk_size(
-            n_entities=100_000, n_buckets=100, n_dims=200,
+            n_entities=100_000,
+            n_buckets=100,
+            n_dims=200,
             memory_budget_bytes=2 * 1024**3,
         )
         assert 1000 <= chunk < 100_000
@@ -70,7 +79,7 @@ class TestPlanExecution:
             available_ram=8 * 1024**3,
         )
         assert n_workers >= 1
-        for pid, cs in chunk_sizes.items():
+        for cs in chunk_sizes.values():
             assert cs >= 1000
 
     def test_single_pattern(self):

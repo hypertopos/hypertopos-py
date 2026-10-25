@@ -5,6 +5,7 @@ Covers: DimensionContribution + InfluenceEntry + InfluenceReport +
 GroupInfluenceReport dataclasses, math helpers, classification, cascading
 flips, group leave-set-out, orchestrator validation gates, π5 additive fields.
 """
+
 from __future__ import annotations
 
 import dataclasses
@@ -15,6 +16,7 @@ import pytest
 # ---------------------------------------------------------------------------
 # Layer 1a — Dataclass construction + frozen
 # ---------------------------------------------------------------------------
+
 
 def test_dimension_contribution_construction_and_frozen():
     from hypertopos.model.sphere import DimensionContribution
@@ -123,6 +125,7 @@ def test_group_influence_report_construction_and_frozen():
 # Layer 1b — Math helper: _compute_leave_one_out_impact
 # ---------------------------------------------------------------------------
 
+
 def test_leave_one_out_two_entities_closed_form():
     from hypertopos.engine.geometry import _compute_leave_one_out_impact
 
@@ -130,7 +133,9 @@ def test_leave_one_out_two_entities_closed_form():
     mu_full = shapes.mean(axis=0)
     sigma_full = shapes.std(axis=0, ddof=0)
     mu_imp, sigma_imp, total_imp, contrib = _compute_leave_one_out_impact(
-        shapes, mu_full, sigma_full,
+        shapes,
+        mu_full,
+        sigma_full,
     )
     assert mu_imp.shape == (2,)
     assert total_imp.shape == (2,)
@@ -146,7 +151,9 @@ def test_leave_one_out_pure_mu_shift():
     mu_full = shapes.mean(axis=0)
     sigma_full = shapes.std(axis=0, ddof=0)
     mu_imp, sigma_imp, total_imp, _ = _compute_leave_one_out_impact(
-        shapes, mu_full, sigma_full,
+        shapes,
+        mu_full,
+        sigma_full,
     )
     assert np.argmax(total_imp) == 9
 
@@ -169,7 +176,9 @@ def test_leave_one_out_pure_sigma_shift_HIDDEN_INFLUENCER_GUARD():
     mu_full = shapes.mean(axis=0)
     sigma_full = shapes.std(axis=0, ddof=0)
     mu_imp, sigma_imp, total_imp, _ = _compute_leave_one_out_impact(
-        shapes, mu_full, sigma_full,
+        shapes,
+        mu_full,
+        sigma_full,
     )
     assert sigma_imp[9] > mu_imp[9], (
         "Hidden-influencer guard failed: σ-shift component of outlier did "
@@ -185,7 +194,9 @@ def test_leave_one_out_zero_drift_yields_zero_impact():
     mu_full = shapes.mean(axis=0)
     sigma_full = shapes.std(axis=0, ddof=0)
     mu_imp, sigma_imp, total_imp, _ = _compute_leave_one_out_impact(
-        shapes, mu_full, sigma_full,
+        shapes,
+        mu_full,
+        sigma_full,
     )
     np.testing.assert_allclose(mu_imp, 0.0, atol=1e-9)
     np.testing.assert_allclose(sigma_imp, 0.0, atol=1e-9)
@@ -200,7 +211,9 @@ def test_leave_one_out_sigma_safe_on_degenerate_dim():
     mu_full = shapes.mean(axis=0)
     sigma_full = shapes.std(axis=0, ddof=0)
     mu_imp, sigma_imp, total_imp, _ = _compute_leave_one_out_impact(
-        shapes, mu_full, sigma_full,
+        shapes,
+        mu_full,
+        sigma_full,
     )
     assert np.all(np.isfinite(mu_imp))
     assert np.all(np.isfinite(sigma_imp))
@@ -223,6 +236,7 @@ def test_leave_one_out_per_dim_contributions_ranked():
 # Layer 1c — Classification: _classify_influence
 # ---------------------------------------------------------------------------
 
+
 def test_classify_hidden_cell():
     from hypertopos.engine.geometry import _classify_influence
 
@@ -230,7 +244,10 @@ def test_classify_hidden_cell():
     delta_norm = np.array([0.1, 0.1, 0.1, 9.0, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1])
     theta_norm = 5.0
     classes = _classify_influence(
-        total_impact, delta_norm, theta_norm, high_threshold_pct=90.0,
+        total_impact,
+        delta_norm,
+        theta_norm,
+        high_threshold_pct=90.0,
     )
     assert classes[0] == "hidden"
     assert classes[3] == "distorter"
@@ -243,7 +260,10 @@ def test_classify_distorter_cell():
     delta_norm = np.array([9.0, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1])
     theta_norm = 5.0
     classes = _classify_influence(
-        total_impact, delta_norm, theta_norm, high_threshold_pct=90.0,
+        total_impact,
+        delta_norm,
+        theta_norm,
+        high_threshold_pct=90.0,
     )
     assert classes[0] == "distorter"
 
@@ -254,13 +274,14 @@ def test_classify_standard_anomaly_cell():
     from hypertopos.engine.geometry import _classify_influence
 
     # Distribution where percentile_90 cleanly separates entity 0 (low) from rest.
-    total_impact = np.array(
-        [0.05, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
-    )
+    total_impact = np.array([0.05, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5])
     delta_norm = np.array([9.0, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1])
     theta_norm = 5.0
     classes = _classify_influence(
-        total_impact, delta_norm, theta_norm, high_threshold_pct=90.0,
+        total_impact,
+        delta_norm,
+        theta_norm,
+        high_threshold_pct=90.0,
     )
     # 90th percentile of the array = 0.5; entity 0 at 0.05 is below cutoff.
     assert classes[0] == "standard_anomaly"
@@ -276,7 +297,10 @@ def test_classify_normal_cell():
     delta_norm = np.full(10, 0.1)
     theta_norm = 5.0
     classes = _classify_influence(
-        total_impact, delta_norm, theta_norm, high_threshold_pct=90.0,
+        total_impact,
+        delta_norm,
+        theta_norm,
+        high_threshold_pct=90.0,
     )
     # Bottom 9 → normal; entity 9 → hidden (high impact + low anomaly).
     assert all(c == "normal" for c in classes[:9])
@@ -291,10 +315,16 @@ def test_classify_threshold_pct_param_sensitivity():
     delta_norm = np.full(100, 0.1)
     theta_norm = 5.0
     classes_50 = _classify_influence(
-        total_impact, delta_norm, theta_norm, high_threshold_pct=50.0,
+        total_impact,
+        delta_norm,
+        theta_norm,
+        high_threshold_pct=50.0,
     )
     classes_99 = _classify_influence(
-        total_impact, delta_norm, theta_norm, high_threshold_pct=99.0,
+        total_impact,
+        delta_norm,
+        theta_norm,
+        high_threshold_pct=99.0,
     )
     n_hidden_50 = sum(c == "hidden" for c in classes_50)
     n_hidden_99 = sum(c == "hidden" for c in classes_99)
@@ -307,15 +337,16 @@ def test_classify_threshold_pct_param_sensitivity():
 # Layer 1d — Cascading flips: _count_cascading_flips
 # ---------------------------------------------------------------------------
 
+
 def test_cascading_no_flips_when_population_stable():
     from hypertopos.engine.geometry import _count_cascading_flips
 
     rng = np.random.default_rng(0)
     shapes = rng.normal(0.0, 1.0, size=(50, 3)).astype(np.float64)
     sum_s = shapes.sum(axis=0)
-    sum_s_sq = (shapes ** 2).sum(axis=0)
+    sum_s_sq = (shapes**2).sum(axis=0)
     mu_full = sum_s / 50
-    sigma_full = np.sqrt(sum_s_sq / 50 - mu_full ** 2)
+    sigma_full = np.sqrt(sum_s_sq / 50 - mu_full**2)
     sigma_full_safe = np.maximum(sigma_full, 1e-12)
     deltas_full = (shapes - mu_full) / sigma_full_safe
     delta_norm_full = np.linalg.norm(deltas_full, axis=1)
@@ -342,9 +373,9 @@ def test_cascading_only_with_verbose_true():
     rng = np.random.default_rng(1)
     shapes = rng.normal(0.0, 1.0, size=(30, 2)).astype(np.float64)
     sum_s = shapes.sum(axis=0)
-    sum_s_sq = (shapes ** 2).sum(axis=0)
+    sum_s_sq = (shapes**2).sum(axis=0)
     mu_full = sum_s / 30
-    sigma_full = np.sqrt(sum_s_sq / 30 - mu_full ** 2)
+    sigma_full = np.sqrt(sum_s_sq / 30 - mu_full**2)
     sigma_full_safe = np.maximum(sigma_full, 1e-12)
     deltas_full = (shapes - mu_full) / sigma_full_safe
     delta_norm_full = np.linalg.norm(deltas_full, axis=1)
@@ -385,14 +416,14 @@ def test_cascading_flip_count_differs_for_engineered_distinct_outliers():
     # different dims at similar magnitudes produces similar flip counts
     # (legit math). Asymmetric magnitudes create asymmetric σ-shrinks →
     # asymmetric flip counts. If counts are STILL identical, bug confirmed.
-    shapes[0] = [50.0, 0.0, 0.0]   # huge on dim 0 → big σ-shrink on dim 0
-    shapes[1] = [0.0, 5.0, 0.0]    # medium on dim 1 → medium σ-shrink on dim 1
-    shapes[2] = [0.0, 0.0, 1.0]    # small on dim 2 → small σ-shrink on dim 2
+    shapes[0] = [50.0, 0.0, 0.0]  # huge on dim 0 → big σ-shrink on dim 0
+    shapes[1] = [0.0, 5.0, 0.0]  # medium on dim 1 → medium σ-shrink on dim 1
+    shapes[2] = [0.0, 0.0, 1.0]  # small on dim 2 → small σ-shrink on dim 2
 
     sum_s = shapes.sum(axis=0)
-    sum_s_sq = (shapes ** 2).sum(axis=0)
+    sum_s_sq = (shapes**2).sum(axis=0)
     mu_full = sum_s / 50
-    sigma_full = np.sqrt(np.maximum(sum_s_sq / 50 - mu_full ** 2, 0.0))
+    sigma_full = np.sqrt(np.maximum(sum_s_sq / 50 - mu_full**2, 0.0))
     sigma_full_safe = np.maximum(sigma_full, 1e-12)
     deltas_full = (shapes - mu_full) / sigma_full_safe
     delta_norm_full = np.linalg.norm(deltas_full, axis=1)
@@ -435,9 +466,9 @@ def test_cascading_flips_neighbours_near_threshold_POSITIVE_CASE():
     shapes = rng.normal(0.0, 0.3, size=(20, 2)).astype(np.float64)
     shapes[0] = [10.0, 0.0]  # σ-inflating outlier
     sum_s = shapes.sum(axis=0)
-    sum_s_sq = (shapes ** 2).sum(axis=0)
+    sum_s_sq = (shapes**2).sum(axis=0)
     mu_full = sum_s / 20
-    sigma_full = np.sqrt(np.maximum(sum_s_sq / 20 - mu_full ** 2, 0.0))
+    sigma_full = np.sqrt(np.maximum(sum_s_sq / 20 - mu_full**2, 0.0))
     sigma_full_safe = np.maximum(sigma_full, 1e-12)
     deltas_full = (shapes - mu_full) / sigma_full_safe
     delta_norm_full = np.linalg.norm(deltas_full, axis=1)
@@ -464,6 +495,7 @@ def test_cascading_flips_neighbours_near_threshold_POSITIVE_CASE():
 # Layer 1e — Group leave-set-out: _compute_leave_set_out_impact
 # ---------------------------------------------------------------------------
 
+
 def test_group_reinforcing_pure_duplicates():
     from hypertopos.engine.geometry import (
         _compute_leave_one_out_impact,
@@ -476,7 +508,9 @@ def test_group_reinforcing_pure_duplicates():
     mu_full = shapes.mean(axis=0)
     sigma_full = shapes.std(axis=0, ddof=0)
     mu_imp, sigma_imp, total_imp, _ = _compute_leave_one_out_impact(
-        shapes, mu_full, sigma_full,
+        shapes,
+        mu_full,
+        sigma_full,
     )
     sum_individual = total_imp[0] + total_imp[1]
 
@@ -512,7 +546,9 @@ def test_group_canceling_opposite_shapes():
     mu_full = shapes.mean(axis=0)
     sigma_full = shapes.std(axis=0, ddof=0)
     mu_imp, sigma_imp, total_imp, _ = _compute_leave_one_out_impact(
-        shapes, mu_full, sigma_full,
+        shapes,
+        mu_full,
+        sigma_full,
     )
     sum_individual = total_imp[0] + total_imp[1]
 
@@ -549,6 +585,7 @@ def test_group_per_dim_contributions_present():
 # Layer 1f — Orchestrator validation gates + happy paths
 # ---------------------------------------------------------------------------
 
+
 def _make_pattern_mock(
     pattern_type="anchor",
     n_dims=2,
@@ -556,6 +593,7 @@ def _make_pattern_mock(
     dim_labels=None,
 ):
     from unittest.mock import MagicMock
+
     pattern = MagicMock()
     pattern.pattern_type = pattern_type
     pattern.dim_labels = dim_labels if dim_labels is not None else [f"d{i}" for i in range(n_dims)]
@@ -567,6 +605,8 @@ def _make_pattern_mock(
     pattern.population_size = population_size
     pattern.relations = []
     pattern.prop_columns = []
+    pattern.dimension_weights = None
+    pattern.cholesky_inv = None
     return pattern
 
 
@@ -577,6 +617,7 @@ def _make_navigator_with_geometry(shapes, pattern_id="p", pattern_type="anchor")
     from unittest.mock import MagicMock
 
     import pyarrow as pa
+
     from hypertopos.navigation.navigator import GDSNavigator
 
     N, D = shapes.shape
@@ -587,11 +628,13 @@ def _make_navigator_with_geometry(shapes, pattern_id="p", pattern_type="anchor")
     delta_norms = np.linalg.norm(deltas, axis=1)
     pks = [f"E{i}" for i in range(N)]
 
-    geo_table = pa.table({
-        "primary_key": pks,
-        "delta": [deltas[i].astype(np.float32).tolist() for i in range(N)],
-        "delta_norm": pa.array(delta_norms.astype(np.float32)),
-    })
+    geo_table = pa.table(
+        {
+            "primary_key": pks,
+            "delta": [deltas[i].astype(np.float32).tolist() for i in range(N)],
+            "delta_norm": pa.array(delta_norms.astype(np.float32)),
+        }
+    )
 
     sphere = MagicMock()
     sphere.patterns = {pattern_id: pattern}
@@ -607,7 +650,10 @@ def _make_navigator_with_geometry(shapes, pattern_id="p", pattern_type="anchor")
     contract = MagicMock()
     engine = MagicMock()
     nav = GDSNavigator(
-        engine=engine, storage=storage, manifest=manifest, contract=contract,
+        engine=engine,
+        storage=storage,
+        manifest=manifest,
+        contract=contract,
     )
     return nav
 
@@ -664,12 +710,17 @@ def test_find_calibration_influencers_returns_report_with_cell_counts():
         np.random.default_rng(0).normal(0, 1, size=(20, 3)),
     )
     report = nav.find_calibration_influencers(
-        pattern_id="p", classify="all", top_n=3,
+        pattern_id="p",
+        classify="all",
+        top_n=3,
     )
     assert report.population_size == 20
     assert sum(report.cell_counts.values()) == 20
     assert set(report.cell_counts.keys()) == {
-        "hidden", "distorter", "standard_anomaly", "normal",
+        "hidden",
+        "distorter",
+        "standard_anomaly",
+        "normal",
     }
     assert len(report.entries) <= 3
 
@@ -679,7 +730,9 @@ def test_find_calibration_influencers_classify_filter_returns_only_filtered():
         np.random.default_rng(1).normal(0, 1, size=(50, 3)),
     )
     report = nav.find_calibration_influencers(
-        pattern_id="p", classify="hidden", top_n=10,
+        pattern_id="p",
+        classify="hidden",
+        top_n=10,
     )
     for e in report.entries:
         assert e.classification == "hidden"
@@ -690,10 +743,16 @@ def test_find_calibration_influencers_verbose_attaches_cascading():
         np.random.default_rng(2).normal(0, 1, size=(30, 3)),
     )
     report_no = nav.find_calibration_influencers(
-        pattern_id="p", classify="all", top_n=3, verbose=False,
+        pattern_id="p",
+        classify="all",
+        top_n=3,
+        verbose=False,
     )
     report_yes = nav.find_calibration_influencers(
-        pattern_id="p", classify="all", top_n=3, verbose=True,
+        pattern_id="p",
+        classify="all",
+        top_n=3,
+        verbose=True,
     )
     for e in report_no.entries:
         assert e.cascading_flip_count is None
@@ -705,6 +764,7 @@ def test_find_calibration_influencers_verbose_attaches_cascading():
 # ---------------------------------------------------------------------------
 # Layer 1g — find_group_influence orchestrator
 # ---------------------------------------------------------------------------
+
 
 def test_find_group_influence_returns_per_group_reports():
     nav = _make_navigator_with_geometry(
@@ -768,6 +828,17 @@ def test_find_group_influence_raises_on_event_pattern():
 # objects — additive happens at MCP→dict conversion layer)
 # ---------------------------------------------------------------------------
 
+
+def test_attach_influence_fields_keeps_small_impacts_nonzero():
+    """On a large population each entity's impact is tiny; it must not be
+    rounded away to 0.0."""
+    nav = _make_navigator_with_geometry(
+        np.random.default_rng(1).normal(0, 1, size=(200000, 3)),
+    )
+    enriched = nav._attach_influence_fields_to_anomaly_entries([{"primary_key": "E7"}], "p")
+    assert 0.0 < enriched[0]["total_impact"] < 5e-5
+
+
 def test_attach_influence_fields_returns_total_impact_and_classification():
     """Helper takes list[dict] of anomaly entries + pattern_id, returns
     enriched list[dict] with total_impact + classification per entry."""
@@ -781,7 +852,10 @@ def test_attach_influence_fields_returns_total_impact_and_classification():
         assert "classification" in entry
         assert isinstance(entry["total_impact"], float)
         assert entry["classification"] in {
-            "hidden", "distorter", "standard_anomaly", "normal",
+            "hidden",
+            "distorter",
+            "standard_anomaly",
+            "normal",
         }
 
 

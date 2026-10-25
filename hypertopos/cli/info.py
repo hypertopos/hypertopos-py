@@ -3,11 +3,14 @@
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
 """``hypertopos info`` — print sphere summary from a built sphere directory."""
+
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
+
+from hypertopos.storage.exceptions import GDSError
+from hypertopos.storage.reader import GDSReader
 
 
 def run_info(sphere_path: str) -> None:
@@ -21,41 +24,35 @@ def run_info(sphere_path: str) -> None:
         )
         sys.exit(1)
 
-    with open(meta_path, encoding="utf-8") as f:
-        sphere = json.load(f)
+    reader = GDSReader(str(p))
+    try:
+        sphere = reader.read_sphere()
+    except GDSError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
-    sphere_id = sphere.get("sphere_id", "?")
-    print(f"Sphere: {sphere_id}")
+    print(f"Sphere: {sphere.sphere_id}")
     print(f"Path:   {p.resolve()}")
     print()
 
     # Lines
-    lines = sphere.get("lines", {})
-    print(f"Lines ({len(lines)}):")
-    for lid, linfo in lines.items():
-        role = linfo.get("role", "?")
-        rows = linfo.get("total_rows", "?")
-        cols = len(linfo.get("columns", []))
-        print(f"  {lid:30s}  role={role:8s}  rows={rows}  cols={cols}")
+    print(f"Lines ({len(sphere.lines)}):")
+    for lid, line in sphere.lines.items():
+        rows = reader.count_points_rows(lid, line.current_version())
+        cols = len(line.columns or [])
+        print(f"  {lid:30s}  role={line.line_role:8s}  rows={rows}  cols={cols}")
     print()
 
     # Patterns
-    patterns = sphere.get("patterns", {})
-    print(f"Patterns ({len(patterns)}):")
-    for pid, pinfo in patterns.items():
-        ptype = pinfo.get("type", "?")
-        entity = pinfo.get("entity_line", "?")
-        n_dims = len(pinfo.get("relations", []))
-        event_dims = pinfo.get("event_dimensions", [])
-        if event_dims:
-            n_dims += len(event_dims)
-        print(f"  {pid:30s}  type={ptype:8s}  entity={entity}  dims={n_dims}")
+    print(f"Patterns ({len(sphere.patterns)}):")
+    for pid, pattern in sphere.patterns.items():
+        entity = sphere.entity_line(pid) or "-"
+        n_dims = len(pattern.dim_labels)
+        print(f"  {pid:30s}  type={pattern.pattern_type:8s}  entity={entity}  dims={n_dims}")
     print()
 
     # Disk size
-    total_bytes = sum(
-        f.stat().st_size for f in p.rglob("*") if f.is_file()
-    )
+    total_bytes = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
     if total_bytes < 1024 * 1024:
         size_str = f"{total_bytes / 1024:.1f} KB"
     else:

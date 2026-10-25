@@ -4,18 +4,17 @@ Uses the bundled AML HI-small sphere (chain anchor tx_chains_pattern over
 account_pattern entities) since it's the only sphere with both a chain
 anchor and an entity anchor with calibrated is_anomaly + delta vectors.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
+
 from hypertopos import HyperSphere
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-AML_PATH = (
-    PROJECT_ROOT / "benchmark" / "ibm-aml" / "hi_small_sphere"
-    / "gds_aml_hi_small"
-)
+AML_PATH = PROJECT_ROOT / "benchmark" / "ibm-aml" / "hi_small_sphere" / "gds_aml_hi_small"
 
 
 def _aml_sphere_unavailable() -> bool:
@@ -23,12 +22,13 @@ def _aml_sphere_unavailable() -> bool:
     if not sphere_json.exists():
         return True
     import json
-    return json.loads(sphere_json.read_text()).get("format_version") != "3.0"
+
+    return json.loads(sphere_json.read_text()).get("format_version", "").split(".")[0] != "3"
 
 
 pytestmark = pytest.mark.skipif(
     _aml_sphere_unavailable(),
-    reason="AML HI-small sphere not built at format 3.0",
+    reason="AML HI-small sphere not built (format 3.x)",
 )
 
 

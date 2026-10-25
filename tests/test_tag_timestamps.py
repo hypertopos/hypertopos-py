@@ -4,13 +4,14 @@
 # See LICENSE.md in the repository root for full terms.
 """Tests for storage._tag_timestamps forward-compat layer.
 
-On Lance 7.0 ``tag_timestamp`` resolves the tag's native ``created_at``
-(tz-aware UTC) carried on ``tags.list()``; on older Lance, or for a tag whose
-listing entry lacks ``created_at``, it falls back to the version-commit
-timestamp. These tests assert the public contract — ordering, unknown-tag
-``KeyError``, tz-robust cleanup — without pinning to the representation of
-either path, so they hold under both.
+``tag_timestamp`` resolves the tag's native ``created_at`` (tz-aware UTC)
+carried on ``tags.list()``; for a tag whose listing entry lacks
+``created_at``, it falls back to the version-commit timestamp. These tests
+assert the public contract — ordering, unknown-tag ``KeyError``, tz-robust
+cleanup — without pinning to the representation of either path, so they hold
+under both.
 """
+
 from __future__ import annotations
 
 import time
@@ -20,6 +21,7 @@ from pathlib import Path
 import lance as _lance
 import pyarrow as pa
 import pytest
+
 from hypertopos.storage._tag_timestamps import (
     _as_comparable,
     cleanup_calibration_epochs,
@@ -31,7 +33,7 @@ def _make_dataset(tmp_path: Path) -> _lance.LanceDataset:
     """Build a small Lance dataset with 3 commits — one per epoch."""
     table = pa.table({"k": pa.array([1, 2, 3], type=pa.int32())})
     path = str(tmp_path / "test.lance")
-    ds = _lance.write_dataset(table, path, mode="create")
+    _lance.write_dataset(table, path, mode="create")
     # Two more commits to give us multiple versions
     _lance.write_dataset(table, path, mode="append")
     _lance.write_dataset(table, path, mode="append")
@@ -81,6 +83,16 @@ class TestTagTimestamp:
         # Tags created in order a → b → c with a sleep between each.
         assert ts_a < ts_b < ts_c
 
+    def test_tag_without_created_at_falls_back_to_version_commit_time(self, tmp_path, monkeypatch):
+        """A tag listing entry without ``created_at`` (pre-7.0 writer) resolves
+        to the commit timestamp of the version the tag points to."""
+        import hypertopos.storage._tag_timestamps as tt
+
+        ds = _make_dataset_with_epoch_tags(tmp_path)
+        monkeypatch.setattr(tt, "_tag_timestamp_native", lambda _ds, _tag: None)
+        commit_ts = {v["version"]: v["timestamp"] for v in ds.versions()}
+        assert tag_timestamp(ds, "epoch_b") == commit_ts[2]
+
 
 class TestCleanupCalibrationEpochs:
     def test_drops_only_old_tags(self, tmp_path):
@@ -107,6 +119,14 @@ class TestCleanupCalibrationEpochs:
         dropped = cleanup_calibration_epochs(ds, older_than=naive_cutoff)
         assert dropped == 3
         assert ds.tags.list() == {}
+
+    def test_tags_that_are_not_epochs_survive(self, tmp_path):
+        ds = _make_dataset_with_epoch_tags(tmp_path)
+        ds.tags.create("user_snapshot", 1)
+        tomorrow = datetime.now(UTC) + timedelta(days=1)
+        dropped = cleanup_calibration_epochs(ds, older_than=tomorrow)
+        assert dropped == 3
+        assert list(ds.tags.list()) == ["user_snapshot"]
 
     def test_keep_all_when_cutoff_in_past(self, tmp_path):
         ds = _make_dataset(tmp_path)

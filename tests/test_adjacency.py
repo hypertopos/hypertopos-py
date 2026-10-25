@@ -43,8 +43,11 @@ def test_neighbors_sorted_by_timestamp():
 
 def test_neighbors_unknown_key_returns_empty():
     idx = AdjacencyIndex.from_edge_lists(
-        from_keys=["A"], to_keys=["B"],
-        timestamps=[1.0], amounts=[10.0], event_keys=["e1"],
+        from_keys=["A"],
+        to_keys=["B"],
+        timestamps=[1.0],
+        amounts=[10.0],
+        event_keys=["e1"],
     )
     assert idx.neighbors_out("Z") == []
     assert idx.neighbors_in("Z") == []
@@ -69,8 +72,10 @@ def test_pair_counts_matches_defaultdict_baseline():
 
 def test_pair_counts_eagerly_populated_and_cached():
     idx = AdjacencyIndex.from_edge_lists(
-        from_keys=["A", "A"], to_keys=["B", "C"],
-        timestamps=[1.0, 2.0], amounts=[10.0, 20.0],
+        from_keys=["A", "A"],
+        to_keys=["B", "C"],
+        timestamps=[1.0, 2.0],
+        amounts=[10.0, 20.0],
         event_keys=["e1", "e2"],
     )
     # _pair_counts eagerly populated by _from_table — must not be None after construction
@@ -134,33 +139,44 @@ def test_graph_wide_iteration():
     assert len(edges) == 3
 
 
-def test_reader_get_adjacency_caches():
+def test_reader_get_adjacency_caches(tmp_path):
     """get_adjacency returns same object on second call (cached)."""
-    import json
-    import os
+    import pyarrow as pa
+
+    from hypertopos.builder.builder import GDSBuilder, RelationSpec
     from hypertopos.storage.reader import GDSReader
 
-    sphere_path = os.path.join(
-        os.path.dirname(__file__), "..", "..", "..",
-        "benchmark", "berka", "sphere", "gds_berka_banking",
+    path = tmp_path / "sphere"
+    b = GDSBuilder("adj_cache", str(path))
+    b.add_line("accts", pa.table({"primary_key": ["A", "B", "C"]}), "primary_key", "t")
+    b.add_line(
+        "tx",
+        pa.table(
+            {
+                "primary_key": [f"TX-{i}" for i in range(6)],
+                "from_account": ["A", "A", "B", "B", "C", "C"],
+                "to_account": ["B", "C", "C", "A", "A", "B"],
+                "amount": [10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
+            }
+        ),
+        "primary_key",
+        "t",
+        role="event",
     )
-    if not os.path.exists(sphere_path):
-        import pytest
-        pytest.skip("Berka sphere not available")
-
-    reader = GDSReader(sphere_path)
-    sphere_data = json.loads(
-        (reader._base / "_gds_meta" / "sphere.json").read_text(),
+    b.add_pattern(
+        "tx_pat",
+        "event",
+        "tx",
+        relations=[
+            RelationSpec(line_id="accts", fk_col="from_account", direction="out"),
+            RelationSpec(line_id="accts", fk_col="to_account", direction="in"),
+        ],
     )
-    edge_patterns = [
-        pid for pid, p in sphere_data["patterns"].items()
-        if p.get("has_edge_table")
-    ]
-    if not edge_patterns:
-        import pytest
-        pytest.skip("No edge table in Berka sphere")
+    b.build()
 
-    pat_id = edge_patterns[0]
+    reader = GDSReader(str(path))
+    pat_id = "tx_pat"
+    assert reader.has_edge_table(pat_id)
     idx1 = reader.get_adjacency(pat_id)
     idx2 = reader.get_adjacency(pat_id)
     assert idx1 is idx2
@@ -170,21 +186,25 @@ def test_reader_get_adjacency_caches():
 
 def test_adjacency_integration_session(tmp_path):
     """Build sphere with edges, open session, verify adjacency caching."""
-    from datetime import datetime
     import json
+    from datetime import datetime
+
     import pyarrow as pa
+
     from hypertopos.builder.builder import GDSBuilder, RelationSpec
     from hypertopos.sphere import HyperSphere
 
     rows = []
     for i in range(30):
-        rows.append({
-            "primary_key": f"TX-{i}",
-            "from_account": ["A", "B", "C"][i % 3],
-            "to_account": ["A", "B", "C"][(i + 1) % 3],
-            "amount": (i + 1) * 10.0,
-            "timestamp": datetime(2024, 1, 1 + i // 10),
-        })
+        rows.append(
+            {
+                "primary_key": f"TX-{i}",
+                "from_account": ["A", "B", "C"][i % 3],
+                "to_account": ["A", "B", "C"][(i + 1) % 3],
+                "amount": (i + 1) * 10.0,
+                "timestamp": datetime(2024, 1, 1 + i // 10),
+            }
+        )
     events = pa.table({k: [r[k] for r in rows] for k in rows[0]})
     accounts = pa.table({"primary_key": ["A", "B", "C"]})
 
@@ -194,10 +214,15 @@ def test_adjacency_integration_session(tmp_path):
     b.add_line("accts", accounts, key_col="primary_key", source_id="t", role="anchor")
     b.add_derived_dimension("accts", "tx", "from_account", "count", None, "tx_count")
     b.add_pattern("acct_pat", "anchor", "accts", relations=[])
-    b.add_pattern("tx_pat", "event", "tx", relations=[
-        RelationSpec(line_id="accts", fk_col="from_account", direction="out"),
-        RelationSpec(line_id="accts", fk_col="to_account", direction="out"),
-    ])
+    b.add_pattern(
+        "tx_pat",
+        "event",
+        "tx",
+        relations=[
+            RelationSpec(line_id="accts", fk_col="from_account", direction="out"),
+            RelationSpec(line_id="accts", fk_col="to_account", direction="out"),
+        ],
+    )
     b.build()
 
     hs = HyperSphere.open(str(path))
@@ -214,3 +239,16 @@ def test_adjacency_integration_session(tmp_path):
     assert adj.edge_count() > 0
     # Cached — same object
     assert sess._reader.get_adjacency(pat_id) is adj
+
+
+def test_sorted_out_keys_is_sorted_and_computed_once():
+    adj = AdjacencyIndex.from_edge_lists(
+        from_keys=["C", "A", "B", "A"],
+        to_keys=["X", "Y", "Z", "W"],
+        timestamps=[0.0, 1.0, 2.0, 3.0],
+        amounts=[1.0, 1.0, 1.0, 1.0],
+        event_keys=["e1", "e2", "e3", "e4"],
+    )
+    first = adj.sorted_out_keys()
+    assert first == ["A", "B", "C"]
+    assert adj.sorted_out_keys() is first

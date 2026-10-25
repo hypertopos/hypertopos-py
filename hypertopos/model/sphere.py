@@ -7,12 +7,12 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
 import numpy as np
-
 
 # ---------------------------------------------------------------------------
 # Conformance rules (M1.7) — declarative compliance predicates evaluated at
@@ -73,10 +73,7 @@ def _predicate_from_dict(d: dict[str, Any]) -> ConformancePredicate:
     """Parse a predicate AST from a JSON dict."""
     op = d["op"]
     terms_raw = d.get("terms")
-    terms = (
-        [_predicate_from_dict(t) for t in terms_raw]
-        if terms_raw is not None else None
-    )
+    terms = [_predicate_from_dict(t) for t in terms_raw] if terms_raw is not None else None
     return ConformancePredicate(
         op=op,
         terms=terms,
@@ -173,11 +170,36 @@ class RelationDef:
     required: bool
     display_name: str | None = None
     interpretation: str | None = None
+    # Name the relation was declared with in sphere.yaml (``display_name:``
+    # there). Selects the relation (e.g. aggregate's group_by_relation) and
+    # labels its dim only when the line repeats in the pattern; the
+    # ``display_name`` above is the semantics overlay and always labels.
+    role: str | None = None
+
+
+def relation_dim_labels(relations: Sequence[Any]) -> list[str]:
+    """Dim labels of a pattern's relations: the semantics ``display_name``
+    when set, else the declared ``role`` when several relations point at the
+    same line (e.g. sender / receiver accounts), else the line id."""
+    counts: dict[str, int] = {}
+    for r in relations:
+        counts[r.line_id] = counts.get(r.line_id, 0) + 1
+    labels: list[str] = []
+    for r in relations:
+        role = getattr(r, "role", None)
+        if r.display_name:
+            labels.append(r.display_name)
+        elif role and counts[r.line_id] > 1:
+            labels.append(role)
+        else:
+            labels.append(r.line_id)
+    return labels
 
 
 @dataclass
 class EventDimDef:
     """Continuous dimension definition parsed from sphere.json."""
+
     column: str
     edge_max: float
     display_name: str | None = None
@@ -190,15 +212,15 @@ class FDRHierarchyLevel:
     Read by GDSNavigator.π5_attract_anomaly when find_anomalies is called
     with `fdr_resolution` set.
     """
+
     level: str
     from_dimension: str
 
     @classmethod
-    def from_dict(cls, d: dict) -> FDRHierarchyLevel:
+    def from_dict(cls, d: dict[str, Any]) -> FDRHierarchyLevel:
         if "level" not in d or "from_dimension" not in d:
             raise ValueError(
-                "FDR hierarchy level requires both 'level' and 'from_dimension', "
-                f"got {d!r}",
+                f"FDR hierarchy level requires both 'level' and 'from_dimension', got {d!r}",
             )
         return cls(level=str(d["level"]), from_dimension=str(d["from_dimension"]))
 
@@ -210,16 +232,16 @@ class FDRTemporalLevel:
     The builder materialises `slice_dimension` at build time when the column
     is not yet present on the geometry table.
     """
+
     level: str
     slice_dimension: str
     bucket: str = "90d"
 
     @classmethod
-    def from_dict(cls, d: dict) -> FDRTemporalLevel:
+    def from_dict(cls, d: dict[str, Any]) -> FDRTemporalLevel:
         if "level" not in d or "slice_dimension" not in d:
             raise ValueError(
-                "FDR temporal level requires both 'level' and 'slice_dimension', "
-                f"got {d!r}",
+                f"FDR temporal level requires both 'level' and 'slice_dimension', got {d!r}",
             )
         return cls(
             level=str(d["level"]),
@@ -242,8 +264,10 @@ class EdgeDimAggregationsRef:
         # rather than each carrying its own back-compat fallback.
         if self.aggregates_per_dim is None and self.dims:
             from hypertopos.engine.edge_features import AGGREGATE_NAMES
+
             object.__setattr__(
-                self, "aggregates_per_dim",
+                self,
+                "aggregates_per_dim",
                 {d: tuple(AGGREGATE_NAMES) for d in self.dims},
             )
 
@@ -277,7 +301,7 @@ class Pattern:
     timestamp_col: str | None = None
     dimension_kinds: list[str] | None = None
     dim_normality_pvalues: dict[str, float] | None = None
-    edge_dim_aggregations: "EdgeDimAggregationsRef | None" = None
+    edge_dim_aggregations: EdgeDimAggregationsRef | None = None
     fdr_hierarchy: list[FDRHierarchyLevel] = field(default_factory=list)
     fdr_temporal_hierarchy: list[FDRTemporalLevel] = field(default_factory=list)
     conformance_rules: list[ConformanceRule] = field(default_factory=list)
@@ -361,10 +385,8 @@ class Pattern:
         block is populated on event patterns that declared
         ``edge_dimensions:`` in sphere.yaml; empty otherwise.
         """
-        labels = [r.display_name if r.display_name else r.line_id for r in self.relations]
-        labels.extend(
-            ed.display_name or ed.column for ed in self.event_dimensions
-        )
+        labels = relation_dim_labels(self.relations)
+        labels.extend(ed.display_name or ed.column for ed in self.event_dimensions)
         labels.extend(self.edge_dim_names)
         labels.extend(self.prop_columns)
         labels.extend(self._edge_dim_aggregation_names())
@@ -399,7 +421,7 @@ class Pattern:
         """
         k = len(self.relations)
         for i, rel in enumerate(self.relations):
-            if rel.line_id == dim_name or (rel.display_name and rel.display_name == dim_name):
+            if dim_name in (rel.line_id, rel.display_name, rel.role):
                 return i
         k2 = k + len(self.event_dimensions)
         for j, ed in enumerate(self.event_dimensions):
@@ -416,16 +438,21 @@ class Pattern:
         for j, agg_label in enumerate(self._edge_dim_aggregation_names()):
             if agg_label == dim_name:
                 return k3 + j
-        available = [
-            rel.line_id + (f" ({rel.display_name})" if rel.display_name else "")
-            for rel in self.relations
-        ] + [
-            ed.column + (f" ({ed.display_name})" if ed.display_name else "")
-            for ed in self.event_dimensions
-        ] + self.edge_dim_names + self.prop_columns + self._edge_dim_aggregation_names()
+        available = (
+            [
+                rel.line_id + (f" ({rel.display_name})" if rel.display_name else "")
+                for rel in self.relations
+            ]
+            + [
+                ed.column + (f" ({ed.display_name})" if ed.display_name else "")
+                for ed in self.event_dimensions
+            ]
+            + self.edge_dim_names
+            + self.prop_columns
+            + self._edge_dim_aggregation_names()
+        )
         raise ValueError(
-            f"Dimension '{dim_name}' not found in pattern relations. "
-            f"Available: {available}"
+            f"Dimension '{dim_name}' not found in pattern relations. Available: {available}"
         )
 
 
@@ -607,8 +634,10 @@ class CalibrationFit:
     dimension_weights: np.ndarray | None
     dimension_kinds: list[str] | None
     dim_percentiles: dict[str, dict[str, float]] | None
-    group_stats: dict[str, GroupStats] | None
-    gmm_components: list[GMMComponent] | None
+    # Segmented variants are stored JSON-ready (plain dicts), exactly as
+    # serialized into the calibration history.
+    group_stats: dict[str, dict[str, Any]] | None
+    gmm_components: list[dict[str, Any]] | None
     edge_max: np.ndarray | None
     computed_at: datetime
     last_calibrated_at: datetime
@@ -660,6 +689,49 @@ class CalibrationDriftReport:
     top_drifted: list[DimensionDrift]
     per_dimension: list[DimensionDrift] | None
     edge_dim_threshold_drift: dict[str, dict[str, float]] | None = None
+
+
+@dataclass(frozen=True)
+class BranchDiffReport:
+    """How one pattern differs between two sphere refs (main or a branch).
+
+    Counts are per entity (one row per ``primary_key``). An entity is
+    anomalous on a side when its ``delta_norm`` reaches that side's global
+    threshold (the rule ``anomaly_summary`` and ``find_anomalies`` count by).
+    Among entities present on both sides, ``flipped_in`` counts those
+    anomalous in ``to_ref`` but not in ``from_ref``; ``flipped_out`` the
+    reverse. ``jaccard`` compares the two anomaly sets (1.0 when both are
+    empty). ``top_movers`` lists the entities with the largest relative
+    ``delta_norm`` change; ``flipped_in_top`` / ``flipped_out_top`` list the
+    flipped entities furthest past the threshold on the side where they are
+    anomalous, each with a ``cause``: ``"threshold"`` (the threshold moved
+    past its unchanged score), ``"score"`` (its score crossed the unchanged
+    threshold) or ``"both"``. ``theta_from`` / ``theta_to`` are the two global
+    thresholds. ``only_in_*`` count keys present on one side only.
+    ``calibration_drift`` compares the two current fits (None when their
+    schemas differ). ``recipe`` is the
+    recipe log of ``to_ref`` (empty for main).
+    """
+
+    pattern_id: str
+    from_ref: str
+    to_ref: str
+    n_from: int
+    n_to: int
+    theta_from: float
+    theta_to: float
+    anomalies_from: int
+    anomalies_to: int
+    flipped_in: int
+    flipped_out: int
+    jaccard: float
+    top_movers: list[dict[str, Any]]
+    flipped_in_top: list[dict[str, Any]]
+    flipped_out_top: list[dict[str, Any]]
+    only_in_from: int
+    only_in_to: int
+    calibration_drift: CalibrationDriftReport | None
+    recipe: list[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -754,6 +826,7 @@ class DimensionContribution:
     Hidden-influencer matrix. See
     `engine.geometry._compute_leave_one_out_impact` for math.
     """
+
     dim_index: int
     dim_kind: str | None
     dim_label: str | None
@@ -770,6 +843,7 @@ class InfluenceEntry:
     auto-discovery mode and identify the cluster the entity represents and
     the entity's distance to its cluster centroid in delta-space.
     """
+
     entity_key: str
     mu_impact: float
     sigma_impact: float
@@ -790,6 +864,7 @@ class InfluenceReport:
     auto-discovery branch (k-means on the population followed by
     leave-one-out ranking on the cluster representatives).
     """
+
     pattern_id: str
     pattern_version: int
     population_size: int
@@ -805,6 +880,7 @@ class InfluenceReport:
 @dataclass(frozen=True)
 class InfluencerHistoryEntry:
     """One epoch's recorded μ-impact for a known influencer."""
+
     epoch: int
     calibrated_at: str
     mu_impact: float
@@ -819,6 +895,7 @@ class InfluencerHistoryReport:
     ``primary_key`` in ``pattern_id``; consult ``hint`` for guidance on how
     to populate the cache.
     """
+
     primary_key: str
     pattern_id: str
     history: list[InfluencerHistoryEntry]
@@ -830,6 +907,7 @@ class InfluencerHistoryReport:
 @dataclass(frozen=True)
 class GroupInfluenceReport:
     """Per-group influence record from find_group_influence (caller-supplied form)."""
+
     pattern_id: str
     pattern_version: int
     group_index: int
@@ -853,6 +931,7 @@ class DimPairLeadLag:
     or Storey-adjusted across all D_A * D_B pairs at the same `fdr_alpha`;
     `is_significant` is `q_value < fdr_alpha`.
     """
+
     dim_index_a: int
     dim_index_b: int
     dim_label_a: str | None
@@ -881,6 +960,7 @@ class LeadLagReport:
     `bartlett_ci_95` reports the unadjusted single-test 95% CI for
     transparency; `is_significant` uses `max_corr_threshold` (peak-adjusted).
     """
+
     pattern_a: str
     pattern_b: str
     entity_key: str | None

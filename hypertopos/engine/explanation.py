@@ -12,8 +12,8 @@ of the entity's anomaly mass.
 
 Pure function — no I/O, no storage access, no ``self``. Operates over
 a contribution vector that the caller has already routed through
-``_per_dim_anomaly_contributions`` (Bregman when calibration trio is
-present, ``delta**2`` otherwise).
+``_per_dim_anomaly_contributions`` (``delta**2``, each dim's part of
+``delta_norm**2``).
 
 Design note (no diversity_alpha):
     Earlier revisions exposed a ``diversity_alpha`` knob that weighted
@@ -27,6 +27,7 @@ Design note (no diversity_alpha):
     Removed entirely so the API does not advertise a knob that does
     nothing.
 """
+
 from __future__ import annotations
 
 import numpy as np
@@ -76,7 +77,7 @@ def submodular_diverse_cover(
     per the design intent).
 
     Args:
-        contributions: per-dim Bregman mass, shape ``(D,)``.
+        contributions: per-dim anomaly mass (``delta**2``), shape ``(D,)``.
         dim_labels: unused at this layer (kept for symmetry with the
             navigator-facing return contract); ``len == D`` is the
             caller's responsibility.
@@ -138,9 +139,8 @@ def submodular_diverse_cover(
             # Cannot clear the floor — drop the partial hypothesis and
             # stop. Any further hypothesis would have strictly less
             # mass to draw on, so it cannot clear the floor either.
-            if requested > len(emitted):
-                if degraded_reason != "capped_to_dim_count":
-                    degraded_reason = "insufficient_diverse_mass"
+            if requested > len(emitted) and degraded_reason != "capped_to_dim_count":
+                degraded_reason = "insufficient_diverse_mass"
             break
 
         emitted.append(hypothesis_dims)

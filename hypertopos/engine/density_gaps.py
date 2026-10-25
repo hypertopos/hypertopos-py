@@ -11,14 +11,19 @@ multiple-testing correction):
 1. Per dim, build empirical CDF cache; transform raw values to uniform
    `[0, 1]` via ``ECDFEntry.transform``.
 2. For a pair `(i, j)` of dims, compute a `bins x bins` joint histogram
-   of `(u_i, u_j)`. Under the null hypothesis of independence with
-   uniform marginals each cell has expected count `N / bins^2`.
+   of `(u_i, u_j)`. Under the null hypothesis of independence each cell
+   has expected count `row_total * col_total / N` (product of the observed
+   marginals). For continuous dims the marginals are uniform and this is
+   `N / bins^2`; for dims with ties (e.g. zero-inflated counts) the PIT is
+   a point mass, some quantile bins are empty by construction, and those
+   cells have expected count 0 and are not tested.
 3. Per cell, compute the chi^2 residual `(observed - expected)^2 /
    expected`. Only under-populated cells (gaps) are kept; over-populated
    cells are clumps and not the target signal.
 4. Apply Benjamini-Hochberg correction across all under-populated cells
    tested. Flag cells with `q <= alpha`.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -53,16 +58,16 @@ class ECDFEntry:
         n = len(self.sorted_values)
         if n == 0:
             return np.zeros_like(x, dtype=np.float64)
-        return (
-            np.searchsorted(self.sorted_values, x, side="right") / n
-        ).astype(np.float64)
+        return (np.searchsorted(self.sorted_values, x, side="right") / n).astype(np.float64)
 
     def inverse(self, u: np.ndarray) -> np.ndarray:
         n = len(self.sorted_values)
         if n == 0:
             return np.zeros_like(u, dtype=np.float64)
         idx = np.clip(
-            (np.asarray(u) * n).astype(np.int64), 0, n - 1,
+            (np.asarray(u) * n).astype(np.int64),
+            0,
+            n - 1,
         )
         return self.sorted_values[idx]
 
@@ -125,28 +130,39 @@ def compute_density_gaps_for_pair(
     ``is_gap`` (BH-rejected at the supplied alpha).
     """
     hist, _, _ = np.histogram2d(
-        u_i, u_j, bins=bins, range=[[0.0, 1.0], [0.0, 1.0]],
+        u_i,
+        u_j,
+        bins=bins,
+        range=[[0.0, 1.0], [0.0, 1.0]],
     )
-    expected = n / (bins * bins)
+    if n <= 0:
+        return []
+    expected_grid = np.outer(hist.sum(axis=1), hist.sum(axis=0)) / n
     cells: list[dict[str, Any]] = []
     p_values: list[float] = []
     for (a, b), obs in np.ndenumerate(hist):
+        expected = float(expected_grid[a, b])
+        if expected <= 0.0:
+            continue  # bin empty in a marginal (ties) — no gap is possible here
         if obs >= expected:
             continue  # over-populated cells are clumps, not gaps
         chi2_comp = (obs - expected) ** 2 / expected
         p = float(chi2.sf(chi2_comp, df=1))
-        cells.append({
-            "u_range_i": (a / bins, (a + 1) / bins),
-            "u_range_j": (b / bins, (b + 1) / bins),
-            "observed": int(obs),
-            "expected": float(expected),
-            "p_value": p,
-        })
+        cells.append(
+            {
+                "u_range_i": (a / bins, (a + 1) / bins),
+                "u_range_j": (b / bins, (b + 1) / bins),
+                "observed": int(obs),
+                "expected": float(expected),
+                "p_value": p,
+            }
+        )
         p_values.append(p)
     if not p_values:
         return []
     rejected, q_values = benjamini_hochberg(
-        np.array(p_values), alpha=alpha,
+        np.array(p_values),
+        alpha=alpha,
     )
     for cell, q, rej in zip(cells, q_values, rejected, strict=False):
         cell["q_value"] = float(q)

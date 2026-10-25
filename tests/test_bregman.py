@@ -99,7 +99,7 @@ class TestBregmanDivergenceSingle:
         assert np.all(np.isfinite(result))
         assert np.all(result >= 0.0)
 
-        expected_gaussian = (3.0 - 1.0) ** 2 / (2 * 0.5 ** 2)
+        expected_gaussian = (3.0 - 1.0) ** 2 / (2 * 0.5**2)
         expected_poisson = 5.0 * math.log(5.0 / 2.0) - (5.0 - 2.0)
         expected_bernoulli = 0.8 * math.log(0.8 / 0.2) + 0.2 * math.log(0.2 / 0.8)
         assert result[0] == pytest.approx(expected_gaussian, rel=1e-5)
@@ -166,7 +166,7 @@ class TestBregmanDivergenceBatch:
         sigma = np.array([0.5, 0.5], dtype=np.float64)
         kinds = ["gaussian", "gaussian"]
         result = bregman_divergence_batch(X, mu, sigma, kinds)
-        expected = (X - mu) ** 2 / (2 * sigma ** 2)
+        expected = (X - mu) ** 2 / (2 * sigma**2)
         np.testing.assert_allclose(result, expected, rtol=1e-10)
 
     def test_poisson_zeros_row(self):
@@ -272,7 +272,7 @@ class TestPerDimTheta:
 
     def test_mixed_kinds_finite(self):
         rng = np.random.default_rng(13)
-        N, D = 100, 3
+        N = 100
         X_gauss = rng.normal(2.0, 0.5, size=(N, 1))
         X_pois = rng.poisson(3, size=(N, 1)).astype(np.float64)
         X_bern = rng.uniform(0.01, 0.99, size=(N, 1))

@@ -71,3 +71,24 @@ def test_entity_table_runs_where_caching_is_refused(monkeypatch):
     monkeypatch.setattr(_api, "entity_frame", lambda df, plan, group_by: frame)
     monkeypatch.setattr(_api, "collect_entities", lambda df: ("collected", df))
     assert _api._entity_table(None, None, None, max_entities=10) == ("collected", frame)
+
+
+def test_sphere_root_falls_back_where_the_conf_cannot_be_read(monkeypatch, tmp_path):
+    """Serverless refuses to read an unknown Spark conf (CONFIG_NOT_AVAILABLE)."""
+    pytest.importorskip("pyspark")
+    from pyspark.errors import AnalysisException
+
+    from hypertopos.spark import _api
+
+    class Conf:
+        def get(self, key, default=None):
+            raise AnalysisException(f"[CONFIG_NOT_AVAILABLE.WITHOUT_SUGGESTION] {key}")
+
+    class Session:
+        conf = Conf()
+
+    class Frame:
+        sparkSession = Session()
+
+    monkeypatch.setenv("HYPERTOPOS_SPHERE_ROOT", str(tmp_path))
+    assert _api._sphere_root(Frame(), None) == str(tmp_path)

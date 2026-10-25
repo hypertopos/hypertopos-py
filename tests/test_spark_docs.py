@@ -39,3 +39,31 @@ def test_try_it_block_runs(spark, tmp_path, monkeypatch):
     exec(compile(code, "spark.md", "exec"), namespace)  # noqa: S102 - the doc example itself
     result = namespace["result"]
     assert result.count() > 0  # type: ignore[attr-defined]
+
+
+GDS_SPARK_SKILL = Path(__file__).parents[2] / "hypertopos-skills" / "gds-spark" / "SKILL.md"
+
+
+@pytest.mark.skipif(not GDS_SPARK_SKILL.exists(), reason="skills package not in this checkout")
+def test_gds_spark_skill_calls_use_real_names_and_keywords():
+    import inspect
+
+    blocks = re.findall(r"```python\n(.*?)```", GDS_SPARK_SKILL.read_text(encoding="utf-8"), re.S)
+    assert blocks, "gds-spark has no python examples"
+    for block in blocks:
+        tree = ast.parse(block)
+        functions = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("hypertopos"):
+                module = importlib.import_module(node.module or "")
+                for alias in node.names:
+                    assert hasattr(module, alias.name), f"{node.module}.{alias.name} in gds-spark"
+                    functions[alias.name] = getattr(module, alias.name)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                fn = functions.get(node.func.id)
+                if fn is None or not callable(fn):
+                    continue
+                params = inspect.signature(fn).parameters
+                for kw in node.keywords:
+                    assert kw.arg in params, f"{node.func.id}({kw.arg}=) in gds-spark"

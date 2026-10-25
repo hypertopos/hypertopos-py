@@ -12,6 +12,9 @@ pip install "hypertopos[spark]"
 
 The extra pulls in `pyspark>=3.5,<5`, plus `setuptools` on Python 3.12+ because PySpark 3.5 imports `distutils`. On Databricks, PySpark is already present: `%pip install hypertopos` is enough. hypertopos needs Python 3.12, so on Databricks use Runtime 16 or later, or serverless environment version 3 or later. Classic clusters and Spark Connect sessions (serverless, shared access mode) both work.
 
+> [!NOTE]
+> `No matching distribution found for hypertopos`, with versions ignored for `Requires-Python >=3.12`, means the compute runs an older Python, not that the package is missing. In a serverless notebook, open the **Environment** side panel and pick environment version 3 or later. In a job, set `environment_version` to 3 or later in the task's environment spec. A job task without an environment spec can still start on an older default version.
+
 > [!TIP]
 > PySpark needs a JVM (Java 11 or 17 for Spark 3.5). Locally, set `PYSPARK_PYTHON` to the interpreter that has hypertopos installed. Otherwise the Python workers start from a different environment. On a laptop, also lower the shuffle partitions, `SparkSession.builder.master("local[2]").config("spark.sql.shuffle.partitions", "4")`. The default of 200 is sized for a cluster and turns every aggregation into hundreds of small tasks.
 
@@ -34,7 +37,7 @@ result.orderBy("delta_norm", ascending=False).show(10, truncate=False)
 explain(result, top_n=3).show(15, truncate=False)
 ```
 
-`data.accounts` carries the labels (`is_laundering_account`, `typology`), so you can check which flagged accounts were laundering, and compare with other detectors on the same data.
+`data.accounts` carries the labels (`is_laundering_account`, `typology`), so you can check which flagged accounts were laundering, and compare with other detectors on the same data. The [quickstart notebook](examples/spark-quickstart.ipynb) runs this flow end to end: find, compare with the labels, explain, score a later period and hand the result to an agent.
 
 ## Find anomalies
 

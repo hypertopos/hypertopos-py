@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from pyspark.errors import AnalysisException
+from pyspark.errors import AnalysisException, PySparkException
 from pyspark.sql import Column, DataFrame, Window
 from pyspark.sql import functions as F
 
@@ -35,7 +35,12 @@ METADATA_PATH = "hypertopos.path"
 def _sphere_root(df: DataFrame, sphere_root: str | None) -> str:
     if sphere_root:
         return sphere_root
-    configured = df.sparkSession.conf.get("hypertopos.sphere_root", None)
+    try:
+        configured = df.sparkSession.conf.get("hypertopos.sphere_root", None)
+    except PySparkException:
+        # Serverless refuses to read a conf it does not know (CONFIG_NOT_AVAILABLE)
+        # instead of returning the default; the error class depends on the client.
+        configured = None
     if configured:
         return configured
     return os.environ.get("HYPERTOPOS_SPHERE_ROOT") or str(

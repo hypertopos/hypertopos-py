@@ -80,15 +80,21 @@ class Sphere:
         Databricks Volumes do not take the random writes a build makes.
         """
         target = self.path / SPHERE_DIR
-        if not (target / "_gds_meta" / "sphere.json").exists():
+        marker = Path("_gds_meta") / "sphere.json"
+        if not (target / marker).exists():
             with tempfile.TemporaryDirectory(prefix="hypertopos_") as local:
                 built = Path(local) / SPHERE_DIR
                 build_sphere(self.entities(), self.calibration(), str(built))
-                staging = self.path / (SPHERE_DIR + ".copying")
-                shutil.rmtree(staging, ignore_errors=True)
-                shutil.copytree(built, staging)
-            shutil.rmtree(target, ignore_errors=True)
-            staging.rename(target)
+                # sphere.json goes last: a copy cut short has none and is rebuilt.
+                # No directory rename, which Windows refuses while freshly
+                # copied files are still held open by indexing or antivirus.
+                shutil.rmtree(target, ignore_errors=True)
+                shutil.copytree(
+                    built,
+                    target,
+                    ignore=lambda d, _: ["sphere.json"] if Path(d) == built / "_gds_meta" else [],
+                )
+                shutil.copy2(built / marker, target / marker)
         return target
 
     def mcp_config(self) -> dict[str, object]:

@@ -7,6 +7,18 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.2] — 2026-10-25
+
+### Added
+
+- A Spark quickstart notebook (`docs/examples/spark-quickstart.ipynb`): labelled synthetic payments, `find_anomalies` per segment, a comparison with the labels, `explain`, `score` on a later period and the hand-off to an agent; runs on Databricks or a local Spark session.
+
+### Fixed
+
+- `sphere_of(result).lance_path()`, `mcp_config()` and `serve()` work on Windows: the sphere is copied into place without a directory rename, which Windows refused right after the copy.
+- `find_anomalies` in a Databricks serverless notebook no longer fails with `CONFIG_NOT_AVAILABLE` for `hypertopos.sphere_root`: a Spark conf that the compute refuses to read counts as not set, and the calibration goes to `HYPERTOPOS_SPHERE_ROOT` or the driver's temp directory.
+- The Spark docs and the quickstart notebook say what `No matching distribution found for hypertopos` means on Databricks (a Python older than 3.12) and how to pick a newer environment.
+
 ## [0.9.1] — 2026-10-25
 
 ### Added

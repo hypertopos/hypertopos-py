@@ -9,7 +9,7 @@
 [![PyArrow](https://img.shields.io/badge/format-PyArrow-red.svg)](https://arrow.apache.org/docs/python/)
 [![Lance](https://img.shields.io/badge/storage-Lance-blueviolet.svg)](https://github.com/lance-format/lance)
 [![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io)
-[![Version](https://img.shields.io/badge/version-0.9.1-%235500FF.svg)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.9.2-%235500FF.svg)](pyproject.toml)
 
 Describe your tables in a YAML file, run `hypertopos build`, and every entity gets a position relative to its own population — so "out of place", "similar", "drifting" and "different between groups" become distances you read instead of queries you write.
 
@@ -167,7 +167,7 @@ Real output (local Spark, two cores):
 > [!TIP]
 > On a laptop, create the session with `.master("local[2]").config("spark.sql.shuffle.partitions", "4")`. The default of 200 shuffle partitions is sized for a cluster.
 
-Everything else, from column roles and the 23 dimensions to time handling, the cache and the CLI, is in [hypertopos on Spark](docs/spark.md).
+Everything else, from column roles and the 23 dimensions to time handling, the cache and the CLI, is in [hypertopos on Spark](docs/spark.md). To run the whole flow on labelled synthetic data, open the [quickstart notebook](docs/examples/spark-quickstart.ipynb) on Databricks or locally.
 
 ## See it in action
 

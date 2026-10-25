@@ -582,6 +582,7 @@ class GDSReader:
                 "heteroscedasticity_diagnostic",
             ),
             edge_dim_names=list(raw.get("edge_dim_names") or []),
+            dim_block_names=list(raw.get("dim_block_names") or []),
             label_aware_calibration=label_aware_calibration,
             label_aware_n_pos=raw.get("label_aware_n_pos"),
             label_aware_n_neg=raw.get("label_aware_n_neg"),

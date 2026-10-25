@@ -2,11 +2,13 @@
 # Licensed under the Business Source License 1.1 (the "License");
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
+import os
 import shutil
 import subprocess
 import sys
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import lance
 import pytest
@@ -85,6 +87,28 @@ def _restore_navigator_engine_class_attrs() -> Iterator[None]:
             for name, original in snap.items():
                 if cls.__dict__.get(name) is not original:
                     setattr(cls, name, original)
+
+
+@pytest.fixture(scope="session")
+def spark() -> Iterator[Any]:
+    """One local SparkSession per test process (each xdist worker starts its own JVM)."""
+    pytest.importorskip("pyspark")
+    os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
+    os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
+    from pyspark.sql import SparkSession
+
+    session = (
+        SparkSession.builder.master("local[2]")
+        .appName("hypertopos-tests")
+        .config("spark.ui.enabled", "false")
+        .config("spark.sql.shuffle.partitions", "2")
+        .config("spark.driver.memory", "1g")
+        .config("spark.sql.session.timeZone", "UTC")
+        .config("spark.sql.execution.arrow.pyspark.enabled", "true")
+        .getOrCreate()
+    )
+    yield session
+    session.stop()
 
 
 @pytest.fixture

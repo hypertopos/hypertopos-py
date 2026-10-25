@@ -133,8 +133,9 @@ class GDSEngine:
                 None if row.get("delta_rank_pct") is None else float(row["delta_rank_pct"])
             ),
         )
-        if pattern.edge_max is None:
+        if pattern.edge_max is None and not pattern.dim_block_names:
             # Discrete mode: recompute delta from edges + prop_fill (prop values may have changed).
+            # Dimension blocks are not edges, so a pattern with blocks keeps its stored delta.
             prop_fill: np.ndarray | None = None
             if pattern.prop_columns:
                 entity_line_id = sphere.entity_line(pattern_id)

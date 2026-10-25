@@ -9,7 +9,7 @@
 [![PyArrow](https://img.shields.io/badge/format-PyArrow-red.svg)](https://arrow.apache.org/docs/python/)
 [![Lance](https://img.shields.io/badge/storage-Lance-blueviolet.svg)](https://github.com/lance-format/lance)
 [![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io)
-[![Version](https://img.shields.io/badge/version-0.9.0-%235500FF.svg)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.9.1-%235500FF.svg)](pyproject.toml)
 
 Describe your tables in a YAML file, run `hypertopos build`, and every entity gets a position relative to its own population — so "out of place", "similar", "drifting" and "different between groups" become distances you read instead of queries you write.
 
@@ -114,6 +114,60 @@ my_sphere/
 
 > [!NOTE]
 > Paths under `sources:` resolve relative to the YAML file, not to your shell. On Windows, `python -m hypertopos.cli.main …` works wherever the `hypertopos` script is not on `PATH`.
+
+## On Spark
+
+Event tables that live in Spark (Databricks, a lakehouse, a cluster) need no YAML: one call goes from a DataFrame of events to a DataFrame of scored entities. The per-entity aggregation runs on the executors, and only one row per entity reaches the driver.
+
+<p align="center">
+  <img src="docs/images/demo-spark.svg" width="900"
+       alt="A data scientist calls find_anomalies on a Spark DataFrame of payment events grouped by segment, shows the three most distant entities, then calls explain on A000335">
+</p>
+<p align="center"><sub><i>Real output on synthetic data. A000335 lands outside its segment's θ ring; <code>explain</code> names the dimension that moved it.</i></sub></p>
+
+```bash
+pip install "hypertopos[spark]"        # on Databricks, plain `%pip install hypertopos`
+```
+
+```python
+from hypertopos.datasets import synthetic_aml
+from hypertopos.spark import explain, find_anomalies
+
+data = synthetic_aml(n_accounts=1_000, seed=1)            # labelled synthetic payments, no download
+tx = spark.createDataFrame(data.transactions.to_pandas())
+accounts = spark.createDataFrame(data.accounts.to_pandas())
+events = tx.join(accounts.select("account", "segment"), tx.from_account == accounts.account)
+
+result = find_anomalies(events, entity="from_account", counterparty="to_account",
+                        amount="amount", time="ts", group_by="segment")
+result.orderBy("delta_norm", ascending=False).show(3)
+explain(result, entities=["A000335"]).show(2)
+```
+
+Real output (local Spark, two cores):
+
+```
++-------+----------+----------+-------+--------+------------------------------------------+
+| entity|delta_norm|is_anomaly|p_value| segment|                               top_reasons|
++-------+----------+----------+-------+--------+------------------------------------------+
+|A000335|    10.616|      true|  0.001|  retail|[{burst_max_daily, 5.31, 25.0}, ...       |
+|A000259|    10.215|      true|  0.002|  retail|[{n_out, 5.62, 30.3}, ...                 |
+|A000179|    10.208|      true|  0.003|business|[{active_days, -4.80, 22.1}, ...          |
++-------+----------+----------+-------+--------+------------------------------------------+
+
++-------+---------------+-----+-----+-----+-----+------------+---------+
+|entity |dim            |value|mu   |sigma|delta|pct_of_total|direction|
++-------+---------------+-----+-----+-----+-----+------------+---------+
+|A000335|burst_max_daily|20.0 |7.683|2.320|5.31 |25.0        |above    |
+|A000335|amount_std_out |7.583|3.771|0.779|4.89 |21.2        |above    |
++-------+---------------+-----+-----+-----+-----+------------+---------+
+```
+
+`A000335` made 20 payments on its busiest day, against about 8 for retail accounts (+5.3 σ), and its payment amounts vary far more than theirs (`amount_std_out` is log-scaled). In the labels of `data.accounts` it is one of the planted fan-out accounts. The other two are not laundering, only unusual, which is what a distance from the population measures: `p_value` 0.001 means one entity in a thousand is as far out. The labels let you measure how a detector does on the same data. `explain` shows where every number comes from. `score(new_events, like=result)` scores the next batch against this calibration on the executors, and `sphere_of(result)` hands the same geometry to an agent through the MCP server.
+> [!TIP]
+> On a laptop, create the session with `.master("local[2]").config("spark.sql.shuffle.partitions", "4")`. The default of 200 shuffle partitions is sized for a cluster.
+
+Everything else, from column roles and the 23 dimensions to time handling, the cache and the CLI, is in [hypertopos on Spark](docs/spark.md).
 
 ## See it in action
 
@@ -233,6 +287,9 @@ hypertopos sphere branch list my_sphere                         # what exists, w
 hypertopos sphere branch create my_sphere trial --purpose "recalibrate without top anomaly"
 hypertopos sphere branch promote my_sphere trial                # replay the branch's recipes on main, then delete it
 hypertopos sphere branch delete my_sphere trial                 # discard it; main is unchanged
+
+hypertopos spark find-anomalies --input tx.parquet --entity from_account \
+    --counterparty to_account --amount amount --time ts --show 20   # events on Spark -> scored entities (hypertopos[spark])
 ```
 
 Every `hypertopos sphere …` subcommand takes `--json` for machine-readable output. See the [full command reference](#full-command-reference) below.
@@ -266,7 +323,7 @@ Every capability below comes from one decision: an entity is a point in a space 
 |---|---|---|
 | Population-relative coordinates | `delta = (shape − μ) / σ` per dimension; one vector serves anomaly, clustering, drift and comparison | Learned embeddings with latent dimensions that need retraining when the data shifts |
 | Self-calibrating threshold | θ is a percentile of the population's own `delta_norm` — per group when a pattern declares `group_by_property` | Choosing a contamination rate or a hand-tuned cut-off |
-| Distribution-aware dimensions | Each dimension declares a kind (gaussian, poisson, bernoulli); `sphere_overview` flags dead, sparse, non-normal and dominant dimensions with concrete advice | One metric for every feature, and silent garbage when a feature breaks its assumption |
+| Distribution-aware dimensions | Each dimension declares a kind (gaussian, poisson, bernoulli), detected or set with `kind:` on precomputed dimensions; `sphere_overview` flags dead, sparse, non-normal and dominant dimensions with concrete advice | One metric for every feature, and silent garbage when a feature breaks its assumption |
 | Calibration epochs | Every build and `recalibrate` records an epoch; `compare_calibrations` shows per-dimension μ / σ / θ drift, `theta_sensitivity` shows whether θ sits near a cliff | No record of how the coordinate system itself moved |
 | Hidden influencers | `find_calibration_influencers` measures each entity's leave-one-out impact on the calibration and names the ones that distort it | Explaining predictions while the baseline itself is contaminated |
 
@@ -313,6 +370,9 @@ Every capability below comes from one decision: an entity is a point in a space 
 | Incremental ingest | `incremental_update` adds, changes and removes entities without a full rebuild | Rebuilding from source for every batch |
 | Operations CLI | `hypertopos sphere health`, `validate` and `diff` give CI gates and drift between two builds; vector-index health is reported before trajectory tools rely on it | Hand-rolled validation scripts |
 | An agent surface | The MCP server runs over stdio or HTTP with a session per agent and compact, strict-JSON responses sized for a context window | Wrapping a database in ad-hoc tools |
+| On Spark | `hypertopos.spark.find_anomalies(df, entity=…, …)` aggregates events per entity on the executors and returns a DataFrame with distance, flag, p-value and reasons; `explain` breaks it down, `sphere_of` hands it to an agent. Runs on classic clusters and Spark Connect, including Databricks serverless | Exporting events, building features by hand and running a detector outside the cluster |
+| Frozen scoring | `FrozenCalibration` (and `hypertopos.spark.score` on executors) scores new data against a fixed population without recalibrating | Refitting the detector on every batch, so yesterday's and today's scores are not comparable |
+| Data to try it on | `hypertopos.datasets.synthetic_aml` generates a labelled payments dataset with six laundering patterns | Hunting for a public dataset before the first call |
 
 ### What changes in practice
 
@@ -387,6 +447,7 @@ See [Configuration](docs/configuration.md) for the YAML reference and [Container
 | [Data Format](docs/data-format.md) | On-disk storage format, including branches |
 | [External Chains as Anchor Lines](docs/external-chains-as-anchor-line.md) | Ingest chains found by other systems and investigate them with the same primitives |
 | [Container Deployment](docs/container-deployment.md) | Run the CLI as one-shot container jobs |
+| [hypertopos on Spark](docs/spark.md) | From a Spark DataFrame of events to per-entity geometry |
 | [Benchmarks](docs/benchmarks.md) | Validation results — banking, AML, transportation |
 
 ## Status

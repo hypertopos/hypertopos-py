@@ -651,6 +651,7 @@ def _add_pattern(
                 edge_max=pc.edge_max,
                 percentile=pc.percentile,
                 display_name=pc.display_name,
+                kind=pc.kind,
             )
 
     # Graph features

@@ -1357,6 +1357,7 @@ class GDSBuilder:
         edge_max: int | str = "auto",
         percentile: float = 99.0,
         display_name: str | None = None,
+        kind: str | None = None,
     ) -> GDSBuilder:
         """Add a dimension from a column already present on the anchor entity table.
 
@@ -1375,9 +1376,18 @@ class GDSBuilder:
             percentile: Percentile for auto edge_max (default 99.0).
             display_name: Relation name (role); labels the dim only when the
                 pattern relates to the same line more than once.
+            kind: Bregman kind of the dimension (``"gaussian"``, ``"poisson"``,
+                ``"bernoulli"``); None detects it (bernoulli for ``edge_max=1``,
+                gaussian otherwise).
         """
+        from hypertopos.builder._bregman import BREGMAN_KINDS
         from hypertopos.builder.derived import PrecomputedDimSpec
 
+        if kind is not None and kind not in BREGMAN_KINDS:
+            raise ValueError(
+                f"Precomputed dim '{dimension_name}': kind '{kind}' is not valid. "
+                f"Expected one of {BREGMAN_KINDS}."
+            )
         self._precomputed_dims.append(
             PrecomputedDimSpec(
                 anchor_line=anchor_line,
@@ -1385,6 +1395,7 @@ class GDSBuilder:
                 edge_max=edge_max,
                 percentile=percentile,
                 display_name=display_name,
+                kind=kind,
             )
         )
         return self
@@ -2051,9 +2062,9 @@ class GDSBuilder:
             _derived_metric_map[dspec.dimension_name] = dspec.metric
 
         # Build lookup: dimension_name → edge_max for precomputed dims
-        _precomputed_map: dict[str, int | float | str | None] = {}
+        _precomputed_map: dict[str, Any] = {}
         for pspec in self._precomputed_dims:
-            _precomputed_map[pspec.dimension_name] = pspec.edge_max
+            _precomputed_map[pspec.dimension_name] = pspec
 
         _POISSON_METRICS = {"count", "count_distinct"}
 
@@ -2066,10 +2077,15 @@ class GDSBuilder:
                 base_metric = metric.split(":")[0]
                 dimension_kinds.append("poisson" if base_metric in _POISSON_METRICS else "gaussian")
             elif dim_name in _precomputed_map:
-                # Precomputed dim — bernoulli if edge_max=1 (ratio), else gaussian
-                em = _precomputed_map[dim_name]
+                # Precomputed dim — explicit kind, else bernoulli if edge_max=1 (ratio),
+                # else gaussian
+                pspec = _precomputed_map[dim_name]
+                em = pspec.edge_max
                 dimension_kinds.append(
-                    "bernoulli" if isinstance(em, (int, float)) and int(em) == 1 else "gaussian"
+                    pspec.kind
+                    or (
+                        "bernoulli" if isinstance(em, (int, float)) and int(em) == 1 else "gaussian"
+                    )
                 )
             else:
                 # Regular FK or graph feature relation.
@@ -4090,7 +4106,18 @@ class GDSBuilder:
             n = len(self._lines[pat.entity_line].table)
 
             if n > GEOMETRY_CHUNK_SIZE:
-                if pat.group_by_property or pat.gmm_n_components or pat.use_mahalanobis:
+                # The streaming path builds shapes from relations, event dims and
+                # tracked properties only; dimension blocks need the full-population
+                # pass of the chunked path.
+                has_dim_blocks = bool(
+                    pat.geo_properties or pat.metric_properties or pat.semantic_dim
+                )
+                if (
+                    pat.group_by_property
+                    or pat.gmm_n_components
+                    or pat.use_mahalanobis
+                    or has_dim_blocks
+                ):
                     pat_id_out, pbr = self._build_and_write_chunked(
                         pat_id,
                         pat,
@@ -5937,9 +5964,9 @@ class GDSBuilder:
         for dspec in self._derived_dims:
             _derived_metric_map_s[dspec.dimension_name] = dspec.metric
 
-        _precomputed_map_s: dict[str, int | float | str | None] = {}
+        _precomputed_map_s: dict[str, Any] = {}
         for pspec in self._precomputed_dims:
-            _precomputed_map_s[pspec.dimension_name] = pspec.edge_max
+            _precomputed_map_s[pspec.dimension_name] = pspec
 
         _POISSON_METRICS_S = {"count", "count_distinct"}
 
@@ -5953,9 +5980,13 @@ class GDSBuilder:
                     "poisson" if base_metric in _POISSON_METRICS_S else "gaussian",
                 )
             elif dim_name in _precomputed_map_s:
-                em = _precomputed_map_s[dim_name]
+                pspec = _precomputed_map_s[dim_name]
+                em = pspec.edge_max
                 dimension_kinds.append(
-                    "bernoulli" if isinstance(em, (int, float)) and int(em) == 1 else "gaussian"
+                    pspec.kind
+                    or (
+                        "bernoulli" if isinstance(em, (int, float)) and int(em) == 1 else "gaussian"
+                    )
                 )
             else:
                 # Regular FK or graph feature relation.
@@ -6829,6 +6860,9 @@ class GDSBuilder:
                 return int(stat.ullAvailPhys)
         except Exception:
             pass
+        available = GDSBuilder._meminfo_available("/proc/meminfo")
+        if available is not None:
+            return available
         try:
             import os
 
@@ -6839,6 +6873,19 @@ class GDSBuilder:
         except Exception:
             pass
         return 4 * 1024**3  # 4 GB fallback
+
+    @staticmethod
+    def _meminfo_available(path: str) -> int | None:
+        # Linux MemAvailable includes the reclaimable page cache; free pages
+        # (SC_AVPHYS_PAGES) do not and read near zero on a machine with a warm cache.
+        try:
+            with open(path, encoding="ascii") as fh:
+                for line in fh:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) * 1024
+        except OSError:
+            return None
+        return None
 
     @staticmethod
     def _compute_max_rolling_z(
@@ -7452,7 +7499,13 @@ class GDSBuilder:
             # geometry without dimensions is meaningless regardless of the storage
             # format. Tracked properties count as dimension sources because they
             # become prop_columns in the resolved delta width.
-            if not pat.relations and not pat.event_dimensions and not pat.tracked_properties:
+            has_dim_blocks = bool(pat.geo_properties or pat.metric_properties or pat.semantic_dim)
+            if (
+                not pat.relations
+                and not pat.event_dimensions
+                and not pat.tracked_properties
+                and not has_dim_blocks
+            ):
                 # Chain anchor with zero extracted chains lands here because
                 # `_resolve_chain_dims` had no `_chain_dims` tuples to inject
                 # (the empty-chains short-circuit in `add_chain_line` returns

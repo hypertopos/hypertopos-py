@@ -100,3 +100,16 @@ class TestDetectMemory:
     def test_at_least_fallback(self):
         mem = GDSBuilder._detect_available_memory()
         assert mem >= 1 * 1024**3  # at least 1 GB on any dev machine
+
+    def test_linux_counts_reclaimable_page_cache(self, tmp_path):
+        # Free pages alone leave out the page cache the kernel reclaims on demand;
+        # a machine with a warm cache would look out of memory.
+        meminfo = tmp_path / "meminfo"
+        meminfo.write_text(
+            "MemTotal:       16384000 kB\nMemFree:          326820 kB\n"
+            "MemAvailable:   12000000 kB\nCached:         11000000 kB\n"
+        )
+        assert GDSBuilder._meminfo_available(str(meminfo)) == 12000000 * 1024
+
+    def test_meminfo_missing_gives_none(self, tmp_path):
+        assert GDSBuilder._meminfo_available(str(tmp_path / "absent")) is None

@@ -48,6 +48,7 @@ class PrecomputedDimSpec:
     edge_max: int | str = "auto"  # int = fixed, "auto" = p{percentile}
     percentile: float = 99.0
     display_name: str | None = None
+    kind: str | None = None  # Bregman kind override; None = auto
 
 
 @dataclass

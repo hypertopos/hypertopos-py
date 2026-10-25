@@ -312,6 +312,9 @@ class Pattern:
     # edge_dim_names → prop_cols → dim_blocks into the full shape vector.
     # Empty for patterns without edge_dimensions (no behaviour change).
     edge_dim_names: list[str] = field(default_factory=list)
+    # Dimension-block labels (``g:<col>`` geo, ``t:<col>`` metric, ``s:pc<k>``
+    # semantic), last in the storage layout. Empty without dimension blocks.
+    dim_block_names: list[str] = field(default_factory=list)
     # Label-aware per-dim calibration result, populated by the builder when
     # the pattern is listed under ``label_audit.patterns`` in sphere.yaml
     # AND the ``--label-aware-calibration`` build flag is set. Maps a
@@ -347,7 +350,7 @@ class Pattern:
             + len(self.edge_dim_names)
             + len(self.prop_columns)
         )
-        return base + len(self._edge_dim_aggregation_names())
+        return base + len(self._edge_dim_aggregation_names()) + len(self.dim_block_names)
 
     @property
     def theta_norm(self) -> float:
@@ -381,8 +384,8 @@ class Pattern:
         """Human-readable dimension labels in storage layout order.
 
         Layout: relations → event_dimensions → edge_dim_names →
-        prop_columns → aggregated edge dim names. The middle ``edge_dim_names``
-        block is populated on event patterns that declared
+        prop_columns → aggregated edge dim names → dimension blocks. The middle
+        ``edge_dim_names`` block is populated on event patterns that declared
         ``edge_dimensions:`` in sphere.yaml; empty otherwise.
         """
         labels = relation_dim_labels(self.relations)
@@ -390,6 +393,7 @@ class Pattern:
         labels.extend(self.edge_dim_names)
         labels.extend(self.prop_columns)
         labels.extend(self._edge_dim_aggregation_names())
+        labels.extend(self.dim_block_names)
         return labels
 
     @property

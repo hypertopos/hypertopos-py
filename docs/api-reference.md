@@ -263,7 +263,7 @@ builder = GDSBuilder(
 | `add_event_dimension(pattern_id, column, edge_max)` | Add a continuous dimension to an event pattern (amounts, quantities) |
 | `add_derived_dimension(anchor_line, event_line, anchor_fk, metric, metric_col, dimension_name)` | Dimension derived from event aggregation (count, sum, max, std, mean) |
 | `add_composite_line(anchor_line, event_line, anchor_fk, ...)` | Create composite anchor line from event-anchor join |
-| `add_precomputed_dimension(anchor_line, dimension_name, edge_max)` | Dimension from a column already on the entity table |
+| `add_precomputed_dimension(anchor_line, dimension_name, edge_max="auto", percentile=99.0, display_name=None, kind=None)` | Dimension from a column already on the entity table; `kind` overrides the Bregman kind (`gaussian`, `poisson`, `bernoulli`) |
 | `add_graph_features(anchor_line, event_line, from_col, to_col, features)` | Auto-compute graph structural features (degree, reciprocity, pagerank, betweenness, community, clustering, components) |
 | `add_chain_line(line_id, chains, features)` | Create anchor line from extracted chain dicts |
 | `add_alias(alias_id, base_pattern_id, cutting_plane_dimension, cutting_plane_threshold)` | Register an alias with a cutting plane for sub-population analysis |

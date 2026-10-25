@@ -7,6 +7,24 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-10-25
+
+### Added
+
+- `hypertopos.spark.find_anomalies(df, entity, counterparty, amount, time)`: one call from a Spark DataFrame of events to a DataFrame with one row per entity - distance from the population, anomaly flag, conformal p-value, rank and the top three reasons. The per-entity aggregation runs on the executors; the driver only calibrates the per-entity table and scores it. Optional per-group populations (`group_by`, with small groups pooled and a `calibration_scope` column), a calibration cache keyed by the input, and shares, spreads and ratios measured on few events pulled toward the population mean so that one or two events cannot make an entity extreme. Runs on classic clusters and on Spark Connect sessions, including Databricks serverless (environment 3 or later, Python 3.12). Install with `pip install "hypertopos[spark]"` (PySpark 3.5 or 4); see the new Spark page in the docs.
+- `hypertopos.scoring.FrozenCalibration`: fit a population calibration on an entity table and score any table against it without recalibrating; plain numpy, picklable.
+- `hypertopos spark find-anomalies` CLI: the same call from the shell, on a local Spark session or as a Databricks Python wheel task; reads a Parquet, CSV or Delta path or a table, and writes Parquet, a table, or prints the top entities (`--show N`).
+- `hypertopos.spark.explain(result, entities=None, top_n=50, dims=None)`: one row per entity and dimension - value, population mean and standard deviation (the group's, with `group_by`), signed deviation, share of the distance and direction - for the most distant entities or named ones. `hypertopos.spark.sphere_of(result)` returns the calibration behind a result: its per-entity geometry as a table, written to a table with `to_delta`, or built into a navigable sphere for the MCP server (`lance_path`, `mcp_config`, `serve`) whose geometry matches the result.
+- `hypertopos.spark.score(df, like=result)`: new events scored against a frozen calibration, aggregated and scored on the executors (no recalibration; `p_value` and `rank_pct` against the original population; unseen `group_by` groups fall back to the global calibration).
+- `hypertopos.datasets.synthetic_aml(n_accounts, n_days, laundering_share, seed)`: a deterministic, labelled synthetic payments dataset (retail and business accounts; fan-out, fan-in, cycle, scatter-gather, structuring and pass-through laundering patterns) for trying the library and comparing detectors, generated on the fly.
+- `kind:` on `precomputed_dimensions` entries in `sphere.yaml` (and `kind=` on `GDSBuilder.add_precomputed_dimension`) sets the Bregman kind of the dimension - `gaussian`, `poisson` or `bernoulli` - instead of the auto-detected one; an unknown value fails the config.
+
+### Fixed
+
+- On Linux the builder's memory budget now counts reclaimable page cache (`MemAvailable`), so a machine with a warm file cache no longer looks out of memory and builds are not split into needlessly small chunks.
+- Patterns with `metric_properties`, `geo_properties` or `semantic_dim` blocks: `Pattern.dim_labels` and `Pattern.delta_dim()` now include the block dimensions (`t:<col>`, `g:<col>`, `s:pc<k>`), so labels and widths match the stored geometry; a pattern above the chunked-build size without `group_by` no longer drops those dimensions; and a pattern made only of dimension blocks is accepted.
+- `explain_anomaly` and other polygon reads on patterns with `metric_properties`, `geo_properties` or `semantic_dim` blocks use the stored geometry instead of failing with a shape mismatch.
+
 ## [0.9.0] — 2026-10-25
 
 ### Added

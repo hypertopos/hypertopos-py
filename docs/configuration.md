@@ -728,7 +728,7 @@ The builder assigns a `kind` tag to every dimension at build time. The tag drive
 | `graph_features` (`community`, `connected_component`) | auto | Integer IDs (categorical) |
 | `geo_properties`, `metric_properties` | `gaussian` | Continuous measurements |
 
-**Override via `kind:`** on individual dimension entries (precomputed, derived). Override takes precedence over auto-detection. Event dimensions use auto-detection only.
+**Override via `kind:`** on precomputed dimension entries (`gaussian`, `poisson` or `bernoulli`). The override takes precedence over auto-detection; an unknown value fails the config. Derived and event dimensions use auto-detection only.
 
 ---
 
@@ -788,6 +788,8 @@ patterns:
       - column: structuring_pct
         edge_max: 1
         display_name: structuring        # Optional label.
+      - column: n_counterparties
+        kind: poisson                    # Optional Bregman kind override.
 ```
 
 | Field | Type | Default | Description |
@@ -796,6 +798,7 @@ patterns:
 | `edge_max` | int or `"auto"` | `"auto"` | Fixed normalization cap, or auto-compute from percentile. |
 | `percentile` | float | `99.0` | Percentile for auto edge_max computation. |
 | `display_name` | string | `null` | Human-readable dimension label. |
+| `kind` | string | auto | Bregman kind: `gaussian`, `poisson` or `bernoulli`. Auto gives `bernoulli` for `edge_max: 1` and `gaussian` otherwise. |
 
 ---
 

@@ -102,7 +102,7 @@ Every dimension in a pattern carries a `kind` tag — the distribution family us
 | `graph_features` pagerank, betweenness, clustering_coefficient | auto |
 | `graph_features` community, connected_component | auto |
 
-Override via `kind:` on individual dimension entries in `sphere.yaml`. The resulting kind list is stored in `Pattern.dimension_kinds` and surfaced in `sphere_overview` as `dimension_kinds`.
+Override via `kind:` on precomputed dimension entries in `sphere.yaml`. The resulting kind list is stored in `Pattern.dimension_kinds` and surfaced in `sphere_overview` as `dimension_kinds`.
 
 ### Dim-quality warnings
 

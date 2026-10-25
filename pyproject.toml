@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hypertopos"
-version = "0.9.0"
+version = "0.9.1"
 description = "Understand the structure of your data — without training machine learning models"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -48,6 +48,14 @@ dev = [
     "ruff==0.15.2",
     "mypy==1.19.1",
     "igraph>=0.11",
+    "pyspark>=3.5,<3.6",
+    "setuptools; python_version >= '3.12'",
+]
+spark = [
+    # Spark 3.5 (DBR 14-16) and Spark 4 (DBR 17, serverless): never downgrade the platform's PySpark.
+    "pyspark>=3.5,<5",
+    # pyspark 3.5 imports distutils, which Python 3.12 dropped; setuptools provides it.
+    "setuptools; python_version >= '3.12'",
 ]
 mcp = [
     "mcp[cli]>=2.3,<3",
@@ -94,6 +102,7 @@ module = [
     "networkx.*",
     "pandas.*",
     "pyarrow.*",
+    "pyspark.*",
     "ripser.*",
     "scipy.*",
     "sklearn.*",

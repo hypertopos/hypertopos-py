@@ -1,0 +1,27 @@
+roles: entity=src counterparty=dst amount=amt time=ts
+log_amounts: log1p(max(x, 0)) on amounts and gaps, negatives count as 0
+long table: one out row per event with a non-null entity (key = entity, other = counterparty); one in row per event whose counterparty is non-null and differs from the entity (key = counterparty, other = entity); events with a null entity are dropped; keys are cast to string; time is epoch seconds in UTC (timestamp = instant, timestamp_ntz = wall clock read as UTC, date = UTC midnight, numeric = epoch seconds)
+dims:
+  n_out [poisson] stage=events: out rows
+  n_in [poisson] stage=events: in rows
+  n_distinct_out [poisson] stage=events: distinct non-null counterparties of out rows
+  n_distinct_in [poisson] stage=events: distinct entities of in rows
+  top_counterparty_share_out [gaussian] stage=pairs: largest out-row count to one non-null counterparty / n_out; 0 when n_out = 0; shrunk toward the population mean, weight 3 vs n_out
+  in_out_ratio [gaussian] stage=events: n_in / n_events; shrunk toward the population mean, weight 3 vs n_events
+  amount_sum_out [gaussian] stage=events: sum of non-null out amounts; 0 when none; log
+  amount_sum_in [gaussian] stage=events: sum of non-null in amounts; 0 when none; log
+  amount_mean_out [gaussian] stage=events: mean of non-null out amounts; 0 when none; log
+  amount_mean_in [gaussian] stage=events: mean of non-null in amounts; 0 when none; log
+  amount_std_out [gaussian] stage=events: population std (ddof 0) of out amounts; 0 when < 2; log; shrunk toward the population mean, weight 3 vs n_out
+  amount_std_in [gaussian] stage=events: population std (ddof 0) of in amounts; 0 when < 2; log; shrunk toward the population mean, weight 3 vs n_in
+  amount_max_out [gaussian] stage=events: max of non-null out amounts; 0 when none; log
+  amount_max_in [gaussian] stage=events: max of non-null in amounts; 0 when none; log
+  amount_min_out [gaussian] stage=events: min of non-null out amounts; 0 when none; log
+  round_amount_share [gaussian] stage=events: share of non-null out amounts that are a positive multiple of 100; 0 when none; shrunk toward the population mean, weight 3 vs n_out
+  active_days [poisson] stage=events: distinct UTC days with an event
+  span_days [gaussian] stage=events: (last - first event time) in days
+  iet_mean [gaussian] stage=gaps: mean gap in seconds between consecutive events; 0 when < 2; log
+  iet_std [gaussian] stage=gaps: population std (ddof 0) of the gaps in seconds; 0 when < 2 gaps; log; shrunk toward the population mean, weight 3 vs n_events
+  burst_max_daily [poisson] stage=days: largest number of events on one UTC day
+  hour_share_night [gaussian] stage=events: share of events with UTC hour in [0, 6); shrunk toward the population mean, weight 3 vs n_events
+  weekend_share [gaussian] stage=events: share of events on a UTC Saturday or Sunday; shrunk toward the population mean, weight 3 vs n_events

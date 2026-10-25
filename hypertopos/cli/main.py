@@ -87,6 +87,10 @@ def main() -> None:
     info_p.add_argument("path", help="Path to a built sphere directory")
 
     # --- sphere (cloud-ops verbs over a built sphere) ---
+    from hypertopos.cli import spark_cmd
+
+    spark_p = spark_cmd.add_parser(sub)
+
     sphere_p = sub.add_parser(
         "sphere",
         help="Cloud-ops verbs over a built sphere (health/validate/diff)",
@@ -237,6 +241,8 @@ def main() -> None:
         from hypertopos.cli.info import run_info
 
         run_info(args.path)
+    elif args.command == "spark":
+        spark_cmd.run(args, spark_p)
     elif args.command == "sphere":
         if args.sphere_command == "health":
             from hypertopos.cli.sphere_ops import run_sphere_health

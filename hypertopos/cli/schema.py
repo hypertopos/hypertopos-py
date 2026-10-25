@@ -103,7 +103,7 @@ _RELATION_KEYS = frozenset(
     {"line", "direction", "key_on_entity", "required", "display_name", "edge_max"}
 )
 _EVENT_DIM_KEYS = frozenset({"column", "display_name"})
-_PRECOMPUTED_KEYS = frozenset({"column", "edge_max", "percentile", "display_name"})
+_PRECOMPUTED_KEYS = frozenset({"column", "edge_max", "percentile", "display_name", "kind"})
 _GRAPH_FEATURES_KEYS = frozenset({"event_line", "from_col", "to_col", "features"})
 _EDGE_TABLE_KEYS = frozenset({"from_col", "to_col", "timestamp_col", "amount_col"})
 _SEMANTIC_DIM_KEYS = frozenset({"columns", "n_components"})
@@ -288,6 +288,7 @@ class PrecomputedDimConfig:
     edge_max: int | str = "auto"
     percentile: float = 99.0
     display_name: str | None = None
+    kind: str | None = None
 
 
 @dataclass
@@ -729,6 +730,7 @@ def _parse_one_pattern(
                     edge_max=pc.get("edge_max", "auto"),
                     percentile=float(pc.get("percentile", 99.0)),
                     display_name=pc.get("display_name"),
+                    kind=_parse_dim_kind(pid, str(pc["column"]), pc.get("kind")),
                 )
             )
 
@@ -1211,6 +1213,19 @@ def _parse_chain_lines(
             category_col=_opt_str(spec.get("category_col")),
         )
     return result
+
+
+def _parse_dim_kind(pid: str, column: str, raw: Any) -> str | None:
+    from hypertopos.builder._bregman import BREGMAN_KINDS
+
+    if raw is None:
+        return None
+    if raw not in BREGMAN_KINDS:
+        raise ValueError(
+            f"Pattern '{pid}' precomputed dim '{column}': kind '{raw}' is not valid. "
+            f"Expected one of {BREGMAN_KINDS}."
+        )
+    return str(raw)
 
 
 def _opt_str(value: Any) -> str | None:

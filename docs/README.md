@@ -21,4 +21,5 @@ hypertopos turns relational data into navigable geometric space — a coordinate
 | [Data Format](data-format.md) | On-disk layout, Lance schemas, branches, sphere.json |
 | [External Chains as Anchor Lines](external-chains-as-anchor-line.md) | Ingesting chains found by other systems and navigating them with the same primitives |
 | [Container Deployment](container-deployment.md) | Running the CLI as one-shot container jobs |
+| [hypertopos on Spark](spark.md) | From a Spark DataFrame of events to per-entity geometry: column roles, dimensions, time handling |
 | [Benchmarks](benchmarks.md) | Validation results — banking, AML, transportation |

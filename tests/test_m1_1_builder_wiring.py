@@ -29,6 +29,7 @@ from pathlib import Path
 import lance
 import numpy as np
 import pyarrow as pa
+import pytest
 
 from hypertopos.builder import GDSBuilder, RelationSpec
 from hypertopos.cli.schema import LabelAuditConfig
@@ -281,6 +282,7 @@ def test_audit_pattern_dims_returns_full_field_path_end_to_end(tmp_path):
     from types import SimpleNamespace
     from unittest.mock import MagicMock
 
+    pytest.importorskip("hypertopos_mcp")
     import hypertopos_mcp.tools.observability  # noqa: F401 — register tool
     from hypertopos_mcp.server import _state
     from hypertopos_mcp.tools.observability import audit_pattern_dims

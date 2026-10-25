@@ -22,6 +22,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pyarrow as pa
+import pytest
 
 from hypertopos.engine.counterfactual import (
     recompute_delta_norm_against_frozen,
@@ -255,6 +256,7 @@ def test_recompute_delta_norm_handles_sigma_dead_dims():
 def test_serializer_round_trips_delta_norm_frozen_pop():
     """MCP serializer emits ``delta_norm_frozen_pop`` when populated, omits
     when None (default path)."""
+    pytest.importorskip("hypertopos_mcp")
     from hypertopos_mcp.serializers import _serialize_slice
 
     mu = np.array([0.0, 0.0], dtype=np.float32)

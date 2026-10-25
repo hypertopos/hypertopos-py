@@ -346,6 +346,7 @@ class TestInfluencerHistoryCache:
 
 class TestTierMapping:
     def test_calibration_influencer_history_in_tool_tiers(self):
+        pytest.importorskip("hypertopos_mcp")
         from hypertopos_mcp.server import _TOOL_TIERS
 
         assert "calibration_influencer_history" in _TOOL_TIERS

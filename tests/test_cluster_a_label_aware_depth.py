@@ -63,6 +63,7 @@ def _call_audit_pattern_dims(
     pattern: object, *, pattern_id: str = "synth_pat", top_k: int = 10
 ) -> dict:
     """Invoke audit_pattern_dims against an in-memory pattern stand-in."""
+    pytest.importorskip("hypertopos_mcp")
     import hypertopos_mcp.tools.observability  # noqa: F401 — register tool
     from hypertopos_mcp.server import _state
     from hypertopos_mcp.tools.observability import audit_pattern_dims

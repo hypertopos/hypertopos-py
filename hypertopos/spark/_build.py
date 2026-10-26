@@ -36,7 +36,10 @@ def estimate_bytes(n_rows: int, n_numeric: int) -> int:
 
 
 def collect_entities(
-    entity_df: DataFrame, *, max_collect_bytes: int = MAX_COLLECT_BYTES
+    entity_df: DataFrame,
+    *,
+    n_rows: int | None = None,
+    max_collect_bytes: int = MAX_COLLECT_BYTES,
 ) -> pa.Table:
     """Bring the per-entity table to the driver as Arrow.
 
@@ -44,9 +47,11 @@ def collect_entities(
     split by a hash of the key), so no single collect reaches
     ``spark.driver.maxResultSize`` and nothing is written to storage the driver
     may not be able to read back (serverless, Volumes). ``entity_df`` should be
-    persisted: it is read once per chunk.
+    persisted: it is read once per chunk. ``n_rows``, when known, saves a count
+    that recomputes the aggregation where the frame cannot be cached.
     """
-    n_rows = entity_df.count()
+    if n_rows is None:
+        n_rows = entity_df.count()
     if n_rows == 0:
         raise ValueError("the aggregation produced no entities; check the entity column")
     size = estimate_bytes(n_rows, len(entity_df.columns) - 1)

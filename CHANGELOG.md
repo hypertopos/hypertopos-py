@@ -7,6 +7,23 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.3] — 2026-10-26
+
+### Added
+
+- `hypertopos spark score --input ... --calibration PATH` scores new events against a saved calibration from the command line or a Databricks Python wheel task, with `--anomalies-only` and `--append` for a daily alerts table; `hypertopos spark find-anomalies` prints the path of its calibration.
+- `explain` works on a `score` result: `explain(today, events=new_events)` recomputes the dimensions of the explained entities from the events they were scored on and compares them with the frozen population; a `score` result now points to its calibration, so `sphere_of(today)` returns it.
+- `hypertopos.spark.sphere_of(path)` opens a saved calibration by its path, so a scheduled job in a new process can score new events against an earlier baseline with `score(df, like=sphere_of(path))`; the Spark docs show the calibrate-once, score-daily recipe on a Unity Catalog Volume.
+
+### Changed
+
+- The README states the license terms plainly: production use is allowed, offering hypertopos to third parties as a hosted or embedded competing service is not, and each version becomes Apache 2.0 three years after its release.
+
+### Fixed
+
+- `p_value` and `rank_pct` in Spark results and `FrozenCalibration` scores are exact ratios of counts (`0.001`, not `0.0010000000474974513`).
+- `find_anomalies` counts the entities from the keys alone and runs the full per-entity aggregation once, instead of three times, on compute that cannot cache a DataFrame (Databricks serverless), so a call there takes a fraction of the time it did.
+
 ## [0.9.2] — 2026-10-25
 
 ### Added

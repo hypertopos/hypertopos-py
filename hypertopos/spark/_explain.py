@@ -22,6 +22,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import functions as F
 
 from hypertopos.scoring import FrozenCalibration
 from hypertopos.spark._api import (
@@ -29,8 +30,11 @@ from hypertopos.spark._api import (
     ENTITIES_FILE,
     METADATA_FINGERPRINT,
     METADATA_PATH,
+    METADATA_SCORED,
+    PLAN_FILE,
+    entity_frame,
 )
-from hypertopos.spark._build import KEY, build_sphere
+from hypertopos.spark._build import KEY, build_sphere, collect_entities
 
 SPHERE_DIR = "sphere"
 _MCP_ARGS = ("-m", "hypertopos_mcp.main")
@@ -38,7 +42,7 @@ _MCP_ARGS = ("-m", "hypertopos_mcp.main")
 
 @dataclass(frozen=True)
 class Sphere:
-    """The calibration behind a ``find_anomalies`` result, found without a path."""
+    """The calibration behind a ``find_anomalies`` result: entities, calibration, geometry."""
 
     path: Path
     fingerprint: str
@@ -117,8 +121,20 @@ class Sphere:
         spark.createDataFrame(self.geometry().to_pandas()).write.mode(mode).saveAsTable(table)
 
 
-def sphere_of(result: DataFrame) -> Sphere:
-    """The ``Sphere`` behind a ``find_anomalies`` result (read from column metadata)."""
+def sphere_of(result: DataFrame | str | os.PathLike[str]) -> Sphere:
+    """The ``Sphere`` behind a ``find_anomalies`` result, or saved at a path.
+
+    A path is the ``Sphere.path`` of an earlier result kept on persistent storage
+    (``sphere_root``), so a later job, in a new process, can score against it.
+    """
+    if isinstance(result, (str, os.PathLike)):
+        path = Path(result)
+        if not (path / CALIBRATION_FILE).exists():
+            raise FileNotFoundError(
+                f"no hypertopos calibration at {path}: pass the path of sphere_of(result) "
+                "from a find_anomalies call whose sphere_root is persistent storage"
+            )
+        return Sphere(path=path, fingerprint=path.name)
     metadata = result.schema[KEY].metadata if KEY in result.columns else {}
     if METADATA_PATH not in metadata:
         raise ValueError(
@@ -134,19 +150,37 @@ def sphere_of(result: DataFrame) -> Sphere:
     return Sphere(path=path, fingerprint=metadata[METADATA_FINGERPRINT])
 
 
+def _scored_entities(
+    events: DataFrame, sphere: Sphere, keys: list[str], group_by: str | None
+) -> pa.Table:
+    """The entity table of ``keys``, aggregated from their own events only."""
+    with open(sphere.path / PLAN_FILE, "rb") as fh:
+        plan = pickle.load(fh)
+    roles = plan.roles
+    touches = F.col(roles["entity"]).cast("string").isin(keys)
+    if "counterparty" in roles:
+        touches = touches | F.col(roles["counterparty"]).cast("string").isin(keys)
+    frame = entity_frame(events.where(touches), plan, group_by)
+    return collect_entities(frame.where(F.col(KEY).isin(keys)))
+
+
 def explain(
     result: DataFrame,
     entities: Sequence[str] | None = None,
     top_n: int = 50,
     dims: Sequence[str] | None = None,
+    events: DataFrame | None = None,
 ) -> DataFrame:
     """Why entities stand out: one row per entity and dimension.
 
     Args:
-        result: The DataFrame ``find_anomalies`` returned.
+        result: The DataFrame ``find_anomalies`` or ``score`` returned.
         entities: Entity keys to explain; default is the ``top_n`` most distant.
         top_n: How many of the most distant entities, when ``entities`` is None.
         dims: Restrict to these dimensions; default is all.
+        events: For a ``score`` result, the events it scored: their entities are
+            not in the calibration, so their dimensions are recomputed from the
+            events of the explained entities only.
 
     Returns:
         ``entity, dim, value, mu, sigma, delta, pct_of_total, direction``: the
@@ -169,8 +203,16 @@ def explain(
         ]
     else:
         keys = [str(k) for k in entities]
-    table = sphere.entities()
-    table = table.filter(pc.is_in(table[KEY], value_set=pa.array(keys, pa.string())))
+    if KEY in result.columns and result.schema[KEY].metadata.get(METADATA_SCORED):
+        if events is None:
+            raise ValueError(
+                "this is a score() result: its entities are not in the calibration; "
+                "pass the events it scored, explain(result, events=df)"
+            )
+        table = _scored_entities(events, sphere, keys, calibration.group_by)
+    else:
+        table = sphere.entities()
+        table = table.filter(pc.is_in(table[KEY], value_set=pa.array(keys, pa.string())))
     missing = set(keys) - set(table[KEY].to_pylist())
     if missing:
         raise ValueError(f"not in this result: {sorted(missing)[:10]}")

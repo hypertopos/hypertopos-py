@@ -32,8 +32,9 @@ def score(df: DataFrame, like: DataFrame | Sphere) -> DataFrame:
         against the frozen population: no recalibration, so ``p_value`` and
         ``rank_pct`` place each entity within the original population. The
         aggregation and the scoring both run on the executors; only the
-        calibration (a few arrays) travels with the tasks. The result carries no
-        calibration metadata: ``explain`` describes ``like``, not this result.
+        calibration (a few arrays) travels with the tasks. ``sphere_of`` on the
+        result gives the calibration; ``explain(result, events=df)`` explains its
+        entities from the events they were scored on.
     """
     sphere = like if isinstance(like, Sphere) else sphere_of(like)
     calibration = sphere.calibration()
@@ -41,7 +42,14 @@ def score(df: DataFrame, like: DataFrame | Sphere) -> DataFrame:
         plan: Plan = pickle.load(fh)
     entities = entity_frame(df, plan, calibration.group_by)
     flat = entities.mapInArrow(_scorer(calibration), _result_schema(calibration))
-    return shape_result(flat, len(calibration.dims), None, None, calibration.group_by)
+    return shape_result(
+        flat,
+        len(calibration.dims),
+        sphere.fingerprint,
+        sphere.path,
+        calibration.group_by,
+        scored=True,
+    )
 
 
 def _scorer(

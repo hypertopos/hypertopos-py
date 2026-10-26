@@ -69,7 +69,8 @@ def test_entity_table_runs_where_caching_is_refused(monkeypatch):
 
     frame = NoCacheFrame()
     monkeypatch.setattr(_api, "entity_frame", lambda df, plan, group_by: frame)
-    monkeypatch.setattr(_api, "collect_entities", lambda df: ("collected", df))
+    monkeypatch.setattr(_api, "count_entities", lambda df, plan: 2)
+    monkeypatch.setattr(_api, "collect_entities", lambda df, *, n_rows: ("collected", df))
     assert _api._entity_table(None, None, None, max_entities=10) == ("collected", frame)
 
 
@@ -92,3 +93,67 @@ def test_sphere_root_falls_back_where_the_conf_cannot_be_read(monkeypatch, tmp_p
 
     monkeypatch.setenv("HYPERTOPOS_SPHERE_ROOT", str(tmp_path))
     assert _api._sphere_root(Frame(), None) == str(tmp_path)
+
+
+def test_entity_table_aggregates_once_without_a_cache(monkeypatch):
+    """Where caching is refused, every action recomputes the aggregation: count the
+    entities from the keys, and run the full aggregation only for the collect."""
+    pytest.importorskip("pyspark")
+    from pyspark.errors import AnalysisException
+
+    from hypertopos.spark import _api
+
+    class AggregatedFrame:
+        def persist(self):
+            raise AnalysisException("[CACHE_REQUIRES_NEWER_CLIENT_ON_SERVERLESS_GC]")
+
+        def count(self):
+            raise AssertionError("count() on the aggregated frame recomputes the aggregation")
+
+    frame = AggregatedFrame()
+    collected = {}
+    monkeypatch.setattr(_api, "entity_frame", lambda df, plan, group_by: frame)
+    monkeypatch.setattr(_api, "count_entities", lambda df, plan: 7)
+
+    def collect(df, *, n_rows=None):
+        collected["n_rows"] = n_rows
+        return "table"
+
+    monkeypatch.setattr(_api, "collect_entities", collect)
+    assert _api._entity_table(None, None, None, max_entities=10) == "table"
+    assert collected["n_rows"] == 7
+    with pytest.raises(ValueError, match="exceed max_entities"):
+        _api._entity_table(None, None, None, max_entities=5)
+
+
+def test_entity_table_counts_the_cached_frame_where_caching_works(monkeypatch):
+    """With a cache, counting the persisted frame materialises it once and the collect
+    reads the cache; a separate key count would be one more pass over the events."""
+    pytest.importorskip("pyspark")
+    from hypertopos.spark import _api
+
+    class CachedFrame:
+        def persist(self):
+            return self
+
+        def unpersist(self):
+            return self
+
+        def count(self):
+            return 3
+
+    def no_key_count(df, plan):
+        raise AssertionError("the key count is an extra pass where the frame is cached")
+
+    frame = CachedFrame()
+    collected = {}
+    monkeypatch.setattr(_api, "entity_frame", lambda df, plan, group_by: frame)
+    monkeypatch.setattr(_api, "count_entities", no_key_count)
+
+    def collect(df, *, n_rows=None):
+        collected["n_rows"] = n_rows
+        return "table"
+
+    monkeypatch.setattr(_api, "collect_entities", collect)
+    assert _api._entity_table(None, None, None, max_entities=10) == "table"
+    assert collected["n_rows"] == 3

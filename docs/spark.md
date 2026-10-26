@@ -10,13 +10,13 @@ In a notebook, `help(find_anomalies)` prints the full parameter list.
 pip install "hypertopos[spark]"
 ```
 
-The extra pulls in `pyspark>=3.5,<5`, plus `setuptools` on Python 3.12+ because PySpark 3.5 imports `distutils`. On Databricks, PySpark is already present: `%pip install hypertopos` is enough. hypertopos needs Python 3.12, so on Databricks use Runtime 16 or later, or serverless environment version 3 or later. Classic clusters and Spark Connect sessions (serverless, shared access mode) both work.
+The extra pulls in `pyspark>=3.5,<5`, plus `setuptools` on Python 3.12+ because PySpark 3.5 imports `distutils`. On Databricks, PySpark is already present: `%pip install hypertopos` is enough. hypertopos needs Python 3.12, so on Databricks use Runtime 16 or later, or serverless environment version 3 or later. It is verified on Databricks serverless (a Spark Connect session) and on classic local Spark sessions; on Databricks, classic clusters run the same classic code path.
 
 > [!NOTE]
 > `No matching distribution found for hypertopos`, with versions ignored for `Requires-Python >=3.12`, means the compute runs an older Python, not that the package is missing. In a serverless notebook, open the **Environment** side panel and pick environment version 3 or later. In a job, set `environment_version` to 3 or later in the task's environment spec. A job task without an environment spec can still start on an older default version.
 
 > [!TIP]
-> PySpark needs a JVM (Java 11 or 17 for Spark 3.5). Locally, set `PYSPARK_PYTHON` to the interpreter that has hypertopos installed. Otherwise the Python workers start from a different environment. On a laptop, also lower the shuffle partitions, `SparkSession.builder.master("local[2]").config("spark.sql.shuffle.partitions", "4")`. The default of 200 is sized for a cluster and turns every aggregation into hundreds of small tasks.
+> PySpark needs a JVM (Java 11 or 17 for Spark 3.5). Locally, set `PYSPARK_PYTHON` to the interpreter that has hypertopos installed. Otherwise the Python workers start from a different environment.
 
 ## Try it on synthetic data
 
@@ -129,11 +129,29 @@ today = score(spark.table("main.aml.transactions_today"), like=result)
 today.where("is_anomaly").write.mode("append").saveAsTable("main.aml.daily_alerts")
 ```
 
-It returns the same columns as `find_anomalies`. The aggregation and the scoring both run on the executors, and only the calibration travels with the tasks (the per-dimension statistics plus the population's sorted distances, about 4 MB per million calibrated entities), so the new data never reaches the driver. Nothing is recalibrated: `p_value` and `rank_pct` place each entity within the original population. With `group_by`, an entity whose group did not exist at calibration time is scored against the whole population, with `calibration_scope` set to `global`. `like` accepts the result or its `sphere_of(result)`. The scored DataFrame does not point back to a calibration, so `explain` it through the original result.
+It returns the same columns as `find_anomalies`. The aggregation and the scoring both run on the executors, and only the calibration travels with the tasks (the per-dimension statistics plus the population's sorted distances, about 4 MB per million calibrated entities), so the new data never reaches the driver. Nothing is recalibrated: `p_value` and `rank_pct` place each entity within the original population. With `group_by`, an entity whose group did not exist at calibration time is scored against the whole population, with `calibration_scope` set to `global`. `like` accepts the result or its `sphere_of(result)`. To see why a scored entity stands out, pass the events it was scored on: `explain(today, events=new_events)`. Its entities are not in the calibration, so `explain` recomputes their dimensions from their own events, on the executors, and compares them with the frozen population.
+
+#### In a scheduled job
+
+A daily job runs in a new process, so the result of the calibration run is gone. Keep the calibration on persistent storage and score against it by its path:
+
+```python
+# Once, or whenever the baseline should move: calibrate on a reference window.
+reference = spark.table("main.aml.transactions").where("ts < '2026-10-01'")
+result = find_anomalies(reference, entity="from_account", counterparty="to_account",
+                        amount="amount", time="ts", sphere_root="/Volumes/main/aml/hypertopos")
+calibration_path = str(sphere_of(result).path)    # keep it, e.g. as a job parameter
+
+# Every day: score the new events against that baseline and append the alerts.
+today = score(spark.table("main.aml.transactions_today"), like=sphere_of(calibration_path))
+today.where("is_anomaly").write.mode("append").saveAsTable("main.aml.daily_alerts")
+```
+
+The baseline stays the same from one day to the next, so the scores stay comparable; it moves only when you run the calibration again. On a Databricks Volume, the entity table and the calibration are written as plain files, which a Volume accepts.
 
 ### Per-group populations
 
-`group_by` names an entity property, such as a segment or a country. Each group gets its own population, so a large business account is compared with businesses, not with retail customers:
+`group_by` names an entity property, such as a segment or a country. Each group gets its own population, so a large business account is compared with businesses, not with retail customers. Use it whenever the entities differ in kind or scale (retail and business accounts, small and large merchants): without it, the largest entities stand out for being large, and the unusual behaviour inside each kind is diluted:
 
 ```python
 find_anomalies(tx, entity="from_account", counterparty="to_account", amount="amount",
@@ -154,7 +172,7 @@ The entity table and its calibration are stored under `sphere_root`. The default
 - **A DataFrame built in memory** is reused only as the same object. A re-created frame always recalibrates.
 - **A plain file rewritten in place under the same name** is not detected. Pass `cache=False` to force a fresh calibration.
 
-The driver temp directory does not survive a cluster restart. Set `sphere_root` to a persistent location to keep calibrations.
+The driver temp directory does not survive a cluster restart. Set `sphere_root` to a persistent location, such as a Unity Catalog Volume, to keep calibrations. On serverless compute a custom Spark conf cannot be set, so pass `sphere_root=` or set `HYPERTOPOS_SPHERE_ROOT`.
 
 > [!TIP]
 > The driver holds the per-entity table, its calibration and the result. With all dimensions, the calibration step alone takes under 1 GB per million entities, and the whole call takes several times that, so size the driver at a few GB per million entities. `max_entities` (5 million by default) stops a larger run with a clear error before it starts; raise it on a bigger driver.
@@ -171,6 +189,14 @@ hypertopos spark find-anomalies --input main.aml.transactions --entity from_acco
 ```
 
 `--input` takes a Parquet or CSV file or directory, a Delta directory, or a table or view name. Exactly one of `--output` (Parquet path), `--output-table` or `--show N` is required. `hypertopos spark find-anomalies --help` lists every option.
+
+`find-anomalies` prints the path of its calibration (`calibration: ...`). A scheduled job scores each new batch against it with `score`, which adds no recalibration and can append only the flagged entities to an alerts table:
+
+```bash
+hypertopos spark score --input main.aml.transactions_today \
+    --calibration /Volumes/main/aml/hypertopos/1bb767d5fc6a53ec \
+    --anomalies-only --append --output-table main.aml.daily_alerts
+```
 
 ## Column roles
 
@@ -249,5 +275,5 @@ Times are converted to UTC epoch seconds arithmetically, so results do not depen
 ## Limits
 
 - Dimensions are per entity. Pair-level and chain-level patterns (counterparty graphs, chains, motifs) are built by the file-based builder; see [Configuration](configuration.md).
-- Each dimension is standardised against the population (mean and standard deviation, with a floor of 0.01 on the deviation) and never clipped, so an entity far beyond the usual range stays far. Dimensions are treated as independent: two dimensions that move together each count in `delta_norm`.
+- Each dimension is standardised against the population (mean and standard deviation, with a floor of 0.01 on the deviation) and never clipped, so an entity far beyond the usual range stays far. Dimensions are treated as independent: two dimensions that move together each count in `delta_norm`. The distance is measured from one centre per population, so a population made of several distinct kinds of entity is described poorly without `group_by`.
 - `find_anomalies` calibrates on the data it is given; to measure new data against an earlier calibration, use `score`.

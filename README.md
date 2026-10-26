@@ -9,7 +9,7 @@
 [![PyArrow](https://img.shields.io/badge/format-PyArrow-red.svg)](https://arrow.apache.org/docs/python/)
 [![Lance](https://img.shields.io/badge/storage-Lance-blueviolet.svg)](https://github.com/lance-format/lance)
 [![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io)
-[![Version](https://img.shields.io/badge/version-0.9.2-%235500FF.svg)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.9.3-%235500FF.svg)](pyproject.toml)
 
 Describe your tables in a YAML file, run `hypertopos build`, and every entity gets a position relative to its own population — so "out of place", "similar", "drifting" and "different between groups" become distances you read instead of queries you write.
 
@@ -164,9 +164,6 @@ Real output (local Spark, two cores):
 ```
 
 `A000335` made 20 payments on its busiest day, against about 8 for retail accounts (+5.3 σ), and its payment amounts vary far more than theirs (`amount_std_out` is log-scaled). In the labels of `data.accounts` it is one of the planted fan-out accounts. The other two are not laundering, only unusual, which is what a distance from the population measures: `p_value` 0.001 means one entity in a thousand is as far out. The labels let you measure how a detector does on the same data. `explain` shows where every number comes from. `score(new_events, like=result)` scores the next batch against this calibration on the executors, and `sphere_of(result)` hands the same geometry to an agent through the MCP server.
-> [!TIP]
-> On a laptop, create the session with `.master("local[2]").config("spark.sql.shuffle.partitions", "4")`. The default of 200 shuffle partitions is sized for a cluster.
-
 Everything else, from column roles and the 23 dimensions to time handling, the cache and the CLI, is in [hypertopos on Spark](docs/spark.md). To run the whole flow on labelled synthetic data, open the [quickstart notebook](docs/examples/spark-quickstart.ipynb) on Databricks or locally.
 
 ## See it in action
@@ -371,7 +368,7 @@ Every capability below comes from one decision: an entity is a point in a space 
 | Operations CLI | `hypertopos sphere health`, `validate` and `diff` give CI gates and drift between two builds; vector-index health is reported before trajectory tools rely on it | Hand-rolled validation scripts |
 | An agent surface | The MCP server runs over stdio or HTTP with a session per agent and compact, strict-JSON responses sized for a context window | Wrapping a database in ad-hoc tools |
 | On Spark | `hypertopos.spark.find_anomalies(df, entity=…, …)` aggregates events per entity on the executors and returns a DataFrame with distance, flag, p-value and reasons; `explain` breaks it down, `sphere_of` hands it to an agent. Runs on classic clusters and Spark Connect, including Databricks serverless | Exporting events, building features by hand and running a detector outside the cluster |
-| Frozen scoring | `FrozenCalibration` (and `hypertopos.spark.score` on executors) scores new data against a fixed population without recalibrating | Refitting the detector on every batch, so yesterday's and today's scores are not comparable |
+| Frozen scoring | `FrozenCalibration` (and `hypertopos.spark.score` on executors) scores new data against a fixed population without recalibrating; a calibration saved on persistent storage serves later scheduled jobs (`sphere_of(path)`, `hypertopos spark score`), and `explain` names the dimensions behind each alert | Refitting the detector on every batch, so yesterday's and today's scores are not comparable |
 | Data to try it on | `hypertopos.datasets.synthetic_aml` generates a labelled payments dataset with six laundering patterns | Hunting for a public dataset before the first call |
 
 ### What changes in practice
@@ -456,4 +453,4 @@ Research-stage project. Working code, reproducible benchmarks, active developmen
 
 ## License
 
-[Business Source License 1.1](LICENSE.md). Free for internal use, development, testing, and research. See LICENSE.md for details.
+[Business Source License 1.1](LICENSE.md). You may use hypertopos in production, including on your own data platform; you may not offer it to third parties as a hosted or embedded competing service. Each version becomes Apache 2.0 three years after its release. See LICENSE.md for the exact terms.

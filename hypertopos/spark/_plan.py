@@ -335,6 +335,11 @@ def _log1p_non_negative(col: Column) -> Column:
     return F.log1p(F.greatest(col, F.lit(0.0)))
 
 
+def count_entities(df: DataFrame, plan: Plan) -> int:
+    """Entities ``aggregate`` produces, from the keys alone (no dimensions computed)."""
+    return int(_long_table(df, plan).select("key").distinct().count())
+
+
 def aggregate(df: DataFrame, plan: Plan) -> DataFrame:
     """Compile the plan to Spark: one row per entity, ``entity`` + the plan's dims."""
     long = _long_table(df, plan)

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hypertopos"
-version = "0.9.2"
+version = "0.9.3"
 description = "Understand the structure of your data — without training machine learning models"
 readme = "README.md"
 requires-python = ">=3.12"

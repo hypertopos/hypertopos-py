@@ -84,6 +84,44 @@ def test_explain_compares_with_the_entitys_own_group(result):
         assert r["delta"] == pytest.approx((r["value"] - r["mu"]) / r["sigma"], rel=1e-4, abs=1e-5)
 
 
-def test_scored_result_carries_no_calibration_metadata(events, result):
+def test_scored_result_points_to_its_calibration_and_is_marked_scored(events, result):
+    # Its entities are not in the calibration's entity table, so explain needs the events.
+    metadata = score(events, like=result).schema["entity"].metadata
+    assert metadata[METADATA_PATH] == str(sphere_of(result).path)
+    assert metadata["hypertopos.scored"] == "true"
+
+
+def test_a_saved_calibration_scores_new_data_by_its_path(events, result):
+    # A scheduled job runs in a fresh process: no result object, only the path.
+    path = str(sphere_of(result).path)
+    from_path = score(events, like=sphere_of(path))
+    expected = {r["entity"]: r["delta_norm"] for r in score(events, like=result).collect()}
+    got = {r["entity"]: r["delta_norm"] for r in from_path.collect()}
+    assert got == pytest.approx(expected)
+
+
+def test_a_path_without_a_calibration_is_refused(tmp_path):
+    with pytest.raises(FileNotFoundError, match="no hypertopos calibration"):
+        sphere_of(str(tmp_path))
+
+
+def test_explain_a_scored_result_from_the_events_it_scored(events, result):
+    # Scoring the calibration data reproduces it, so the explanations must match.
+    from hypertopos.spark import explain
+
     scored = score(events, like=result)
-    assert METADATA_PATH not in scored.schema["entity"].metadata
+    assert sphere_of(scored).path == sphere_of(result).path
+    keys = [r["entity"] for r in result.orderBy("delta_norm", ascending=False).limit(3).collect()]
+    expected = explain(result, entities=keys).collect()
+    got = explain(scored, entities=keys, events=events).collect()
+    assert [(r["entity"], r["dim"]) for r in got] == [(r["entity"], r["dim"]) for r in expected]
+    for g, e in zip(got, expected, strict=True):
+        assert g["value"] == pytest.approx(e["value"], rel=1e-6, abs=1e-6)
+        assert g["delta"] == pytest.approx(e["delta"], rel=1e-5, abs=1e-5)
+
+
+def test_explain_a_scored_result_needs_its_events(events, result):
+    from hypertopos.spark import explain
+
+    with pytest.raises(ValueError, match="events="):
+        explain(score(events, like=result), top_n=2)

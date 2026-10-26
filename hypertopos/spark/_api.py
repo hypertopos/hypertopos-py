@@ -20,7 +20,7 @@ from pyspark.sql import functions as F
 
 from hypertopos.scoring import MIN_GROUP_SIZE, FrozenCalibration
 from hypertopos.spark._build import KEY, collect_entities, fingerprint, sphere_dir
-from hypertopos.spark._plan import Plan, aggregate, build_plan
+from hypertopos.spark._plan import Plan, aggregate, build_plan, count_entities
 from hypertopos.spark._result import TOP_REASONS, result_table
 
 MAX_ENTITIES = 5_000_000
@@ -30,6 +30,9 @@ CALIBRATION_FILE = "calibration.pkl"
 PLAN_FILE = "plan.pkl"
 METADATA_FINGERPRINT = "hypertopos.fingerprint"
 METADATA_PATH = "hypertopos.path"
+METADATA_SCORED = (
+    "hypertopos.scored"  # set on score() results: their entities are not in the calibration
+)
 
 
 def _sphere_root(df: DataFrame, sphere_root: str | None) -> str:
@@ -141,21 +144,23 @@ def _entity_table(
     max_entities: int,
 ) -> pa.Table:
     entity_df = entity_frame(df, plan, group_by)
-    # Caching saves recomputing the aggregation between count and collect;
-    # serverless compute on older client environments refuses it.
+    # Cached, counting the frame computes the aggregation once and the collect
+    # reads the cache. Where caching is refused (serverless on older client
+    # environments) every action recomputes it, so the count comes from the keys
+    # alone and the full aggregation runs only for the collect.
     try:
         entity_df = entity_df.persist()
         cached = True
     except AnalysisException:
         cached = False
     try:
-        n_entities = entity_df.count()
+        n_entities = entity_df.count() if cached else count_entities(df, plan)
         if n_entities > max_entities:
             raise ValueError(
                 f"{n_entities} entities exceed max_entities={max_entities}. Raise "
                 "max_entities on a driver with more memory."
             )
-        return collect_entities(entity_df)
+        return collect_entities(entity_df, n_rows=n_entities)
     finally:
         if cached:
             entity_df.unpersist()
@@ -200,7 +205,13 @@ def _save(path: Path, entities: pa.Table, plan: Plan, calibration: FrozenCalibra
 
 
 def shape_result(
-    flat: DataFrame, n_dims: int, fp: str | None, path: Path | None, group_by: str | None
+    flat: DataFrame,
+    n_dims: int,
+    fp: str | None,
+    path: Path | None,
+    group_by: str | None,
+    *,
+    scored: bool = False,
 ) -> DataFrame:
     """Flat reason columns -> the result contract; metadata only when ``fp`` is given."""
     k = min(TOP_REASONS, n_dims)
@@ -214,11 +225,10 @@ def shape_result(
             for i in range(1, k + 1)
         ]
     )
-    key = (
-        F.col(KEY).alias(KEY, metadata={METADATA_FINGERPRINT: fp, METADATA_PATH: str(path)})
-        if fp is not None
-        else F.col(KEY)
-    )
+    metadata = {METADATA_FINGERPRINT: fp, METADATA_PATH: str(path)}
+    if scored:
+        metadata[METADATA_SCORED] = "true"
+    key = F.col(KEY).alias(KEY, metadata=metadata) if fp is not None else F.col(KEY)
     columns: list[Column | str] = [
         key,
         "delta_norm",

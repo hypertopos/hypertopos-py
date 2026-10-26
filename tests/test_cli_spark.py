@@ -143,3 +143,61 @@ def test_find_anomalies_on_a_view_prints_the_top_entities(spark, monkeypatch, ca
     out = capsys.readouterr().out
     assert "delta_norm" in out
     assert "top_reasons" in out
+
+
+def test_score_help_names_the_calibration_and_the_alert_options(monkeypatch, capsys):
+    with pytest.raises(SystemExit):
+        _run(monkeypatch, "spark", "score", "--help")
+    text = capsys.readouterr().out
+    for flag in ("--input", "--calibration", "--anomalies-only", "--append", "--output-table"):
+        assert flag in text
+
+
+def test_calibrate_then_score_from_the_command_line(spark, monkeypatch, capsys, tmp_path):
+    # A daily job: find-anomalies prints where the calibration is kept; score reads it.
+    pytest.importorskip("pyspark")
+    from pyspark.sql import functions as F
+
+    def events(seed: int, view: str) -> None:
+        spark.range(3000).select(
+            F.concat(F.lit("E"), (F.col("id") % 300).cast("string")).alias("src"),
+            F.concat(F.lit("E"), ((F.col("id") * 31 + 7) % 300).cast("string")).alias("dst"),
+            (F.exp(F.randn(seed=seed)) * 100).alias("amt"),
+        ).createOrReplaceTempView(view)
+
+    events(5, "cli_ref")
+    events(6, "cli_today")
+    roles = ("--entity", "src", "--counterparty", "dst", "--amount", "amt")
+    _run(
+        monkeypatch,
+        "spark",
+        "find-anomalies",
+        "--input",
+        "cli_ref",
+        *roles,
+        "--sphere-root",
+        str(tmp_path),
+        "--show",
+        "1",
+    )
+    out = capsys.readouterr().out
+    calibration = next(
+        line.split(": ", 1)[1] for line in out.splitlines() if line.startswith("calibration: ")
+    )
+    assert Path(calibration, "calibration.pkl").exists()
+
+    _run(
+        monkeypatch,
+        "spark",
+        "score",
+        "--input",
+        "cli_today",
+        "--calibration",
+        calibration,
+        "--anomalies-only",
+        "--show",
+        "50",
+    )
+    out = capsys.readouterr().out
+    assert "delta_norm" in out
+    assert "false" not in out  # only flagged entities

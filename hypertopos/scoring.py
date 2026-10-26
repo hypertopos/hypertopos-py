@@ -149,8 +149,8 @@ class FrozenCalibration:
             delta=delta,
             delta_norm=norm,
             is_anomaly=is_anomaly,
-            rank_pct=(left / population * 100).astype(np.float32),
-            conformal_p=((population - left) / population).astype(np.float32),
+            rank_pct=left / population * 100,
+            conformal_p=(population - left) / population,
             calibration_scope=scope,
         )
 

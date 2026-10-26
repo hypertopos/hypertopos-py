@@ -61,11 +61,43 @@ def add_parser(sub: Any) -> argparse.ArgumentParser:
     out.add_argument(
         "--show", type=int, metavar="N", help="print the N most distant entities instead"
     )
+    sc = spark_sub.add_parser(
+        "score",
+        help="Score new events against a saved calibration (no recalibration)",
+        description=(
+            "Aggregate new events per entity and score them against the population a "
+            "find-anomalies run calibrated, as a scheduled job does every day. "
+            "find-anomalies prints the calibration path; give it with --calibration."
+        ),
+        epilog=(
+            "example:\n  hypertopos spark score --input main.aml.transactions_today "
+            "\\\n      --calibration /Volumes/main/aml/hypertopos/1bb767d5fc6a53ec "
+            "\\\n      --anomalies-only --append --output-table main.aml.daily_alerts\n\n"
+            f"docs: {DOCS}"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sc.add_argument(
+        "--input",
+        required=True,
+        help="Parquet/CSV file or directory, Delta directory, or a table / view name",
+    )
+    sc.add_argument(
+        "--calibration", required=True, help="calibration path printed by find-anomalies"
+    )
+    sc.add_argument("--anomalies-only", action="store_true", help="keep flagged entities only")
+    sc.add_argument("--append", action="store_true", help="append to the output, not overwrite")
+    sc_out = sc.add_mutually_exclusive_group(required=True)
+    sc_out.add_argument("--output", help="write the result as Parquet to this path")
+    sc_out.add_argument("--output-table", help="write the result to this table (saveAsTable)")
+    sc_out.add_argument(
+        "--show", type=int, metavar="N", help="print the N most distant entities instead"
+    )
     return spark_p
 
 
 def run(args: argparse.Namespace, spark_p: argparse.ArgumentParser) -> None:
-    if args.spark_command != "find-anomalies":
+    if args.spark_command not in ("find-anomalies", "score"):
         spark_p.print_help()
         sys.exit(1)
     try:
@@ -73,9 +105,15 @@ def run(args: argparse.Namespace, spark_p: argparse.ArgumentParser) -> None:
     except ImportError:
         print('PySpark is not installed: pip install "hypertopos[spark]"', file=sys.stderr)
         sys.exit(2)
-    from hypertopos.spark import find_anomalies
+    from hypertopos.spark import find_anomalies, score, sphere_of
 
     spark = SparkSession.builder.appName("hypertopos").getOrCreate()
+    if args.spark_command == "score":
+        result = score(read_input(spark, args.input), like=sphere_of(args.calibration))
+        if args.anomalies_only:
+            result = result.where("is_anomaly")
+        _write(result, args, "append" if args.append else "overwrite")
+        return
     result = find_anomalies(
         read_input(spark, args.input),
         entity=args.entity,
@@ -88,12 +126,18 @@ def run(args: argparse.Namespace, spark_p: argparse.ArgumentParser) -> None:
         sphere_root=args.sphere_root,
         cache=not args.no_cache,
     )
+    # A scheduled score job reads the calibration from this path.
+    print(f"calibration: {sphere_of(result).path}")
+    _write(result, args, "overwrite")
+
+
+def _write(result: Any, args: argparse.Namespace, mode: str) -> None:
     if args.show is not None:
         result.orderBy("delta_norm", ascending=False).show(args.show, truncate=False)
     elif args.output_table:
-        result.write.mode("overwrite").saveAsTable(args.output_table)
+        result.write.mode(mode).saveAsTable(args.output_table)
     else:
-        result.write.mode("overwrite").parquet(args.output)
+        result.write.mode(mode).parquet(args.output)
 
 
 def read_input(spark: Any, source: str) -> Any:

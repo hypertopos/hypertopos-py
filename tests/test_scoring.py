@@ -194,3 +194,15 @@ def test_pickle_round_trip():
     np.testing.assert_array_equal(
         restored.score(table).delta_norm, calibration.score(table).delta_norm
     )
+
+
+def test_p_value_and_rank_are_exact_ratios():
+    # Ratios of counts: a float32 round trip printed 0.001 as 0.0010000000474974513.
+    table = _table()
+    scores = FrozenCalibration.fit(table, DIMS).score(table)
+    n = len(scores.delta_norm)
+    left = np.round(scores.rank_pct * n / 100).astype(int)
+    assert scores.conformal_p.dtype == np.float64
+    assert scores.rank_pct.dtype == np.float64
+    np.testing.assert_array_equal(scores.conformal_p, (n - left) / n)
+    np.testing.assert_array_equal(scores.rank_pct, left / n * 100)

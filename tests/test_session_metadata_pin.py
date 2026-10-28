@@ -86,7 +86,7 @@ def test_sphere_json_write_matches_previous_format(tmp_path):
 
     meta = tmp_path / "_gds_meta"
     meta.mkdir()
-    data = {"format_version": "3.1", "patterns": {"p": {"mu": [1.0]}}}
+    data = {"format_version": "4.1", "patterns": {"p": {"mu": [1.0]}}}
     write_sphere_json(meta, data)
     assert (meta / "sphere.json").read_text() == json.dumps(data, indent=2)
     assert not (meta / "sphere.json.tmp").exists()

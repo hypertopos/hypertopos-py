@@ -48,7 +48,7 @@ raw_cols = [
     "n_currencies_in",
 ]
 geo_cols = [
-    "delta_rank_pct",
+    "score_rank_pct",
     "conformal_p",
     "is_anomaly",
     "multi_source_score",
@@ -112,13 +112,13 @@ def load_sphere(sphere_path, csv_prefix):
         geo = reader.read_geometry(
             "account_pattern",
             1,
-            columns=["primary_key", "delta_norm", "delta_rank_pct", "conformal_p", "is_anomaly"],
+            columns=["primary_key", "delta_norm", "score_rank_pct", "conformal_p", "is_anomaly"],
         )
         geo_map = {}
         for i in range(geo.num_rows):
             pk = geo["primary_key"][i].as_py()
             geo_map[pk] = {
-                "rk": geo["delta_rank_pct"][i].as_py() or 0,
+                "rk": geo["score_rank_pct"][i].as_py() or 0,
                 "cp": geo["conformal_p"][i].as_py() or 1.0,
                 "an": 1 if geo["is_anomaly"][i].as_py() else 0,
             }
@@ -290,7 +290,7 @@ def load_sphere(sphere_path, csv_prefix):
         src_border = {
             geo["primary_key"][i].as_py()
             for i in range(geo.num_rows)
-            if not geo["is_anomaly"][i].as_py() and (geo["delta_rank_pct"][i].as_py() or 0) >= 80
+            if not geo["is_anomaly"][i].as_py() and (geo["score_rank_pct"][i].as_py() or 0) >= 80
         }
         src_rep = set()
         acct_near = defaultdict(int)

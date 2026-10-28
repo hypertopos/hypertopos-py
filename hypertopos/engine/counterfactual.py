@@ -40,17 +40,16 @@ _AGG_COUNT_ABOVE = "count_above_threshold"  # requires per-source-dim threshold
 def _delta_fn(
     mu: np.ndarray,
     sigma_diag: np.ndarray,
-    cholesky_inv: np.ndarray | None,
     dimension_weights: np.ndarray | None,
 ) -> Callable[[np.ndarray], np.ndarray]:
     """Shape → delta in the pattern's stored metric.
 
-    Patterns with Mahalanobis whitening or ``dimension_weights`` use the same
+    Patterns with ``dimension_weights`` use the same
     calibration as the stored delta, so a removal that leaves the shape
     unchanged reproduces the stored ``delta_norm``. Plain diagonal patterns
     keep the z-score with sigma-dead dims (``sigma < 1e-10``) held at 0.
     """
-    if cholesky_inv is None and dimension_weights is None:
+    if dimension_weights is None:
         dead = sigma_diag < _SIGMA_ZERO_FLOOR
         safe = np.where(dead, 1.0, sigma_diag)
         return lambda s: np.where(dead, 0.0, (s - mu) / safe)
@@ -62,7 +61,6 @@ def _delta_fn(
             s,
             mu=mu,
             sigma_diag=sigma_diag,
-            cholesky_inv=cholesky_inv,
             dimension_weights=dimension_weights,
         )[0]
         return out
@@ -253,7 +251,6 @@ def simulate_edge_removal_with_aggregations(
     candidate_edge_ids: list[str] | None,
     top_n: int,
     thresholds: dict[str, float] | None = None,
-    cholesky_inv: np.ndarray | None = None,
     dimension_weights: np.ndarray | None = None,
 ) -> list[dict[str, Any]]:
     """Per-edge counterfactual covering relations + edge_dim_aggregations.
@@ -272,7 +269,7 @@ def simulate_edge_removal_with_aggregations(
            EXCLUDING the candidate ``e`` and write the new value into
            ``new_shape[edge_agg_dim_offset + i]``.
         3. Re-normalise in the pattern's metric (``(new_shape - mu) /
-           sigma_diag``, or the ``cholesky_inv`` whitening, then
+           sigma_diag``, then
            ``dimension_weights`` when given) and report the delta_norm drop.
 
     ``count_above_threshold`` requires population-level threshold lookup
@@ -297,7 +294,7 @@ def simulate_edge_removal_with_aggregations(
             the builder's group_by + aggregate would consume.
         candidate_edge_ids: filter.
         top_n: cap on returned entries.
-        cholesky_inv, dimension_weights: the pattern's saved calibration;
+        dimension_weights: the pattern's saved calibration;
             pass them so the after-removal delta uses the same metric as the
             stored ``delta_norm``.
 
@@ -318,7 +315,7 @@ def simulate_edge_removal_with_aggregations(
 
     sigma_dead_mask = sigma_diag < _SIGMA_ZERO_FLOOR
     dims_skipped = [int(i) for i, dead in enumerate(sigma_dead_mask) if dead]
-    to_delta = _delta_fn(mu, sigma_diag, cholesky_inv, dimension_weights)
+    to_delta = _delta_fn(mu, sigma_diag, dimension_weights)
     old_delta = to_delta(shape)
 
     # Relations lookup (same as naive path).
@@ -677,7 +674,6 @@ def simulate_joint_edge_removal(
     edge_agg_specs: list[tuple[str, str]],
     event_source_values: dict[str, dict[str, float]],
     thresholds: dict[str, float] | None = None,
-    cholesky_inv: np.ndarray | None = None,
     dimension_weights: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Joint counterfactual: remove a SET of edges simultaneously and
@@ -695,7 +691,7 @@ def simulate_joint_edge_removal(
         all_edges: full edge inventory (needed to rescan aggregations
             over the surviving events).
         relations, edge_agg_dim_offset, edge_agg_specs,
-            event_source_values, thresholds, cholesky_inv,
+            event_source_values, thresholds,
             dimension_weights: identical to the per-edge primitive.
 
     Returns:
@@ -714,7 +710,7 @@ def simulate_joint_edge_removal(
     sigma_diag = sigma_diag.astype(np.float64, copy=False)
 
     sigma_dead_mask = sigma_diag < _SIGMA_ZERO_FLOOR
-    to_delta = _delta_fn(mu, sigma_diag, cholesky_inv, dimension_weights)
+    to_delta = _delta_fn(mu, sigma_diag, dimension_weights)
     thresholds_map = thresholds or {}
 
     def _agg_is_supported(source_dim: str, agg: str) -> bool:
@@ -768,7 +764,6 @@ def select_minimal_joint_removal(
     target_drop_pct: float = 50.0,
     k_max: int = 10,
     thresholds: dict[str, float] | None = None,
-    cholesky_inv: np.ndarray | None = None,
     dimension_weights: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Greedy submodular selection of the smallest edge set whose joint
@@ -788,7 +783,7 @@ def select_minimal_joint_removal(
     set.
 
     Args:
-        cholesky_inv, dimension_weights: the pattern's saved calibration,
+        dimension_weights: the pattern's saved calibration,
             forwarded to :func:`simulate_joint_edge_removal`.
         target_drop_pct: stop when joint reduction reaches this percent.
         k_max: hard cap on selected set size (greedy compute cost is
@@ -830,7 +825,6 @@ def select_minimal_joint_removal(
                 edge_agg_specs=edge_agg_specs,
                 event_source_values=event_source_values,
                 thresholds=thresholds,
-                cholesky_inv=cholesky_inv,
                 dimension_weights=dimension_weights,
             )
             cand_signed = r["joint_drop_pct"]

@@ -347,3 +347,6 @@ that binary typology match/no-match cannot capture.
 | [`_layer2_cross_eval.py`](_layer2_cross_eval.py) | Layer 2 cross-eval: train on HI-Small, apply to LI-Small without retraining |
 | [`_layer3_cross_eval.py`](_layer3_cross_eval.py) | Layer 3 cross-eval: train on HI-Small, apply + typology filter to LI-Small without retraining |
 
+> **Note:** the scripts read `score_rank_pct`, which is now the population rank of the
+> calibrated anomaly score. The results recorded above were taken on the earlier rank of
+> `delta_norm`, so a rerun on a current sphere will not reproduce them exactly.

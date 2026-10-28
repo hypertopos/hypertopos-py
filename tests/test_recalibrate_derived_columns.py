@@ -60,9 +60,15 @@ def test_recalibrate_refreshes_every_calibration_dependent_column(built_sphere: 
         session.close()
 
     t = lance.dataset(str(built_sphere / "geometry" / "acct_pattern" / "data.lance")).to_table()
-    norms = t["delta_norm"].to_numpy().astype(np.float64)
     delta = np.stack(t["delta"].to_numpy(zero_copy_only=False))
-    expected_p = np.array([(norms >= v).sum() / len(norms) for v in norms], dtype=np.float32)
+    # The pattern is on the calibrated evidence score: p is against the
+    # refitted reference (fitted without the excluded keys).
+    from hypertopos.engine.robust import conformal_p
+    from hypertopos.storage.reader import GDSReader
+
+    ref = GDSReader(str(built_sphere)).read_reference("acct_pattern")
+    assert ref.n_fitted == len(_ACCOUNTS) - 12
+    expected_p = conformal_p(ref.cal_sorted, t["anomaly_score"].to_numpy())
     np.testing.assert_allclose(t["conformal_p"].to_numpy(), expected_p, rtol=1e-6)
     # n_anomalous_dims counts against the per-dim thresholds stored on the
     # pattern node, the same rule as a full build.

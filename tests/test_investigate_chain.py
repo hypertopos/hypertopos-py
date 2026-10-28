@@ -281,7 +281,7 @@ def test_shape_anomaly_does_not_increment_score(synthetic_nav):
             "ok": True,
             "data": {
                 "is_anomaly": True,
-                "delta_rank_pct": 99.5,
+                "score_rank_pct": 99.5,
             },
         },
         extension_forward={
@@ -337,7 +337,7 @@ def test_r9_sweet_spot_reaches_strong_without_shape(synthetic_nav):
             "ok": True,
             "data": {
                 "is_anomaly": False,  # shape-normal — the R9 sweet spot
-                "delta_rank_pct": 92.0,
+                "score_rank_pct": 92.0,
             },
         },
         extension_forward={

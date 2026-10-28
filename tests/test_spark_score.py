@@ -52,8 +52,10 @@ def test_scoring_the_calibration_data_reproduces_the_result(events, result):
     for r in result.collect():
         s = got[r["entity"]]
         assert s["delta_norm"] == pytest.approx(r["delta_norm"], rel=1e-6, abs=1e-6)
+        assert s["anomaly_score"] == pytest.approx(r["anomaly_score"], abs=1e-6)
         assert s["is_anomaly"] == r["is_anomaly"]
         assert s["p_value"] == pytest.approx(r["p_value"], abs=1e-6)
+        assert s["score_rank_pct"] == pytest.approx(r["score_rank_pct"], abs=1e-4)
         assert s["calibration_scope"] == r["calibration_scope"]
         assert [x["dim"] for x in s["top_reasons"]] == [x["dim"] for x in r["top_reasons"]]
 
@@ -111,7 +113,8 @@ def test_explain_a_scored_result_from_the_events_it_scored(events, result):
 
     scored = score(events, like=result)
     assert sphere_of(scored).path == sphere_of(result).path
-    keys = [r["entity"] for r in result.orderBy("delta_norm", ascending=False).limit(3).collect()]
+    top = result.orderBy("anomaly_score", ascending=False).limit(3).collect()
+    keys = [r["entity"] for r in top]
     expected = explain(result, entities=keys).collect()
     got = explain(scored, entities=keys, events=events).collect()
     assert [(r["entity"], r["dim"]) for r in got] == [(r["entity"], r["dim"]) for r in expected]

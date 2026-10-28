@@ -98,7 +98,7 @@ def test_parse_alias_with_cutting_plane(tmp_path):
 
     sphere_json = {
         "sphere_id": "test",
-        "format_version": "3.0",
+        "format_version": "4.0",
         "name": "Test",
         "lines": {},
         "patterns": {
@@ -161,7 +161,7 @@ def test_parse_alias_cutting_plane_validates_dim(tmp_path):
 
     sphere_json = {
         "sphere_id": "test",
-        "format_version": "3.0",
+        "format_version": "4.0",
         "name": "Test",
         "lines": {},
         "patterns": {

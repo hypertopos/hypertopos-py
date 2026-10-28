@@ -606,7 +606,7 @@ def _make_pattern_mock(
     pattern.relations = []
     pattern.prop_columns = []
     pattern.dimension_weights = None
-    pattern.cholesky_inv = None
+    pattern.score_dims = None  # scored by delta_norm, not the calibrated score
     return pattern
 
 
@@ -859,15 +859,14 @@ def test_attach_influence_fields_returns_total_impact_and_classification():
         }
 
 
-def test_attach_influence_fields_resolves_to_none_on_event_pattern():
+def test_attach_influence_fields_leaves_event_pattern_entries_unchanged():
     nav = _make_navigator_with_geometry(
         np.random.default_rng(0).normal(0, 1, size=(20, 3)),
         pattern_type="event",
     )
     fake_entries = [{"primary_key": "E0"}]
     enriched = nav._attach_influence_fields_to_anomaly_entries(fake_entries, "p")
-    assert enriched[0]["total_impact"] is None
-    assert enriched[0]["classification"] is None
+    assert enriched == [{"primary_key": "E0"}]
 
 
 def test_attach_influence_fields_resolves_to_none_on_unknown_entity():

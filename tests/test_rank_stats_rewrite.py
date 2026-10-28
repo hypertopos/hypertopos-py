@@ -4,7 +4,7 @@
 # See LICENSE.md in the repository root for full terms.
 """Population rank columns are rewritten in place, fragment by fragment.
 
-``delta_rank_pct`` and ``conformal_p`` are whole-population statistics, so
+``score_rank_pct`` and ``conformal_p`` are whole-population statistics, so
 every append rewrites them for every row. A key-joined upsert of the whole
 population builds one hash table over all rows and exhausts the query memory
 pool on multi-million-row patterns; it also drops the key-lookup index. The
@@ -42,7 +42,8 @@ def _geometry(tmp_path: Path) -> tuple[str, Path]:
             {
                 "primary_key": pa.array([f"K{j:04d}" for j in range(lo, lo + 300)]),
                 "delta_norm": pa.array(norms[sl], pa.float32()),
-                "delta_rank_pct": pa.array(np.full(300, -1.0), pa.float32()),
+                "anomaly_score": pa.array(norms[sl].astype(np.float64), pa.float64()),
+                "score_rank_pct": pa.array(np.full(300, -1.0), pa.float32()),
                 "conformal_p": pa.array(np.full(300, -1.0), pa.float32()),
             }
         )
@@ -65,12 +66,12 @@ def _expected(path: Path) -> dict[str, tuple[float, float]]:
 
 
 def _stored(path: Path) -> dict[str, tuple[float, float]]:
-    t = lance.dataset(str(path)).to_table(columns=["primary_key", "delta_rank_pct", "conformal_p"])
+    t = lance.dataset(str(path)).to_table(columns=["primary_key", "score_rank_pct", "conformal_p"])
     return {
         k: (float(r), float(c))
         for k, r, c in zip(
             t["primary_key"].to_pylist(),
-            t["delta_rank_pct"].to_pylist(),
+            t["score_rank_pct"].to_pylist(),
             t["conformal_p"].to_pylist(),
             strict=True,
         )
@@ -108,7 +109,7 @@ def test_fixture_spans_several_fragments(tmp_path: Path) -> None:
     ("method", "rank", "cp"),
     [
         ("recompute_rank_stats", True, True),
-        ("recompute_delta_rank_pct", True, False),
+        ("recompute_score_rank_pct", True, False),
         ("recompute_conformal_p", False, True),
     ],
 )
@@ -147,14 +148,14 @@ def test_rewrite_keeps_key_index_and_commits_once(tmp_path: Path) -> None:
 
 def test_rewrite_refreshes_index_on_rewritten_column(tmp_path: Path) -> None:
     base, path = _geometry(tmp_path)
-    lance.dataset(str(path)).create_scalar_index("delta_rank_pct", "BTREE")
+    lance.dataset(str(path)).create_scalar_index("score_rank_pct", "BTREE")
 
     GDSWriter(base).recompute_rank_stats(PATTERN)
 
     ds = lance.dataset(str(path))
-    rank_index = next(i for i in ds.describe_indices() if "delta_rank_pct" in i.field_names)
+    rank_index = next(i for i in ds.describe_indices() if "score_rank_pct" in i.field_names)
     assert rank_index.num_rows_indexed == ds.count_rows()
     expected = sum(1 for r, _ in _expected(path).values() if r >= 90.0)
-    assert ds.count_rows(filter="delta_rank_pct >= 90.0") == expected
+    assert ds.count_rows(filter="score_rank_pct >= 90.0") == expected
     # the -1.0 placeholders written by the fixture must not survive in the index
-    assert ds.count_rows(filter="delta_rank_pct < 0") == 0
+    assert ds.count_rows(filter="score_rank_pct < 0") == 0

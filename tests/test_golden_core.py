@@ -162,9 +162,11 @@ def _anomalies(
                 "primary_key": p.primary_key,
                 "delta_norm": p.delta_norm,
                 "delta": p.delta,
-                "delta_rank_pct": p.delta_rank_pct,
+                "score_rank_pct": p.score_rank_pct,
                 "is_anomaly": p.is_anomaly,
                 "anomaly_confidence": p.anomaly_confidence,
+                "anomaly_score": p.anomaly_score,
+                "conformal_p": p.conformal_p,
             }
             for p in polygons
         ],
@@ -185,9 +187,8 @@ def test_built_sphere_overview(built_nav: GDSNavigator, built_sphere: Path) -> N
 
 
 def test_built_attract_anomaly_accounts(built_nav: GDSNavigator) -> None:
-    _snap(
-        "built_attract_anomaly_accounts", _anomalies(built_nav, "account_pattern", 10, radius=0.5)
-    )
+    # account_pattern is ranked by its calibrated score: selection = is_anomaly.
+    _snap("built_attract_anomaly_accounts", _anomalies(built_nav, "account_pattern", 10))
 
 
 def test_built_attract_anomaly_transactions(built_nav: GDSNavigator) -> None:

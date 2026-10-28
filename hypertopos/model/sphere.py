@@ -294,18 +294,15 @@ class Pattern:
     group_by_property: str | None = None
     dimension_weights: np.ndarray | None = None
     gmm_components: list[GMMComponent] | None = None
-    cholesky_inv: np.ndarray | None = None
     entity_line_id: str | None = None
     event_dimensions: list[EventDimDef] = field(default_factory=list)
     dim_percentiles: dict[str, dict[str, float]] | None = None
     timestamp_col: str | None = None
     dimension_kinds: list[str] | None = None
-    dim_normality_pvalues: dict[str, float] | None = None
     edge_dim_aggregations: EdgeDimAggregationsRef | None = None
     fdr_hierarchy: list[FDRHierarchyLevel] = field(default_factory=list)
     fdr_temporal_hierarchy: list[FDRTemporalLevel] = field(default_factory=list)
     conformance_rules: list[ConformanceRule] = field(default_factory=list)
-    heteroscedasticity_diagnostic: dict[str, dict[str, Any]] | None = None
     # Edge-derived per-event dim names emitted on event patterns when
     # ``edge_dimensions:`` is declared in sphere.yaml. Order matches the
     # storage layout: builder concatenates relations → event_dims →
@@ -342,6 +339,18 @@ class Pattern:
     # label-aware calibration; co-populated with ``label_aware_calibration``.
     intrinsic_displacement_mean: float | None = None
     extrinsic_displacement_mean: float | None = None
+    # Calibrated evidence score. ``score_dims`` (non-empty) marks a pattern on
+    # the score: the named point-property dimensions of the ``score_delta``
+    # geometry column. ``score_axes`` are the axes fitted (order of
+    # ``axis_ranks``) and ``reference_epoch`` the epoch of the stored reference
+    # under ``_gds_meta/reference/``. All ``None`` on patterns scored by
+    # ``delta_norm`` (event, discrete, GMM, no point-property dimension).
+    score_dims: tuple[str, ...] | None = None
+    # Population percentile of the anomaly boundary: ``is_anomaly`` holds for
+    # ``conformal_p <= 1 - anomaly_percentile / 100`` on calibrated patterns.
+    anomaly_percentile: float = 95.0
+    score_axes: tuple[str, ...] | None = None
+    reference_epoch: int | None = None
 
     def delta_dim(self) -> int:
         base = (
@@ -647,7 +656,6 @@ class CalibrationFit:
     last_calibrated_at: datetime
     edge_dim_thresholds: dict[str, float] | None = None
     theta_sensitivity: dict[str, dict[str, float]] | None = None
-    dim_normality_pvalues: dict[str, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -700,18 +708,24 @@ class BranchDiffReport:
     """How one pattern differs between two sphere refs (main or a branch).
 
     Counts are per entity (one row per ``primary_key``). An entity is
-    anomalous on a side when its ``delta_norm`` reaches that side's global
-    threshold (the rule ``anomaly_summary`` and ``find_anomalies`` count by).
+    anomalous on a side by the rule ``anomaly_summary`` and ``find_anomalies``
+    count by: its ``delta_norm`` reaches that side's global θ, or, on a
+    calibrated pattern, its stored ``is_anomaly`` (the score is then
+    ``anomaly_score`` and the threshold the lowest flagged score).
     Among entities present on both sides, ``flipped_in`` counts those
     anomalous in ``to_ref`` but not in ``from_ref``; ``flipped_out`` the
     reverse. ``jaccard`` compares the two anomaly sets (1.0 when both are
-    empty). ``top_movers`` lists the entities with the largest relative
-    ``delta_norm`` change; ``flipped_in_top`` / ``flipped_out_top`` list the
-    flipped entities furthest past the threshold on the side where they are
-    anomalous, each with a ``cause``: ``"threshold"`` (the threshold moved
-    past its unchanged score), ``"score"`` (its score crossed the unchanged
-    threshold) or ``"both"``. ``theta_from`` / ``theta_to`` are the two global
-    thresholds. ``only_in_*`` count keys present on one side only.
+    empty). ``top_movers`` lists the entities that moved most: by the change
+    of evidence bits (``-log2 conformal_p``) on a calibrated pattern (rows
+    then also carry ``anomaly_score_from/to`` and ``evidence_change``), by
+    relative ``delta_norm`` change otherwise; ``flipped_in_top`` /
+    ``flipped_out_top`` list the flipped entities furthest past the threshold
+    on the side where they are anomalous, each with a ``cause``:
+    ``"threshold"`` (the threshold moved past its unchanged score),
+    ``"score"`` (its score crossed the unchanged threshold) or ``"both"``.
+    ``theta_from`` / ``theta_to`` are the two thresholds (the global θ norm,
+    or the lowest flagged score on a calibrated pattern). ``only_in_*`` count
+    keys present on one side only.
     ``calibration_drift`` compares the two current fits (None when their
     schemas differ). ``recipe`` is the
     recipe log of ``to_ref`` (empty for main).

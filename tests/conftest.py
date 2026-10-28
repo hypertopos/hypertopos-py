@@ -32,10 +32,10 @@ def ensure_fixtures() -> None:
     """
     lock_path = FIXTURES_PATH.parent / ".generate.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    # Fixtures written by one Lance version may not be readable by another, so the
-    # generated spheres are tagged with the Lance version that wrote them.
+    # Fixtures written by one Lance version (or an older sphere format) may not be
+    # readable by another, so the generated spheres are tagged with both.
     stamp_path = FIXTURES_PATH.parent / ".fixtures_lance_version"
-    lance_version = lance.__version__
+    lance_version = f"{lance.__version__} format 4"
     with FileLock(str(lock_path)):
         stale = not stamp_path.exists() or stamp_path.read_text().strip() != lance_version
         if stale:

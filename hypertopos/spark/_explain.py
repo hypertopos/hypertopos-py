@@ -24,7 +24,7 @@ import pyarrow.parquet as pq
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
-from hypertopos.scoring import FrozenCalibration
+from hypertopos.scoring import FrozenCalibration, score_shares
 from hypertopos.spark._api import (
     CALIBRATION_FILE,
     ENTITIES_FILE,
@@ -66,10 +66,11 @@ class Sphere:
         for j, dim in enumerate(calibration.dims):
             columns[dim] = pa.array(shapes[:, j].astype(np.float64))
             columns[f"delta_{dim}"] = pa.array(scores.delta[:, j].astype(np.float64))
-        columns["delta_norm"] = pa.array(scores.delta_norm.astype(np.float64))
+        columns["anomaly_score"] = pa.array(scores.anomaly_score.astype(np.float64))
         columns["is_anomaly"] = pa.array(scores.is_anomaly)
         columns["p_value"] = pa.array(scores.conformal_p.astype(np.float64))
-        columns["rank_pct"] = pa.array(scores.rank_pct.astype(np.float64))
+        columns["score_rank_pct"] = pa.array(scores.score_rank_pct.astype(np.float64))
+        columns["delta_norm"] = pa.array(scores.delta_norm.astype(np.float64))
         if calibration.group_by is not None and scores.calibration_scope is not None:
             columns[calibration.group_by] = entities[calibration.group_by].combine_chunks()
             columns["calibration_scope"] = pa.array(scores.calibration_scope.tolist(), pa.string())
@@ -78,8 +79,8 @@ class Sphere:
     def lance_path(self) -> Path:
         """The navigable Lance sphere for agents, built on first use and reused after.
 
-        Its geometry is the one ``find_anomalies`` reports: same ``delta_norm``,
-        flags, ranks and p-values. It is built on the driver's local disk and
+        Its geometry is the one ``find_anomalies`` reports: same scores, flags,
+        ranks, p-values and ``delta_norm``. It is built on the driver's local disk and
         copied next to the calibration, since object-store mounts such as
         Databricks Volumes do not take the random writes a build makes.
         """
@@ -175,8 +176,8 @@ def explain(
 
     Args:
         result: The DataFrame ``find_anomalies`` or ``score`` returned.
-        entities: Entity keys to explain; default is the ``top_n`` most distant.
-        top_n: How many of the most distant entities, when ``entities`` is None.
+        entities: Entity keys to explain; default is the ``top_n`` highest scores.
+        top_n: How many of the highest-scoring entities, when ``entities`` is None.
         dims: Restrict to these dimensions; default is all.
         events: For a ``score`` result, the events it scored: their entities are
             not in the calibration, so their dimensions are recomputed from the
@@ -187,9 +188,12 @@ def explain(
         entity's value of the dimension (shares and spreads after the
         small-count adjustment ``find_anomalies`` applies), the population mean and standard
         deviation it is compared with (its group's, with ``group_by``), the
-        signed deviation in standard deviations, the dimension's share of
-        ``delta_norm**2`` in percent, and ``above`` / ``below`` / ``at`` the
-        mean. Rows are ordered by entity distance, then by share.
+        signed deviation in standard deviations, the dimension's share of the
+        entity's ``anomaly_score`` in percent (the Shapley split of its
+        Mahalanobis evidence that ``explain_anomaly`` reports on a sphere, so
+        correlated dimensions share a deviation they make together), and
+        ``above`` / ``below`` / ``at`` the mean. Rows are ordered by entity
+        score, then by share.
     """
     sphere = sphere_of(result)
     calibration = sphere.calibration()
@@ -199,7 +203,7 @@ def explain(
             raise ValueError(f"unknown dims {unknown}; calibrated: {list(calibration.dims)}")
     if entities is None:
         keys = [
-            r[KEY] for r in result.orderBy("delta_norm", ascending=False).limit(top_n).collect()
+            r[KEY] for r in result.orderBy("anomaly_score", ascending=False).limit(top_n).collect()
         ]
     else:
         keys = [str(k) for k in entities]
@@ -221,9 +225,7 @@ def explain(
     shapes = calibration.shapes(table)
     mu, sigma = calibration.raw_params(table)
     delta = scores.delta.astype(np.float64)
-    squared = delta**2
-    total = squared.sum(axis=1, keepdims=True)
-    shares = np.divide(squared * 100.0, total, out=np.zeros_like(squared), where=total > 0)
+    shares = 100.0 * score_shares(calibration.reference, scores.score_delta)
     wanted = [calibration.dims.index(d) for d in (dims or calibration.dims)]
     names = table[KEY].to_pylist()
     rank = {k: i for i, k in enumerate(keys)}

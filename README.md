@@ -9,19 +9,19 @@
 [![PyArrow](https://img.shields.io/badge/format-PyArrow-red.svg)](https://arrow.apache.org/docs/python/)
 [![Lance](https://img.shields.io/badge/storage-Lance-blueviolet.svg)](https://github.com/lance-format/lance)
 [![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io)
-[![Version](https://img.shields.io/badge/version-0.9.3-%235500FF.svg)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.10.0-%235500FF.svg)](pyproject.toml)
 
 Describe your tables in a YAML file, run `hypertopos build`, and every entity gets a position relative to its own population — so "out of place", "similar", "drifting" and "different between groups" become distances you read instead of queries you write.
 
-- **No model, no labels.** The threshold θ is a percentile of the population's own distances; nothing is trained and nothing has to be annotated.
+- **No model, no labels.** Every entity's anomaly score is calibrated against the population itself, with an exact alarm budget — at the 95th percentile 5 % is flagged, and 5 % of a population like it would be; nothing is trained and nothing has to be annotated.
 - **Explanations in the data's own columns.** `explain_anomaly` splits an anomaly into each dimension's share of the distance; the shares sum to 100%.
 - **One snapshot per reader, what-if on a branch.** A session keeps its answers while data keeps arriving; a recalibration or trial ingest runs on a copy-free branch, gets compared with main, then is promoted or deleted.
 
 <p align="center">
   <img src="docs/images/demo-find-anomalies.svg" width="900"
-       alt="An agent ranks anomalies with find_anomalies and explains the top one with explain_anomaly; the entity sits outside the θ ring.">
+       alt="An agent ranks anomalies with find_anomalies and explains the top one with explain_anomaly; the entity sits outside the p = 0.05 alarm-budget ring.">
 </p>
-<p align="center"><sub><i>Distance from the centre is the real <code>delta_norm</code>; θ comes from the population.</i></sub></p>
+<p align="center"><sub><i>Distance from the centre is each entity's evidence in bits (−log<sub>2</sub> p); the ring is the alarm budget, p = 0.05.</i></sub></p>
 
 hypertopos is not a database, and not a machine learning model. It is a layer that turns relational data into a coordinate system where every entity gets a position derived from its relationships and the population around it. It complements SQL: the database answers *which rows match*; hypertopos answers *which entities are out of place, how that is changing, and why*.
 
@@ -123,7 +123,7 @@ Event tables that live in Spark (Databricks, a lakehouse, a cluster) need no YAM
   <img src="docs/images/demo-spark.svg" width="900"
        alt="A data scientist calls find_anomalies on a Spark DataFrame of payment events grouped by segment, shows the three most distant entities, then calls explain on A000335">
 </p>
-<p align="center"><sub><i>Real output on synthetic data. A000335 lands outside its segment's θ ring; <code>explain</code> names the dimension that moved it.</i></sub></p>
+<p align="center"><sub><i>Real output on synthetic data. A000335 is flagged by its conformal p-value; <code>explain</code> names the dimension that drives its score.</i></sub></p>
 
 ```bash
 pip install "hypertopos[spark]"        # on Databricks, plain `%pip install hypertopos`
@@ -140,7 +140,7 @@ events = tx.join(accounts.select("account", "segment"), tx.from_account == accou
 
 result = find_anomalies(events, entity="from_account", counterparty="to_account",
                         amount="amount", time="ts", group_by="segment")
-result.orderBy("delta_norm", ascending=False).show(3)
+result.orderBy("anomaly_score", ascending=False).show(3)
 explain(result, entities=["A000335"]).show(2)
 ```
 
@@ -303,7 +303,7 @@ Every `hypertopos sphere …` subcommand takes `--json` for machine-readable out
 | Creating a branch on Windows fails with a message about the 260-character path limit | Branch files live under `<dataset>/tree/<branch>/`, which can push paths past Windows' limit. Move the sphere to a shorter directory, use a shorter branch name, or enable long paths in Windows (`LongPathsEnabled`). |
 | `Validation errors:` / `Source 'orders': file not found: …` | Source paths resolve relative to the YAML file's directory, not the shell's. |
 | `error: not a sphere directory (no _gds_meta/sphere.json): …` | Point `info` and `sphere …` at the directory that contains `_gds_meta/sphere.json`. |
-| `sphere validate` prints `dim_quality warning (non_normal_dim) on dim 'amount'` | Advisory: a gaussian-declared dimension with a heavy tail. Declare a `kind` or transform the column; `--strict` turns it into a failure for CI. |
+| `sphere validate` prints `dim_quality warning (sparse_dim) on dim 'amount'` | The dimension is mostly-zero with rare nonzero values — gaussian z-score assumption is wrong. Declare `kind: bernoulli` (presence/absence) or `kind: poisson` (count) in the sphere YAML, or split the column into a binary `is_active` dim and a continuous `value_when_active` dim. |
 | `sphere validate` prints `dim_quality warning (dominant_dim_mass)` | One dimension carries most of the tail variance — the pattern is effectively a one-dimension detector. Add independent dimensions or split the column. |
 | A session keeps returning the same answers after an ingest | Sessions are pinned to a snapshot. `session.is_stale()`, then `session.refresh()`. |
 | `promote_branch` refused: main moved since the branch was created | `compare_branches` to see what differs, then delete the branch and create it again from the current main. |
@@ -319,7 +319,8 @@ Every capability below comes from one decision: an entity is a point in a space 
 | Capability | What it does | Instead of |
 |---|---|---|
 | Population-relative coordinates | `delta = (shape − μ) / σ` per dimension; one vector serves anomaly, clustering, drift and comparison | Learned embeddings with latent dimensions that need retraining when the data shifts |
-| Self-calibrating threshold | θ is a percentile of the population's own `delta_norm` — per group when a pattern declares `group_by_property` | Choosing a contamination rate or a hand-tuned cut-off |
+| Calibrated anomaly score | Continuous anchor patterns score each entity on rank-Gaussian, shrunk-covariance Mahalanobis distance plus, when an event line with an edge table exists, its motion against the population's velocity field (`score_axes`, nearest-peer distance opt-in); a split-conformal p-value against a stored reference makes `is_anomaly` an exact alarm budget | Choosing a contamination rate or a hand-tuned cut-off, or trusting a p-value from a Gaussian null the data does not follow |
+| Self-calibrating threshold | θ is a percentile of the population's own `delta_norm` — per group when a pattern declares `group_by_property` — for event, mixture and discrete patterns | Choosing a contamination rate or a hand-tuned cut-off |
 | Distribution-aware dimensions | Each dimension declares a kind (gaussian, poisson, bernoulli), detected or set with `kind:` on precomputed dimensions; `sphere_overview` flags dead, sparse, non-normal and dominant dimensions with concrete advice | One metric for every feature, and silent garbage when a feature breaks its assumption |
 | Calibration epochs | Every build and `recalibrate` records an epoch; `compare_calibrations` shows per-dimension μ / σ / θ drift, `theta_sensitivity` shows whether θ sits near a cliff | No record of how the coordinate system itself moved |
 | Hidden influencers | `find_calibration_influencers` measures each entity's leave-one-out impact on the calibration and names the ones that distort it | Explaining predictions while the baseline itself is contaminated |
@@ -330,7 +331,7 @@ Every capability below comes from one decision: an entity is a point in a space 
 |---|---|---|
 | Named attribution | `explain_anomaly` ranks real dimensions by their share of `delta_norm²`; shares sum to 100% | SHAP / LIME approximations over a trained model |
 | Alternative hypotheses | `find_diverse_explanations` returns disjoint dimension sets that each explain the anomaly | One explanation and a manual search for "what else could it be" |
-| Error-controlled detection | Benjamini-Hochberg or Storey FDR on χ² p-values, per entity or per dimension; bootstrap `anomaly_confidence` with a `min_confidence` filter | A ranked list with no statement about false discoveries or stability |
+| Error-controlled detection | The alarm budget on every calibrated pattern; a cell gate (hypergeometric enrichment, Benjamini-Hochberg or Storey over cells) that names the regions holding more anomalies than their size predicts; a `calibration_age` alert when the reference gets old | A ranked list with no statement about false alarms or where they concentrate |
 | Verdicts an agent can act on | `assess_anomaly_certainty`, `consensus_classification`, `calibration_drift_report`, `theta_sensitivity_report` return a verdict with its rationale | Stitching several low-level calls and interpreting them by hand |
 | Anomaly by absence | `find_density_gaps` finds combinations that are missing from the population; `find_conformance_violations` checks declared rules | Outlier detection, which only sees extremes that exist |
 
@@ -375,9 +376,9 @@ Every capability below comes from one decision: an entity is a point in a space 
 
 | Problem | Typical approach | With hypertopos |
 |---|---|---|
-| Find what is unusual | Engineer features, train a model, pick a contamination rate, retrain on shift | Build from YAML, call `find_anomalies` — θ comes from the population |
+| Find what is unusual | Engineer features, train a model, pick a contamination rate, retrain on shift | Build from YAML, call `find_anomalies` — the score is calibrated on the population |
 | Say why it is unusual | Feature importance from a model you have to trust | `explain_anomaly` — real dimensions, shares that sum to 100%; `find_diverse_explanations` for alternatives |
-| Know it is not a fluke | Rerun with other thresholds, ask a domain expert | `find_witness_cohort` for unconnected look-alikes, `min_confidence` for stability, FDR for the whole list |
+| Know it is not a fluke | Rerun with other thresholds, ask a domain expert | `find_witness_cohort` for unconnected look-alikes, `conformal_p` and the alarm budget for every flag, the cell gate for where they cluster |
 | Find the cause | Explain, then counterparties, then contagion, then hubs | `trace_root_cause` in one call |
 | Catch layering and typologies | Rule engines and rare-pair SQL | `score_edge`, `find_high_potential_motifs`, `find_motif_by_hops`, and chain investigation with a verdict |
 | See behaviour change | Export to a time-series database and set manual alerts | `find_drifting_entities` with direction; `decompose_drift` to separate entity from baseline |
@@ -395,7 +396,7 @@ Validated on three domains with the same engine, zero domain rules, zero labels:
 | AML | IBM AML (synthetic) | 80.4% recall, zero labels |
 | Transport | NYC Yellow Taxi (7.6M trips) | 8/8 anomaly categories detected |
 
-Benchmark scripts and data preparation are included. Results are reproducible. Numbers are from the pre-0.1.0 validation run and have not been re-evaluated against recent releases.
+Benchmark scripts and data preparation are included. Results were reproducible at the release they were measured on. Numbers are from the pre-0.1.0 validation run and have not been re-evaluated against recent releases.
 
 Full results: [Benchmarks](docs/benchmarks.md)
 

@@ -24,7 +24,7 @@ def nav():
             "primary_key": ["A"],
             "delta_norm": [1.5],
             "is_anomaly": [True],
-            "delta_rank_pct": [97.2],
+            "score_rank_pct": [97.2],
         }
     )
     n._storage.read_sphere.return_value = MagicMock(
@@ -273,7 +273,7 @@ def test_storage_error_and_null_rank_do_not_abort_the_report(nav):
             "primary_key": ["A"],
             "delta_norm": [1.5],
             "is_anomaly": [False],
-            "delta_rank_pct": pa.array([None], pa.float64()),
+            "score_rank_pct": pa.array([None], pa.float64()),
         }
     )
     with (
@@ -287,7 +287,7 @@ def test_storage_error_and_null_rank_do_not_abort_the_report(nav):
         result = nav.investigate_entity("A", pattern_id="account_pattern", line_id="tx_pattern")
 
     assert result["steps_status"]["polygon"]["ok"]
-    assert result["polygon"]["delta_rank_pct"] is None
+    assert result["polygon"]["score_rank_pct"] is None
     assert result["steps_status"]["explain_anomaly"] == {
         "ok": False,
         "error": "GDSError: calibration file missing",

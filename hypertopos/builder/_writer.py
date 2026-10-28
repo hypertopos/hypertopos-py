@@ -70,9 +70,23 @@ def write_points(
 def _prepare_geometry_for_lance(table: pa.Table) -> tuple[pa.Table, int]:
     """Cast delta to fixed-size list and add per-dimension scalar columns.
 
+    ``axis_ranks`` / ``score_delta`` are cast to fixed-size lists too when every
+    row carries them (patterns on the calibrated evidence score); patterns
+    without the score keep them as all-null lists.
+
     Returns (prepared_table, list_size).
     """
     list_size = 0
+    for name in ("axis_ranks", "score_delta"):
+        if name in table.schema.names and table.num_rows > 0 and table[name].null_count == 0:
+            col = table[name]
+            if not pa.types.is_fixed_size_list(col.type):
+                size = len(col[0])
+                table = table.set_column(
+                    table.schema.get_field_index(name),
+                    name,
+                    col.cast(pa.list_(pa.float32(), size)),
+                )
     if table.num_rows > 0:
         delta_col = table["delta"]
         list_size = len(delta_col[0])  # ListScalar supports len() natively
@@ -102,7 +116,7 @@ def write_geometry(
     table: pa.Table,
     version: int,
 ) -> None:
-    """Write geometry Lance dataset for a pattern. Sorts by delta_norm descending.
+    """Write geometry Lance dataset for a pattern. Sorts by anomaly_score descending.
 
     Casts delta to a fixed-size list (required for IVF_FLAT ANN indexing), then
     writes the dataset and builds IVF_FLAT + scalar indices via GDSWriter.
@@ -110,7 +124,7 @@ def write_geometry(
     Auto-detects binary geometry (all shape values in {0, 1}) and skips IVF_FLAT
     index — binary vectors produce degenerate KMeans clusters, wasting 30s+.
     """
-    sorted_table = table.sort_by([("delta_norm", "descending")])
+    sorted_table = table.sort_by([("anomaly_score", "descending")])
     sorted_table, list_size = _prepare_geometry_for_lance(sorted_table)
 
     # Detect binary/low-cardinality geometry — skip IVF_FLAT if unique vector

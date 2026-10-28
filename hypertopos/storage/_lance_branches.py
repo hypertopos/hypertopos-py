@@ -545,7 +545,11 @@ def _meta_paths_for(base: Path, pattern_ids: Iterable[str]) -> list[Path]:
     paths = [meta / "sphere.json"]
     for pid in pattern_ids:
         paths += sorted((meta / "geometry_stats").glob(f"{pid}_v*.json"))
-        paths += [meta / "calibration" / f"{pid}.json", meta / "calibration_history" / pid]
+        paths += [
+            meta / "calibration" / f"{pid}.json",
+            meta / "calibration_history" / pid,
+            meta / "reference" / pid,
+        ]
     return paths
 
 

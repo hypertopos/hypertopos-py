@@ -572,7 +572,7 @@ class TestDetectDataQualityIssues:
         assert mismatch[0]["stored_delta_norm"] == pytest.approx(9.9, abs=0.01)
         assert mismatch[0]["actual_delta_norm"] == pytest.approx(1.0, abs=0.01)
         assert "does not match" in mismatch[0]["message"]
-        assert "recompute_delta_rank_pct" in mismatch[0]["message"]
+        assert "recompute_score_rank_pct" in mismatch[0]["message"]
 
     def test_no_delta_norm_mismatch_when_consistent(self):
         """detect_data_quality_issues must NOT flag delta_norm when it matches ||delta||."""

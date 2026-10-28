@@ -479,11 +479,11 @@ class TestInvestigationCoverage:
         assert result["explored"] >= 1
 
     def test_unexplored_have_anomaly_info(self, nav):
-        """Unexplored anomalous entries should have is_anomaly and delta_rank_pct."""
+        """Unexplored anomalous entries should have is_anomaly and score_rank_pct."""
         result = nav.investigation_coverage("A000", "tx_pattern", set())
         for entry in result["unexplored_anomalous"]:
             assert "is_anomaly" in entry
-            assert "delta_rank_pct" in entry
+            assert "score_rank_pct" in entry
 
     def test_leaf_node_no_crash(self, nav):
         """Entity with zero edges should not crash (coverage_pct=None)."""
@@ -661,7 +661,7 @@ class TestAnomalousEdges:
         for edge in result["edges"]:
             assert "delta_norm" in edge
             assert "is_anomaly" in edge
-            assert "delta_rank_pct" in edge
+            assert "score_rank_pct" in edge
             assert isinstance(edge["delta_norm"], float)
             assert isinstance(edge["is_anomaly"], bool)
 

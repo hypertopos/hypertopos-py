@@ -49,7 +49,7 @@ where μ = E[s] is the population mean, σ = max(std(s), ε) the clamped standar
 - **Population comparison** — contrasting δ distributions between groups reveals which dimensions discriminate them (Cohen's d)
 - **Hub analysis** — structural centrality scores from normalized connectivity in the shape vector
 - **Segment partitioning** — cutting planes (w·δ ≥ b) partition the population into named segments with derived statistics
-- **Anomaly detection** — entities with ‖δ‖₂ > θ (empirical quantile threshold) are flagged — no training, no labels
+- **Anomaly detection** — every continuous anchor pattern carries a calibrated evidence score with an exact alarm budget (see [Calibrated anomaly score](#calibrated-anomaly-score)); other patterns flag entities with ‖δ‖₂ > θ (empirical quantile threshold) — no training, no labels
 - **Dimension ranking** — each dimension's share of `delta_norm²` identifies which relations drive an entity's position (witness sets)
 - **Drift tracking** — temporal sequences τ(e) = (δ₁, ..., δₜ) measure how an entity's geometric position evolves
 - **Trajectory forecasting** — extrapolation of temporal coordinate sequences predicts future position, anomaly status, and segment crossings
@@ -58,23 +58,41 @@ where μ = E[s] is the population mean, σ = max(std(s), ε) the clamped standar
 - **Cross-sphere comparison** — `delta_norm` is dimensionless, so scalar metrics from independently calibrated coordinate spaces compare across separate data systems
 - **What-if analysis** — hypothetical edge or dimension changes (`simulate_edge_removal`, `simulate_dimension_change`) recompute an entity's position against the fixed calibration; a recalibration or ingest tried on a [sphere branch](#sessions-snapshots-and-branches) shows its effect on the whole population before it touches main
 
-## Statistical Guarantees
+## Calibrated anomaly score
 
-Two opt-in post-processing stages are available. Diverse selection applies to every attract primitive that scans a population (pi5, pi6, pi7, pi9); FDR control applies only where a model p-value exists (pi5, pi6). Both are off by default.
+The shape layer above (δ, `delta_norm`, μ, σ, θ) says *where* an entity sits, per named dimension. The anomaly decision of a continuous anchor pattern whose dimensions are point properties comes from a second, separate layer — the **calibrated evidence score**. A pattern on this score lists the dimensions it scores in `score_dims` (identifier-like dimensions such as component or community ids are left out) and the axes it fits in `score_axes`.
 
-**FDR control.** When `fdr_alpha` is set on pi5 / pi6, the result set passes through a Benjamini-Hochberg (BH) procedure on χ² model p-values: the upper-tail χ²(df) survival on `‖δ‖²` with `df` = pattern dimensionality — the null under `δ_i ~ N(0, 1)`. The BH procedure guarantees `E[FDR] <= alpha` under independence or positive regression dependency (PRDS). The family is the whole tested population, not the returned page: q-values use the pattern's population size and each entity's rank among all tested entities (exact for an unfiltered top-n page, conservative under filters or sampling), and Storey's π̂₀ is estimated from the stored `delta_norm` column of the whole population. Every returned entity carries a q-value — the minimum alpha at which it would still be retained — and entities with `q_value > alpha` are dropped from the page. The guarantee is only as good as the χ² null: check the calibration regime (`median(‖δ‖)` vs `√df`) before reading q-values as error rates. Rank-only scores — hub score (pi7) and drift displacement (pi9) — have no model p-value: a p-value derived from population rank is uniform by construction and only encodes the entity's position in the result set, so BH on it would select a fixed fraction of whatever was requested. Those primitives therefore offer no FDR parameters.
+**Axes.** Each axis turns the entity into one number, and the score combines their population ranks:
 
-**Storey adaptive correction.** `fdr_method="storey"` scales BH q-values by the Storey LSL estimator of the null-hypothesis proportion π₀ — when the population contains a genuine null mass alongside the anomalous tail, Storey shrinks q-values by that factor and recovers additional discoveries at the same α. This works because χ² p-values can separate null from alternative.
+- `mahal` — Ledoit–Wolf (shrunk-covariance) Mahalanobis distance on rank-Gaussian coordinates of `score_dims`: every dimension is mapped through its population CDF to a standard normal value, so heavy tails and mixed units do not dominate, and correlated dimensions are not counted twice. Always present.
+- `current` — the entity's motion against the current: from its events in the two calendar halves of the event period, its state change is compared with the change of its nearest neighbours (the population's velocity field); the residual is what the entity does that its peers do not. Requested by default; `current` is fitted when exactly one event pattern references the pattern's entity line and carries an edge table (from / to keys, timestamp, amount) whose events span more than one moment; otherwise the pattern scores without it.
+- `knn` — distance to the nearest peers in a compressed coordinate space. Opt-in (`score_axes: [mahal, current, knn]` in the pattern YAML).
 
-Power recovery is **regime-dependent**, and the regime is read from `median(‖δ‖)` relative to `√df`. When the ranking metric has a moderate super-anomaly distribution with a real null tail (median somewhat above `√df`), Storey recovers additional discoveries at the same α. When `δ` is over-compressed relative to the N(0,1) null (median below `√df`), Storey sees the whole population as null and falls back to BH. When `δ` is extreme super-anomaly (median several times `√df`), BH already rejects every entity, so there is nothing left for Storey to recover.
+`anomaly_score` is the mean of the axis ranks (each axis rank in `axis_ranks`), and `score_rank_pct` is the rank of `anomaly_score` in the population (0–100).
 
-**Diverse selection.** When `select="diverse"`, the top-N step is replaced by a lazy-greedy facility location algorithm that maximizes a monotone submodular objective over pairwise cosine similarity of delta vectors. The greedy selection achieves a `(1 - 1/e)` approximation to the optimal K-subset. Each selected entity reports a representativeness count — how many population members are closest to it among the selected set. The result is K entities that cover the geometric space of the result set rather than clustering around a single extreme region.
+**Conformal p-value and the alarm budget.** `conformal_p` is a split-conformal p-value: the fraction of the calibration reference scoring at least as high as the entity. The decision is
 
-Both stages compose on pi5 / pi6: `fdr_alpha=0.05, select="diverse"` first filters to FDR-controlled discoveries, then picks the K most geometrically diverse among them.
+```
+is_anomaly = conformal_p <= 1 - anomaly_percentile / 100
+```
+
+and the calibrated statement is an **alarm budget**: at the 95th percentile, 5 % of the population is flagged, and 5 % of a population drawn like the reference would be. θ is still stored, as the shape-space radius at that percentile, but on these patterns it is not the boundary.
+
+**Why there is no entity-level FDR.** The conformal p-values of the fitted population are its own ranks, `(k + 1) / (n + 1)`, so a Benjamini-Hochberg or Storey cut over them cannot reject anything beyond what the alarm budget already states. The anomaly χ² p-values that entity- and per-dimension FDR used to read are retired: the dimensions are heavy-tailed and dependent, so a χ² null mis-states the error rate. What stays is the **cell gate**: with `fdr_resolution` / `fdr_temporal_resolution` (pi5), each cell of a declared spatial or temporal hierarchy is tested for enrichment in `is_anomaly` (hypergeometric upper tail), with BH or Storey over the cells of a level (`fdr_alpha`, `fdr_method`, default Storey). That tests a real hypothesis — "this region holds more anomalies than its size predicts".
+
+**Attribution.** `explain_anomaly` reports the evidence in bits, `−log2 conformal_p`, split first over the axes (by each axis's marginal rarity) and then, within `mahal`, over the named dimensions; the shares add up exactly to the whole.
+
+**Reference and staleness.** The fit — per-dimension CDF sketches, the Ledoit–Wolf location and precision, the event halves, a velocity-field sample, the optional kNN sample, and the sorted calibration scores — is stored per pattern per calibration epoch (`_gds_meta/reference/`). Incremental ingest, hypothetical-entity tools and Spark scoring score new entities against it without a refit, on the axes available without events (no `current` for rows ingested later), so `find_anomalies` orders a calibrated pattern by `conformal_p`, which stays comparable across the two calibrations. A frozen reference stays valid for a limited time while the population moves; `check_alerts` raises `calibration_age` when a pattern's calibration is older than 60 days, and `recalibrate` refits it.
+
+Event, GMM and discrete (edge-count) patterns keep `delta_norm` against θ as their score, with a conformal p-value on `delta_norm`.
+
+## Diverse selection
+
+Every attract primitive that scans a population (pi5, pi6, pi7, pi9) accepts `select="diverse"`: the top-N step is replaced by a lazy-greedy facility location algorithm that maximizes a monotone submodular objective over pairwise cosine similarity of delta vectors. The greedy selection achieves a `(1 - 1/e)` approximation to the optimal K-subset. Each selected entity reports a representativeness count — how many population members are closest to it among the selected set. The result is K entities that cover the geometric space of the result set rather than clustering around a single extreme region.
 
 ## Bregman Divergence
 
-Anomaly scoring in GDS uses `delta_norm` = `‖δ‖₂` — a single Euclidean distance that treats every dimension identically. It is the metric behind `is_anomaly`, the threshold θ and anomaly ranking, and it works well when dimensions are roughly Gaussian.
+The shape-space distance `delta_norm` = `‖δ‖₂` is a single Euclidean distance that treats every dimension identically. It is the metric behind θ, and behind `is_anomaly` and anomaly ranking on patterns without the calibrated score; it works well when dimensions are roughly Gaussian.
 
 **Bregman divergence** is a distribution-aware companion score: each dimension contributes a term computed from the generator function matched to its distribution family (`kind`). For a dimension with kind `gaussian`, the generator is squared loss (identical to L2). For `poisson`, it is the Kullback-Leibler divergence for counts. For `bernoulli`, it is binary cross-entropy.
 
@@ -83,7 +101,7 @@ The per-dimension terms are summed into `bregman_divergence` — one float per p
 **What this enables:**
 - A binary FK dimension (bernoulli) is scored for the 0/1 nature of the edge, so an entity that is merely "active" in that relation does not get a large term
 - Count-based derived features (poisson) are scored against their expected arrival rate rather than a z-score
-- `explain_anomaly` tags each entry of `top_dimensions` (`{dim, kind, delta, pct_of_total}`) with its `kind`; the ranking itself (`pct_of_total`) is the dimension's share of `delta_norm²`, the metric behind `is_anomaly`, so the explanation always names the dimensions that pushed the entity past theta and the shares sum to 100%
+- `explain_anomaly` tags each entry of `top_dimensions` (`{dim, kind, delta, pct_of_total}`) with its `kind`, and `pct_of_total` is the dimension's share of `delta_norm²` (the shares sum to 100%) on patterns scored by `delta_norm`. On calibrated patterns the entries are `{dim, z, bits, pct_of_total}`: `pct_of_total` is the dimension's share of the evidence bits (`−log2 conformal_p`), and the shares sum to the `mahal` axis's fraction of `bits` (the whole of it when `mahal` is the only axis)
 
 ### Dimension Kinds
 
@@ -106,13 +124,12 @@ Override via `kind:` on precomputed dimension entries in `sphere.yaml`. The resu
 
 ### Dim-quality warnings
 
-`sphere_overview` surfaces a `dim_quality_warnings[]` block per pattern that catches silent build-time failures of z-score / `delta_norm` semantics. Every warning carries `type`, `dim_label`, `reason`, `advice`. `dominant_dim_mass` and `heteroscedasticity` additionally carry numeric `evidence_value` (the firing metric) and `threshold` (the firing cutoff) so the agent can rank patterns by severity. Computed from cached pattern state (`sigma_diag`, `mu`, `dim_percentiles`, `dimension_kinds`, `heteroscedasticity_diagnostic`) — sub-millisecond, no storage scan. Five auditor types:
+`sphere_overview` surfaces a `dim_quality_warnings[]` block per pattern that catches silent build-time failures of z-score / `delta_norm` semantics. Every warning carries `type`, `dim_label`, `reason`, `advice`. `dominant_dim_mass` additionally carries numeric `evidence_value` (the firing metric) and `threshold` (the firing cutoff) so the agent can rank patterns by severity. Computed from cached pattern state (`sigma_diag`, `mu`, `dim_percentiles`, `dimension_kinds`) — sub-millisecond, no storage scan. Four auditor types:
 
 - `dead_dim` — per-dim signal. Fires on dims with `sigma_diag[i] < 1e-10`. The z-score `(x − mu) / sigma` is undefined; the dim contributes nothing meaningful and silently dilutes other dims' signal. Advice: drop the dim from the pattern, or investigate the data source for a constant column.
 - `sparse_dim` — per-dim signal. Fires on dims with `dim_percentiles[label].p50 == 0` and `p99 > 0` (mostly-zero with rare nonzero tail). The gaussian z-score assumption is wrong because the empirical distribution is point-mass-at-zero plus a tail. Advice: switch to Bregman with `kind='poisson'` or `kind='bernoulli'`, or split into `is_active` + `value_when_active` dims.
 - `dominant_dim_mass` — pattern-level signal. Computed as the max share of `((p99 − μ_d) / σ_d)²` across all dims with `dim_percentiles` coverage; fires when one dim's share ≥ 0.70 (matches the per-polygon `single_dim_driven` threshold). Means the pattern's `delta_norm` ranking is effectively single-dim; investigator should cross-check the per-polygon `reliability_flags.single_dim_driven` incidence on top-N anomalies. Aggregated edge dims without `dim_percentiles` entries are silently skipped.
 - `negative_space` — per-dim signal. Fires on dims with `dim_percentiles[label].p50 == 0` AND `dimension_kinds[i] == "gaussian"`. The gaussian z-score is wrong for these dims because the empirical distribution is point-mass-at-zero, not centered. Advice: re-declare with `kind='bernoulli'` (presence/absence) or `kind='poisson'` (count), or split into a binary `is_active` dim plus a continuous `value_when_active` dim.
-- `heteroscedasticity` — pattern-level signal, keyed by the pattern's `group_by_property`. Computed at build time from a Brown-Forsythe (median-centred Levene) test on `delta_norm` partitioned by the grouping column; fires when `p < 0.01`. The `dim_label` carries the grouping variable name (the categorical line property), not a δ-dim. Means the global θ assumption is statistically violated for this pattern — per-group θ calibration is statistically warranted. Advice: keep the per-group calibration the pattern already carries, or consider a variance-stabilizing transform (`log1p`) on `delta_norm` before thresholding. Groups with N < 30 are silently dropped from the test (low Levene power) and surfaced in the persisted entry as `skipped_groups_low_n`.
 
 ## Anomaly Confidence
 
@@ -125,9 +142,9 @@ The builder draws `bootstrap_iterations` bootstrap samples from the population (
 - `0.5–0.99` — entity sits near the boundary; classification may flip with slightly different calibration data
 - `< 0.5` — entity is nominally anomalous (delta_norm > theta) but unstable; treat with caution
 
-`anomaly_confidence` is skipped when the pattern uses `group_by_property` (bootstrap is per-group, cost grows multiplicatively), `use_mahalanobis` (full covariance bootstrap is expensive), or N > 50K entities. In those cases the field is `None`.
+`anomaly_confidence` is skipped when the pattern uses `group_by_property` (bootstrap is per-group, cost grows multiplicatively) or N > 50K entities, and on calibrated patterns, whose decision comes from `conformal_p`, not θ. In those cases the field is `None`.
 
-Filter `find_anomalies` by minimum confidence using `min_confidence` — for example `min_confidence=0.8` returns only entities whose anomaly classification is stable across at least 80% of bootstrap samples.
+On patterns without the calibrated score, filter `find_anomalies` by minimum confidence using `min_confidence` — for example `min_confidence=0.8` returns only entities whose anomaly classification is stable across at least 80% of bootstrap samples.
 
 ## Three Scales
 
@@ -275,7 +292,7 @@ Chains (both build-time `chain_lines` and runtime `extract_chains`) are sequence
 | **Shape vector** | Normalized raw representation before population-relative centering |
 | **Delta vector** | Centered and scaled deviation from the population mean |
 | **Delta norm** | L2 magnitude of the deviation -- basis for similarity, clustering, and anomaly scoring |
-| **Theta threshold** | Statistical boundary derived from the population distribution (used for anomaly classification) |
+| **Theta threshold** | Statistical boundary derived from the population distribution (the anomaly boundary on patterns without the calibrated score) |
 | **Deformation log** | History of changes that produced the current solid |
 | **Bregman divergence** | Distribution-aware anomaly distance summed across per-dimension Bregman terms |
 | **Anomaly confidence** | Bootstrap stability score (0–1) for anomaly classification under population resampling |
@@ -283,7 +300,7 @@ Chains (both build-time `chain_lines` and runtime `extract_chains`) are sequence
 
 Every dimension has a meaning tied to a relation or tracked property.
 
-Optionally, `dimension_weights` adjusts importance of individual axes, and Mahalanobis mode accounts for inter-dimension correlations. See [configuration.md](configuration.md) for details.
+Optionally, `dimension_weights` adjusts importance of individual axes in the shape space; the calibrated score accounts for inter-dimension correlations on its own (shrunk-covariance Mahalanobis on rank-Gaussian coordinates). See [configuration.md](configuration.md) for details.
 
 Every dimension corresponds to a relation line, tracked property, or event-derived signal. The geometry is population-relative — the same raw record can look typical in one population and unusual in another.
 
@@ -373,7 +390,7 @@ That pattern is the core of the system: broad structure first, focused investiga
 A pattern's **calibration** is the population statistics (μ, σ, θ) its coordinates are measured against. A **calibration epoch** is one recorded fit. Two operations record one:
 
 - a full build, which fits the population from source data;
-- `HyperSession.recalibrate(pattern_id)`, which refits μ, σ and θ on the stored shapes and rewrites the calibration-dependent geometry. `exclude_keys` fits without those entities — suspected influencers, known bad records — while every entity is still scored against the new fit.
+- `HyperSession.recalibrate(pattern_id)`, which refits μ, σ and θ on the stored shapes — and, on a calibrated pattern, the score reference — and rewrites the calibration-dependent geometry. `exclude_keys` fits without those entities — suspected influencers, known bad records — while every entity is still scored against the new fit.
 
 Because both record an epoch, `compare_calibrations`, the theta-sensitivity diagnostics and the drift tools compare the fit before and after a recalibration exactly as they do across rebuilds.
 

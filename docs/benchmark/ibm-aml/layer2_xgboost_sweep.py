@@ -7,7 +7,7 @@ Stream B: Stage 3 (35K)  → XGBoost → daily-ops / case-team
 Stream C: Stage 4 (14K)  → XGBoost → high-confidence / escalation
 
 Each stream: geometry provides recall pool, XGBoost provides precision filtering.
-Features: 24 raw account aggregates + 15 geometry-output (delta_rank_pct, conformal_p,
+Features: 24 raw account aggregates + 15 geometry-output (score_rank_pct, conformal_p,
 is_anomaly, multi_source_score, n_anom_pairs, max_pair_dn, n_chains, n_anom_chains,
 in_cyclic, tx_density, connected_risk, n_anom_cp, cp_anom_rate, community_anom_rate,
 n_counterparties).
@@ -101,13 +101,13 @@ with hs.session("ml") as s:
     geo = reader.read_geometry(
         "account_pattern",
         1,
-        columns=["primary_key", "delta_norm", "delta_rank_pct", "conformal_p", "is_anomaly"],
+        columns=["primary_key", "delta_norm", "score_rank_pct", "conformal_p", "is_anomaly"],
     )
     geo_map = {}
     for i in range(geo.num_rows):
         pk = geo["primary_key"][i].as_py()
         geo_map[pk] = {
-            "rk": geo["delta_rank_pct"][i].as_py() or 0,
+            "rk": geo["score_rank_pct"][i].as_py() or 0,
             "cp": geo["conformal_p"][i].as_py() or 1.0,
             "an": 1 if geo["is_anomaly"][i].as_py() else 0,
         }
@@ -288,7 +288,7 @@ with hs.session("ml") as s:
     src_border = set()
     for i in range(geo.num_rows):
         if not geo["is_anomaly"][i].as_py():
-            pct = geo["delta_rank_pct"][i].as_py()
+            pct = geo["score_rank_pct"][i].as_py()
             if pct is not None and pct >= 80:
                 src_border.add(geo["primary_key"][i].as_py())
 
@@ -376,7 +376,7 @@ with hs.session("ml") as s:
 
     # === BUILD FEATURES ===
     geo_cols = [
-        "delta_rank_pct",
+        "score_rank_pct",
         "conformal_p",
         "is_anomaly",
         "multi_source_score",

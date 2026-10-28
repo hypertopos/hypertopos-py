@@ -77,9 +77,11 @@ def find_anomalies(
         amount: Numeric column with the size of the event.
         time: Timestamp, timestamp_ntz, date or epoch-seconds column.
         group_by: Column of an entity property (e.g. segment, country); the
-            population and the anomaly threshold are computed per group. An
-            entity takes the most frequent value in its own events (ties: the
-            smallest); entities seen only as a counterparty go to ``"(none)"``.
+            deviations behind ``delta_norm`` and the reasons' ``delta`` are
+            computed per group (the score and the reasons' shares stay
+            population-wide). An entity takes the most frequent value in its own
+            events (ties: the smallest); entities seen only as a counterparty go
+            to ``"(none)"``.
         percentile: Population percentile above which an entity is flagged.
         dims: ``"auto"`` or the dimension names to use (see ``docs/spark.md``).
         extra_dims: ``{name: Spark SQL aggregate}`` over the event rows.
@@ -92,15 +94,25 @@ def find_anomalies(
         max_entities: Refuse to calibrate above this many entities (driver memory).
 
     Returns:
-        One row per entity: ``entity``, ``delta_norm`` (distance from the
-        population centre, in standard deviations), ``is_anomaly``, ``p_value``
-        (share of the population at least as far out), ``rank_pct`` (0-100,
-        share of the population with a smaller ``delta_norm``), ``top_reasons``
-        (up to three ``{dim, delta, pct_of_total}``, the share of
-        ``delta_norm**2`` in percent; empty for an entity at the centre). With
-        ``group_by``: that column and ``calibration_scope`` (``group`` or
-        ``pooled``). The ``entity`` column's metadata carries the fingerprint
-        and the calibration path.
+        One row per entity: ``entity``, ``anomaly_score`` (the calibrated
+        evidence score, 0-1: how rare the entity's combination of dimensions
+        is in the population), ``is_anomaly`` (``p_value`` at or below
+        ``1 - percentile / 100``), ``p_value`` (conformal: share of the
+        population scoring at least as high), ``score_rank_pct`` (0-100, share
+        of the population with a lower score), ``delta_norm`` (distance from
+        the population centre, in standard deviations), ``top_reasons`` (up to
+        three ``{dim, delta, pct_of_total}``: the dimension's deviation in
+        standard deviations and its share of ``anomaly_score`` in percent, the
+        Shapley split of the Mahalanobis evidence that ``explain_anomaly``
+        reports on a sphere; empty for an entity at the centre of the score).
+        The score is the Mahalanobis axis only: a sphere built from the same
+        events with an event pattern also scores motion (``current``), so its
+        scores and p-values can differ. With ``group_by``: ``delta_norm`` and
+        the reasons' ``delta`` are measured against the entity's group while
+        the score and its shares are over the whole population; the result adds that
+        column and ``calibration_scope`` (``group`` or ``pooled``). The
+        ``entity`` column's metadata carries the fingerprint and the
+        calibration path.
     """
     plan = build_plan(
         entity,
@@ -231,10 +243,11 @@ def shape_result(
     key = F.col(KEY).alias(KEY, metadata=metadata) if fp is not None else F.col(KEY)
     columns: list[Column | str] = [
         key,
-        "delta_norm",
+        "anomaly_score",
         "is_anomaly",
         "p_value",
-        "rank_pct",
+        "score_rank_pct",
+        "delta_norm",
         F.filter(reasons, lambda r: r["pct_of_total"] > 0).alias("top_reasons"),
     ]
     if group_by is not None:

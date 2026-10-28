@@ -37,12 +37,12 @@ def result(spark, tmp_path_factory):
 
 
 def test_explain_matches_top_reasons(result):
-    top = result.orderBy("delta_norm", ascending=False).limit(5).collect()
+    top = result.orderBy("anomaly_score", ascending=False).limit(5).collect()
     rows = explain(result, top_n=5).collect()
     by_entity: dict[str, list] = {}
     for r in rows:
         by_entity.setdefault(r["entity"], []).append(r)
-    assert list(by_entity) == [t["entity"] for t in top]  # most distant first
+    assert list(by_entity) == [t["entity"] for t in top]  # highest score first
     for t in top:
         explained = by_entity[t["entity"]]
         assert sum(r["pct_of_total"] for r in explained) == pytest.approx(100.0)
@@ -113,4 +113,11 @@ def test_to_delta_writes_the_geometry_table(spark, result):
     sphere_of(result).to_delta(spark, "hypertopos_geometry_test")
     written = spark.table("hypertopos_geometry_test")
     assert written.count() == result.count()
-    assert {"entity", "delta_norm", "is_anomaly", "p_value", "rank_pct"} <= set(written.columns)
+    assert {
+        "entity",
+        "anomaly_score",
+        "is_anomaly",
+        "p_value",
+        "score_rank_pct",
+        "delta_norm",
+    } <= set(written.columns)

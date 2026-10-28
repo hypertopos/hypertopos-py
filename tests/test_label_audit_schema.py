@@ -193,7 +193,7 @@ def test_parse_rejects_non_mapping(tmp_path: Path) -> None:
 
 def test_round_trip_block_present(tmp_path: Path) -> None:
     """A LabelAuditConfig set on the builder lands in sphere.json with
-    format_version bumped to 3.1; reader reconstructs Sphere.label_audit
+    format_version bumped to 4.1; reader reconstructs Sphere.label_audit
     and sphere_info reports label_aware_available=True."""
     block = LabelAuditConfig(
         label_column="laundering",
@@ -203,7 +203,7 @@ def test_round_trip_block_present(tmp_path: Path) -> None:
     out = _build_sphere_with_block(tmp_path, block)
 
     meta = json.loads((Path(out) / "_gds_meta" / "sphere.json").read_text())
-    assert meta["format_version"] == "3.1"
+    assert meta["format_version"] == "4.1"
     assert meta["label_audit"]["label_column"] == "laundering"
     assert meta["label_audit"]["label_positive_value"] is True
     assert meta["label_audit"]["patterns"] == ["account_pattern"]
@@ -219,7 +219,7 @@ def test_round_trip_block_absent(tmp_path: Path) -> None:
     out = _build_sphere_with_block(tmp_path, None)
 
     meta = json.loads((Path(out) / "_gds_meta" / "sphere.json").read_text())
-    assert meta["format_version"] == "3.0"
+    assert meta["format_version"] == "4.0"
     assert "label_audit" not in meta
 
     sphere = HyperSphere.open(out)

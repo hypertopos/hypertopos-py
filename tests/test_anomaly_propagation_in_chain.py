@@ -25,7 +25,7 @@ def _aml_sphere_unavailable() -> bool:
     import json
 
     raw = json.loads(sphere_json.read_text())
-    return raw.get("format_version", "").split(".")[0] != "3"
+    return raw.get("format_version", "").split(".")[0] != "4"
 
 
 pytestmark = pytest.mark.skipif(
@@ -132,7 +132,7 @@ def test_hop_fields_well_formed(aml_nav, known_anomalous_chain_id):
         assert "is_anomaly" in h
         assert "delta_norm" in h
         assert "top_dim" in h
-        assert "delta_rank_pct" in h
+        assert "score_rank_pct" in h
         assert isinstance(h["hop_idx"], int)
         assert isinstance(h["primary_key"], str)
         assert isinstance(h["is_anomaly"], bool)

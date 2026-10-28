@@ -7,6 +7,48 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-10-28
+
+### Added
+
+- **Calibrated evidence score** — the default anomaly score of continuous anchor patterns whose dimensions are point properties. Each entity is scored on a shrunk-covariance Mahalanobis distance over rank-Gaussian coordinates (`mahal`) and on its motion against the population's velocity field (`current`, fitted when one event pattern with an edge table references the entity line); `anomaly_score` is the mean of the axis ranks. A split-conformal p-value against a stored calibration reference sets `is_anomaly = conformal_p <= 1 - anomaly_percentile/100` — an exact alarm budget: at the 95th percentile 5 % of the population is flagged, and 5 % of a population like the reference would be. New geometry columns `anomaly_score`, `axis_ranks`, `conformal_p`, `score_rank_pct`, `score_delta` (all but `axis_ranks` also `Polygon` fields); new `Pattern` fields `score_dims`, `score_axes`, `reference_epoch`, `anomaly_percentile`.
+- `score_axes` pattern YAML key — choose the scoring axes from `mahal`, `current` and `knn` (distance to nearest peers, opt-in); must contain `mahal`. Default `[mahal, current]`; `current` is dropped when the entity line has no such event pattern.
+- The calibration reference is stored per pattern per calibration epoch under `_gds_meta/reference/{pattern_id}/v={epoch}.npz`; incremental ingest scores new entities against it without a refit, and `recalibrate` refits it.
+- `check_alerts` raises a `calibration_age` alert (MEDIUM) when a pattern's calibration is older than 60 days.
+- `explain_anomaly` on a calibrated pattern reports the evidence `bits = -log2 conformal_p`, split over the scoring axes (`axes`) and over the dimensions (`top_dimensions[].bits`), adding up exactly; `severity` follows `conformal_p` against the alarm budget.
+
+### Changed
+
+- **Sphere format 4.0.** Spheres built with format 3.x raise `GDSVersionError` on open and must be rebuilt from source.
+- On a calibrated pattern `find_anomalies` (π5) selects by the stored `is_anomaly` and orders by `conformal_p` ascending, then `anomaly_score` descending (rows added by incremental ingest are scored without the event axis, so only their p-values compare with built rows); `rank_by` now defaults to `None` (the pattern's own score). Options that recompute a distance from the shape-space `delta` or use θ as the boundary (`radius`, `metric="Linf"`, `dimension_weights`, `rank_by="delta_norm"` / `"signed_confidence"`, `boundary_aware`, `min_confidence > 0`) raise `ValueError` there. Event, GMM and discrete patterns keep `delta_norm` against θ, with a conformal p-value on `delta_norm`.
+- `fdr_alpha` on `find_anomalies` is now the level of the cell gate only and requires `fdr_resolution` or `fdr_temporal_resolution`; `fdr_method` defaults to `"storey"`.
+- `delta`, `delta_norm`, μ, σ and θ keep their shape-space meaning — the stored `delta` is always the per-dimension z-score. On calibrated patterns θ is no longer the anomaly boundary.
+- `score_rank_pct` replaces `delta_rank_pct` everywhere (geometry column, `Polygon` field, `geometry_filters` key, borderline passive-scan source); it is the population rank of the anomaly score. `recompute_delta_rank_pct` is renamed `recompute_score_rank_pct`.
+- Multi-detector consensus combines the stored conformal p-values.
+- Rankings change for every continuous anchor pattern; rebuild and re-check saved thresholds or top-K lists.
+- **Spark and frozen scoring use the calibrated score.** The `hypertopos.spark` result columns are now `entity, anomaly_score, is_anomaly, p_value, score_rank_pct, delta_norm, top_reasons` (plus the group column and `calibration_scope` with `group_by`): `rank_pct` is renamed `score_rank_pct`, `anomaly_score` is added and is the ranking column, and `p_value` is the conformal p-value of the score. With `group_by` the flags are global; only `delta_norm` and the reasons stay group-relative. `hypertopos.scoring.Scores` carries `anomaly_score, conformal_p, score_rank_pct, is_anomaly, delta, delta_norm, calibration_scope`; `FrozenCalibration` gains `reference`, loses `theta_norm` and `population_norms`, and `row_params` returns `(mu, sigma, scope)`. The Spark CLI `--show` orders by `anomaly_score`. Patterns built from a YAML metric block also get the score layer.
+- At the 99th percentile a population needs about 100 entities before anything can be flagged — the smallest conformal p-value is `1/(n+1)`.
+- `anomaly_summary`, `aggregate_anomalies`, `sphere_overview`, `detect_data_quality_issues` and `compare_branches` count a calibrated pattern's anomalies by its stored `is_anomaly` — the set `find_anomalies` selects; `sphere_overview` reports `anomaly_rate_source: "is_anomaly"` there. On a calibrated pattern `compare_branches` explains flips on `anomaly_score`, ranks `top_movers` by the change of evidence bits (`−log2 conformal_p`) and adds `anomaly_score_from` / `anomaly_score_to` and `evidence_change` to each row, and `theta_from` / `theta_to` are the lowest flagged score on each side; the θ-ceiling data-quality check is skipped.
+- `simulate_dimension_change` on a calibrated pattern takes natural values of score dimensions (other dimensions raise) and rescores them against the stored reference; the result is the calibrated layer: `anomaly_score_before/after`, `conformal_p_before/after`, `held_axes`, `top_dimensions_after` and `dimensions_overridden` in natural values. `find_diverse_explanations(validate=True)` neutralises score dimensions at their reference median and reports `conformal_p_after_override`.
+- On a calibrated pattern `find_anomalies` (π5) polygons carry `anomaly_dimensions` (`{dim, z, mahal_share}`) and `reliability_flags` from the Shapley split of the `mahal` evidence — the dimensions `explain_anomaly` names.
+- `find_calibration_influencers` raises `ValueError` on a calibrated pattern: its classes are flips of the θ verdict, and no single entity can mask itself in the rank-based reference.
+- `passive_scan` with `scoring="weighted"` scores direct, sibling and borderline sources of a calibrated pattern on its alarm budget, `anomaly_intensity = log(conformal_p) / log(alpha)`, so an entity flagged by the budget counts at least 1.
+- `find_anomalies(include_emerging=True)` returns no emerging entities on a calibrated pattern: the forecast tracks `delta_norm` against θ, which does not decide the flag there.
+- Spark `top_reasons` and `explain` attribute the calibrated `anomaly_score`: `pct_of_total` is each dimension's Shapley share of the score's Mahalanobis evidence (the split `explain_anomaly` reports on a sphere) instead of its share of `delta_norm²`; `delta` is unchanged. Spark scores on the Mahalanobis axis only, so a sphere built from the same events with an event pattern, which also scores event motion, can give different scores and p-values.
+
+### Removed
+
+- `use_mahalanobis` pattern option — the YAML key is rejected; the `mahal` axis of the calibrated score replaces it.
+- Entity-level and per-dimension FDR on anomaly results: `find_anomalies` loses `p_value_method`, `fdr_axis` and `rank_by="min_q_per_dim"`, and no longer returns `q_value`, `q_values_per_dim`, `min_q_per_dim` or `dominant_q_dim_idx`; `attract_boundary` (π6) loses `fdr_alpha`, `fdr_method` and `p_value_method`. The conformal p-values of the fitted population are its own ranks, so an entity-level FDR cut cannot reject beyond the alarm budget; the cell gate stays.
+- The anomaly χ² p-values, and the build diagnostics that only served them (per-dimension normality p-values, the heteroscedasticity check).
+- `anomaly_confidence` is not computed on calibrated patterns.
+- `Pattern.dim_normality_pvalues`, `Pattern.heteroscedasticity_diagnostic`, `CalibrationFit.dim_normality_pvalues`, and the `non_normal_dim` / `heteroscedasticity` warnings of `sphere_overview` and `sphere validate`.
+
+### Fixed
+
+- `combine_anomaly_pvalues` scores every entity over the same detector family: a detector that cannot score an entity (an account without graph neighbours) counts as no evidence instead of raising the weight of the entity's other detectors, so isolated entities no longer outrank connected ones. Per-detector p-values are floored at the population's resolution `1/(N+1)`, so a segment-level test cannot tie a whole segment. `composite_risk` reports `combined_p` unrounded.
+- Building a sphere whose edge-table timestamp column is in nanoseconds no longer fails with `Integer value ... not in range`; timestamps of every unit convert to epoch seconds.
+
 ## [0.9.3] — 2026-10-26
 
 ### Added

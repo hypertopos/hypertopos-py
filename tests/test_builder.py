@@ -369,7 +369,7 @@ def test_compute_stats_basic():
         ],
         dtype=np.float32,
     )
-    mu, sigma, theta, _, _, _ = compute_stats(shape_vectors, anomaly_percentile=95.0)
+    mu, sigma, theta, _, _ = compute_stats(shape_vectors, anomaly_percentile=95.0)
     assert mu.shape == (2,)
     assert sigma.shape == (2,)
     assert theta.shape == (2,)
@@ -388,7 +388,7 @@ def test_compute_stats_theta_at_percentile():
     normal = np.ones((95, 3), dtype=np.float32)
     anomalous = np.zeros((5, 3), dtype=np.float32)
     shape_vectors = np.vstack([normal, anomalous])
-    mu, sigma, theta, _, _, _ = compute_stats(shape_vectors, anomaly_percentile=95.0)
+    mu, sigma, theta, _, _ = compute_stats(shape_vectors, anomaly_percentile=95.0)
     theta_norm = float(np.linalg.norm(theta))
     deltas = (shape_vectors - mu) / np.maximum(sigma, 1e-2)
     norms = np.linalg.norm(deltas, axis=1)
@@ -886,8 +886,8 @@ def test_builder_zero_theta_no_anomalies(tmp_path):
     )
 
 
-def test_delta_rank_pct_minimum_norm_gets_zero_percentile():
-    """Entity with the minimum delta_norm must get delta_rank_pct=0, not 100.
+def test_score_rank_pct_minimum_norm_gets_zero_percentile():
+    """Entity with the minimum delta_norm must get score_rank_pct=0, not 100.
 
     When ALL entities have delta_norm=0.0, each entity is at the minimum.
     Expected: pct=0 (0% of entities have lower norm than 0.0).
@@ -902,7 +902,7 @@ def test_delta_rank_pct_minimum_norm_gets_zero_percentile():
     assert (pcts == 0.0).all(), f"Expected all 0.0 pct for all-zero norms, got {pcts}"
 
 
-def test_delta_rank_pct_distinct_norms_ranked_correctly():
+def test_score_rank_pct_distinct_norms_ranked_correctly():
     """Distinct delta_norms must produce strictly increasing percentile ranks.
 
     Minimum entity gets pct=0, each next entity gets a strictly higher percentile.
@@ -920,19 +920,19 @@ def test_delta_rank_pct_distinct_norms_ranked_correctly():
     )
 
 
-def test_delta_rank_pct_consistent_after_two_builds(tmp_path):
-    """Entities built in a second pass must get globally-consistent delta_rank_pct.
+def test_score_rank_pct_consistent_after_two_builds(tmp_path):
+    """Entities built in a second pass must get globally-consistent score_rank_pct.
 
     Without the fix, entities added in a second append batch get their percentile
     computed only against that small batch — so the entity with the highest delta_norm
-    in the batch receives delta_rank_pct=100.0 even if it is mid-population globally.
-    With the fix, recompute_delta_rank_pct re-ranks all entities against the full population.
+    in the batch receives score_rank_pct=100.0 even if it is mid-population globally.
+    With the fix, recompute_score_rank_pct re-ranks all entities against the full population.
 
     Setup:
     - First batch: 10 GL entries, 8 have a customer FK (low delta), 2 do not (high delta).
     - Second batch (append): 1 synthetic row with a mid-range delta_norm (0.3) explicitly
-      written with delta_rank_pct=100.0 to simulate the per-batch bug.
-    - After recompute: C-NEW must have delta_rank_pct well below 100.0.
+      written with score_rank_pct=100.0 to simulate the per-batch bug.
+    - After recompute: C-NEW must have score_rank_pct well below 100.0.
     """
     from datetime import UTC, datetime
 
@@ -987,9 +987,12 @@ def test_delta_rank_pct_consistent_after_two_builds(tmp_path):
             "scale": pa.array([1], type=pa.int32()),
             "delta": pa.array([[mid_norm]], type=pa.list_(pa.float32())),
             "delta_norm": pa.array([mid_norm], type=pa.float32()),
-            "delta_rank_pct": pa.array([100.0], type=pa.float32()),  # bad pre-fix value
+            "score_rank_pct": pa.array([100.0], type=pa.float32()),  # bad pre-fix value
             "is_anomaly": pa.array([False], type=pa.bool_()),
             "conformal_p": pa.array([0.5], type=pa.float32()),
+            "anomaly_score": pa.array([mid_norm], type=pa.float64()),
+            "axis_ranks": pa.nulls(1, type=pa.list_(pa.float32())),
+            "score_delta": pa.nulls(1, type=pa.list_(pa.float32())),
             "bregman_divergence": pa.array([0.0], type=pa.float32()),
             "anomaly_confidence": pa.array([0.0], type=pa.float32()),
             "n_anomalous_dims": pa.array([0], type=pa.int32()),
@@ -1000,30 +1003,30 @@ def test_delta_rank_pct_consistent_after_two_builds(tmp_path):
         },
         schema=GEOMETRY_EVENT_SCHEMA,
     )
-    # append_geometry automatically recomputes delta_rank_pct globally
+    # append_geometry automatically recomputes score_rank_pct globally
     writer.append_geometry(new_row, "gp")
 
     # After fix: verify global consistency
     tbl_fixed = lance.dataset(str(geo_path)).to_table(
-        columns=["primary_key", "delta_rank_pct", "delta_norm"]
+        columns=["primary_key", "score_rank_pct", "delta_norm"]
     )
     pct_fixed = {
-        tbl_fixed["primary_key"][i].as_py(): tbl_fixed["delta_rank_pct"][i].as_py()
+        tbl_fixed["primary_key"][i].as_py(): tbl_fixed["score_rank_pct"][i].as_py()
         for i in range(tbl_fixed.num_rows)
     }
     norm_fixed = {
         tbl_fixed["primary_key"][i].as_py(): tbl_fixed["delta_norm"][i].as_py()
         for i in range(tbl_fixed.num_rows)
     }
-    # The entity with the global maximum norm must have the highest delta_rank_pct.
+    # The entity with the global maximum norm must have the highest score_rank_pct.
     # With side="left" searchsorted the maximum entity gets rank=(n-1), so pct=(n-1)/n*100 < 100.
     max_norm_key = max(norm_fixed, key=norm_fixed.__getitem__)
     assert pct_fixed[max_norm_key] == max(pct_fixed.values()), (
-        f"Entity with global max delta_norm ({max_norm_key}) must have the highest delta_rank_pct"
+        f"Entity with global max delta_norm ({max_norm_key}) must have the highest score_rank_pct"
     )
     # C-NEW (mid-range norm) must NOT be ranked at the top after global recompute
     assert pct_fixed["C-NEW"] < 99.0, (
-        f"After fix: C-NEW (mid-range norm) must have delta_rank_pct < 99.0, "
+        f"After fix: C-NEW (mid-range norm) must have score_rank_pct < 99.0, "
         f"got {pct_fixed['C-NEW']:.1f}"
     )
 
@@ -1366,7 +1369,7 @@ def test_streaming_stats_match_full_population(tmp_path, monkeypatch):
     def _sorted_geo(geo):
         keys = geo["primary_key"].to_pylist()
         norms = geo["delta_norm"].to_pylist()
-        ranks = geo["delta_rank_pct"].to_pylist()
+        ranks = geo["score_rank_pct"].to_pylist()
         anomaly = geo["is_anomaly"].to_pylist()
         order = sorted(range(len(keys)), key=lambda i: keys[i])
         return (
@@ -1384,7 +1387,7 @@ def test_streaming_stats_match_full_population(tmp_path, monkeypatch):
         norms_a, norms_b, atol=1e-4, rtol=1e-4, err_msg="delta_norm mismatch"
     )
     np.testing.assert_allclose(
-        ranks_a, ranks_b, atol=1e-2, rtol=1e-2, err_msg="delta_rank_pct mismatch"
+        ranks_a, ranks_b, atol=1e-2, rtol=1e-2, err_msg="score_rank_pct mismatch"
     )
     assert anom_a == anom_b, "is_anomaly flags differ"
 
@@ -1706,106 +1709,6 @@ def test_streaming_complex_mode_falls_back_to_chunked(tmp_path, monkeypatch):
         assert mock_chunked.call_count == 1, (
             "Complex mode (group_by) must use _build_and_write_chunked"
         )
-
-
-def test_heteroscedasticity_diagnostic_persisted_when_group_by_property(tmp_path):
-    """Patterns with `group_by_property` get a Brown-Forsythe Levene
-    entry persisted into sphere.json under
-    `heteroscedasticity_diagnostic`, keyed by the grouping column name.
-    Engineered anchor-pattern fixture: customers carry an `event_count`
-    numeric column whose distribution differs sharply by region — region
-    `high` is N(50, 30) tailed, regions `low_1`/`low_2` are N(20, 3).
-    The `edge_max` relation turns those counts into delta vector entries,
-    so delta_norm variance differs by region ⇒ Levene p ≪ 0.01."""
-    import json
-
-    rng = np.random.default_rng(42)
-
-    customers: list[dict] = []
-    cust_id = 0
-    for region_label, mean_count, std_count in (
-        ("low_1", 20, 3),
-        ("low_2", 20, 3),
-        ("high", 50, 30),
-    ):
-        for _ in range(100):
-            event_count = max(0, int(rng.normal(mean_count, std_count)))
-            customers.append(
-                {
-                    "cust_id": f"C-{cust_id:04d}",
-                    "region": region_label,
-                    "event_count": event_count,
-                }
-            )
-            cust_id += 1
-
-    out_path = tmp_path / "gds_het"
-    b = GDSBuilder("het_test", str(out_path))
-    b.add_line(
-        "customers",
-        customers,
-        key_col="cust_id",
-        source_id="test",
-    )
-    b.add_pattern(
-        "cust_pat",
-        pattern_type="anchor",
-        entity_line="customers",
-        relations=[
-            RelationSpec(
-                "customers",
-                fk_col="event_count",
-                direction="in",
-                edge_max=100,
-            ),
-        ],
-        group_by_property="region",
-        anomaly_percentile=95.0,
-    )
-    b.build()
-
-    sphere_json_path = out_path / "_gds_meta" / "sphere.json"
-    with open(sphere_json_path) as f:
-        sphere = json.load(f)
-    pat_node = sphere["patterns"]["cust_pat"]
-    assert "heteroscedasticity_diagnostic" in pat_node, (
-        "heteroscedasticity_diagnostic missing on a pattern that carries "
-        "group_by_property — diagnostic was not threaded through "
-        "PopulationStats / PatternBuildResult / sphere.json writer"
-    )
-    diag = pat_node["heteroscedasticity_diagnostic"]
-    assert "region" in diag
-    entry = diag["region"]
-    assert entry["k_groups"] == 3
-    assert entry["skipped_groups_low_n"] == 0
-    assert entry["W_statistic"] is not None
-    assert entry["p_value"] is not None
-    assert set(entry["per_group_n"].keys()) == {"low_1", "low_2", "high"}
-    # Engineered fixture: high-region std ~10x low-region std ⇒ Levene
-    # must reject equal-variance well below the 0.01 warning threshold.
-    assert entry["p_value"] < 0.01
-
-    # Round-trip: reopen the sphere and verify the warning surfaces via
-    # sphere_overview's dim_quality_warnings block — proves the
-    # build → sphere.json → reader → Pattern → navigator chain.
-    from hypertopos.sphere import HyperSphere
-
-    sphere_obj = HyperSphere.open(str(out_path))
-    session = sphere_obj.session(agent_id="het_test")
-    nav = session.navigator()
-    entries = nav.sphere_overview()
-    pat_entry = next(e for e in entries if e["pattern_id"] == "cust_pat")
-    het = [
-        w for w in pat_entry.get("dim_quality_warnings", []) if w["type"] == "heteroscedasticity"
-    ]
-    assert len(het) == 1, (
-        "heteroscedasticity warning missing from sphere_overview — the "
-        "field round-trip from sphere.json → reader → Pattern → navigator "
-        "is broken"
-    )
-    assert het[0]["dim_label"] == "region"
-    assert het[0]["threshold"] == 0.01
-    assert het[0]["evidence_value"] < 0.01
 
 
 def test_welford_batch_update_accuracy():

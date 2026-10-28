@@ -134,7 +134,7 @@ class TestWriteLanceGeometryAutoStats:
                 "scale": pa.array([1] * n, type=pa.int32()),
                 "delta": [[float(i), float(i)] for i in range(n)],
                 "delta_norm": delta_norms.tolist(),
-                "delta_rank_pct": np.linspace(0, 100, n, dtype=np.float32).tolist(),
+                "score_rank_pct": np.linspace(0, 100, n, dtype=np.float32).tolist(),
                 "is_anomaly": [bool(v > 5.0) for v in delta_norms],
                 "edges": pa.array([[]] * n, type=pa.list_(edge_struct_type)),
                 "last_refresh_at": [ts] * n,

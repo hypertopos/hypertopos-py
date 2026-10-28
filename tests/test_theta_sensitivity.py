@@ -3,7 +3,7 @@
 These functions characterise how stable the anomaly threshold (`theta`) is
 to perturbations of the `anomaly_percentile` parameter. The cheap path is
 wired into `_BuildState._compute_population_stats` (glued onto the existing
-`sorted_norms` for `delta_rank_pcts`) and populates the `theta_sensitivity`
+`sorted_norms` for `score_rank_pcts`) and populates the `theta_sensitivity`
 field on `CalibrationFit`.
 
 Tests cover:

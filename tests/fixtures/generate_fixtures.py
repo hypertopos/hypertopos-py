@@ -28,7 +28,7 @@ def _write_lance(path: Path, table: pa.Table) -> None:
 def generate_sphere_json() -> None:
     sphere = {
         "sphere_id": "sales_sphere",
-        "format_version": "3.0",
+        "format_version": "4.0",
         "name": "Sales Sphere",
         "lines": {
             "customers": {
@@ -135,8 +135,9 @@ def generate_geometry() -> None:
             pa.field("scale", pa.int32()),
             pa.field("delta", pa.list_(pa.float32())),
             pa.field("delta_norm", pa.float32()),
-            pa.field("delta_rank_pct", pa.float32()),
+            pa.field("score_rank_pct", pa.float32()),
             pa.field("is_anomaly", pa.bool_()),
+            pa.field("anomaly_score", pa.float64()),
             pa.field("edges", pa.list_(edge_struct_type)),
             pa.field("last_refresh_at", pa.timestamp("us", tz="UTC")),
             pa.field("updated_at", pa.timestamp("us", tz="UTC")),
@@ -157,15 +158,17 @@ def generate_geometry() -> None:
     delta_norms_raw = np.array([11.18, 2.01], dtype=np.float32)
     sorted_norms = np.sort(delta_norms_raw)
     ranks = np.searchsorted(sorted_norms, delta_norms_raw, side="right")
-    delta_rank_pcts = (ranks / len(delta_norms_raw) * 100).astype(np.float32)
+    score_rank_pcts = (ranks / len(delta_norms_raw) * 100).astype(np.float32)
     table = pa.table(
         {
             "primary_key": ["CUST-001", "CUST-002"],
             "scale": [1, 1],
             "delta": [[10.0, 5.0], [1.5, -1.333333]],
             "delta_norm": delta_norms_raw.tolist(),
-            "delta_rank_pct": delta_rank_pcts.tolist(),
+            "score_rank_pct": score_rank_pcts.tolist(),
             "is_anomaly": [True, False],
+            # A delta_norm-scored fixture pattern: anomaly_score == delta_norm.
+            "anomaly_score": delta_norms_raw.astype(np.float64).tolist(),
             "edges": pa.array([edges_001, edges_002], type=pa.list_(edge_struct_type)),
             "last_refresh_at": [ts, ts],
             "updated_at": [ts, ts],

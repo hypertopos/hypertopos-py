@@ -182,7 +182,7 @@ def main() -> None:
         "--finalize",
         action="store_true",
         help=(
-            "Recompute the global delta_rank_pct and rebuild the ANN index once "
+            "Recompute the global score_rank_pct and rebuild the ANN index once "
             "after the append (use at the end of a batched ingest session)"
         ),
     )

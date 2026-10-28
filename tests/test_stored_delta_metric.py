@@ -49,7 +49,6 @@ def _prop_table(keys: list[str], seed: int) -> pa.Table:
 def _build(
     tmp_path: Path,
     *,
-    use_mahalanobis: bool = False,
     weights: list[float] | None = None,
     anomaly_percentile: float = 95.0,
 ) -> tuple[str, pa.Table]:
@@ -62,7 +61,6 @@ def _build(
         entity_line="items",
         relations=[],
         tracked_properties=PROPS,
-        use_mahalanobis=use_mahalanobis,
         dimension_weights=weights,
         bootstrap_iterations=0,
         anomaly_percentile=anomaly_percentile,
@@ -110,21 +108,14 @@ def _assert_consistent(sphere_path: str, shapes: dict[str, np.ndarray]) -> None:
     np.testing.assert_array_equal(anom, norms >= pattern.theta_norm)
 
 
-def test_build_prop_columns_with_mahalanobis_stores_saved_metric(tmp_path: Path) -> None:
-    sphere_path, table = _build(tmp_path, use_mahalanobis=True)
-    pattern = _pattern(sphere_path)
-    assert pattern.cholesky_inv is not None
-    _assert_consistent(sphere_path, _shapes(table, pattern))
-
-
 @pytest.mark.parametrize(
-    ("use_mahalanobis", "weights"),
-    [(True, None), (False, [2.0, 0.5, 1.5]), (True, [2.0, 0.5, 1.5])],
+    "weights",
+    [None, [2.0, 0.5, 1.5]],
 )
 def test_incremental_update_stores_saved_metric(
-    tmp_path: Path, use_mahalanobis: bool, weights: list[float] | None
+    tmp_path: Path, weights: list[float] | None
 ) -> None:
-    sphere_path, table = _build(tmp_path, use_mahalanobis=use_mahalanobis, weights=weights)
+    sphere_path, table = _build(tmp_path, weights=weights)
     new = _prop_table([f"n_{i}" for i in range(12)], seed=11).rename_columns(
         ["primary_key", *PROPS]
     )
@@ -138,20 +129,17 @@ def test_incremental_update_stores_saved_metric(
 
 
 @pytest.mark.parametrize(
-    ("use_mahalanobis", "weights"),
-    [(True, None), (False, [2.0, 0.5, 1.5]), (True, [2.0, 0.5, 1.5])],
+    "weights",
+    [None, [2.0, 0.5, 1.5]],
 )
-def test_recalibrate_stores_saved_metric(
-    tmp_path: Path, use_mahalanobis: bool, weights: list[float] | None
-) -> None:
+def test_recalibrate_stores_saved_metric(tmp_path: Path, weights: list[float] | None) -> None:
     from hypertopos.sphere import HyperSphere
 
-    sphere_path, table = _build(tmp_path, use_mahalanobis=use_mahalanobis, weights=weights)
+    sphere_path, table = _build(tmp_path, weights=weights)
     before = _pattern(sphere_path)
     shapes = _shapes(table, before)
     HyperSphere.open(sphere_path).session("test").recalibrate(PID)
     after = _pattern(sphere_path)
-    assert (after.cholesky_inv is not None) == use_mahalanobis
     if weights is not None:
         assert after.dimension_weights is not None
         np.testing.assert_allclose(after.dimension_weights, weights)

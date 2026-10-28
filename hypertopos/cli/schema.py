@@ -18,6 +18,8 @@ from typing import Any, Literal, cast
 
 import yaml
 
+from hypertopos.engine.robust import AXES_DEFAULT
+
 # ── valid enum values ────────────────────────────────────────────────
 
 _VALID_ROLES: frozenset[str] = frozenset({"anchor", "event", "context"})
@@ -86,7 +88,7 @@ _PATTERN_KEYS = frozenset(
         "gmm_n_components",
         "group_by_property",
         "tracked_properties",
-        "use_mahalanobis",
+        "score_axes",
         "description",
         "geo_properties",
         "metric_properties",
@@ -256,7 +258,7 @@ class PatternConfig:
     gmm_n_components: int | None = None
     group_by_property: str | None = None
     tracked_properties: list[str] | None = None
-    use_mahalanobis: bool = False
+    score_axes: list[str] = field(default_factory=lambda: list(AXES_DEFAULT))
     description: str | None = None
     # --- Generalized dimension blocks ---
     geo_properties: list[str] | None = None
@@ -660,6 +662,13 @@ def _parse_one_pattern(
     lines: dict[str, LineConfig],
     _composite_line_ids: set[str],
 ) -> PatternConfig:
+    from hypertopos.builder.builder import validate_score_axes
+
+    if "use_mahalanobis" in spec:
+        raise ValueError(
+            f"Pattern '{pid}': use_mahalanobis is no longer supported — the "
+            "Mahalanobis distance is part of the default score; remove the key"
+        )
     _warn_unknown_keys(f"Pattern '{pid}'", spec, _PATTERN_KEYS)
     entity_line = spec.get("entity_line")
     if not entity_line:
@@ -836,17 +845,14 @@ def _parse_one_pattern(
             f"Pattern '{pid}' conformance_rules must be a list, "
             f"got {type(conformance_rules_raw).__name__}"
         )
-    if spec.get("use_mahalanobis") and spec.get("group_by_property"):
-        # Grouped calibration standardises per group with diagonal sigma; the
-        # full-covariance metric would be silently dropped.
+    raw_axes = spec.get("score_axes")
+    if raw_axes is not None and not isinstance(raw_axes, list):
         raise ValueError(
-            f"Pattern '{pid}': use_mahalanobis cannot be combined with group_by_property "
-            "— remove one of the two options"
+            f"Pattern '{pid}' score_axes must be a list, got {type(raw_axes).__name__}"
         )
-    if spec.get("use_mahalanobis") and isinstance(dim_weights, list):
-        from hypertopos.builder._stats import validate_mahalanobis_weights
-
-        validate_mahalanobis_weights(pid, dim_weights)
+    score_axes = list(
+        validate_score_axes(pid, [str(a) for a in raw_axes] if raw_axes is not None else None)
+    )
 
     return PatternConfig(
         type=cast(Literal["anchor", "event"], ptype),  # validated above
@@ -862,7 +868,7 @@ def _parse_one_pattern(
         gmm_n_components=spec.get("gmm_n_components"),
         group_by_property=spec.get("group_by_property"),
         tracked_properties=spec.get("tracked_properties"),
-        use_mahalanobis=bool(spec.get("use_mahalanobis", False)),
+        score_axes=score_axes,
         description=spec.get("description"),
         geo_properties=geo_props,
         metric_properties=metric_props,

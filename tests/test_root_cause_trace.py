@@ -458,13 +458,13 @@ class TestTraceRootCauseRecursion:
                 return {
                     "incoming": [],
                     "outgoing": [
-                        {"primary_key": "ACC-B", "is_anomaly": True, "delta_rank_pct": 99.5},
+                        {"primary_key": "ACC-B", "is_anomaly": True, "score_rank_pct": 99.5},
                     ],
                 }
             return {
                 "incoming": [],
                 "outgoing": [
-                    {"primary_key": "ACC-ROOT", "is_anomaly": True, "delta_rank_pct": 99.5},
+                    {"primary_key": "ACC-ROOT", "is_anomaly": True, "score_rank_pct": 99.5},
                 ],
             }
 
@@ -558,13 +558,13 @@ class TestTraceRootCauseQualityFixes:
             lambda self, pk, line_id, from_col, to_col, **kw: {
                 "incoming": [],
                 "outgoing": [
-                    {"primary_key": "HIGH_VOL", "is_anomaly": False, "delta_rank_pct": 50.0},
-                    {"primary_key": "HIGHER_VOL", "is_anomaly": False, "delta_rank_pct": 60.0},
-                    {"primary_key": "LOW_VOL_ANOM", "is_anomaly": True, "delta_rank_pct": 99.5},
+                    {"primary_key": "HIGH_VOL", "is_anomaly": False, "score_rank_pct": 50.0},
+                    {"primary_key": "HIGHER_VOL", "is_anomaly": False, "score_rank_pct": 60.0},
+                    {"primary_key": "LOW_VOL_ANOM", "is_anomaly": True, "score_rank_pct": 99.5},
                     {
                         "primary_key": "LOW_VOL_ANOM_WEAK",
                         "is_anomaly": True,
-                        "delta_rank_pct": 90.0,
+                        "score_rank_pct": 90.0,
                     },
                 ],
             },
@@ -607,8 +607,8 @@ class TestTraceRootCauseQualityFixes:
                 "incoming": [],
                 "outgoing": [
                     {"primary_key": "CP1", "is_anomaly": False},
-                    {"primary_key": "CP2", "is_anomaly": True, "delta_rank_pct": 98.0},
-                    {"primary_key": "CP3", "is_anomaly": True, "delta_rank_pct": 99.0},
+                    {"primary_key": "CP2", "is_anomaly": True, "score_rank_pct": 98.0},
+                    {"primary_key": "CP3", "is_anomaly": True, "score_rank_pct": 99.0},
                     {"primary_key": "CP4", "is_anomaly": False},
                 ],
             },
@@ -702,7 +702,7 @@ class TestTraceRootCauseQualityFixes:
             lambda self, pk, line_id, from_col, to_col, **kw: {
                 "incoming": [],
                 "outgoing": [
-                    {"primary_key": "ANOM_CP", "is_anomaly": True, "delta_rank_pct": 99.95},
+                    {"primary_key": "ANOM_CP", "is_anomaly": True, "score_rank_pct": 99.95},
                 ],
             },
         )
@@ -894,7 +894,7 @@ class TestTraceRootCauseQualityFixes:
                     {
                         "primary_key": f"ACC-CHAIN-{chain_depth['n']}",
                         "is_anomaly": True,
-                        "delta_rank_pct": 99.9,
+                        "score_rank_pct": 99.9,
                     },
                 ],
             }
@@ -1040,9 +1040,9 @@ class TestTraceRootCauseQualityFixes:
             "find_counterparties",
             lambda self, pk, line_id, from_col, to_col, **kw: {
                 "outgoing": [
-                    {"primary_key": "ANOM1", "is_anomaly": True, "delta_rank_pct": 99.9},
-                    {"primary_key": "ANOM2", "is_anomaly": True, "delta_rank_pct": 99.5},
-                    {"primary_key": "ANOM3", "is_anomaly": True, "delta_rank_pct": 99.0},
+                    {"primary_key": "ANOM1", "is_anomaly": True, "score_rank_pct": 99.9},
+                    {"primary_key": "ANOM2", "is_anomaly": True, "score_rank_pct": 99.5},
+                    {"primary_key": "ANOM3", "is_anomaly": True, "score_rank_pct": 99.0},
                 ],
                 "incoming": [],
             },
@@ -1091,7 +1091,7 @@ class TestTraceRootCauseQualityFixes:
             lambda self, pk, line_id, from_col, to_col, **kw: (
                 {
                     "outgoing": [
-                        {"primary_key": "ANOM1", "is_anomaly": True, "delta_rank_pct": 99.5},
+                        {"primary_key": "ANOM1", "is_anomaly": True, "score_rank_pct": 99.5},
                     ],
                     "incoming": [],
                 }
@@ -1105,7 +1105,7 @@ class TestTraceRootCauseQualityFixes:
         edge_cps = [c for c in result["root"]["children"] if c["role"] == "edge_counterparty"]
         assert len(edge_cps) == 1
         assert "witness_counterparty_delta_norm" not in edge_cps[0]["evidence"]
-        assert "witness_counterparty_delta_rank_pct" in edge_cps[0]["evidence"]
+        assert "witness_counterparty_score_rank_pct" in edge_cps[0]["evidence"]
 
     def test_contagion_and_cps_cache_within_single_call(self, monkeypatch):
         """contagion_score and find_counterparties are called at most ONCE per entity
@@ -1127,7 +1127,7 @@ class TestTraceRootCauseQualityFixes:
             if pk == "ACC-1":
                 return {
                     "outgoing": [
-                        {"primary_key": "ACC-2", "is_anomaly": True, "delta_rank_pct": 99.0},
+                        {"primary_key": "ACC-2", "is_anomaly": True, "score_rank_pct": 99.0},
                     ],
                     "incoming": [],
                 }
@@ -1208,8 +1208,8 @@ class TestTraceRootCauseQualityFixes:
             "find_counterparties",
             lambda self, pk, line_id, from_col, to_col, **kw: {
                 "outgoing": [
-                    {"primary_key": "ACC-1", "is_anomaly": True, "delta_rank_pct": 99.0},
-                    {"primary_key": "ACC-2", "is_anomaly": True, "delta_rank_pct": 98.0},
+                    {"primary_key": "ACC-1", "is_anomaly": True, "score_rank_pct": 99.0},
+                    {"primary_key": "ACC-2", "is_anomaly": True, "score_rank_pct": 98.0},
                 ],
                 "incoming": [],
             },
@@ -1259,7 +1259,7 @@ class TestTraceRootCauseQualityFixes:
             if pk == "ACC-A":
                 return {
                     "outgoing": [
-                        {"primary_key": "ACC-B", "is_anomaly": True, "delta_rank_pct": 99.0}
+                        {"primary_key": "ACC-B", "is_anomaly": True, "score_rank_pct": 99.0}
                     ],
                     "incoming": [],
                 }
@@ -1429,7 +1429,7 @@ class TestTraceRootCauseQualityFixes:
             lambda self, pk, line_id, from_col, to_col, **kw: (
                 {
                     "outgoing": [
-                        {"primary_key": "ANOM_CP", "is_anomaly": True, "delta_rank_pct": 99.5},
+                        {"primary_key": "ANOM_CP", "is_anomaly": True, "score_rank_pct": 99.5},
                     ],
                     "incoming": [],
                 }
@@ -1489,7 +1489,7 @@ class TestTraceRootCauseQualityFixes:
             lambda self, pk, line_id, from_col, to_col, **kw: (
                 {
                     "outgoing": [
-                        {"primary_key": "ANOM_CP", "is_anomaly": True, "delta_rank_pct": 99.5},
+                        {"primary_key": "ANOM_CP", "is_anomaly": True, "score_rank_pct": 99.5},
                     ],
                     "incoming": [],
                 }
@@ -1573,7 +1573,7 @@ class TestTraceRootCauseQualityFixes:
             lambda self, pk, line_id, from_col, to_col, **kw: (
                 {
                     "outgoing": [
-                        {"primary_key": "X", "is_anomaly": True, "delta_rank_pct": 99.0},
+                        {"primary_key": "X", "is_anomaly": True, "score_rank_pct": 99.0},
                     ],
                     "incoming": [],
                 }

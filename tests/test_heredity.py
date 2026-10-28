@@ -121,7 +121,7 @@ def _build_edge_sphere(tmp_path: Path) -> Path:
     # sphere.json
     sphere = {
         "sphere_id": "heredity_test",
-        "format_version": "3.0",
+        "format_version": "4.0",
         "name": "Heredity Test Sphere",
         "lines": {
             "accounts": {
@@ -217,7 +217,7 @@ def _build_edge_sphere(tmp_path: Path) -> Path:
             "scale": [1, 1, 1, 1, 1],
             "delta": list(deltas),
             "delta_norm": pa.array(delta_norms, type=pa.float32()),
-            "delta_rank_pct": pa.array(rank_pcts, type=pa.float32()),
+            "score_rank_pct": pa.array(rank_pcts, type=pa.float32()),
             "is_anomaly": is_anomaly,
             "edges": pa.array(empty_edges, type=pa.list_(edge_struct_type)),
             "last_refresh_at": [ts] * 5,

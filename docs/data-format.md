@@ -21,6 +21,9 @@ gds_{sphere_id}/
 │   ├── edge_features/           # per-edge derived dim sidecar (event patterns with edge_dimensions: in YAML)
 │   │   └── {pattern_id}/
 │   │       └── data.lance       # event_key + 5 dim columns; same values baked into polygon shape
+│   ├── reference/               # calibrated-score reference per pattern per calibration epoch
+│   │   └── {pattern_id}/
+│   │       └── v={epoch}.npz    # CDF sketches, Ledoit–Wolf location/precision, event halves, velocity-field sample, optional kNN sample + basis, sorted calibration scores
 │   ├── contagion_stats/         # per-pattern (primary_key, neighbor_count, anomalous_neighbor_count, contagion_ratio) — feeds the graph contagion scanner directly, BTREE-indexed on primary_key
 │   └── branches/                # one directory per sphere branch (see "Branches" below)
 │       └── {branch}/
@@ -81,12 +84,12 @@ The central config file. Loaded once on `open_sphere` (typically a few KB). Cont
 | Field | Type | Description |
 |-------|------|-------------|
 | `sphere_id` | string | Unique sphere identifier |
-| `format_version` | string | On-disk layout version, written as `"<major>.<minor>"`. Major `3` is required; minor bumps (e.g. `"3.1"`) ride a backward-compatible field addition and load on any major-3 reader. Pre-3.x and malformed values are rejected with a rebuild hint. |
+| `format_version` | string | On-disk layout version, written as `"<major>.<minor>"`. Major `4` is required (the calibrated evidence score layer); minor bumps (e.g. `"4.1"`) ride a backward-compatible field addition and load on any major-4 reader. Pre-4.x and malformed values are rejected with a rebuild hint — rebuild the sphere from source. |
 | `lines` | dict | Line definitions: versions, columns, partition config, descriptions |
-| `patterns` | dict | Pattern stats: `mu`, `sigma_diag`, `theta`, `edge_max`, `dimension_weights`, `group_stats` |
+| `patterns` | dict | Pattern stats: `mu`, `sigma_diag`, `theta`, `edge_max`, `dimension_weights`, `group_stats`, `anomaly_percentile`; calibrated patterns add `score_dims` (scored dimensions), `score_axes` (fitted axes, order of `axis_ranks`) and `reference_epoch` (epoch of the file under `_gds_meta/reference/{pattern_id}/`) |
 | `aliases` | dict | Alias definitions: `base_pattern`, cutting plane (`normal` vector, `bias`) |
 | `storage` | dict | Storage config per layer (format, partition mode) |
-| `label_audit` | dict, optional | Top-level label-aware calibration metadata — `{label_column, label_positive_value, patterns: [...]}`. Present only when the build registered a YAML `label_audit:` block; absent on spheres built without one. When present, `format_version` is stamped `"3.1"`. |
+| `label_audit` | dict, optional | Top-level label-aware calibration metadata — `{label_column, label_positive_value, patterns: [...]}`. Present only when the build registered a YAML `label_audit:` block; absent on spheres built without one. When present, `format_version` is stamped `"4.1"`. |
 
 Example (abridged pattern entry):
 
@@ -122,7 +125,7 @@ Example (abridged pattern entry):
 
 Event patterns with adjacency structure (`has_edge_table: true`) carry an `edge_table` block describing the source columns used to materialize `edges/{pattern_id}/data.lance`. `timestamp_col` and `amount_col` are present whenever they were resolved from explicit YAML config or auto-detected from the event line schema.
 
-`mu` is the population mean per dimension, `sigma_diag` is the standard deviation used for z-scoring, and `theta` is the per-dimension anomaly threshold vector (entities whose z-scored delta exceeds theta on any dimension are flagged). `anomaly_percentile` is the population percentile of `delta_norm` that `theta` was set at; `recalibrate` reuses it (spheres written without it fall back to 95.0).
+`mu` is the population mean per dimension, `sigma_diag` is the standard deviation used for z-scoring, and `theta` is the per-dimension threshold vector; on patterns without the calibrated score an entity is flagged when `delta_norm >= ‖theta‖`, or its group's or cluster's θ norm with `group_by_property` / clusters (on calibrated patterns `is_anomaly` follows `conformal_p`, see below). `anomaly_percentile` is the population percentile of `delta_norm` that `theta` was set at; `recalibrate` reuses it (spheres written without it fall back to 95.0).
 
 ---
 
@@ -146,13 +149,17 @@ Single Lance dataset per pattern. Calibration epochs are not separate directorie
 | `primary_key` | string | Entity identifier |
 | `delta` | fixed_size_list\<float32\> | Z-scored delta vector (deviation from mu) |
 | `delta_norm` | float32 | L2 norm of delta (distance from population center -- used for scoring, clustering, and similarity) |
-| `delta_rank_pct` | float32 | Percentile rank of delta_norm (0--100) |
-| `conformal_p` | float32 | Conformal p-value (null when not computed) |
-| `bregman_divergence` | float32 | Sum of per-dimension Bregman terms (distribution-aware anomaly distance). Null on pre-2.3 spheres. |
+| `is_anomaly` | bool | The stored verdict: `conformal_p <= 1 − anomaly_percentile/100` on a calibrated pattern, `delta_norm >= θ` otherwise |
+| `score_rank_pct` | float32 | Percentile rank of `anomaly_score` in the population (0--100) |
+| `conformal_p` | float32 | Split-conformal p-value of the score against the stored reference |
+| `anomaly_score` | float64 | Calibrated patterns: the fused evidence score (mean of the axis ranks). Patterns scored by `delta_norm` carry `delta_norm` here |
+| `axis_ranks` | list\<float32\> | Calibrated patterns: population rank of each axis, in the order of `score_axes`. Null otherwise |
+| `score_delta` | list\<float32\> | Calibrated patterns: rank-Gaussian coordinates of the `score_dims`. Null otherwise |
+| `bregman_divergence` | float32 | Sum of per-dimension Bregman terms (distribution-aware anomaly distance). |
 | `anomaly_confidence` | float32 | Bootstrap stability score: fraction of bootstrap resamples in which entity is anomalous. Null when bootstrap was skipped. |
 | `edges` | list\<struct\> | Edge list: line_id, point_key, direction, status |
 
-The `delta` vector length equals the number of dimensions in the pattern. Geometry datasets carry an IVF-PQ ANN index on the `delta` column for trajectory similarity search.
+`delta`, `delta_norm` and θ (in sphere.json) form the shape layer: `delta` is always the diagonal z-score per named dimension. `anomaly_score`, `axis_ranks`, `conformal_p`, `score_rank_pct` and `score_delta` form the score layer; on a calibrated pattern `is_anomaly = conformal_p <= 1 − anomaly_percentile/100`. The `delta` vector length equals the number of dimensions in the pattern. Geometry datasets carry an IVF-PQ ANN index on the `delta` column for trajectory similarity search.
 
 ### Edges (`edges/{pattern_id}/data.lance`)
 
@@ -176,6 +183,7 @@ Emitted automatically for event patterns with 2+ FK relations to the same anchor
 | `time_since_pair_last_edge` | float32 | Seconds since the previous edge in the same pair; first edge in a pair gets a sentinel = `dormant_seconds` (auto-resolved to sphere span) |
 | `pair_amount_zscore` | float32 | Signed z-score of amount within `(from_key, to_key)` pairs whose CV < `cv_threshold`; HIGH_VAR pairs and pairs below `min_count` write 0.0 |
 | `find_motif_structuring` | float32 | 1.0 if the edge participates in any A→B→C→D structuring motif within `time_window_hours`; else 0.0 |
+| `edge_curvature_frc` | float32 | Forman-Ricci curvature of the undirected transaction graph edge (`4 − deg(u) − deg(v) + #triangles(u, v)`); negative = sparse-hub topology, near-zero = tight ring, positive = over-clustered local structure |
 
 Written when an event pattern declares an `edge_dimensions:` block. The same per-event values are also baked into the polygon `shape_snapshot` (event polygons grow by the declared dim count) so `find_anomalies` and other navigator primitives transparently include them in `delta` / `delta_norm` / classification. The sidecar persists separately for forward-compatibility with a future HopPredicate query API that will reference per-edge dim values directly. Patterns without the YAML block emit no sidecar.
 
@@ -259,7 +267,7 @@ per-source-dim `_count_above_threshold` cutoffs persisted only when the
 anchor pattern declares `edge_dim_aggregations:`, otherwise omitted). The
 file is immutable for the lifetime of the epoch.
 
-`sphere.json` carries three calibration-history fields (introduced in the prior format and retained under `3.0`):
+`sphere.json` carries three calibration-history fields (retained under `4.0`):
 
 - root: `calibration_history_policy: {"last_k": 5}` — number of most-recent
   epochs to keep on disk. `last_k < 1` is rejected with `ValueError` at load

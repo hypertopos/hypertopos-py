@@ -33,7 +33,7 @@ events = tx.join(accounts.select("account", "segment"), tx.from_account == accou
 
 result = find_anomalies(events, entity="from_account", counterparty="to_account",
                         amount="amount", time="ts", group_by="segment")
-result.orderBy("delta_norm", ascending=False).show(10, truncate=False)
+result.orderBy("anomaly_score", ascending=False).show(10, truncate=False)
 explain(result, top_n=3).show(15, truncate=False)
 ```
 
@@ -51,7 +51,7 @@ result = find_anomalies(
     amount="amount",
     time="ts",
 )
-result.orderBy("delta_norm", ascending=False).show(5, truncate=False)
+result.orderBy("anomaly_score", ascending=False).show(5, truncate=False)
 ```
 
 One row per entity, sender or receiver:
@@ -59,11 +59,14 @@ One row per entity, sender or receiver:
 | Column | Meaning |
 |---|---|
 | `entity` | The entity key, as a string |
-| `delta_norm` | Distance from the population centre, in standard deviations across all dimensions |
-| `is_anomaly` | `true` for entities beyond the population's `percentile` (99 by default, about 1 % of entities) |
-| `p_value` | Share of the population at least as far from the centre (a conformal p-value: 0.01 means 1 % of entities are as unusual or more) |
-| `rank_pct` | Share of the population with a smaller `delta_norm`, 0–100 |
-| `top_reasons` | Up to three `{dim, delta, pct_of_total}`: the dimensions that move the entity most, with the signed deviation and each one's share of `delta_norm²` in percent. Empty for an entity exactly at the centre |
+| `anomaly_score` | The calibrated evidence score — the same score the sphere builder gives continuous anchor patterns; higher = more unusual. Rank by it |
+| `is_anomaly` | `true` when `p_value` is at most `1 − percentile/100` (99 by default): the alarm budget — about 1 % of the population is flagged, and about 1 % of a population like it would be |
+| `p_value` | Conformal p-value of `anomaly_score`: the share of the calibration population scoring at least as high (0.01 means 1 % score as high or higher) |
+| `score_rank_pct` | Rank of `anomaly_score` in the population, 0–100 |
+| `delta_norm` | Distance from the (group's) centre, in standard deviations across all dimensions — the shape, for reference; it does not decide the flag |
+| `top_reasons` | Up to three `{dim, delta, pct_of_total}`: the dimensions that drive `anomaly_score` most, with the signed deviation and each one's share of the score in percent — the same Shapley split of the Mahalanobis evidence that `explain_anomaly` reports on a sphere, so dimensions that move together share the deviation they make together, and a dimension can lead with a moderate `delta`. Empty for an entity exactly at the centre of the score |
+
+The score is the Mahalanobis axis alone: Spark has no event-motion axis (`current`), so a sphere built from the same events with an event pattern can score the same entities differently and give different p-values.
 
 `top_reasons` is an `array<struct>`, so it works in `display`, in SQL (`top_reasons[0].dim`) and when written to Delta:
 
@@ -73,7 +76,7 @@ result.write.mode("overwrite").saveAsTable("main.aml.entity_anomalies")
 
 ### Why an entity stands out
 
-`explain` turns a result into one row per entity and dimension, for the most distant entities or the ones you name:
+`explain` turns a result into one row per entity and dimension, for the highest-scoring entities or the ones you name:
 
 ```python
 from hypertopos.spark import explain
@@ -88,7 +91,7 @@ explain(result, entities=["ACC-1029", "ACC-4471"], dims=["amount_sum_out", "n_di
 | `value` | The entity's value of the dimension (log-scaled where the dimension is) |
 | `mu`, `sigma` | The population mean and standard deviation it is compared with (its group's, with `group_by`) |
 | `delta` | `(value − mu) / sigma`: the signed deviation in standard deviations |
-| `pct_of_total` | The dimension's share of `delta_norm²`, in percent; an entity's rows sum to 100 |
+| `pct_of_total` | The dimension's share of `anomaly_score`, in percent (`explain_anomaly` gives the same share as a fraction); an entity's rows sum to 100 |
 | `direction` | `above`, `below` or `at` the mean |
 
 The first three rows of an entity are its `top_reasons`. `explain` runs on the driver over the cached calibration; it needs the result DataFrame itself, because renaming or selecting away the `entity` column drops the metadata that points to the calibration.
@@ -108,7 +111,7 @@ sphere.to_delta(spark, "main.aml.entity_geometry")   # the same table, written w
 
 ### Hand the result to an agent
 
-The same calibration becomes a navigable sphere for the [hypertopos MCP server](https://github.com/hypertopos/hypertopos-mcp), so an agent can investigate the entities `find_anomalies` flagged. The agent then sees the same `delta_norm`, flags, ranks and p-values.
+The same calibration becomes a navigable sphere for the [hypertopos MCP server](https://github.com/hypertopos/hypertopos-mcp), so an agent can investigate the entities `find_anomalies` flagged. The agent then sees the same scores, flags, ranks and p-values.
 
 ```python
 sphere.lance_path()     # builds the sphere on first use, then reuses it
@@ -129,7 +132,7 @@ today = score(spark.table("main.aml.transactions_today"), like=result)
 today.where("is_anomaly").write.mode("append").saveAsTable("main.aml.daily_alerts")
 ```
 
-It returns the same columns as `find_anomalies`. The aggregation and the scoring both run on the executors, and only the calibration travels with the tasks (the per-dimension statistics plus the population's sorted distances, about 4 MB per million calibrated entities), so the new data never reaches the driver. Nothing is recalibrated: `p_value` and `rank_pct` place each entity within the original population. With `group_by`, an entity whose group did not exist at calibration time is scored against the whole population, with `calibration_scope` set to `global`. `like` accepts the result or its `sphere_of(result)`. To see why a scored entity stands out, pass the events it was scored on: `explain(today, events=new_events)`. Its entities are not in the calibration, so `explain` recomputes their dimensions from their own events, on the executors, and compares them with the frozen population.
+It returns the same columns as `find_anomalies`. The aggregation and the scoring both run on the executors, and only the calibration travels with the tasks (the per-dimension statistics plus the frozen score reference), so the new data never reaches the driver. Nothing is recalibrated: `anomaly_score`, `p_value` and `score_rank_pct` place each entity within the original population. With `group_by`, an entity whose group did not exist at calibration time is scored against the whole population, with `calibration_scope` set to `global`. `like` accepts the result or its `sphere_of(result)`. To see why a scored entity stands out, pass the events it was scored on: `explain(today, events=new_events)`. Its entities are not in the calibration, so `explain` recomputes their dimensions from their own events, on the executors, and compares them with the frozen population.
 
 #### In a scheduled job
 
@@ -151,16 +154,16 @@ The baseline stays the same from one day to the next, so the scores stay compara
 
 ### Per-group populations
 
-`group_by` names an entity property, such as a segment or a country. Each group gets its own population, so a large business account is compared with businesses, not with retail customers. Use it whenever the entities differ in kind or scale (retail and business accounts, small and large merchants): without it, the largest entities stand out for being large, and the unusual behaviour inside each kind is diluted:
+`group_by` names an entity property, such as a segment or a country. With groups, `delta_norm` and the reasons' `delta` are measured against the entity's own group; the score, `p_value` and `is_anomaly` stay global, so `group_by` does not change who is flagged. Use it to read deviations within a kind of entity, and filter the result by the group column to rank inside a group.
 
 ```python
 find_anomalies(tx, entity="from_account", counterparty="to_account", amount="amount",
                time="ts", group_by="segment")
 ```
 
-An entity takes the most frequent value of the column in its own events, and the smallest one on a tie. Entities seen only as a counterparty go to the group `"(none)"`. Groups with fewer than `min_group_size` entities (100 by default) are calibrated together: a 99th-percentile threshold cannot flag anyone in a group of five. The result gains the `group_by` column and `calibration_scope`, which is `group` or `pooled`.
+An entity takes the most frequent value of the column in its own events, and the smallest one on a tie. Entities seen only as a counterparty go to the group `"(none)"`. Groups with fewer than `min_group_size` entities (100 by default) are pooled: a mean and spread need enough members to measure a deviation against. The result gains the `group_by` column and `calibration_scope`, which is `group` or `pooled`.
 
-With groups, `delta_norm` and `is_anomaly` are measured against the entity's own group: its mean, its spread and its threshold. `p_value` and `rank_pct` then place that group-relative distance within the whole population, so every entity is on one scale. An entity at the 99th percentile of a quiet group can therefore be flagged while its `rank_pct` is lower than that of an unflagged entity in a noisy group. To compare within a group, filter the result by the `group_by` column.
+With groups, `delta_norm` and the reasons' `delta` are measured against the entity's own group: its mean and its spread. The score, its shares (`pct_of_total`), `p_value`, `score_rank_pct` and `is_anomaly` are global — every entity is flagged on one scale against the whole population. To see what is unusual for a group, read the group-relative reasons, or filter the result by the `group_by` column.
 
 ### Where the work runs, and the cache
 
@@ -275,5 +278,6 @@ Times are converted to UTC epoch seconds arithmetically, so results do not depen
 ## Limits
 
 - Dimensions are per entity. Pair-level and chain-level patterns (counterparty graphs, chains, motifs) are built by the file-based builder; see [Configuration](configuration.md).
-- Each dimension is standardised against the population (mean and standard deviation, with a floor of 0.01 on the deviation) and never clipped, so an entity far beyond the usual range stays far. Dimensions are treated as independent: two dimensions that move together each count in `delta_norm`. The distance is measured from one centre per population, so a population made of several distinct kinds of entity is described poorly without `group_by`.
+- Each dimension is standardised against the population (mean and standard deviation, with a floor of 0.01 on the deviation) and never clipped, so an entity far beyond the usual range stays far. `delta_norm` treats dimensions as independent (two dimensions that move together each count in it); the anomaly score does not, because it measures distance on rank-Gaussian coordinates with a shrunk covariance. The distance is measured from one centre per population, so a population made of several distinct kinds of entity is described poorly without `group_by`.
 - `find_anomalies` calibrates on the data it is given; to measure new data against an earlier calibration, use `score`.
+- The smallest possible `p_value` is `1/(n+1)` for a population of n entities, so at `percentile=99` a population needs about 100 entities before anything can be flagged.

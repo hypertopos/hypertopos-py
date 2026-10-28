@@ -78,7 +78,10 @@ class GDSEngine:
             "scale",
             "delta",
             "delta_norm",
-            "delta_rank_pct",
+            "score_rank_pct",
+            "anomaly_score",
+            "conformal_p",
+            "score_delta",
             "is_anomaly",
             "last_refresh_at",
             "updated_at",
@@ -129,9 +132,7 @@ class GDSEngine:
             edges=edges,
             last_refresh_at=row["last_refresh_at"],
             updated_at=row["updated_at"],
-            delta_rank_pct=(
-                None if row.get("delta_rank_pct") is None else float(row["delta_rank_pct"])
-            ),
+            **_score_fields(row),
         )
         if pattern.edge_max is None and not pattern.dim_block_names:
             # Discrete mode: recompute delta from edges + prop_fill (prop values may have changed).
@@ -183,11 +184,8 @@ class GDSEngine:
         shape_vector = self._polygon_to_shape_vector(polygon, pattern)
         if prop_fill is not None and len(prop_fill) > 0:
             shape_vector = np.concatenate([shape_vector, prop_fill])
-        if pattern.cholesky_inv is not None:
-            delta = pattern.cholesky_inv @ (shape_vector - pattern.mu)
-        else:
-            sigma = np.maximum(pattern.sigma_diag, self.SIGMA_EPSILON)
-            delta = (shape_vector - pattern.mu) / sigma
+        sigma = np.maximum(pattern.sigma_diag, self.SIGMA_EPSILON)
+        delta = (shape_vector - pattern.mu) / sigma
         if pattern.dimension_weights is not None:
             delta = delta * pattern.dimension_weights
         result: np.ndarray = delta
@@ -1013,6 +1011,7 @@ class GDSEngine:
         pattern_id: str = "",
         pattern_type: str = "",
         pattern_ver: int = 0,
+        preserve_order: bool = False,
     ) -> list[Polygon]:
         """Reconstruct Polygon objects from a geometry Arrow table.
 
@@ -1029,7 +1028,8 @@ class GDSEngine:
             absent, ``np.linalg.norm(delta)`` is computed on the fly.
         top_n:
             If given, return only the *top_n* polygons with the highest
-            ``delta_norm`` (list is always sorted descending).
+            ``delta_norm`` (list sorted descending), or the first *top_n*
+            rows when ``preserve_order`` is set.
         pattern:
             Pattern object for edge reconstruction when edges column is absent.
         pattern_id:
@@ -1039,6 +1039,9 @@ class GDSEngine:
             Injected pattern_type (``"anchor"`` or ``"event"``).
         pattern_ver:
             Injected pattern version.
+        preserve_order:
+            Keep the row order of ``geo`` (e.g. rows already ordered by
+            ``anomaly_score``) instead of sorting by ``delta_norm``.
         """
         if norm_lookup is None:
             norm_lookup = {}
@@ -1089,9 +1092,7 @@ class GDSEngine:
                     edges=edges,
                     last_refresh_at=row["last_refresh_at"],
                     updated_at=row["updated_at"],
-                    delta_rank_pct=(
-                        None if row.get("delta_rank_pct") is None else float(row["delta_rank_pct"])
-                    ),
+                    **_score_fields(row),
                     bregman_divergence=(
                         None
                         if row.get("bregman_divergence") is None
@@ -1105,7 +1106,8 @@ class GDSEngine:
                 )
             )
 
-        results.sort(key=lambda p: (-p.delta_norm, p.primary_key))
+        if not preserve_order:
+            results.sort(key=lambda p: (-p.delta_norm, p.primary_key))
         if top_n is not None:
             return results[:top_n]
         return results
@@ -1357,21 +1359,34 @@ def cluster_label(delta_key: Sequence[float], names: list[str]) -> str:
     return "; ".join(parts) if parts else "no deviation"
 
 
+def _score_fields(row: dict[str, Any]) -> dict[str, Any]:
+    """Polygon score-layer fields of a geometry row (None where a column is absent)."""
+
+    def _float(name: str) -> float | None:
+        value = row.get(name)
+        return None if value is None else float(value)
+
+    score_delta = row.get("score_delta")
+    return {
+        "score_rank_pct": _float("score_rank_pct"),
+        "anomaly_score": _float("anomaly_score"),
+        "conformal_p": _float("conformal_p"),
+        "score_delta": None if score_delta is None else np.asarray(score_delta, dtype=np.float32),
+    }
+
+
 def slice_deltas(shapes: np.ndarray, pattern: Pattern) -> np.ndarray:
     """Delta vectors for temporal shape snapshots, in the pattern's stored metric.
 
     ``shapes`` is ``(n, w)``. Temporal snapshots carry the structural dims
-    only, so calibration is clamped to the snapshot width ``w``: Mahalanobis
-    via ``cholesky_inv[:w, :w]`` (the leading block of a lower-triangular
-    inverse is the inverse of the leading Cholesky block) when the pattern has
-    one, otherwise ``sigma_diag[:w]`` floored at ``SIGMA_EPSILON``; then
-    ``dimension_weights[:w]``. Same maths as the stored polygon delta.
+    only, so calibration is clamped to the snapshot width ``w``:
+    ``sigma_diag[:w]`` floored at ``SIGMA_EPSILON``, then
+    ``dimension_weights[:w]``.
     """
     return calibrated_deltas(
         shapes,
         mu=pattern.mu,
         sigma_diag=pattern.sigma_diag,
-        cholesky_inv=pattern.cholesky_inv,
         dimension_weights=pattern.dimension_weights,
     )
 
@@ -1460,7 +1475,6 @@ def calibrated_deltas(
     *,
     mu: np.ndarray,
     sigma_diag: np.ndarray,
-    cholesky_inv: np.ndarray | None,
     dimension_weights: np.ndarray | None,
 ) -> np.ndarray:
     """:func:`slice_deltas` on raw calibration arrays (``shapes`` ``(..., w)``).
@@ -1472,10 +1486,7 @@ def calibrated_deltas(
     dtype = np.result_type(shapes.dtype, np.float32)
     w = shapes.shape[-1]
     delta: np.ndarray = shapes - np.asarray(mu[:w], dtype=dtype)
-    if cholesky_inv is not None:
-        delta = delta @ np.asarray(cholesky_inv, dtype=dtype)[:w, :w].T
-    else:
-        delta /= np.maximum(np.asarray(sigma_diag[:w], dtype=dtype), GDSEngine.SIGMA_EPSILON)
+    delta /= np.maximum(np.asarray(sigma_diag[:w], dtype=dtype), GDSEngine.SIGMA_EPSILON)
     if dimension_weights is not None:
         delta *= np.asarray(dimension_weights[:w], dtype=dtype)
     return delta
@@ -1486,13 +1497,11 @@ def shapes_from_deltas(deltas: np.ndarray, pattern: Pattern) -> np.ndarray:
 
     ``deltas`` is ``(..., w)``; the output has the same shape. Calibration is
     clamped to width ``w`` exactly like the forward direction: un-weight by
-    ``dimension_weights[:w]``, then either solve the lower-triangular
-    ``cholesky_inv[:w, :w]`` system (Mahalanobis) or scale by ``sigma_diag[:w]``
-    floored at ``SIGMA_EPSILON``, and add ``mu[:w]``.
+    ``dimension_weights[:w]``, scale by ``sigma_diag[:w]`` floored at
+    ``SIGMA_EPSILON``, and add ``mu[:w]``.
 
     A coordinate with dimension weight 0 carries no information in the stored
-    delta, so it is returned as ``mu``; under Mahalanobis its whitened value is
-    taken as 0, which leaves the later coordinates that mix it approximate.
+    delta, so it is returned as ``mu``.
 
     Keeps float32 input in float32; other inputs are computed in float64.
     """
@@ -1500,7 +1509,6 @@ def shapes_from_deltas(deltas: np.ndarray, pattern: Pattern) -> np.ndarray:
         deltas,
         mu=pattern.mu,
         sigma_diag=pattern.sigma_diag,
-        cholesky_inv=pattern.cholesky_inv,
         dimension_weights=pattern.dimension_weights,
     )
 
@@ -1510,13 +1518,10 @@ def calibrated_shapes(
     *,
     mu: np.ndarray,
     sigma_diag: np.ndarray,
-    cholesky_inv: np.ndarray | None,
     dimension_weights: np.ndarray | None,
 ) -> np.ndarray:
     """:func:`shapes_from_deltas` on raw calibration arrays (inverse of
     :func:`calibrated_deltas`)."""
-    from scipy.linalg import solve_triangular
-
     deltas = np.asarray(deltas)
     dtype = np.result_type(deltas.dtype, np.float32)
     w = deltas.shape[-1]
@@ -1528,14 +1533,8 @@ def calibrated_shapes(
         np.divide(z, weights, out=z, where=known)
         z[..., ~known] = 0.0
     mu_w = np.asarray(mu[:w], dtype=dtype)
-    if cholesky_inv is not None:
-        l_inv = np.asarray(cholesky_inv, dtype=dtype)[:w, :w]
-        flat = z.reshape(-1, w)
-        solved = solve_triangular(l_inv, flat.T, lower=True, check_finite=False)
-        shapes: np.ndarray = np.asarray(solved.T, dtype=dtype).reshape(z.shape) + mu_w
-    else:
-        sigma = np.maximum(np.asarray(sigma_diag[:w], dtype=dtype), GDSEngine.SIGMA_EPSILON)
-        shapes = z * sigma + mu_w
+    sigma = np.maximum(np.asarray(sigma_diag[:w], dtype=dtype), GDSEngine.SIGMA_EPSILON)
+    shapes: np.ndarray = z * sigma + mu_w
     if known is not None and not known.all():
         shapes[..., ~known] = mu_w[~known]
     return shapes

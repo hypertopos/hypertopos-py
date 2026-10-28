@@ -92,7 +92,7 @@ def test_reader_without_snapshot_reads_the_new_epoch(tmp_path):
     assert GDSReader(base).read_calibration_fit(PID).calibration_epoch == 2
 
 
-@pytest.mark.parametrize("field", ["dim_percentiles", "dim_normality_pvalues", "edge_max"])
+@pytest.mark.parametrize("field", ["dim_percentiles", "edge_max"])
 def test_fields_computed_from_entity_data_carry_over(tmp_path, field):
     base = _sphere_with_outliers(tmp_path)
     session = HyperSphere.open(base).session("carry")

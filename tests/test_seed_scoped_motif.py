@@ -58,7 +58,9 @@ def sphere_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
             RelationSpec(line_id="accounts", fk_col="receiver_id", direction="in"),
         ],
     )
-    b.add_pattern("acct_pattern", "anchor", "accounts", relations=[])
+    # 30 accounts: a calibrated 95th-percentile budget flags at most one, so the
+    # traced roots would carry no anomaly; a low percentile keeps several anomalous.
+    b.add_pattern("acct_pattern", "anchor", "accounts", relations=[], anomaly_percentile=50.0)
     return Path(b.build())
 
 

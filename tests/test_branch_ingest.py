@@ -94,8 +94,8 @@ def test_branch_ingest_leaves_every_main_dataset_untouched(sphere_dir: Path) -> 
     assert branch.count_rows() == n_before + 10
     # Ranks were recomputed over the whole branch population: the appended
     # rows (shapes clip at the maximum) share the top rank with the old maximum.
-    ranks = branch.to_table(columns=["primary_key", "delta_rank_pct"])
-    pct = ranks["delta_rank_pct"].to_numpy()
+    ranks = branch.to_table(columns=["primary_key", "score_rank_pct"])
+    pct = ranks["score_rank_pct"].to_numpy()
     top_keys = {
         k for k, r in zip(ranks["primary_key"].to_pylist(), pct, strict=True) if r == pct.max()
     }
@@ -215,8 +215,11 @@ def test_flip_report_carries_thresholds_and_causes(sphere_dir: Path) -> None:
         PID, branch="x", exclude_keys=[table["primary_key"][int(i)].as_py() for i in order[:10]]
     )
     report = hs.session("u").navigator().compare_branches(PID, "x")
-    main_theta = hs.session("v").sphere().patterns[PID].theta_norm
-    assert report.theta_from == pytest.approx(main_theta)
+    # A calibrated pattern's threshold is its lowest flagged anomaly_score.
+    main = lance.dataset(str(_geo(sphere_dir))).to_table(
+        columns=["anomaly_score"], filter="is_anomaly = true"
+    )
+    assert report.theta_from == pytest.approx(min(main["anomaly_score"].to_pylist()))
     assert report.theta_to != report.theta_from
     flipped = report.flipped_in_top + report.flipped_out_top
     assert flipped

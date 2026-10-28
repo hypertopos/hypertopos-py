@@ -5,11 +5,14 @@
 """Population calibration held in memory: fit on an entity table, score any table.
 
 ``FrozenCalibration`` is the calibration a sphere build computes for one anchor
-pattern whose dimensions are a metric block (per-dimension mean and spread, the
-anomaly radius at a population percentile, optionally per group), without
-writing a sphere. It runs the builder's own steps, so a sphere built from the
-same table reports the same ``delta_norm``, ``is_anomaly``, rank and conformal
-p-value. It is plain numpy and picklable: it can be broadcast to Spark executors.
+pattern whose dimensions are a metric block, without writing a sphere: the
+calibrated evidence score (a frozen reference of the population on the
+dimension values, its conformal p-value and the flag at a population
+percentile) and the per-dimension mean and spread, optionally per group, that
+the deviations explaining a score are measured with. It runs the builder's own
+steps, so a sphere built from the same table reports the same ``anomaly_score``,
+``conformal_p``, ``score_rank_pct``, ``is_anomaly`` and ``delta_norm``. It is
+plain numpy and picklable: it can be broadcast to Spark executors.
 """
 
 from __future__ import annotations
@@ -24,11 +27,12 @@ import pyarrow.compute as pc
 from hypertopos.builder._stats import compute_stats, compute_stats_grouped
 from hypertopos.builder.dim_blocks import normalize_metric_block
 from hypertopos.engine.geometry import calibrated_deltas
+from hypertopos.engine.robust import Reference, dim_shares_rows, fit_reference, is_anomaly
+from hypertopos.engine.robust import score as score_reference
 
 MIN_GROUP_SIZE = 100
 """Groups smaller than this are calibrated together as ``POOLED_GROUP``: a
-percentile threshold needs about 1 / (1 - percentile / 100) members to flag
-anyone, and a one-member group would never be flagged."""
+group's mean and spread need enough members to measure a deviation against."""
 POOLED_GROUP = "(small groups)"
 SHRINK_WEIGHT = 3.0
 """Pseudo-count of a shrunk dimension: a share or spread measured on ``n`` events
@@ -40,7 +44,6 @@ so one or two events cannot place an entity at an extreme by themselves."""
 class GroupCalibration:
     mu: np.ndarray  # standardised units
     sigma: np.ndarray
-    theta_norm: float
     size: int
 
 
@@ -48,11 +51,13 @@ class GroupCalibration:
 class Scores:
     """Scores of the rows of one table, in table order."""
 
-    delta: np.ndarray  # (n, D) z-scored deviations
+    anomaly_score: np.ndarray  # (n,) calibrated evidence score (mean of the axis ranks)
+    conformal_p: np.ndarray  # (n,) conformal p of the score against the fitted population
+    score_rank_pct: np.ndarray  # (n,) share of the population with a smaller score, 0-100
+    is_anomaly: np.ndarray  # (n,) bool: conformal_p at the calibration's percentile
+    delta: np.ndarray  # (n, D) z-scored deviations (group-relative with groups)
     delta_norm: np.ndarray  # (n,)
-    is_anomaly: np.ndarray  # (n,) bool
-    rank_pct: np.ndarray  # (n,) share of the population with a smaller delta_norm, 0-100
-    conformal_p: np.ndarray  # (n,) share of the population with delta_norm >= this one
+    score_delta: np.ndarray  # (n, D) float32 rank-Gaussian coordinates the score is computed on
     calibration_scope: np.ndarray | None  # (n,) "group" | "pooled" | "global"; None without groups
 
 
@@ -64,8 +69,8 @@ class FrozenCalibration:
     pre_sigma: np.ndarray
     mu: np.ndarray  # population statistics in standardised units
     sigma: np.ndarray
-    theta_norm: float
-    population_norms: np.ndarray  # sorted delta_norm of the fitted population
+    size: int  # rows of the fitted population
+    reference: Reference  # the calibrated evidence score of the fitted population
     group_by: str | None = None
     groups: dict[str, GroupCalibration] | None = None
     pooled: frozenset[str] = frozenset()  # groups calibrated inside POOLED_GROUP
@@ -85,10 +90,13 @@ class FrozenCalibration:
     ) -> FrozenCalibration:
         """Calibrate on ``table``; nulls in a dimension count as 0, as in a build.
 
-        The dimensions go through the steps of a sphere's metric block: a global
-        standardisation, then the population (or per-group) statistics. Scoring
-        repeats the same arithmetic, so the fitted population scores to exactly
-        the norms it was ranked by.
+        The score's reference is fitted on the dimension values (after
+        shrinkage) over the whole population, also with ``group_by``. There are
+        no events, so the score has the ``mahal`` axis only, as in a build of
+        the same table. The deviations go through the steps of a sphere's metric
+        block: a global standardisation, then the population (or per-group)
+        statistics. Scoring repeats the same arithmetic, so the fitted
+        population scores to exactly the values a build stores.
 
         ``shrink`` maps a dimension to the column holding its sample size; the
         value is pulled toward the population mean with weight ``SHRINK_WEIGHT``
@@ -98,19 +106,19 @@ class FrozenCalibration:
             dim: (count, float(_column(table, dim).mean())) for dim, count in (shrink or {}).items()
         }
         shapes = _shapes(table, dims, priors)
+        reference, _ = fit_reference(shapes.astype(np.float64), tuple(dims))
         standard, pre_mu, pre_sigma = normalize_metric_block(shapes)
-        mu, sigma, theta, _, norms, _ = compute_stats(standard, percentile)
-        theta_norm = float(np.linalg.norm(theta))
+        mu, sigma, _, _, _ = compute_stats(standard, percentile)
         groups: dict[str, GroupCalibration] | None = None
         pooled: frozenset[str] = frozenset()
         if group_by is not None:
             raw_ids = _group_ids(table, group_by)
             ids = pool_small_groups(raw_ids, min_group_size)
             pooled = frozenset(raw_ids[ids != raw_ids].tolist())
-            stats, _, norms = compute_stats_grouped(standard, ids, percentile)
+            stats, _, _ = compute_stats_grouped(standard, ids, percentile)
             groups = {
-                gid: GroupCalibration(g_mu, g_sigma, float(np.linalg.norm(g_theta)), size)
-                for gid, (g_mu, g_sigma, g_theta, size) in stats.items()
+                gid: GroupCalibration(g_mu, g_sigma, size)
+                for gid, (g_mu, g_sigma, _, size) in stats.items()
             }
         return cls(
             dims=tuple(dims),
@@ -119,8 +127,8 @@ class FrozenCalibration:
             pre_sigma=pre_sigma,
             mu=mu,
             sigma=sigma,
-            theta_norm=theta_norm,
-            population_norms=np.sort(norms.astype(np.float32)),
+            size=table.num_rows,
+            reference=reference,
             group_by=group_by,
             groups=groups,
             pooled=pooled,
@@ -129,28 +137,27 @@ class FrozenCalibration:
 
     def score(self, table: pa.Table) -> Scores:
         """Score ``table`` against the frozen population (no recalibration)."""
-        standard = _deltas(self.shapes(table), self.pre_mu, self.pre_sigma)
+        shapes = self.shapes(table)
+        evidence = score_reference(self.reference, shapes.astype(np.float64))
+        standard = _deltas(shapes, self.pre_mu, self.pre_sigma)
         n = table.num_rows
         delta = np.empty_like(standard)
-        theta_norm = np.empty(n, dtype=np.float64)
         scope: np.ndarray | None = (
             np.empty(n, dtype=object) if self.groups is not None and self.group_by else None
         )
         for mask, cal, label in self._assignments(table):
             delta[mask] = _deltas(standard[mask], cal.mu, cal.sigma)
-            theta_norm[mask] = cal.theta_norm
             if scope is not None:
                 scope[mask] = label
         norm = np.sqrt(np.einsum("ij,ij->i", delta, delta)).astype(np.float32)
-        is_anomaly = (theta_norm > 0.0) & (norm >= theta_norm)
-        population = len(self.population_norms)
-        left = np.searchsorted(self.population_norms, norm, side="left")
         return Scores(
+            anomaly_score=evidence.anomaly_score,
+            conformal_p=evidence.conformal_p,
+            score_rank_pct=evidence.score_rank_pct,
+            is_anomaly=is_anomaly(evidence.conformal_p, self.percentile),
             delta=delta,
             delta_norm=norm,
-            is_anomaly=is_anomaly,
-            rank_pct=left / population * 100,
-            conformal_p=(population - left) / population,
+            score_delta=evidence.delta,
             calibration_scope=scope,
         )
 
@@ -158,10 +165,8 @@ class FrozenCalibration:
         """The calibrated dimensions of ``table`` as an (n, D) float32 matrix, shrunk."""
         return _shapes(table, self.dims, self.shrink or {})
 
-    def row_params(
-        self, table: pa.Table
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
-        """Per-row standardised ``mu`` and ``sigma`` (n, D), threshold norm and scope.
+    def row_params(self, table: pa.Table) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+        """Per-row standardised ``mu`` and ``sigma`` (n, D) and scope.
 
         Each row gets its group's calibration, the pool's for a group pooled at
         fit time, and the global one for a group never seen (scope ``global``).
@@ -170,21 +175,18 @@ class FrozenCalibration:
         d = len(self.dims)
         mu = np.empty((n, d), dtype=np.float32)
         sigma = np.empty((n, d), dtype=np.float32)
-        theta_norm = np.empty(n, dtype=np.float64)
         scope: np.ndarray | None = (
             np.empty(n, dtype=object) if self.groups is not None and self.group_by else None
         )
         for mask, cal, label in self._assignments(table):
-            mu[mask], sigma[mask], theta_norm[mask] = cal.mu, cal.sigma, cal.theta_norm
+            mu[mask], sigma[mask] = cal.mu, cal.sigma
             if scope is not None:
                 scope[mask] = label
-        return mu, sigma, theta_norm, scope
+        return mu, sigma, scope
 
     def _assignments(self, table: pa.Table) -> list[tuple[np.ndarray, GroupCalibration, str]]:
         """Row masks with the calibration each uses: its group, the pool, or global."""
-        everyone = GroupCalibration(
-            self.mu, self.sigma, self.theta_norm, len(self.population_norms)
-        )
+        everyone = GroupCalibration(self.mu, self.sigma, self.size)
         n = table.num_rows
         if self.groups is None or self.group_by is None:
             return [(np.ones(n, dtype=bool), everyone, "global")]
@@ -205,8 +207,18 @@ class FrozenCalibration:
 
         Standardising ``x`` with these gives the row's deviations (``Scores.delta``).
         """
-        mu, sigma, _, _ = self.row_params(table)
+        mu, sigma, _ = self.row_params(table)
         return self.pre_mu + mu * self.pre_sigma, sigma * self.pre_sigma
+
+
+def score_shares(reference: Reference, score_delta: np.ndarray) -> np.ndarray:
+    """Each dimension's share of the score's ``mahal`` evidence, per row (n, D).
+
+    The same Shapley split :func:`hypertopos.engine.robust.dim_shares` gives one
+    entity (and ``explain_anomaly`` reports on a sphere), for many rows at once.
+    A row at the centre of the score (zero distance) has no share.
+    """
+    return dim_shares_rows(reference, score_delta)
 
 
 def pool_small_groups(ids: np.ndarray, min_group_size: int) -> np.ndarray:
@@ -223,9 +235,7 @@ def pool_small_groups(ids: np.ndarray, min_group_size: int) -> np.ndarray:
 
 def _deltas(shapes: np.ndarray, mu: np.ndarray, sigma: np.ndarray) -> np.ndarray:
     # The library's diagonal metric (sigma already floored by the statistics step).
-    deltas: np.ndarray = calibrated_deltas(
-        shapes, mu=mu, sigma_diag=sigma, cholesky_inv=None, dimension_weights=None
-    )
+    deltas: np.ndarray = calibrated_deltas(shapes, mu=mu, sigma_diag=sigma, dimension_weights=None)
     return deltas.astype(np.float32)
 
 

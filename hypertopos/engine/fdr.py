@@ -15,45 +15,16 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 from numpy.typing import NDArray
-from scipy.special import gammaincc
 from scipy.stats import hypergeom
 
 __all__ = [
     "benjamini_hochberg",
     "cell_p_values_from_anomaly_indicator",
     "fdr_multi_resolution",
-    "fdr_per_dimension",
-    "parametric_p_values_chi2",
-    "per_dim_p_values_chi2_univariate",
     "q_values_from_p_values",
     "storey_pi0",
     "storey_q_values",
 ]
-
-
-def parametric_p_values_chi2(
-    delta_norms: NDArray[np.float64],
-    df: int,
-) -> NDArray[np.float64]:
-    """Upper-tail p-values under the χ²(df) null for ||delta||².
-
-    If delta_i ~ N(0, 1) iid across df dimensions (the population-relative
-    construction), then ||delta||² ~ χ²(df) and the upper-tail survival
-    function gives per-entity p-values that concentrate near 0 for genuine
-    alternatives — unlike p-values derived from population rank, which are
-    uniform by construction and carry no null/alternative signal.
-
-    Returns: p-values in (0, 1], clipped to [1e-10, 1].
-    """
-    if df <= 0:
-        raise ValueError(f"df must be positive, got {df}")
-    chi2 = np.asarray(delta_norms, dtype=np.float64) ** 2
-    # gammaincc(df/2, x/2) == 1 - F_χ²(df, x) (upper-tail survival function)
-    p = gammaincc(df / 2.0, chi2 / 2.0)
-    # A NaN delta_norm carries no evidence against the null.
-    p = np.where(np.isnan(p), 1.0, p)
-    clipped: NDArray[np.float64] = np.clip(p, 1e-10, 1.0)
-    return clipped
 
 
 def q_values_from_p_values(
@@ -136,91 +107,6 @@ def storey_q_values(
     if pi0 is None:
         pi0 = storey_pi0(p, lam=lam) if n_tests is None or n_tests == n else 1.0
     return np.clip(pi0 * q_bh, 0.0, 1.0)
-
-
-def per_dim_p_values_chi2_univariate(
-    deltas: NDArray[np.float64],
-) -> NDArray[np.float64]:
-    """Per-entity-per-dim two-sided p-value under univariate N(0,1) null.
-
-    Each cell ``deltas[i, d]`` is treated as a single z-score under the
-    population-relative construction (delta = (shape - mu) / sigma_diag).
-    The two-sided p-value is ``2 * (1 - Φ(|delta_i,d|))``, equivalent to
-    ``chi²(1).sf(delta_i,d²)`` for a single observation.
-
-    Warning — direction-agnostic: the chi²(1) survival on ``delta²``
-    collapses sign, so both extreme-positive and extreme-negative deviations
-    on a given dim produce equally small p-values. On spheres where some
-    dims are *anti-signal* (high ``|delta|`` correlated with the non-target
-    class — measured by ``engine.dim_audit.compute_per_dim_label_auroc``),
-    flagging both wings inflates the false-positive count on the anti-signal
-    side. When labels are available, combine with a per-dim label-AUROC
-    filter or pre-multiply ``deltas`` by a sign-aware weight vector before
-    passing to this function.
-
-    Returns:
-        ``(n_entities, n_dims)`` p-value matrix in [1e-10, 1.0].
-    """
-    chi2 = np.asarray(deltas, dtype=np.float64) ** 2
-    p = gammaincc(0.5, chi2 / 2.0)
-    clipped: NDArray[np.float64] = np.clip(p, 1e-10, 1.0)
-    return clipped
-
-
-def fdr_per_dimension(
-    p_values_per_dim: NDArray[np.float64],
-    *,
-    alpha: float = 0.05,
-    method: str = "bh",
-    n_tests: int | None = None,
-) -> tuple[NDArray[np.bool_], NDArray[np.float64]]:
-    """Apply BH or Storey FDR INDEPENDENTLY per column (per dim).
-
-    ``n_tests``: family size per dim when the rows are a subset of the tested
-    entities (conservative; Storey then uses π₀ = 1).
-
-    Unlike a flat FDR over all ``n_entities * n_dims`` p-values (which
-    would inflate every dim's threshold when one dim drives many
-    discoveries), per-dim FDR corrects each dim's column on its own
-    ``n_entities`` test pool.
-
-    Args:
-        p_values_per_dim: ``(n_entities, n_dims)`` matrix of per-entity-
-            per-dim p-values. Caller is responsible for the p-value
-            construction (see ``per_dim_p_values_chi2_univariate``).
-        alpha: nominal FDR control level in (0, 1).
-        method: ``"bh"`` (Benjamini-Hochberg) or ``"storey"`` (BH scaled
-            by Storey π₀ per dim — recovers power when most dims have
-            π₀ < 1).
-
-    Returns:
-        ``(rejected, q_values)`` both shaped ``(n_entities, n_dims)``.
-        ``rejected[i, d] = True`` iff ``q_values[i, d] <= alpha``.
-    """
-    if not 0.0 < alpha < 1.0:
-        raise ValueError(f"alpha must be in (0, 1), got {alpha}")
-    if method not in ("bh", "storey"):
-        raise ValueError(f"method must be 'bh' or 'storey', got {method!r}")
-    p = np.asarray(p_values_per_dim, dtype=np.float64)
-    if p.ndim != 2:
-        raise ValueError(f"p_values_per_dim must be 2-D, got shape {p.shape}")
-    n_entities, n_dims = p.shape
-    if n_entities == 0:
-        return (
-            np.empty((0, n_dims), dtype=np.bool_),
-            np.empty((0, n_dims), dtype=np.float64),
-        )
-    q_values = np.empty_like(p)
-    for d in range(n_dims):
-        col = p[:, d]
-        q_col = (
-            q_values_from_p_values(col, n_tests=n_tests)
-            if method == "bh"
-            else storey_q_values(col, n_tests=n_tests)
-        )
-        q_values[:, d] = q_col
-    rejected = q_values <= alpha
-    return rejected, q_values
 
 
 def benjamini_hochberg(

@@ -79,7 +79,7 @@ def _make_geometry_table(banks=("B1", "B2"), n_per_bank=8, temporal=False):
             is_anomaly.append(bank == "B1")
             bank_ids.append(bank)
             quarters.append("Q1" if bank == "B1" else "Q2")
-    # delta_rank_pct: 100 = most-extreme. B1 entities sit at the top end of
+    # score_rank_pct: 100 = most-extreme. B1 entities sit at the top end of
     # the population (≥ 95) so they sail through entity-axis FDR; B2 entities
     # land near 0 (irrelevant — they're below threshold and never reach FDR).
     n_total = len(keys)
@@ -97,7 +97,7 @@ def _make_geometry_table(banks=("B1", "B2"), n_per_bank=8, temporal=False):
         "delta": deltas,
         "delta_norm": norms,
         "is_anomaly": is_anomaly,
-        "delta_rank_pct": pa.array(rank_pcts, type=pa.float64()),
+        "score_rank_pct": pa.array(rank_pcts, type=pa.float64()),
         "last_refresh_at": [_DT] * len(keys),
         "updated_at": [_DT] * len(keys),
         "bank_id": bank_ids,
@@ -210,7 +210,6 @@ class TestFDRResolutionSpatial:
             top_n=30,
             fdr_alpha=0.05,
             fdr_resolution="bank",
-            p_value_method="chi2",
             fdr_method="storey",
         )
         # Every survivor must come from anomaly-enriched bank B1
@@ -252,7 +251,6 @@ class TestFDRResolutionIntersection:
             fdr_alpha=0.05,
             fdr_resolution="bank",
             fdr_temporal_resolution="quarter",
-            p_value_method="chi2",
             fdr_method="storey",
         )
         # B1 is in Q1 + all anomalous -> intersection should keep B1-* only
@@ -280,7 +278,6 @@ class TestFDRResolutionIntersection:
             fdr_alpha=0.05,
             fdr_resolution="bank",
             fdr_temporal_resolution="quarter",
-            p_value_method="chi2",
             fdr_method="storey",
         )
         assert polys
@@ -345,7 +342,7 @@ class TestFDRResolutionDefaultsAutoUpgrade:
                 fdr_alpha=0.05,
                 fdr_resolution="bank",
             )
-        # explicit chi2+storey
+        # explicit storey
         with warnings.catch_warnings():
             warnings.simplefilter("error", UserWarning)
             nav.π5_attract_anomaly(
@@ -353,28 +350,15 @@ class TestFDRResolutionDefaultsAutoUpgrade:
                 top_n=10,
                 fdr_alpha=0.05,
                 fdr_resolution="bank",
-                p_value_method="chi2",
                 fdr_method="storey",
             )
         # no resolution at all
         with warnings.catch_warnings():
             warnings.simplefilter("error", UserWarning)
             nav.π5_attract_anomaly("p_x", top_n=10)
-        # per_dim axis (entity-axis FDR not on path)
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", UserWarning)
-            nav.π5_attract_anomaly(
-                "p_x",
-                top_n=10,
-                fdr_alpha=0.05,
-                fdr_resolution="bank",
-                fdr_axis="per_dim",
-            )
 
-    def test_explicit_chi2_storey_matches_auto_upgrade(self):
-        """Explicit chi2+storey produces the same output as the auto-upgrade
-        path — sanity that the upgrade picks the documented combo, not some
-        third hidden code branch."""
+    def test_explicit_storey_matches_default(self):
+        """Explicit storey produces the same output as the default fdr_method."""
         pat = _make_pattern_with_hierarchy(spatial=True, temporal=False)
         nav = _nav_with(pat, _make_geometry_table())
         polys_explicit, *_ = nav.π5_attract_anomaly(
@@ -382,7 +366,6 @@ class TestFDRResolutionDefaultsAutoUpgrade:
             top_n=10,
             fdr_alpha=0.05,
             fdr_resolution="bank",
-            p_value_method="chi2",
             fdr_method="storey",
         )
         polys_auto, *_ = nav.π5_attract_anomaly(

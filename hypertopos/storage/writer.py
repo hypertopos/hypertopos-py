@@ -23,6 +23,8 @@ from hypertopos.model.objects import SolidSlice
 from hypertopos.storage.exceptions import GDSStorageError
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from hypertopos.engine.calibration import CalibrationTracker
 
 logger = logging.getLogger(__name__)
@@ -451,8 +453,8 @@ class GDSWriter:
             return False
         return True
 
-    def recompute_delta_rank_pct(self, pattern_id: str) -> None:
-        """Recompute delta_rank_pct globally across all entities in the pattern geometry.
+    def recompute_score_rank_pct(self, pattern_id: str) -> None:
+        """Recompute score_rank_pct globally across all entities in the pattern geometry.
 
         Called automatically by append_geometry after each incremental write.
         May also be called manually for repair scenarios (e.g. after raw Lance writes
@@ -461,7 +463,7 @@ class GDSWriter:
         Performance note: this is O(N) over the full geometry dataset. For the current
         builder workflow (one append_geometry call per pattern), this is acceptable.
         For future live-ingestion use cases with many small batches, consider batching
-        appends and calling recompute_delta_rank_pct only at the end of each ingestion
+        appends and calling recompute_score_rank_pct only at the end of each ingestion
         session rather than on every individual append.
         """
         self._rewrite_population_ranks(pattern_id, rank=True, conformal=False)
@@ -469,33 +471,32 @@ class GDSWriter:
     def recompute_conformal_p(self, pattern_id: str) -> None:
         """Recompute conformal_p globally across all entities in the pattern geometry.
 
-        The conformal p-value is a whole-population right-tail statistic
-        (``p = fraction of the population with delta_norm >= this entity's``,
-        so *lower = more anomalous*). Incremental appends write a batch-local
-        value, so — exactly like ``recompute_delta_rank_pct`` — it must be
-        recomputed against the full population after an append, or freshly
-        ingested rows carry a p-value relative only to their ingest batch.
-        Same O(N) cost profile and call sites as ``recompute_delta_rank_pct``.
+        For patterns scored by ``delta_norm`` the conformal p-value is a
+        whole-population right-tail statistic (``p = fraction of the population
+        with delta_norm >= this entity's``, so *lower = more anomalous*).
+        Incremental appends write a batch-local value, so — exactly like
+        ``recompute_score_rank_pct`` — it must be recomputed against the full
+        population after an append. Patterns on the calibrated evidence score
+        keep the p-value computed against their frozen reference: no-op there.
         """
         self._rewrite_population_ranks(pattern_id, rank=False, conformal=True)
 
     def recompute_rank_stats(self, pattern_id: str) -> None:
-        """Recompute the population-relative geometry stats — ``delta_rank_pct``
-        and ``conformal_p`` — in a single pass.
+        """Recompute the population-relative geometry stats — ``score_rank_pct``
+        (rank of ``anomaly_score``) and, for patterns scored by ``delta_norm``,
+        ``conformal_p`` — in a single pass.
 
-        Both are O(N) whole-population statistics over ``delta_norm``. Computing
-        them together reads the geometry once and issues one commit, halving the
-        append-path recompute I/O versus calling ``recompute_delta_rank_pct`` and
-        ``recompute_conformal_p`` back to back. Recomputes whichever of the two
-        columns the geometry actually carries.
+        Computing them together reads the geometry once and issues one commit.
+        Recomputes whichever of the two columns the geometry actually carries.
         """
         self._rewrite_population_ranks(pattern_id, rank=True, conformal=True)
 
     def _rewrite_population_ranks(self, pattern_id: str, *, rank: bool, conformal: bool) -> None:
         """Rewrite the population rank columns in place, one fragment at a time.
 
-        Both columns are functions of a row's ``delta_norm`` and the sorted
-        population, so each fragment's values are computed against the global
+        ``score_rank_pct`` is a function of a row's ``anomaly_score`` and the
+        sorted population (``conformal_p`` of its ``delta_norm`` on patterns
+        without a frozen reference), so each fragment's values are computed against the global
         sort and joined back on row id inside that fragment, then committed as
         one update. Join memory is bounded by fragment size (compaction caps
         fragments) instead of population size, and only indexes on the
@@ -514,26 +515,35 @@ class GDSWriter:
             return
         ds = self._dataset(lance_path)
         field_names = {f.name for f in ds.schema}
-        rank = rank and "delta_rank_pct" in field_names
+        rank = rank and "score_rank_pct" in field_names and "anomaly_score" in field_names
         conformal = conformal and "conformal_p" in field_names
+        if conformal and "axis_ranks" in field_names:
+            head = ds.to_table(columns=["axis_ranks"], limit=1)
+            # A frozen reference scores these rows; their p-values do not move.
+            conformal = head.num_rows == 0 or head["axis_ranks"].null_count == head.num_rows
         if not (rank or conformal):
             return
+        columns_read = [c for c, on in (("anomaly_score", rank), ("delta_norm", conformal)) if on]
         fragments = ds.get_fragments()
-        parts = [f.to_table(columns=["delta_norm"], with_row_id=True) for f in fragments]
+        parts = [f.to_table(columns=columns_read, with_row_id=True) for f in fragments]
         if not parts:
             return
-        delta_norms = np.concatenate(
-            [p["delta_norm"].to_numpy(zero_copy_only=False) for p in parts]
-        )
-        n = len(delta_norms)
+        n = sum(p.num_rows for p in parts)
         if n == 0:
             return
-        ranks = population_left_ranks(delta_norms)
         values: dict[str, np.ndarray] = {}
         if rank:
-            values["delta_rank_pct"] = (ranks / n * 100).astype(np.float32)
+            scores = np.concatenate(
+                [p["anomaly_score"].to_numpy(zero_copy_only=False) for p in parts]
+            )
+            values["score_rank_pct"] = (population_left_ranks(scores) / n * 100).astype(np.float32)
         if conformal:
-            values["conformal_p"] = compute_conformal_p(delta_norms, ranks)
+            delta_norms = np.concatenate(
+                [p["delta_norm"].to_numpy(zero_copy_only=False) for p in parts]
+            )
+            values["conformal_p"] = compute_conformal_p(
+                delta_norms, population_left_ranks(delta_norms)
+            )
 
         bounds = np.cumsum([0] + [p.num_rows for p in parts])
         updated: list[Any] = []
@@ -641,7 +651,7 @@ class GDSWriter:
         The delta column must be a fixed-size list of float32 — the method casts
         variable-size lists automatically when num_rows > 0.
 
-        Automatically recomputes delta_rank_pct globally after appending to ensure
+        Automatically recomputes score_rank_pct globally after appending to ensure
         percentile ranks reflect the full population, not just the appended batch.
         """
         lance_path = self._base / "geometry" / pattern_id / "data.lance"
@@ -709,7 +719,7 @@ class GDSWriter:
             ("primary_key", "BTREE"),
             ("delta_norm", "BTREE"),
             ("is_anomaly", "BITMAP"),
-            ("delta_rank_pct", "BTREE"),
+            ("score_rank_pct", "BTREE"),
             ("entity_keys", "LABEL_LIST"),
         ]
         # delta_dim_* columns are deliberately left unindexed: Lance prunes
@@ -1115,6 +1125,22 @@ class GDSWriter:
                     index_type="BTREE",
                     replace=True,
                 )
+
+    def write_reference(
+        self, pattern_id: str, epoch: int, arrays: Mapping[str, np.ndarray]
+    ) -> Path:
+        """Persist a frozen score reference to ``_gds_meta/reference/{pattern_id}/v={epoch}.npz``.
+
+        ``arrays`` is :func:`hypertopos.engine.robust.reference_to_arrays` output.
+        Each calibration epoch gets its own file; existing files are not rewritten.
+        """
+        ref_dir = self._base / "_gds_meta" / "reference" / pattern_id
+        ref_dir.mkdir(parents=True, exist_ok=True)
+        path = ref_dir / f"v={epoch}.npz"
+        tmp = ref_dir / f"v={epoch}.tmp.npz"
+        np.savez(tmp, allow_pickle=False, **dict(arrays))
+        tmp.replace(path)
+        return path
 
     def write_calibration_tracker(
         self,

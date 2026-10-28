@@ -369,7 +369,6 @@ def test_incremental_update_edge_dim_aggregation_pattern(agg_sphere):
     The new entity's geometry must be the full mu-width (1 derived relation +
     5 aggregated edge dims = 6), and the new key must surface through the
     find_anomalies scan path on a fresh HyperSphere session."""
-    from hypertopos.sphere import HyperSphere
 
     pat_meta = _get_pattern_meta(agg_sphere, "account_pattern")
     expected_width = len(pat_meta["mu"])
@@ -407,31 +406,23 @@ def test_incremental_update_edge_dim_aggregation_pattern(agg_sphere):
     assert result.added == 1
     assert result.population_size == old_pop + 1
 
-    # New geometry row must be full mu-width — not truncated to relation count
-    # — and flagged anomalous (its extreme feature values exceed theta).
+    # New geometry row must be full mu-width — not truncated to relation count.
+    # Its extreme values put it above the whole frozen reference: the smallest
+    # possible conformal p, 1 / (n_fitted + 1). It carries no events, so it is
+    # scored without the current axis. With a 4-entity reference that p is 0.2,
+    # so it is not flagged at the 95th percentile — the calibration is exact.
     reader = GDSReader(agg_sphere)
     geo = reader.read_geometry("account_pattern", version=1)
     new_rows = geo.filter(pc.equal(geo["primary_key"], "NEW_ACCT"))
     assert new_rows.num_rows == 1
     assert len(new_rows["delta"][0].as_py()) == expected_width
-    assert new_rows["is_anomaly"][0].as_py() is True, (
-        "extreme incrementally-added account must be flagged is_anomaly=True"
-    )
+    n_fitted = reader.read_reference("account_pattern").n_fitted
+    assert new_rows["conformal_p"][0].as_py() == pytest.approx(1 / (n_fitted + 1))
+    assert new_rows["is_anomaly"][0].as_py() is (1 / (n_fitted + 1) <= 0.05)
 
-    # find_anomalies (π5 scan) must surface the new extreme account, and rank
-    # it at the top (select=top_norm) — a population of 5 means top_n=10 would
-    # return everyone, so use top_n=1 to make surfacing non-trivial.
-    hs = HyperSphere.open(agg_sphere)
-    nav = hs.session("inc-agg-test").navigator()
-    polygons, _total, _emerging, _meta = nav.π5_attract_anomaly(
-        "account_pattern",
-        top_n=1,
-    )
-    surfaced = {p.primary_key for p in polygons}
-    assert "NEW_ACCT" in surfaced, (
-        f"new incrementally-added anomalous account not the top anomaly via "
-        f"find_anomalies; got {surfaced}"
-    )
+    # The new extreme account ranks first by the pattern's calibrated score.
+    top = geo.sort_by([("anomaly_score", "descending")])["primary_key"][0].as_py()
+    assert top == "NEW_ACCT", f"new extreme account not ranked first; got {top}"
 
 
 def test_incremental_update_triggers_reindex(agg_sphere, monkeypatch):
@@ -537,7 +528,7 @@ def _read_rank(sphere_path, key, pattern_id="cust_pattern"):
     geo = reader.read_geometry(pattern_id, version=1)
     row = geo.filter(pc.equal(geo["primary_key"], key))
     assert row.num_rows == 1
-    return float(row["delta_rank_pct"][0].as_py())
+    return float(row["score_rank_pct"][0].as_py())
 
 
 def _read_conformal_p(sphere_path, key, pattern_id="cust_pattern"):
@@ -559,7 +550,7 @@ def test_incremental_conformal_p_is_population_relative_not_batch_local(tmp_path
     always got exactly 0.5, contradicting the documented 'lower = more
     anomalous' contract that assess_anomaly_certainty / composite_risk rely on.
     The fix recomputes conformal_p globally (recompute_conformal_p), mirroring
-    delta_rank_pct."""
+    score_rank_pct."""
     sphere = _build_anchor_sphere(tmp_path / "gds_cp", 300)
 
     # Append ONE extreme outlier: event_count far above the population.
@@ -583,22 +574,20 @@ def test_incremental_conformal_p_is_population_relative_not_batch_local(tmp_path
     # Sanity: it must NOT be the tell-tale single-batch 0.5.
     assert abs(cp - 0.5) > 0.01
 
-    # And it agrees with the population oracle on the full post-ingest set.
-    from hypertopos.builder._stats import compute_conformal_p
+    # The pattern is on the calibrated evidence score: the ingested row is
+    # scored against the frozen reference, so its p matches that reference.
+    from hypertopos.engine.robust import score
 
-    geo = GDSReader(sphere).read_geometry("cust_pattern", version=1)
-    norms = geo["delta_norm"].to_numpy(zero_copy_only=False)
-    keys = geo["primary_key"].to_pylist()
-    oracle = compute_conformal_p(norms)
-    idx = keys.index("C_OUTLIER")
-    assert abs(cp - float(oracle[idx])) < 1e-3, (
-        f"stored conformal_p {cp} must match the full-population oracle {float(oracle[idx])}"
+    ref = GDSReader(sphere).read_reference("cust_pattern")
+    oracle = score(ref, np.array([[99999.0]])).conformal_p[0]
+    assert abs(cp - float(oracle)) < 1e-6, (
+        f"stored conformal_p {cp} must match the frozen-reference p {float(oracle)}"
     )
 
 
 def test_recompute_rank_stats_matches_separate_recomputes(tmp_path):
-    """recompute_rank_stats (single-pass) produces the same delta_rank_pct and
-    conformal_p as calling recompute_delta_rank_pct + recompute_conformal_p
+    """recompute_rank_stats (single-pass) produces the same score_rank_pct and
+    conformal_p as calling recompute_score_rank_pct + recompute_conformal_p
     separately — at half the append-path scan/merge I/O. Corrupts both columns
     first so the recompute is observably doing work, not a no-op."""
     from pathlib import Path
@@ -629,7 +618,7 @@ def test_recompute_rank_stats_matches_separate_recomputes(tmp_path):
             pa.table(
                 {
                     "primary_key": pks,
-                    "delta_rank_pct": sentinel,
+                    "score_rank_pct": sentinel,
                     "conformal_p": sentinel,
                 }
             )
@@ -637,24 +626,27 @@ def test_recompute_rank_stats_matches_separate_recomputes(tmp_path):
 
     def _read():
         geo = GDSReader(sphere).read_geometry("cust_pattern", version=1)
-        return {r["primary_key"]: (r["delta_rank_pct"], r["conformal_p"]) for r in geo.to_pylist()}
+        return {r["primary_key"]: (r["score_rank_pct"], r["conformal_p"]) for r in geo.to_pylist()}
 
     writer = GDSWriter(str(sphere))
     _corrupt()
     writer.recompute_rank_stats("cust_pattern")
     fused = _read()
     _corrupt()
-    writer.recompute_delta_rank_pct("cust_pattern")
+    writer.recompute_score_rank_pct("cust_pattern")
     writer.recompute_conformal_p("cust_pattern")
     separate = _read()
 
     assert fused == separate
-    # The fused recompute actually ran — no sentinel survived.
-    assert all(rank != -1.0 and cp != -1.0 for rank, cp in fused.values())
+    # The fused recompute actually ran — no rank sentinel survived. The pattern
+    # is on the calibrated evidence score, so its conformal_p is against the
+    # frozen reference and the population rewrite leaves it alone.
+    assert all(rank != -1.0 for rank, _ in fused.values())
+    assert all(cp == -1.0 for _, cp in fused.values())
 
 
 def test_incremental_recompute_ranks_false_defers_then_finalize(tmp_path):
-    """recompute_ranks=False keeps existing rows' delta_rank_pct stale during
+    """recompute_ranks=False keeps existing rows' score_rank_pct stale during
     batched ingestion; finalize_incremental restores them to the same values
     recompute_ranks=True would produce. Proves both the skip and the
     finalize-correctness in one test (no copytree, ~300 rows)."""
@@ -697,7 +689,7 @@ def test_incremental_recompute_ranks_false_defers_then_finalize(tmp_path):
     # build even though the population grew by 40 high-norm rows.
     rank_deferred_mid = _read_rank(deferred, "C0")
     assert rank_deferred_mid == rank_before, (
-        "recompute_ranks=False must leave existing rows' delta_rank_pct stale "
+        "recompute_ranks=False must leave existing rows' score_rank_pct stale "
         f"until finalize; was {rank_before}, now {rank_deferred_mid}"
     )
 
@@ -780,7 +772,7 @@ def test_incremental_reindex_covers_all_rows_after_recompute(tmp_path):
     assert indexed is not None, "delta vector index missing after reindex=True"
     assert indexed == total, (
         f"IVF index must cover all {total} rows after reindex; covers "
-        f"{indexed}. reindex likely ran BEFORE recompute_delta_rank_pct, "
+        f"{indexed}. reindex likely ran BEFORE recompute_score_rank_pct, "
         f"whose merge_insert rewrote rows into fresh fragments."
     )
 

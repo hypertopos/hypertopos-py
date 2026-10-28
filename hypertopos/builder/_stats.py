@@ -14,26 +14,10 @@ SIGMA_EPS: float = 1e-2  # minimum sigma — matches engine/geometry.py SIGMA_EP
 SIGMA_EPS_PROP: float = 0.2  # minimum sigma for binary prop_columns — caps deltas at ±5
 
 
-def validate_mahalanobis_weights(pattern_id: str, weights: list[float]) -> None:
-    """Reject non-positive explicit ``dimension_weights`` on a Mahalanobis pattern.
-
-    Whitened coordinates mix every earlier dimension, so a weight of 0 erases
-    information that later coordinates depend on and the pattern's deltas can
-    no longer be mapped back to shapes; a negative weight flips the metric.
-    """
-    bad = [i for i, w in enumerate(weights) if not w > 0.0]
-    if bad:
-        raise ValueError(
-            f"Pattern '{pattern_id}': dimension_weights must all be > 0 when "
-            f"use_mahalanobis is set; non-positive weight(s) at index {bad}"
-        )
-
-
 def compute_stats(
     shape_vectors: np.ndarray,
     anomaly_percentile: float = 95.0,
-    use_mahalanobis: bool = False,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Auto-compute pattern statistics from a population of shape vectors.
 
@@ -43,11 +27,6 @@ def compute_stats(
         theta: (D,) float32 — z-scored threshold vector; norm(theta) == anomaly boundary
         deltas: (N, D) float32 — z-scored delta vectors
         delta_norms: (N,) float32 — L2 norms of delta vectors
-        cholesky_inv: (D, D) float32 | None — inverse Cholesky factor (Mahalanobis only)
-
-    When use_mahalanobis=True, deltas are computed via full covariance matrix
-    (Cholesky decomposition) instead of per-dimension sigma. This produces an
-    ellipsoidal anomaly boundary that accounts for inter-dimension correlations.
     """
     if len(shape_vectors) == 0:
         raise ValueError("shape_vectors must be non-empty")
@@ -57,23 +36,7 @@ def compute_stats(
     sigma_raw = shape_vectors.std(axis=0).astype(np.float32)
     sigma = np.maximum(sigma_raw, SIGMA_EPS)
 
-    cholesky_inv: np.ndarray | None = None
-
-    if use_mahalanobis and D > 1:
-        # Full covariance with Tikhonov regularization
-        cov = np.cov(shape_vectors.T).astype(np.float64)
-        cov += (SIGMA_EPS**2) * np.eye(D)
-        try:
-            L = np.linalg.cholesky(cov)
-            centered = (shape_vectors - mu).astype(np.float64)
-            deltas = np.linalg.solve(L, centered.T).T.astype(np.float32)
-            L_inv = np.linalg.inv(L).astype(np.float32)
-            cholesky_inv = L_inv
-        except np.linalg.LinAlgError:
-            logger.warning("Cholesky decomposition failed — falling back to diagonal sigma")
-            deltas = ((shape_vectors - mu) / sigma).astype(np.float32)
-    else:
-        deltas = ((shape_vectors - mu) / sigma).astype(np.float32)
+    deltas = ((shape_vectors - mu) / sigma).astype(np.float32)
 
     delta_norms = np.sqrt(np.einsum("ij,ij->i", deltas, deltas)).astype(np.float32)
 
@@ -98,7 +61,7 @@ def compute_stats(
             len(np.unique(delta_norms)),
         )
 
-    return mu, sigma, theta, deltas, delta_norms, cholesky_inv
+    return mu, sigma, theta, deltas, delta_norms
 
 
 def population_left_ranks(values: np.ndarray) -> np.ndarray:
@@ -128,7 +91,7 @@ def compute_conformal_p(
     Args:
         delta_norms: Per-entity delta norms.
         left_ranks: ``population_left_ranks(delta_norms)``, when the caller
-            already holds it (it also yields ``delta_rank_pct``).
+            already holds it (it also yields ``score_rank_pct``).
     """
     n = len(delta_norms)
     if n == 0:
@@ -188,7 +151,7 @@ def compute_stats_grouped(
             group_results[gid_str] = (mu_g, sigma_g, theta_g, int(mask.sum()))
             continue
 
-        mu_g, sigma_g, theta_g, group_deltas, group_norms, _ = compute_stats(
+        mu_g, sigma_g, theta_g, group_deltas, group_norms = compute_stats(
             group_shape,
             anomaly_percentile,
         )
@@ -343,7 +306,7 @@ def fit_kmeans_components(
             components.append((mu_k, sigma_k, theta_k, pop))
             continue
 
-        mu_k, sigma_k, theta_k, _, _, _ = compute_stats(
+        mu_k, sigma_k, theta_k, _, _ = compute_stats(
             cluster_shapes,
             anomaly_percentile,
         )

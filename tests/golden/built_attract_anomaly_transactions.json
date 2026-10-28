@@ -4,113 +4,133 @@
   "ranking": [
     {
       "anomaly_confidence": 1.0,
+      "anomaly_score": 14.68196297,
+      "conformal_p": 0.0008333333535,
       "delta": [
         0.0,
         14.68196297
       ],
       "delta_norm": 14.68196297,
-      "delta_rank_pct": 99.91666412,
       "is_anomaly": true,
-      "primary_key": "TX-00552"
+      "primary_key": "TX-00552",
+      "score_rank_pct": 99.91666412
     },
     {
       "anomaly_confidence": 1.0,
+      "anomaly_score": 13.125453,
+      "conformal_p": 0.001666666707,
       "delta": [
         0.0,
         13.125453
       ],
       "delta_norm": 13.125453,
-      "delta_rank_pct": 99.83333588,
       "is_anomaly": true,
-      "primary_key": "TX-00210"
+      "primary_key": "TX-00210",
+      "score_rank_pct": 99.83333588
     },
     {
       "anomaly_confidence": 1.0,
+      "anomaly_score": 8.491706848,
+      "conformal_p": 0.002499999944,
       "delta": [
         0.0,
         8.491706848
       ],
       "delta_norm": 8.491706848,
-      "delta_rank_pct": 99.75,
       "is_anomaly": true,
-      "primary_key": "TX-01047"
+      "primary_key": "TX-01047",
+      "score_rank_pct": 99.75
     },
     {
       "anomaly_confidence": 1.0,
+      "anomaly_score": 7.968487263,
+      "conformal_p": 0.003333333414,
       "delta": [
         0.0,
         7.968487263
       ],
       "delta_norm": 7.968487263,
-      "delta_rank_pct": 99.66666412,
       "is_anomaly": true,
-      "primary_key": "TX-01038"
+      "primary_key": "TX-01038",
+      "score_rank_pct": 99.66666412
     },
     {
       "anomaly_confidence": 1.0,
+      "anomaly_score": 7.147213936,
+      "conformal_p": 0.004166666884,
       "delta": [
         0.0,
         7.147213936
       ],
       "delta_norm": 7.147213936,
-      "delta_rank_pct": 99.58333588,
       "is_anomaly": true,
-      "primary_key": "TX-00362"
+      "primary_key": "TX-00362",
+      "score_rank_pct": 99.58333588
     },
     {
       "anomaly_confidence": 1.0,
+      "anomaly_score": 7.11359787,
+      "conformal_p": 0.004999999888,
       "delta": [
         0.0,
         7.11359787
       ],
       "delta_norm": 7.11359787,
-      "delta_rank_pct": 99.5,
       "is_anomaly": true,
-      "primary_key": "TX-00420"
+      "primary_key": "TX-00420",
+      "score_rank_pct": 99.5
     },
     {
       "anomaly_confidence": 1.0,
+      "anomaly_score": 6.686235428,
+      "conformal_p": 0.005833333358,
       "delta": [
         0.0,
         6.686235428
       ],
       "delta_norm": 6.686235428,
-      "delta_rank_pct": 99.41666412,
       "is_anomaly": true,
-      "primary_key": "TX-00699"
+      "primary_key": "TX-00699",
+      "score_rank_pct": 99.41666412
     },
     {
       "anomaly_confidence": 1.0,
+      "anomaly_score": 6.499014854,
+      "conformal_p": 0.006666666828,
       "delta": [
         0.0,
         6.499014854
       ],
       "delta_norm": 6.499014854,
-      "delta_rank_pct": 99.33333588,
       "is_anomaly": true,
-      "primary_key": "TX-00207"
+      "primary_key": "TX-00207",
+      "score_rank_pct": 99.33333588
     },
     {
       "anomaly_confidence": 1.0,
+      "anomaly_score": 6.039201736,
+      "conformal_p": 0.007499999832,
       "delta": [
         0.0,
         6.039201736
       ],
       "delta_norm": 6.039201736,
-      "delta_rank_pct": 99.25,
       "is_anomaly": true,
-      "primary_key": "TX-00719"
+      "primary_key": "TX-00719",
+      "score_rank_pct": 99.25
     },
     {
       "anomaly_confidence": 1.0,
+      "anomaly_score": 5.809378147,
+      "conformal_p": 0.008333333768,
       "delta": [
         0.0,
         5.809378147
       ],
       "delta_norm": 5.809378147,
-      "delta_rank_pct": 99.16666412,
       "is_anomaly": true,
-      "primary_key": "TX-00735"
+      "primary_key": "TX-00735",
+      "score_rank_pct": 99.16666412
     }
   ],
   "total_found": 60

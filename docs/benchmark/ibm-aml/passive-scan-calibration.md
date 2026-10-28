@@ -51,7 +51,7 @@ For full 3-layer pipeline results see [`README.md`](README.md).
 | # | Source | Logic | Suspects | +TP |
 |---|--------|-------|----------|-----|
 | 4 | Multi-cur cross-border | return_ratio >30% + multi-cur OR ≥3 dest banks + multi-cur | 7,823 | +473 |
-| 5 | Borderline | `delta_rank_pct >= 80` AND NOT `is_anomaly` | 77,259 | +176 |
+| 5 | Borderline | `score_rank_pct >= 80` AND NOT `is_anomaly` | 77,259 | +176 |
 | 6 | Reputation (chronic) | `reputation >= 0.5` AND `anomaly_tenure >= 2` (max-consecutive-run) | 785 | +0 |
 | 7 | Structuring | >50% of amounts within 2% of round thousands, ≥5 tx | 30,926 | +32 |
 
@@ -229,4 +229,4 @@ multi-source pipeline.
 
 Key insight: density works as BOOSTER (+1 to score) not FILTER. Account with score=2
 plus high tx density gets promoted to score=3. Legit high-volume accounts without
-tx anomalies stay at score=2 and drop out.
+tx anomalies stay at score=2 and drop out.

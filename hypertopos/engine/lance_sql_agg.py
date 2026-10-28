@@ -461,6 +461,53 @@ def find_anomalies(
     }
 
 
+def find_calibrated_anomalies(
+    geo_lance_path: str,
+    top_n: int,
+    offset: int = 0,
+    lance_version: Pin | None = None,
+) -> dict[str, Any]:
+    """Top-N anomalous polygons of a calibrated-score pattern via Lance SQL.
+
+    Rows with ``is_anomaly`` ordered by ``conformal_p`` ascending, then
+    ``anomaly_score`` descending, then ``primary_key``. Within one calibration
+    the two orders agree; across calibrations (rows ingested later score
+    without the event axis) only the p-value is comparable. A key repeated in
+    the table keeps its best anomalous row in that order. Returns ``{"keys",
+    "anomaly_scores", "total_found"}`` with ``total_found`` = number of
+    anomalous rows (an upper bound on unique keys).
+    """
+    if top_n < 1:
+        raise ValueError(f"find_calibrated_anomalies: top_n must be >= 1, got {top_n}")
+    if offset < 0:
+        raise ValueError(f"find_calibrated_anomalies: offset must be >= 0, got {offset}")
+    ds = _open_geometry(geo_lance_path, lance_version)
+    total_found = ds.count_rows(filter="is_anomaly")
+    if total_found == 0 or offset >= total_found:
+        return {"keys": [], "anomaly_scores": [], "total_found": total_found}
+    sql = (
+        "SELECT primary_key, conformal_p, anomaly_score FROM dataset WHERE is_anomaly "
+        "ORDER BY conformal_p ASC, anomaly_score DESC, primary_key ASC "
+        f"LIMIT {offset + top_n}"
+    )
+    best: dict[str, tuple[float, float]] = {}
+    for batch in ds.sql(sql).build().to_batch_records():
+        keys = batch["primary_key"].to_pylist()
+        ps = batch["conformal_p"].to_pylist()
+        scores = batch["anomaly_score"].to_pylist()
+        for pk, p, score in zip(keys, ps, scores, strict=True):
+            # A null p-value carries no evidence (p = 1), as on the in-process path.
+            row = (1.0 if p is None else float(p), -float(score))
+            if pk not in best or row < best[pk]:
+                best[pk] = row
+    paged = sorted(best.items(), key=lambda kv: (kv[1], kv[0]))[offset : offset + top_n]
+    return {
+        "keys": [k for k, _ in paged],
+        "anomaly_scores": [-v[1] for _, v in paged],
+        "total_found": total_found,
+    }
+
+
 def aggregate_percentile(
     geo_lance_path: str,
     ctx_lance_path: str,

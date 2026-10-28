@@ -99,7 +99,7 @@ def _attach_per_dim_columns(table: pa.Table, list_size: int) -> pa.Table:
 def generate_sphere_json() -> None:
     sphere = {
         "sphere_id": "synthetic_chain_sphere",
-        "format_version": "3.0",
+        "format_version": "4.0",
         "name": "Synthetic Chain Sphere",
         "lines": {
             "accounts": {
@@ -252,8 +252,9 @@ def _build_geometry_table(
             pa.field("scale", pa.int32()),
             pa.field("delta", pa.list_(pa.float32())),
             pa.field("delta_norm", pa.float32()),
-            pa.field("delta_rank_pct", pa.float32()),
+            pa.field("score_rank_pct", pa.float32()),
             pa.field("is_anomaly", pa.bool_()),
+            pa.field("anomaly_score", pa.float64()),
             pa.field("edges", pa.list_(edge_struct)),
             pa.field("last_refresh_at", pa.timestamp("us", tz="UTC")),
             pa.field("updated_at", pa.timestamp("us", tz="UTC")),
@@ -282,8 +283,9 @@ def _build_geometry_table(
             "scale": [1] * len(pks),
             "delta": z_deltas,
             "delta_norm": norms_arr.tolist(),
-            "delta_rank_pct": rank_pcts.tolist(),
+            "score_rank_pct": rank_pcts.tolist(),
             "is_anomaly": is_anomaly,
+            "anomaly_score": norms_arr.astype(np.float64).tolist(),
             "edges": pa.array([[]] * len(pks), type=pa.list_(edge_struct)),
             "last_refresh_at": [ts] * len(pks),
             "updated_at": [ts] * len(pks),

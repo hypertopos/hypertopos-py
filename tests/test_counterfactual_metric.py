@@ -33,8 +33,6 @@ EDGES = [
 
 CASES = {
     "weights": (None, WEIGHTS),
-    "mahalanobis": (L_INV, None),
-    "mahalanobis_weights": (L_INV, WEIGHTS),
 }
 
 
@@ -64,7 +62,6 @@ def test_per_edge_drop_in_pattern_metric(case: str) -> None:
         event_source_values={},
         candidate_edge_ids=["E-real", "E-noop"],
         top_n=10,
-        cholesky_inv=chol,
         dimension_weights=weights,
     )
     by_id = {r["edge_id"]: r for r in rows}
@@ -86,7 +83,6 @@ def test_joint_drop_in_pattern_metric(case: str) -> None:
         edge_agg_dim_offset=2,
         edge_agg_specs=[],
         event_source_values={},
-        cholesky_inv=chol,
         dimension_weights=weights,
     )
     assert out["joint_drop_pct"] == pytest.approx(_expected_drop(chol, weights), abs=1e-6)
@@ -101,7 +97,6 @@ def test_joint_drop_in_pattern_metric(case: str) -> None:
         edge_agg_dim_offset=2,
         edge_agg_specs=[],
         event_source_values={},
-        cholesky_inv=chol,
         dimension_weights=weights,
     )
     assert noop["joint_drop_pct"] == pytest.approx(0.0, abs=1e-9)
@@ -124,7 +119,6 @@ def test_navigator_simulate_edge_removal_in_pattern_metric(case: str) -> None:
         version=1,
         status="production",
         dimension_weights=weights,
-        cholesky_inv=chol,
     )
     sphere = MagicMock(spec=Sphere)
     sphere.patterns = {"P": pattern}

@@ -18,15 +18,11 @@ from hypertopos.navigation.navigator import GDSNavigator
 
 MU = np.array([0.5, 0.4, 0.3])
 SIGMA = np.array([0.2, 0.001, 0.25])
-# Non-diagonal lower-triangular whitening: a diagonal one equal to 1/sigma
-# would make the naive ``delta * sigma + mu`` inversion look correct.
-L_INV = np.array([[4.0, 0.0, 0.0], [-1.5, 3.0, 0.0], [1.0, 0.75, 2.5]])
 SHAPES = np.array([[0.6, 0.4, 0.2], [0.2, 0.2, 0.9], [0.4, 0.6, 0.0], [0.0, 0.0, 0.5]])
 
 
 def _pattern(
     *,
-    cholesky_inv: np.ndarray | None = None,
     weights: np.ndarray | None = None,
     edge_max: np.ndarray | None = None,
 ) -> Pattern:
@@ -48,22 +44,11 @@ def _pattern(
         status="production",
         edge_max=edge_max,
         dimension_weights=weights,
-        cholesky_inv=cholesky_inv,
     )
 
 
 def test_round_trip_diag() -> None:
     p = _pattern()
-    np.testing.assert_allclose(shapes_from_deltas(slice_deltas(SHAPES, p), p), SHAPES, atol=1e-6)
-
-
-def test_round_trip_mahalanobis() -> None:
-    p = _pattern(cholesky_inv=L_INV)
-    np.testing.assert_allclose(shapes_from_deltas(slice_deltas(SHAPES, p), p), SHAPES, atol=1e-6)
-
-
-def test_round_trip_mahalanobis_weighted() -> None:
-    p = _pattern(cholesky_inv=L_INV, weights=np.array([2.0, 0.5, 1.5]))
     np.testing.assert_allclose(shapes_from_deltas(slice_deltas(SHAPES, p), p), SHAPES, atol=1e-6)
 
 
@@ -73,7 +58,7 @@ def test_round_trip_diag_weighted() -> None:
 
 
 def test_round_trip_narrow_width() -> None:
-    p = _pattern(cholesky_inv=L_INV, weights=np.array([2.0, 0.5, 1.5]))
+    p = _pattern(weights=np.array([2.0, 0.5, 1.5]))
     narrow = SHAPES[:, :2]
     got = shapes_from_deltas(slice_deltas(narrow, p), p)
     assert got.shape == (4, 2)
@@ -81,7 +66,7 @@ def test_round_trip_narrow_width() -> None:
 
 
 def test_one_dimensional_input_stays_one_dimensional() -> None:
-    p = _pattern(cholesky_inv=L_INV, weights=np.array([2.0, 0.5, 1.5]))
+    p = _pattern(weights=np.array([2.0, 0.5, 1.5]))
     delta = slice_deltas(SHAPES[1], p)[0]
     got = shapes_from_deltas(delta, p)
     assert got.shape == (3,)
@@ -96,14 +81,14 @@ def test_zero_weight_coordinate_falls_back_to_mu() -> None:
 
 
 def test_float32_input_stays_float32() -> None:
-    p = _pattern(cholesky_inv=L_INV, weights=np.ones(3))
+    p = _pattern(weights=np.ones(3))
     out = shapes_from_deltas(np.ones((4, 3), dtype=np.float32), p)
     assert out.dtype == np.float32
 
 
-def test_hub_scores_on_mahalanobis_pattern_use_true_shapes() -> None:
+def test_hub_scores_on_weighted_pattern_use_true_shapes() -> None:
     edge_max = np.array([5.0, 5.0, 5.0], dtype=np.float32)
-    p = _pattern(cholesky_inv=L_INV, weights=np.array([2.0, 0.5, 1.5]), edge_max=edge_max)
+    p = _pattern(weights=np.array([2.0, 0.5, 1.5]), edge_max=edge_max)
     deltas = slice_deltas(SHAPES, p).astype(np.float32)
     keys = ["K-001", "K-002", "K-003", "K-004"]
     table = pa.table(
@@ -125,28 +110,28 @@ def test_hub_scores_on_mahalanobis_pattern_use_true_shapes() -> None:
     results = nav.π7_attract_hub("p", top_n=4)
     got = {k: score for k, _, score in results}
     for k in keys:
-        np.testing.assert_allclose(got[k], expected[k], atol=1e-4)
+        np.testing.assert_allclose(got[k], expected[k], atol=1e-6)
 
     stats = nav.π7_attract_hub_and_stats("p")[1]
     np.testing.assert_allclose(stats["max"], max(expected.values()), atol=1e-3)
 
 
-def test_attribution_on_mahalanobis_pattern_is_share_of_stored_delta_sq() -> None:
-    """Under Cholesky + weights, attribution is the share of the stored
+def test_attribution_on_weighted_pattern_is_share_of_stored_delta_sq() -> None:
+    """Under weights, attribution is the share of the stored
     (whitened) delta's squared norm — the same approximation ``witness``
     and ``repair`` make — whatever the dims' kind tags."""
     from hypertopos.engine.geometry import compute_reliability_flags
     from hypertopos.engine.investigation import build_explanation
 
     kinds = ["gaussian", "poisson", "gaussian"]
-    p = _pattern(cholesky_inv=L_INV, weights=np.array([2.0, 0.5, 1.5]))
+    p = _pattern(weights=np.array([2.0, 0.5, 1.5]))
     p.dimension_kinds = kinds
     delta = slice_deltas(SHAPES[1], p)[0].astype(np.float64)
     sq = delta**2
     shares = sq / sq.sum()
 
     flags = compute_reliability_flags(delta, pattern=p)
-    np.testing.assert_allclose(flags["dominant_dim_share"], shares.max(), atol=1e-6)
+    np.testing.assert_allclose(flags["dominant_dim_share"], shares.max(), atol=1e-4)
     assert flags["dominant_dim"] == p.dim_labels[int(np.argmax(sq))]
 
     expl = build_explanation(

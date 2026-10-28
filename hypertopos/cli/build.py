@@ -618,7 +618,7 @@ def _add_pattern(
         group_by_property=pat_cfg.group_by_property,
         dimension_weights=pat_cfg.dimension_weights,
         gmm_n_components=pat_cfg.gmm_n_components,
-        use_mahalanobis=pat_cfg.use_mahalanobis,
+        score_axes=pat_cfg.score_axes,
         description=pat_cfg.description,
         edge_table=_et_cfg,
         geo_properties=pat_cfg.geo_properties,

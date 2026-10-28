@@ -123,7 +123,7 @@ class TestPassiveScannerDirect:
             "acct_tight",
             "account_pattern",
             key_type="direct",
-            filter_expr="delta_rank_pct > 99",
+            filter_expr="score_rank_pct > 99",
         )
         result = scanner.scan("accounts")
         # Tighter filter → fewer hits
@@ -200,7 +200,8 @@ class TestPassiveScannerScoring:
         sess.__exit__(None, None, None)
 
     def test_total_flagged_counts_hits_beyond_top_n(self, tmp_path):
-        scanner, sess = _make_scanner_fixture(tmp_path)
+        # 200 accounts: the calibrated 5 % budget flags about ten of them.
+        scanner, sess = _make_scanner_fixture(tmp_path, n=200)
         scanner.add_source("acct", "account_pattern", key_type="direct")
         everything = scanner.scan("accounts", threshold=1)
         assert everything.total_flagged >= 2, "fixture must flag at least two entities"

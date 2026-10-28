@@ -12,6 +12,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
+from hypertopos.engine.robust import fit_reference, is_anomaly
 from hypertopos.scoring import POOLED_GROUP, FrozenCalibration
 
 DIMS = ("a", "b", "c")
@@ -44,15 +45,25 @@ def _matrix(table: pa.Table) -> np.ndarray:
 def test_fit_and_score_match_a_numpy_oracle():
     table = _table()
     scores = FrozenCalibration.fit(table, DIMS, percentile=99.0).score(table)
-    norm, delta, theta = _oracle(_matrix(table).astype(np.float64), 99.0)
+    norm, delta, _ = _oracle(_matrix(table).astype(np.float64), 99.0)
     np.testing.assert_allclose(scores.delta_norm, norm, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(scores.delta, delta, rtol=1e-4, atol=1e-5)
-    np.testing.assert_array_equal(scores.is_anomaly, norm >= theta)
-    assert scores.is_anomaly.mean() == pytest.approx(0.01, abs=0.002)
-    smaller = (norm[None, :] < norm[:, None]).sum(axis=1)
-    np.testing.assert_allclose(scores.rank_pct, smaller / len(norm) * 100, atol=1e-3)
-    np.testing.assert_allclose(scores.conformal_p, (len(norm) - smaller) / len(norm), atol=1e-6)
     assert scores.calibration_scope is None
+
+
+def test_score_layer_is_the_calibrated_evidence_score():
+    # anomaly_score, p and rank come from the robust reference fitted on the same
+    # values a sphere build scores; is_anomaly is the conformal p at the percentile.
+    table = _table()
+    calibration = FrozenCalibration.fit(table, DIMS, percentile=99.0)
+    scores = calibration.score(table)
+    _, fitted = fit_reference(_matrix(table).astype(np.float64), DIMS)
+    assert calibration.reference.axes == ("mahal",)  # no events: no current axis
+    np.testing.assert_array_equal(scores.anomaly_score, fitted.anomaly_score)
+    np.testing.assert_array_equal(scores.conformal_p, fitted.conformal_p)
+    np.testing.assert_array_equal(scores.score_rank_pct, fitted.score_rank_pct)
+    np.testing.assert_array_equal(scores.is_anomaly, is_anomaly(fitted.conformal_p, 99.0))
+    assert scores.is_anomaly.mean() == pytest.approx(0.01, abs=0.002)
 
 
 def test_extreme_values_keep_their_distance():
@@ -100,10 +111,13 @@ def test_groups_are_calibrated_separately():
     scores = calibration.score(shifted)
     for name in ("big", "small"):
         mask = np.array(segment) == name
-        norm, _, theta = _oracle(_matrix(shifted)[mask].astype(np.float64), 99.0)
+        norm, _, _ = _oracle(_matrix(shifted)[mask].astype(np.float64), 99.0)
         np.testing.assert_allclose(scores.delta_norm[mask], norm, rtol=1e-5, atol=1e-5)
-        assert scores.is_anomaly[mask].mean() == pytest.approx(0.01, abs=0.005)
     assert set(scores.calibration_scope) == {"group"}
+    # The score is global, as in a sphere build: groups change only the deviations.
+    overall = FrozenCalibration.fit(shifted, DIMS).score(shifted)
+    np.testing.assert_array_equal(scores.anomaly_score, overall.anomaly_score)
+    np.testing.assert_array_equal(scores.is_anomaly, overall.is_anomaly)
 
 
 def test_small_groups_are_pooled_and_unseen_groups_use_global():
@@ -115,8 +129,7 @@ def test_small_groups_are_pooled_and_unseen_groups_use_global():
     scope = scores.calibration_scope
     assert set(scope[:1900]) == {"group"}
     assert set(scope[1900:]) == {"pooled"}
-    # The pooled group has 100 members, so its threshold can flag someone.
-    assert calibration.groups[POOLED_GROUP].theta_norm > 0
+    assert calibration.groups[POOLED_GROUP].size == 100
     unseen = pa.table(
         {"entity": ["U"], "a": [1.0], "b": [4], "c": [10.0], "segment": ["never-seen"]}
     )
@@ -125,7 +138,9 @@ def test_small_groups_are_pooled_and_unseen_groups_use_global():
 
 @pytest.mark.parametrize("grouped", [False, True], ids=["global", "grouped"])
 def test_calibration_matches_the_sphere_built_from_it(tmp_path, grouped):
-    """The contract: a sphere built from the calibration reports the same geometry."""
+    """The contract: a sphere built from the calibration reports the same scores."""
+    import json
+
     import lance
 
     from hypertopos.spark._build import PATTERN_ID, build_sphere
@@ -154,8 +169,15 @@ def test_calibration_matches_the_sphere_built_from_it(tmp_path, grouped):
         geo["delta_norm"].to_numpy()[order], scores.delta_norm, rtol=1e-6, atol=1e-6
     )
     np.testing.assert_array_equal(geo["is_anomaly"].to_numpy()[order], scores.is_anomaly)
-    np.testing.assert_allclose(geo["delta_rank_pct"].to_numpy()[order], scores.rank_pct, atol=1e-4)
+    np.testing.assert_allclose(
+        geo["anomaly_score"].to_numpy()[order], scores.anomaly_score, rtol=1e-6, atol=1e-6
+    )
+    np.testing.assert_allclose(
+        geo["score_rank_pct"].to_numpy()[order], scores.score_rank_pct, atol=1e-4
+    )
     np.testing.assert_allclose(geo["conformal_p"].to_numpy()[order], scores.conformal_p, atol=1e-6)
+    meta = json.loads((tmp_path / "s" / "_gds_meta" / "sphere.json").read_text(encoding="utf-8"))
+    assert meta["patterns"][PATTERN_ID]["score_dims"] == list(DIMS)
     if grouped:
         assert set(scores.calibration_scope[2550:]) == {"pooled"}
 
@@ -194,15 +216,19 @@ def test_pickle_round_trip():
     np.testing.assert_array_equal(
         restored.score(table).delta_norm, calibration.score(table).delta_norm
     )
+    np.testing.assert_array_equal(
+        restored.score(table).anomaly_score, calibration.score(table).anomaly_score
+    )
 
 
 def test_p_value_and_rank_are_exact_ratios():
     # Ratios of counts: a float32 round trip printed 0.001 as 0.0010000000474974513.
     table = _table()
     scores = FrozenCalibration.fit(table, DIMS).score(table)
-    n = len(scores.delta_norm)
-    left = np.round(scores.rank_pct * n / 100).astype(int)
+    n = len(scores.anomaly_score)
+    reference = np.sort(scores.anomaly_score)
+    above = n - np.searchsorted(reference, scores.anomaly_score, side="left")
     assert scores.conformal_p.dtype == np.float64
-    assert scores.rank_pct.dtype == np.float64
-    np.testing.assert_array_equal(scores.conformal_p, (n - left) / n)
-    np.testing.assert_array_equal(scores.rank_pct, left / n * 100)
+    assert scores.score_rank_pct.dtype == np.float64
+    np.testing.assert_array_equal(scores.conformal_p, (1.0 + above) / (n + 1.0))
+    np.testing.assert_array_equal(scores.score_rank_pct, 100.0 * (n - above) / n)

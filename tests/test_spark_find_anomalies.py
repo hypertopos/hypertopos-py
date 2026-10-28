@@ -52,10 +52,11 @@ def result(events, tmp_path_factory):
 def test_one_row_per_entity_with_the_contract_columns(result):
     assert result.columns == [
         "entity",
-        "delta_norm",
+        "anomaly_score",
         "is_anomaly",
         "p_value",
-        "rank_pct",
+        "score_rank_pct",
+        "delta_norm",
         "top_reasons",
     ]
     assert result.count() == N_ENTITIES
@@ -81,19 +82,20 @@ def test_reasons_are_the_largest_shares_in_order(result):
 
 def test_single_dimension_reason_takes_the_whole_distance(events, tmp_path):
     out = find_anomalies(events, entity="src", sphere_root=str(tmp_path)).collect()
+    assert any(row["top_reasons"] for row in out)
     for row in out:
-        if row["delta_norm"] == 0:
-            assert row["top_reasons"] == []  # at the centre: no reason to report
-            continue
-        (reason,) = row["top_reasons"]
-        assert reason["dim"] == "n_events"
-        assert reason["pct_of_total"] == pytest.approx(100.0)
+        assert len(row["top_reasons"]) <= 1  # empty only at the centre of the score
+        for reason in row["top_reasons"]:
+            assert reason["dim"] == "n_events"
+            assert reason["pct_of_total"] == pytest.approx(100.0)
 
 
-def test_p_value_and_rank_are_consistent_with_the_distance(result):
-    rows = sorted(result.select("delta_norm", "p_value", "rank_pct").collect(), key=lambda r: r[0])
+def test_p_value_and_rank_are_consistent_with_the_score(result):
+    rows = sorted(
+        result.select("anomaly_score", "p_value", "score_rank_pct").collect(), key=lambda r: r[0]
+    )
     p_values = [r["p_value"] for r in rows]
-    ranks = [r["rank_pct"] for r in rows]
+    ranks = [r["score_rank_pct"] for r in rows]
     assert all(0.0 <= p <= 1.0 for p in p_values)
     assert p_values == sorted(p_values, reverse=True)
     assert ranks == sorted(ranks)
@@ -120,19 +122,20 @@ def test_second_call_reuses_the_calibration(events, result):
     assert sphere_json.stat().st_mtime_ns != before
 
 
-def test_group_by_flags_about_the_percentile_in_each_group(events, tmp_path):
+def test_group_by_measures_deviations_per_group_and_scores_globally(events, result, tmp_path):
+    # As in a sphere build: groups set the deviations; score and flags are global.
     out = find_anomalies(events, **ROLES, group_by="segment", sphere_root=str(tmp_path))
     assert out.columns[-2:] == ["segment", "calibration_scope"]
     assert {r[0] for r in out.select("calibration_scope").distinct().collect()} == {"group"}
-    per_group = {
-        r["segment"]: (r["n"], r["flagged"])
-        for r in out.groupBy("segment")
-        .agg(F.count("*").alias("n"), F.sum(F.col("is_anomaly").cast("int")).alias("flagged"))
-        .collect()
-    }
-    assert set(per_group) == {"retail", "business"}
-    for n, flagged in per_group.values():
-        assert flagged / n == pytest.approx(0.01, abs=0.005)
+    grouped = {r["entity"]: r for r in out.collect()}
+    assert {r["segment"] for r in grouped.values()} == {"retail", "business"}
+    for r in result.collect():
+        g = grouped[r["entity"]]
+        assert g["anomaly_score"] == r["anomaly_score"]
+        assert g["is_anomaly"] == r["is_anomaly"]
+    assert sum(r["is_anomaly"] for r in grouped.values()) / N_ENTITIES == pytest.approx(
+        0.01, abs=0.002
+    )
 
 
 def test_max_entities_refuses_a_too_large_build(events, tmp_path):

@@ -205,14 +205,14 @@ def tiny_anchor_sphere_factory():
 
 def test_build_once_writes_v1(tiny_sphere_factory, tmp_path):
     """First builder run on a fresh dir writes v=1.json with schema_hash and
-    sphere.json with format_version=3.0 + calibration_epoch=1."""
+    sphere.json with format_version=4.0 + calibration_epoch=1."""
     from hypertopos.storage.reader import GDSReader
 
     sphere_path = tmp_path / "sphere"
     pid = tiny_sphere_factory(sphere_path)
 
     meta = json.loads((sphere_path / "_gds_meta" / "sphere.json").read_text())
-    assert meta["format_version"] == "3.0"
+    assert meta["format_version"] == "4.0"
     assert meta["calibration_history_policy"] == {"last_k": 5}
     assert meta["patterns"][pid]["calibration_epoch"] == 1
     assert len(meta["patterns"][pid]["schema_hash"]) == 64
@@ -539,9 +539,9 @@ def test_pattern_removed_leaves_orphan_dir(tiny_two_pattern_factory, tmp_path):
 
 
 def test_legacy_sphere_first_build_writes_3_0(tiny_sphere_factory, tmp_path):
-    """A legacy (pre-3.0) sphere.json on disk is rewritten as 3.0 by the
-    first builder run — the builder always emits 3.0 regardless of prior
-    format_version, since the only supported reader path requires 3.0."""
+    """A legacy sphere.json on disk is rewritten as 4.0 by the
+    first builder run — the builder always emits 4.0 regardless of prior
+    format_version, since the only supported reader path requires 4.0."""
     sphere_path = tmp_path / "sphere"
     sphere_path.mkdir(parents=True)
 
@@ -563,11 +563,11 @@ def test_legacy_sphere_first_build_writes_3_0(tiny_sphere_factory, tmp_path):
 
         shutil.rmtree(history_root)
 
-    # Re-build — fresh 3.0 metadata.
+    # Re-build — fresh 4.0 metadata.
     pid = tiny_sphere_factory(sphere_path)
 
     meta_after = json.loads(sphere_path_meta.read_text())
-    assert meta_after["format_version"] == "3.0"
+    assert meta_after["format_version"] == "4.0"
     assert meta_after["calibration_history_policy"] == {"last_k": 5}
     assert meta_after["patterns"][pid]["calibration_epoch"] == 1
     assert "schema_hash" in meta_after["patterns"][pid]
@@ -899,7 +899,7 @@ def test_theta_sensitivity_navigator_raises_on_missing_pattern(tiny_sphere_facto
 
 def test_theta_sensitivity_round_trip_on_built_sphere(tiny_sphere_factory, tmp_path):
     """Builder must populate `theta_sensitivity` on every CalibrationFit
-    (cheap-path glued onto the existing `sorted_norms` for delta_rank_pcts).
+    (cheap-path glued onto the existing `sorted_norms` for score_rank_pcts).
     Field must survive the v=N.json round-trip with all five expected stat
     fields per percentile."""
     from hypertopos.storage.reader import GDSReader
@@ -1000,9 +1000,10 @@ def test_decompose_drift_on_built_sphere(tiny_anchor_sphere_factory, tmp_path):
 
 
 def test_find_calibration_influencers_on_built_sphere(tiny_anchor_sphere_factory, tmp_path):
-    """Build the anchor sphere once, run find_calibration_influencers(classify='all'),
-    verify cell_counts sum to N, classifications consistent with delta_norm
-    + total_impact ranking."""
+    """A built continuous anchor pattern is ranked by its calibrated score, where
+    the θ-flip classes do not apply: the call is refused (the leave-one-out
+    algorithm itself is covered on delta_norm-scored patterns in
+    test_find_calibration_influencers.py)."""
     from hypertopos.sphere import HyperSphere
 
     sphere_path = tmp_path / "sphere"
@@ -1012,22 +1013,8 @@ def test_find_calibration_influencers_on_built_sphere(tiny_anchor_sphere_factory
     session = sphere_obj.session(agent_id="m4_test")
     try:
         nav = session.navigator()
-        report = nav.find_calibration_influencers(
-            pattern_id=pid,
-            classify="all",
-            top_n=5,
-        )
-        assert report.population_size >= 2
-        assert sum(report.cell_counts.values()) == report.population_size
-        assert len(report.entries) <= 5
-        for entry in report.entries:
-            assert entry.classification in {
-                "hidden",
-                "distorter",
-                "standard_anomaly",
-                "normal",
-            }
-            assert entry.total_impact >= 0.0
-            assert len(entry.top_dim_contributions) >= 1
+        assert nav._storage.read_sphere().patterns[pid].score_dims
+        with pytest.raises(ValueError, match="calibrated score"):
+            nav.find_calibration_influencers(pattern_id=pid, classify="all", top_n=5)
     finally:
         session.close()

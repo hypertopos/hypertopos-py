@@ -55,11 +55,14 @@ _MOTIF_SCORE_MAX = 1e300
 # hub bank with 500 accounts at 25 % anomaly vs 5 % population) would
 # otherwise dominate ``sum(w_i / p_i)`` so completely that orthogonal
 # detector signal is erased and entities collapse onto a single HMP
-# value (~ 3e-300 for L=3 detectors). 1e-12 sits well below typical
-# operating significance levels yet stays inside float64's reciprocal
-# round-trip range so the harmonic mean still discriminates between
-# entities whose dominant detector saturated.
+# value (~ 3e-300 for L=3 detectors). 1e-12 is the absolute minimum; the
+# working floor is the population's resolution 1/(N+1) (see
+# ``combine_anomaly_pvalues``).
 _HMP_INPUT_P_FLOOR = 1e-12
+
+CALIBRATION_MAX_AGE_DAYS = 60
+"""Age after which ``sphere_overview`` flags a pattern's calibration as stale: a
+frozen population reference keeps its p-values in range for about two months."""
 
 logger = logging.getLogger(__name__)
 
@@ -160,13 +163,99 @@ def _auroc_rank_sum(scores: np.ndarray, labels: np.ndarray) -> float:
     return (rank_sum_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
 
 
-def _validate_p_value_method(p_value_method: str) -> None:
-    """Reject any p-value source other than the χ² model p-value."""
-    if p_value_method != "chi2":
+def _score_fields(row: dict[str, Any]) -> dict[str, Any]:
+    """Calibrated-score fields of a geometry row, as ``Polygon`` keyword arguments."""
+    score_delta = row.get("score_delta")
+    return {
+        "conformal_p": None if row.get("conformal_p") is None else float(row["conformal_p"]),
+        "anomaly_score": None if row.get("anomaly_score") is None else float(row["anomaly_score"]),
+        "score_delta": None if score_delta is None else np.array(score_delta, dtype=np.float32),
+    }
+
+
+def _calibrated_order_value(p_vals: np.ndarray, scores: np.ndarray) -> np.ndarray:
+    """Dense rank of (conformal_p asc, anomaly_score desc), larger = ranked first.
+
+    Ties in both columns share one value, so callers that page on equal values
+    keep tied rows together.
+    """
+    n = p_vals.shape[0]
+    out = np.empty(n, dtype=np.float64)
+    if n == 0:
+        return out
+    order = np.lexsort((-scores, p_vals))
+    p_sorted, s_sorted = p_vals[order], scores[order]
+    new_group = np.empty(n, dtype=bool)
+    new_group[0] = True
+    new_group[1:] = (p_sorted[1:] != p_sorted[:-1]) | (s_sorted[1:] != s_sorted[:-1])
+    out[order] = -np.cumsum(new_group).astype(np.float64)
+    return out
+
+
+def _uses_calibrated_score(pattern: Any) -> bool:
+    """True when the pattern stores the calibrated evidence score (``score_dims``)."""
+    return bool(getattr(pattern, "score_dims", None))
+
+
+def _anomaly_filter(pattern: Any) -> str | None:
+    """Lance filter for the entities ``find_anomalies`` counts as anomalous.
+
+    A calibrated pattern uses its stored ``is_anomaly`` (the alarm budget); any
+    other pattern uses ``delta_norm`` at or above the global θ, since its stored
+    ``is_anomaly`` may follow per-group thresholds. None when θ is zero.
+    """
+    if _uses_calibrated_score(pattern):
+        return "is_anomaly = true"
+    theta_norm = float(np.linalg.norm(pattern.theta))
+    return f"delta_norm >= {theta_norm}" if theta_norm > 0.0 else None
+
+
+def _score_dim_name(dim_label: str, requested: str, score_dims: tuple[str, ...]) -> str | None:
+    """The score dimension a ``set_dimension`` key names: the key itself, the
+    resolved dim label, or that label without the derived-dimension ``_d_`` prefix."""
+    for name in (requested, dim_label, dim_label.removeprefix("_d_")):
+        if name in score_dims:
+            return name
+    return None
+
+
+def _count_anomalies(pattern: Any, table: pa.Table, theta_norm: float) -> int:
+    """Rows of ``table`` (``delta_norm``, ``is_anomaly``) anomalous by ``_anomaly_filter``."""
+    if _uses_calibrated_score(pattern):
+        return int(pc.sum(pc.fill_null(table["is_anomaly"], False)).as_py() or 0)
+    if theta_norm <= 0.0:
+        return 0
+    return int(pc.sum(pc.greater_equal(table["delta_norm"], theta_norm)).as_py() or 0)
+
+
+def _reject_shape_space_options_on_calibrated(
+    *,
+    radius: float | None,
+    metric: str,
+    dimension_weights: dict[str, float] | None,
+    rank_by: str | None,
+    boundary_aware: bool,
+    min_confidence: float,
+) -> None:
+    """Options that recompute a distance from the shape-space ``delta`` (or use its
+    θ boundary) do not apply to a pattern ranked by its calibrated score."""
+    offending = []
+    if radius is not None:
+        offending.append("radius (scales the shape-space threshold; use fdr_alpha or top_n)")
+    if metric != "L2":
+        offending.append(f"metric={metric!r}")
+    if dimension_weights:
+        offending.append("dimension_weights")
+    if rank_by in ("delta_norm", "signed_confidence"):
+        offending.append(f"rank_by={rank_by!r}")
+    if boundary_aware:
+        offending.append("boundary_aware")
+    if min_confidence > 0.0:
+        offending.append("min_confidence (stability of the shape-space boundary)")
+    if offending:
         raise ValueError(
-            f"p_value_method must be 'chi2', got {p_value_method!r} — rank-derived "
-            "p-values only encode an entity's position in the result set, so FDR "
-            "on them carries no evidence"
+            "this pattern is ranked by its calibrated anomaly score (anomaly_score, "
+            "conformal_p); not applicable: " + ", ".join(offending)
         )
 
 
@@ -331,7 +420,7 @@ class CohortMember:
     witness_overlap: float  # Jaccard ∈ [0, 1]
     trajectory_alignment: float | None  # cos sim remapped to [0, 1], or None
     is_anomaly: bool
-    delta_rank_pct: float
+    score_rank_pct: float
     explanation: str
     component_scores: dict[str, float]
 
@@ -561,25 +650,6 @@ _SIGMA_SAFE_FLOOR = 1e-12
 # pattern-level audit and the per-polygon flag share the same notion of
 # "one dim drives the score".
 _DOMINANT_DIM_MASS_SHARE_THRESHOLD = 0.7
-
-# Brown-Forsythe (median-centred Levene) p-value below which delta_norm
-# variance is taken to differ meaningfully across the levels of a
-# pattern's ``group_by_property`` — i.e. the global θ assumption is
-# statistically violated and the agent should treat a single global
-# threshold with caution. 0.01 keeps the false-positive rate low on
-# multi-group spheres (typical agent surfaces 4-12 patterns ⇒ a 0.05
-# threshold would fire spuriously on healthy spheres).
-_HETEROSCEDASTICITY_P_THRESHOLD = 0.01
-
-# Per-dim normality alpha — Shapiro-Wilk / KS p-value below this fires
-# the ``non_normal_dim`` warning on gaussian dims. 0.01 is intentionally
-# stricter than the classical 0.05 because pattern dims are tested in
-# batch (one test per dim) and the calibration scan happens on the full
-# population (large N) — both push raw p-values down, so a tighter alpha
-# keeps the warning surface focused on dims with material distributional
-# departure rather than near-normal dims with statistically significant
-# but practically negligible skew.
-_NON_NORMAL_DIM_PVALUE_THRESHOLD = 0.01
 
 # ``kind_mismatch`` gates. The warning fires on a gaussian-declared dim
 # when the Fisher LDA direction component is near zero (the dim does
@@ -1059,7 +1129,16 @@ class GDSNavigator:
         self._dead_dim_cache[key] = dead
         return dead
 
-    _LIGHT_COLUMNS = ["primary_key", "delta", "delta_norm", "is_anomaly", "delta_rank_pct"]
+    _LIGHT_COLUMNS = [
+        "primary_key",
+        "delta",
+        "delta_norm",
+        "is_anomaly",
+        "score_rank_pct",
+        "conformal_p",
+        "anomaly_score",
+        "score_delta",
+    ]
     _CONTRAST_COLUMNS: list[str] = [
         "primary_key",
         "delta",
@@ -1081,8 +1160,11 @@ class GDSNavigator:
         "scale",
         "delta",
         "delta_norm",
-        "delta_rank_pct",
+        "score_rank_pct",
         "is_anomaly",
+        "conformal_p",
+        "anomaly_score",
+        "score_delta",
         "last_refresh_at",
         "updated_at",
         "edges",
@@ -1096,143 +1178,15 @@ class GDSNavigator:
     ]
     _CENTROID_AUTO_SAMPLE: int = 100_000
 
-    def _fdr_population(
-        self,
-        pattern_id: str,
-        pattern: Pattern,
-        *,
-        fdr_alpha: float | None,
-        fdr_method: str,
-        n_candidates: int,
-    ) -> tuple[int | None, float | None]:
-        """(n_tests, pi0) for FDR over the tested population, not the returned page.
-
-        n_tests = the pattern's population size (at least the candidate count).
-        pi0 (Storey only) = #{p > 0.5} / (0.5 · n_tests), counted on the stored
-        ``delta_norm`` column: p > 0.5 ⇔ ‖δ‖² < χ²_df⁻¹(0.5).
-        """
-        if fdr_alpha is None:
-            return None, None
-        n_tests = max(int(pattern.population_size), n_candidates)
-        if fdr_method != "storey":
-            return n_tests, None
-        from scipy.stats import chi2
-
-        cut = float(np.sqrt(chi2.isf(0.5, len(pattern.theta))))
-        try:
-            n_tail = int(
-                self._storage.count_geometry_rows(pattern_id, filter=f"delta_norm < {cut}")
-            )
-        except _NAVIGATION_RECOVERABLE_ERRORS:
-            return n_tests, None
-        return n_tests, float(min(max(n_tail / (0.5 * n_tests), 1.0 / n_tests), 1.0))
-
     @staticmethod
-    def _apply_fdr_select_polygons(
-        polygons: list[Polygon],
-        *,
-        fdr_alpha: float | None,
-        select: str,
-        top_n: int,
-        fdr_method: str = "bh",
-        p_value_method: str = "chi2",
-        pattern_df: int | None = None,
-        fdr_axis: str = "entity",
-        n_tests: int | None = None,
-        rank_offset: int = 0,
-        pi0: float | None = None,
-    ) -> list[Polygon]:
-        """Apply FDR filtering and diverse selection to a list of Polygons.
+    def _select_polygons(polygons: list[Polygon], *, select: str, top_n: int) -> list[Polygon]:
+        """Optional diverse selection of a ranked list of Polygons.
 
-        Mutates Polygon objects in-place (sets q_value / representativeness)
-        and returns the filtered/reordered list.
-
-        ``polygons`` is usually a top-n page of the tested population, so BH
-        is applied with ``n_tests`` = population size and ``rank_offset`` =
-        number of more-extreme entities skipped before the page (see
-        ``engine.fdr.q_values_from_p_values``); ``pi0`` is the population-level
-        Storey π̂₀ (π₀ = 1 when absent). Required whenever ``fdr_alpha`` is set.
-
-        p_value_method: "chi2" — upper-tail χ²(df) on ||delta||². The only
-          supported value: FDR needs model p-values that carry null vs
-          alternative evidence. Requires pattern_df when fdr_alpha is set.
-
-        fdr_axis: "entity" (default, current behaviour — flat FDR over per-
-          entity anomaly p-values), "per_dim" (independent BH/Storey per
-          dim using chi²(1) univariate per-cell p-values; keep entity iff
-          any dim's q ≤ alpha), "both" (entity-level survival AND ≥1 dim
-          surviving per-dim FDR). Per-dim mode reduces inflation when one
-          dim drives many anomalies.
+        ``select="diverse"`` keeps ``top_n`` representatives (facility location
+        on ``delta``) and sets ``representativeness``; ``"top_norm"`` keeps the
+        ranked order. Entity-level FDR is not offered: the conformal p-values of
+        a fitted population are its own ranks, so BH can never reject.
         """
-        _validate_p_value_method(p_value_method)
-        if fdr_alpha is not None and (pattern_df is None or n_tests is None):
-            raise ValueError("FDR requires pattern_df and n_tests (tested population size)")
-        if fdr_axis not in ("entity", "per_dim", "both"):
-            raise ValueError(
-                f"fdr_axis must be 'entity', 'per_dim', or 'both', got {fdr_axis!r}",
-            )
-
-        # --- FDR filtering (opt-in) ---
-        if fdr_alpha is not None and len(polygons) > 0:
-            from hypertopos.engine.fdr import (
-                benjamini_hochberg,
-                fdr_per_dimension,
-                parametric_p_values_chi2,
-                per_dim_p_values_chi2_univariate,
-            )
-
-            # Entity-axis FDR (always computed when fdr_alpha is set so that
-            # poly.q_value reflects the entity-level test, even in per_dim
-            # mode where the keep-decision is dim-driven).
-            delta_norms = np.array(
-                [float(p.delta_norm) for p in polygons],
-                dtype=np.float64,
-            )
-            p_values = parametric_p_values_chi2(
-                delta_norms, df=int(cast(int, pattern_df))
-            )  # None raises above
-            rejected_entity, q_values = benjamini_hochberg(
-                p_values,
-                fdr_alpha,
-                method=fdr_method,
-                n_tests=n_tests,
-                rank_offset=rank_offset,
-                pi0=pi0,
-            )
-            for poly, q in zip(polygons, q_values, strict=True):
-                poly.q_value = float(q)  # type: ignore[attr-defined]
-
-            # Per-dim FDR — opt-in via fdr_axis.
-            if fdr_axis in ("per_dim", "both"):
-                delta_matrix = np.array(
-                    [p.delta for p in polygons],
-                    dtype=np.float64,
-                )
-                p_per_dim = per_dim_p_values_chi2_univariate(delta_matrix)
-                rejected_per_dim, q_per_dim = fdr_per_dimension(
-                    p_per_dim,
-                    alpha=fdr_alpha,
-                    method=fdr_method,
-                    n_tests=n_tests,
-                )
-                # Per-entity decision: ≥ 1 dim survives.
-                rejected_any_dim = cast(np.ndarray, rejected_per_dim.any(axis=1))  # 2-D input
-                # Attach per-dim q-values + most-significant-dim summary.
-                for i, poly in enumerate(polygons):
-                    poly.q_values_per_dim = q_per_dim[i, :].tolist()  # type: ignore[attr-defined]
-                    poly.min_q_per_dim = float(q_per_dim[i, :].min())  # type: ignore[attr-defined]
-                    poly.dominant_q_dim_idx = int(  # type: ignore[attr-defined]
-                        q_per_dim[i, :].argmin(),
-                    )
-                if fdr_axis == "per_dim":
-                    rejected_final = rejected_any_dim
-                else:  # both
-                    rejected_final = rejected_entity & rejected_any_dim
-            else:
-                rejected_final = rejected_entity
-            polygons = [p for p, keep in zip(polygons, rejected_final, strict=True) if keep]
-
-        # --- Diverse selection (opt-in) ---
         if select not in ("top_norm", "diverse"):
             raise ValueError(f"unknown select mode: {select!r}")
         if select == "diverse" and len(polygons) > 0:
@@ -1301,8 +1255,8 @@ class GDSNavigator:
         chosen.sort()
         return light.take(pa.array(chosen))
 
-    @staticmethod
     def _attach_reliability_flags(
+        self,
         polygons: list[Polygon],
         *,
         pattern: Any,
@@ -1311,11 +1265,48 @@ class GDSNavigator:
 
         Uses the same per-dim contribution machinery as
         ``explain_anomaly.top_dimensions`` so the dominant-dim attribution
-        is consistent across surfaces. Sanitises ``anomaly_confidence``
-        (``NaN`` / ``±inf`` → ``None``) per the strict-JSON convention.
+        is consistent across surfaces: the shape-space ``delta`` on a pattern
+        scored by ``delta_norm``, the Shapley split of the ``mahal`` evidence
+        on a calibrated pattern, which then also gets ``anomaly_dimensions``
+        (``{dim, z, mahal_share}``, top 3 above 5 %). Sanitises
+        ``anomaly_confidence`` (``NaN`` / ``±inf`` → ``None``) per the
+        strict-JSON convention.
         """
         from hypertopos.engine.geometry import compute_reliability_flags
 
+        if _uses_calibrated_score(pattern):
+            if not any(poly.score_delta is not None for poly in polygons):
+                return
+            from hypertopos.engine import robust
+
+            ref = self._storage.read_reference(pattern.pattern_id)
+            cov = np.linalg.pinv(ref.lw_precision, hermitian=True)
+            for poly in polygons:
+                if poly.score_delta is None:
+                    continue
+                z = np.asarray(poly.score_delta, dtype=np.float64)
+                shares = robust.dim_shares(ref, z, cov)
+                top = int(np.argmax(shares))
+                poly.reliability_flags = {  # type: ignore[attr-defined]
+                    "single_dim_driven": bool(shares[top] > _DOMINANT_DIM_MASS_SHARE_THRESHOLD),
+                    "dominant_dim": ref.dims[top],
+                    "dominant_dim_share": round(float(shares[top]), 4),
+                    "flags": (
+                        ["single_dim_driven"]
+                        if shares[top] > _DOMINANT_DIM_MASS_SHARE_THRESHOLD
+                        else []
+                    ),
+                }
+                poly.anomaly_dimensions = [  # type: ignore[attr-defined]
+                    {
+                        "dim": ref.dims[i],
+                        "z": round(float(z[i]), 4),
+                        "mahal_share": float(shares[i]),
+                    }
+                    for i in np.argsort(-shares, kind="stable")[:3]
+                    if shares[i] > 0.05
+                ]
+            return
         for poly in polygons:
             poly.reliability_flags = compute_reliability_flags(  # type: ignore[attr-defined]
                 poly.delta,
@@ -1512,11 +1503,9 @@ class GDSNavigator:
         property_filters: dict[str, Any] | None = None,
         fdr_alpha: float | None = None,
         fdr_method: str | None = None,
-        p_value_method: str = "chi2",
-        fdr_axis: str = "entity",
         fdr_resolution: str | None = None,
         fdr_temporal_resolution: str | None = None,
-        rank_by: str = "delta_norm",
+        rank_by: str | None = None,
         select: str = "top_norm",
         metric: str = "L2",
         min_confidence: float = 0.0,
@@ -1551,18 +1540,17 @@ class GDSNavigator:
         Note: when weights are active, only ``delta_norm`` on the returned
         polygons reflects the weighted rank score. ``delta`` is the raw
         unweighted vector; ``is_anomaly``, ``bregman_divergence``,
-        ``delta_rank_pct``, and ``emerging[]`` come from storage and reflect
+        ``score_rank_pct``, and ``emerging[]`` come from storage and reflect
         the unweighted calibration. The threshold (``theta_norm``) is also
         unweighted — silencing dims naturally reduces the surviving count.
 
-        ``rank_by`` (default ``"delta_norm"``) selects the final ranking key
-        for survivors:
-          - ``"delta_norm"`` — sort by ``||delta||`` descending (default).
-          - ``"min_q_per_dim"`` — sort by per-dim FDR q-value ascending
-            (smallest q first). Re-ranks the same delta_norm top-N pool by
-            the dimension that produced the strongest single-dim signal;
-            requires ``fdr_alpha`` set and ``fdr_axis in {"per_dim", "both"}``;
-            incompatible with ``select="diverse"``.
+        ``rank_by`` (default ``None``) selects the final ranking key for
+        survivors:
+          - ``None`` — the pattern's own score: ``anomaly_score`` descending on
+            a pattern with the calibrated score (selection = stored
+            ``is_anomaly``), ``||delta||`` descending otherwise.
+          - ``"delta_norm"`` — sort by ``||delta||`` descending (patterns
+            without the calibrated score only).
           - ``"signed_confidence"`` — sort by a confidence-weighted signed
             score ``delta_norm_signed × |lda_alignment| × (1 - penalty)``
             descending, where ``delta_norm_signed = delta · direction`` and
@@ -1576,18 +1564,14 @@ class GDSNavigator:
             land at the bottom by design, not the top. Requires
             ``pattern.label_aware_calibration`` to be populated (raises
             ``GDSNavigationError`` otherwise — no silent fallback to
-            ``delta_norm``); incompatible with ``select="diverse"``.
+            ``delta_norm``); incompatible with ``select="diverse"``. Patterns
+            without the calibrated score only.
 
-        Warning: ``fdr_axis="per_dim"`` and ``rank_by="min_q_per_dim"`` use
-        chi²(1) two-sided survival on ``delta_i,d``, which is *direction-
-        agnostic* — both extreme-positive and extreme-negative deviations
-        produce small p-values. On spheres with anti-signal dims (high
-        ``|delta|`` correlated with non-fraud — see ``engine.dim_audit``
-        per-dim label AUROC), per-dim FDR can flag both wings. When ground-
-        truth labels exist, combine with
-        ``engine.dim_audit.compute_per_dim_label_auroc`` to identify and
-        down-weight anti-signal dims via ``dimension_weights`` before
-        ranking.
+        On a pattern with the calibrated score, options that recompute a
+        distance from the shape-space ``delta`` or use its θ boundary
+        (``radius``, ``metric``, ``dimension_weights``, ``rank_by='delta_norm'``,
+        ``rank_by='signed_confidence'``, ``boundary_aware``, ``min_confidence``)
+        raise ``ValueError``.
 
         ``fdr_resolution`` (optional) — when set, filter survivors to those
         in cells that clear per-level BH/Storey FDR on the spatial hierarchy
@@ -1600,12 +1584,11 @@ class GDSNavigator:
         hierarchy declared via ``Pattern.fdr_temporal_hierarchy``. Survivors
         gain ``cell_q_temporal`` and ``cell_path`` attributes.
 
-        Entity-level FDR always runs on χ² model p-values
-        (``p_value_method='chi2'``, the only accepted value — upper-tail
-        χ²(df) on ``||delta||²`` with ``df = len(pattern.theta)``).
-        ``fdr_method=None`` means "pick the context-correct value":
-        ``'storey'`` when ``fdr_resolution`` / ``fdr_temporal_resolution`` is
-        set on the entity axis, ``'bh'`` otherwise.
+        ``fdr_alpha`` is the level of this cell gate and requires
+        ``fdr_resolution`` or ``fdr_temporal_resolution``; entity-level FDR is
+        not offered (the conformal p-values of the fitted population are its
+        own ranks, so BH can never reject — ``is_anomaly`` is the calibrated
+        alarm budget). ``fdr_method=None`` means ``'storey'``.
 
         When both are set, intersection-FDR applies: an entity survives iff
         its cell cleared every named spatial level AND every named temporal
@@ -1631,15 +1614,8 @@ class GDSNavigator:
         minority of the population. Requires ``sample_size`` to be set; raises
         ``ValueError`` otherwise. Forces the in-process scan path.
         """
-        _validate_p_value_method(p_value_method)
-        # Resolve the sentinel-None fdr_method BEFORE its value-set validation.
-        # Storey applies only when fdr_resolution / fdr_temporal_resolution is
-        # set on the entity axis; explicit non-None values pass through.
-        _needs_resolution_upgrade = fdr_axis == "entity" and (
-            fdr_resolution is not None or fdr_temporal_resolution is not None
-        )
         if fdr_method is None:
-            fdr_method = "storey" if _needs_resolution_upgrade else "bh"
+            fdr_method = "storey"
         if fdr_method not in ("bh", "storey"):
             raise ValueError(f"fdr_method must be 'bh' or 'storey', got {fdr_method!r}")
         if metric not in ("L2", "Linf"):
@@ -1651,29 +1627,20 @@ class GDSNavigator:
             )
         if sample_size is not None and sample_size <= 0:
             raise ValueError(f"sample_size must be positive, got {sample_size}")
-        if rank_by not in ("delta_norm", "min_q_per_dim", "signed_confidence"):
+        if rank_by not in (None, "delta_norm", "signed_confidence"):
             raise ValueError(
-                f"rank_by must be 'delta_norm', 'min_q_per_dim', or "
+                f"rank_by must be None (the pattern's own score), 'delta_norm' or "
                 f"'signed_confidence', got {rank_by!r}"
             )
         if rank_order not in ("desc", "asc"):
             raise ValueError(f"rank_order must be 'desc' or 'asc', got {rank_order!r}")
-        if rank_by == "min_q_per_dim":
-            if fdr_alpha is None:
-                raise ValueError(
-                    "rank_by='min_q_per_dim' requires fdr_alpha to be set",
-                )
-            if fdr_axis not in ("per_dim", "both"):
-                raise ValueError(
-                    "rank_by='min_q_per_dim' requires fdr_axis in {'per_dim', 'both'} "
-                    f"(got fdr_axis={fdr_axis!r}) — without per-dim FDR no q-values "
-                    "are computed to sort by",
-                )
-            if select != "top_norm":
-                raise ValueError(
-                    "rank_by='min_q_per_dim' is incompatible with select='diverse' — "
-                    "diverse selection re-orders by representativeness, not q-values",
-                )
+        if fdr_alpha is not None and fdr_resolution is None and fdr_temporal_resolution is None:
+            raise ValueError(
+                "fdr_alpha is the level of the cell gate: set fdr_resolution or "
+                "fdr_temporal_resolution. Entity-level FDR is not offered — the "
+                "conformal p-values of the fitted population are its own ranks, so "
+                "BH can never reject; is_anomaly is the calibrated alarm budget"
+            )
         if rank_by == "signed_confidence" and select != "top_norm":
             raise ValueError(
                 "rank_by='signed_confidence' is incompatible with select='diverse' — "
@@ -1682,6 +1649,18 @@ class GDSNavigator:
         version = self._resolve_version(pattern_id)
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns[pattern_id]
+        calibrated = _uses_calibrated_score(pattern)
+        if calibrated:
+            _reject_shape_space_options_on_calibrated(
+                radius=radius,
+                metric=metric,
+                dimension_weights=dimension_weights,
+                rank_by=rank_by,
+                boundary_aware=boundary_aware,
+                min_confidence=min_confidence,
+            )
+        # None = the pattern's own score: anomaly_score (calibrated) / delta_norm.
+        rank_by = rank_by or "delta_norm"
         # signed_confidence ranking requires label-aware calibration —
         # fail fast with a structured error instead of silently degrading
         # to delta_norm ranking, so callers know they need to rebuild with
@@ -1760,21 +1739,31 @@ class GDSNavigator:
             from hypertopos.engine.lance_sql_agg import (
                 find_anomalies as _lance_sql_find_anomalies,
             )
+            from hypertopos.engine.lance_sql_agg import (
+                find_calibrated_anomalies as _lance_sql_find_calibrated,
+            )
 
             geo_lance_path = str(
                 self._storage._base.resolve() / "geometry" / pattern_id / "data.lance"
             )
-            resp = _lance_sql_find_anomalies(
-                geo_lance_path,
-                threshold=float(threshold),
-                top_n=offset + top_n,
-                offset=0,
-                min_confidence=min_confidence,
-                lance_version=self._storage.pinned_geometry_version(pattern_id),
-            )
+            pin = self._storage.pinned_geometry_version(pattern_id)
+            if calibrated:
+                resp = _lance_sql_find_calibrated(
+                    geo_lance_path, top_n=offset + top_n, offset=0, lance_version=pin
+                )
+                _all_norm_lookup: dict[str, float] = {}
+            else:
+                resp = _lance_sql_find_anomalies(
+                    geo_lance_path,
+                    threshold=float(threshold),
+                    top_n=offset + top_n,
+                    offset=0,
+                    min_confidence=min_confidence,
+                    lance_version=pin,
+                )
+                # Build norm lookup from full response first (handles duplicates)
+                _all_norm_lookup = dict(zip(resp["keys"], resp["delta_norms"], strict=False))
             total_found = resp["total_found"]
-            # Build norm lookup from full response first (handles duplicates)
-            _all_norm_lookup = dict(zip(resp["keys"], resp["delta_norms"], strict=False))
             sub_keys = list(dict.fromkeys(resp["keys"][offset:]))
             if sub_keys:
                 light_cols = [
@@ -1782,8 +1771,11 @@ class GDSNavigator:
                     "scale",
                     "delta",
                     "delta_norm",
-                    "delta_rank_pct",
+                    "score_rank_pct",
                     "is_anomaly",
+                    "conformal_p",
+                    "anomaly_score",
+                    "score_delta",
                     "last_refresh_at",
                     "updated_at",
                     "bregman_divergence",
@@ -1797,40 +1789,29 @@ class GDSNavigator:
                     point_keys=sub_keys,
                     columns=light_cols,
                 )
+                if calibrated:
+                    # Keep the SQL order (conformal_p asc, anomaly_score desc, key);
+                    # a key repeated in storage takes its best-ranked row (the
+                    # first match of index_in after this sort).
+                    full_geo = full_geo.sort_by(
+                        [("conformal_p", "ascending"), ("anomaly_score", "descending")]
+                    )
+                    position = pc.index_in(pa.array(sub_keys), value_set=full_geo["primary_key"])
+                    full_geo = full_geo.take(position.drop_null())
                 norm_lookup = {k: _all_norm_lookup[k] for k in sub_keys if k in _all_norm_lookup}
                 results = self._engine.geometry_to_polygons(
                     full_geo,
-                    norm_lookup=norm_lookup,
+                    norm_lookup=norm_lookup or None,
                     top_n=top_n,
                     pattern=pattern,
                     pattern_id=pattern_id,
                     pattern_type=pattern.pattern_type,
                     pattern_ver=version,
+                    preserve_order=calibrated,
                 )
             else:
                 results = []
-            _n_tests, _pi0 = self._fdr_population(
-                pattern_id,
-                pattern,
-                fdr_alpha=fdr_alpha,
-                fdr_method=fdr_method,
-                n_candidates=offset + len(results),
-            )
-            results = self._apply_fdr_select_polygons(
-                results,
-                fdr_alpha=fdr_alpha,
-                select=select,
-                top_n=top_n,
-                fdr_method=fdr_method,
-                p_value_method=p_value_method,
-                pattern_df=len(pattern.theta),
-                fdr_axis=fdr_axis,
-                n_tests=_n_tests,
-                rank_offset=offset,
-                pi0=_pi0,
-            )
-            if rank_by == "min_q_per_dim":
-                results.sort(key=lambda p: p.min_q_per_dim)  # type: ignore[attr-defined]  # set dynamically by FDR
+            results = self._select_polygons(results, select=select, top_n=top_n)
             if fdr_resolution is not None or fdr_temporal_resolution is not None:
                 results = self._apply_fdr_multi_resolution_gate(
                     results,
@@ -1881,7 +1862,7 @@ class GDSNavigator:
                 pattern_id,
                 version,
                 columns=cols,
-                filter=f"delta_norm >= {threshold}",
+                filter="is_anomaly" if calibrated else f"delta_norm >= {threshold}",
             )
         if _drop_norm_prefilter and light.num_rows > 0:
             light = self._stratified_sample_light(
@@ -1917,15 +1898,27 @@ class GDSNavigator:
                 )
                 return [], 0, emerging, None
 
-        # Vectorized recompute + rank
-        delta_matrix = delta_matrix_from_arrow(light)
-        if weight_vector is not None:
-            delta_matrix = delta_matrix * weight_vector
-        if metric == "Linf":
-            norms = np.max(np.abs(delta_matrix), axis=1).astype(np.float32)
+        # Vectorized recompute + rank. A calibrated pattern selects its stored
+        # is_anomaly (conformal_p boundary) and ranks by conformal_p ascending,
+        # then anomaly_score descending: rows ingested later score without the
+        # event axis, so only their p-values compare with built rows. ``norms``
+        # carries that order as a descending dense rank.
+        if calibrated:
+            scores = light["anomaly_score"].to_numpy(zero_copy_only=False).astype(np.float64)
+            p_vals = light["conformal_p"].to_numpy(zero_copy_only=False).astype(np.float64)
+            norms = _calibrated_order_value(p_vals, scores)
+            valid = light["is_anomaly"].to_numpy(zero_copy_only=False).astype(bool)
         else:
-            norms = np.sqrt(np.einsum("ij,ij->i", delta_matrix, delta_matrix)).astype(np.float32)
-        valid = norms >= threshold
+            delta_matrix = delta_matrix_from_arrow(light)
+            if weight_vector is not None:
+                delta_matrix = delta_matrix * weight_vector
+            if metric == "Linf":
+                norms = np.max(np.abs(delta_matrix), axis=1).astype(np.float32)
+            else:
+                norms = np.sqrt(np.einsum("ij,ij->i", delta_matrix, delta_matrix)).astype(
+                    np.float32
+                )
+            valid = norms >= threshold
         if not np.any(valid):
             emerging = self._find_emerging(
                 pattern_id,
@@ -2092,8 +2085,11 @@ class GDSNavigator:
             "scale",
             "delta",
             "delta_norm",
-            "delta_rank_pct",
+            "score_rank_pct",
             "is_anomaly",
+            "conformal_p",
+            "anomaly_score",
+            "score_delta",
             "last_refresh_at",
             "updated_at",
             "bregman_divergence",
@@ -2113,9 +2109,13 @@ class GDSNavigator:
         for i in range(full.num_rows):
             row = {col: full[col][i].as_py() for col in full.schema.names}
             pk = row["primary_key"]
-            recomputed_norm = key_to_norm.get(
-                pk, float(np.linalg.norm(np.array(row["delta"], dtype=np.float32)))
-            )
+            if calibrated:
+                # key_to_norm holds anomaly_score here; delta_norm keeps its stored meaning.
+                recomputed_norm = float(row["delta_norm"])
+            else:
+                recomputed_norm = key_to_norm.get(
+                    pk, float(np.linalg.norm(np.array(row["delta"], dtype=np.float32)))
+                )
             # Decode edges from struct column or reconstruct from entity_keys
             if row.get("edges"):
                 edges = [
@@ -2148,8 +2148,8 @@ class GDSNavigator:
                     edges=edges,
                     last_refresh_at=row["last_refresh_at"],
                     updated_at=row["updated_at"],
-                    delta_rank_pct=(
-                        None if row.get("delta_rank_pct") is None else float(row["delta_rank_pct"])
+                    score_rank_pct=(
+                        None if row.get("score_rank_pct") is None else float(row["score_rank_pct"])
                     ),
                     bregman_divergence=(
                         None
@@ -2161,51 +2161,37 @@ class GDSNavigator:
                         if row.get("anomaly_confidence") is None
                         else float(row["anomaly_confidence"])
                     ),
+                    **_score_fields(row),
                 )
             )
+
+        def _rank_key(p: Polygon) -> tuple[float, float]:
+            # The pattern's own order, smaller first: (conformal_p, -anomaly_score)
+            # on a calibrated pattern, -delta_norm otherwise.
+            if calibrated:
+                p_val = 1.0 if p.conformal_p is None else float(p.conformal_p)
+                return (p_val, -float(p.anomaly_score or 0.0))
+            return (-float(p.delta_norm), 0.0)
+
         # Deduplicate on primary_key — Lance may have duplicate rows from
-        # interrupted incremental_update. Keep highest delta_norm per key.
+        # interrupted incremental_update. Keep the best-ranked row per key.
         seen: dict[str, Polygon] = {}
         for p in results:
-            if p.primary_key not in seen or p.delta_norm > seen[p.primary_key].delta_norm:
+            if p.primary_key not in seen or _rank_key(p) < _rank_key(seen[p.primary_key]):
                 seen[p.primary_key] = p
         if rank_by_property is not None:
             # The property ranking already chose and ordered this page.
             key_order = {k: i for i, k in enumerate(top_keys)}
             results = sorted(seen.values(), key=lambda p: key_order.get(p.primary_key, 999999))
         else:
-            # Sort by (-delta_norm, primary_key) for deterministic pagination on tied norms
-            results = sorted(seen.values(), key=lambda p: (-p.delta_norm, p.primary_key))
+            # Sort by (rank key, primary_key) for deterministic pagination on ties
+            results = sorted(seen.values(), key=lambda p: (_rank_key(p), p.primary_key))
         # signed_confidence defers the top_n truncation until after the
         # score is computed so the full anomalous pool is re-ranked rather
         # than only the delta_norm top_n.
-        _rank_offset = 0
-        if rank_by != "signed_confidence":
-            if rank_by_property is None:
-                results = results[offset : offset + top_n]
-            _rank_offset = offset
-        _n_tests, _pi0 = self._fdr_population(
-            pattern_id,
-            pattern,
-            fdr_alpha=fdr_alpha,
-            fdr_method=fdr_method,
-            n_candidates=_rank_offset + len(results),
-        )
-        results = self._apply_fdr_select_polygons(
-            results,
-            fdr_alpha=fdr_alpha,
-            select=select,
-            top_n=top_n,
-            fdr_method=fdr_method,
-            p_value_method=p_value_method,
-            pattern_df=len(pattern.theta),
-            fdr_axis=fdr_axis,
-            n_tests=_n_tests,
-            rank_offset=_rank_offset,
-            pi0=_pi0,
-        )
-        if rank_by == "min_q_per_dim":
-            results.sort(key=lambda p: p.min_q_per_dim)  # type: ignore[attr-defined]  # set dynamically by FDR
+        if rank_by != "signed_confidence" and rank_by_property is None:
+            results = results[offset : offset + top_n]
+        results = self._select_polygons(results, select=select, top_n=top_n)
         if fdr_resolution is not None or fdr_temporal_resolution is not None:
             results = self._apply_fdr_multi_resolution_gate(
                 results,
@@ -2317,10 +2303,14 @@ class GDSNavigator:
         """Scan non-anomalous entities for emerging anomaly trajectories.
 
         Returns a sorted list of dicts or None when *include_emerging* is
-        False or *offset > 0*.
+        False or *offset > 0*. A calibrated pattern returns an empty list: the
+        forecast is a ``delta_norm`` path against θ, and θ does not decide the
+        verdict there.
         """
         if not include_emerging or offset != 0:
             return None
+        if _uses_calibrated_score(pattern):
+            return []
 
         from hypertopos.engine.forecast import forecast_anomaly_status
 
@@ -2408,10 +2398,7 @@ class GDSNavigator:
                 columns=["primary_key", "delta_norm", "is_anomaly"],
             )
             norms_arr = dist_table["delta_norm"].to_numpy().astype(np.float64)
-
-            # Recount from stored delta_norm — matches cache-miss path and
-            # find_anomalies semantics.
-            anomaly_count = int((norms_arr >= theta_norm).sum()) if theta_norm > 0.0 else 0
+            anomaly_count = _count_anomalies(pattern, dist_table, theta_norm)
 
             # Theta-relative distribution from the dist_table norms
             if theta_norm > 0:
@@ -2424,18 +2411,23 @@ class GDSNavigator:
                 distribution["0–0.25θ"] = total
 
             # Load delta only for anomalous rows (typically <5% of total) for cluster breakdown.
-            anomaly_table = self._storage.read_geometry(
-                pattern_id,
-                version,
-                columns=["primary_key", "delta"],
-                filter=f"delta_norm >= {theta_norm}",
+            anomaly_filter = _anomaly_filter(pattern)
+            anomaly_table = (
+                self._storage.read_geometry(
+                    pattern_id,
+                    version,
+                    columns=["primary_key", "delta"],
+                    filter=anomaly_filter,
+                )
+                if anomaly_filter is not None
+                else dist_table.select(["primary_key"]).slice(0, 0)
             )
         else:
             # Cache miss: full scan including delta column (backwards compatibility)
             table = self._storage.read_geometry(
                 pattern_id,
                 version,
-                columns=["primary_key", "delta", "delta_norm"],
+                columns=["primary_key", "delta", "delta_norm", "is_anomaly"],
             )
             total = table.num_rows
 
@@ -2454,7 +2446,7 @@ class GDSNavigator:
                 }
 
             norms_arr = table["delta_norm"].to_numpy().astype(np.float64)
-            anomaly_count = int((norms_arr >= theta_norm).sum()) if theta_norm > 0.0 else 0
+            anomaly_count = _count_anomalies(pattern, table, theta_norm)
             percentiles = {
                 "p50": round(float(np.percentile(norms_arr, 50)), 4),
                 "p75": round(float(np.percentile(norms_arr, 75)), 4),
@@ -2474,7 +2466,9 @@ class GDSNavigator:
                 distribution = dict.fromkeys(bucket_labels, 0)
                 distribution["0–0.25θ"] = total
 
-            if theta_norm > 0.0:
+            if _uses_calibrated_score(pattern):
+                anomaly_table = table.filter(pc.fill_null(table["is_anomaly"], False))
+            elif theta_norm > 0.0:
                 anomaly_mask = pc.greater_equal(table["delta_norm"], theta_norm)
                 anomaly_table = table.filter(anomaly_mask)
             else:
@@ -2584,15 +2578,12 @@ class GDSNavigator:
                     f"'{entity_line_id}'. Available: {sorted(col_names)}"
                 )
 
-        # Use delta_norm >= theta_norm to match anomaly_summary / find_anomalies
-        # semantics. The is_anomaly column uses per-group thetas for
-        # grouped patterns, which diverges from the global threshold.
-        theta_norm = float(np.linalg.norm(pattern.theta))
+        # The anomaly rule anomaly_summary / find_anomalies count by.
         geom = self._storage.read_geometry(
             pattern_id,
             version,
             columns=["primary_key", "delta_norm"],
-            filter=f"delta_norm >= {theta_norm}" if theta_norm > 0.0 else "is_anomaly = true",
+            filter=_anomaly_filter(pattern) or "is_anomaly = true",
             sample_size=sample_size,
         )
         total = self._storage.count_geometry_rows(pattern_id)
@@ -2708,20 +2699,20 @@ class GDSNavigator:
             pattern_id,
             version,
             primary_key=self._position.primary_key,
-            columns=["delta", "delta_norm", "is_anomaly", "delta_rank_pct"],
+            columns=["delta", "delta_norm", "is_anomaly", "score_rank_pct"],
         )
         if geo.num_rows > 0:
             stored_delta = np.array(geo["delta"][0].as_py(), dtype=np.float32)
             stored_delta_norm = float(geo["delta_norm"][0].as_py())
             stored_is_anomaly = bool(geo["is_anomaly"][0].as_py())
-            pct_val = geo["delta_rank_pct"][0].as_py()
-            stored_delta_rank_pct = float(pct_val) if pct_val is not None else None
+            pct_val = geo["score_rank_pct"][0].as_py()
+            stored_score_rank_pct = float(pct_val) if pct_val is not None else None
             polygon = dataclasses.replace(
                 polygon,
                 delta=stored_delta,
                 delta_norm=stored_delta_norm,
                 is_anomaly=stored_is_anomaly,
-                delta_rank_pct=stored_delta_rank_pct,
+                score_rank_pct=stored_score_rank_pct,
             )
         return polygon
 
@@ -2858,7 +2849,7 @@ class GDSNavigator:
         # obtain total_unfiltered without a second scan.
         self._last_total_pre_geometry_filter = table.num_rows if geometry_filters else None
         if geometry_filters:
-            _supported = {"is_anomaly", "delta_rank_pct", "delta_dim"}
+            _supported = {"is_anomaly", "score_rank_pct", "delta_dim"}
             unknown = set(geometry_filters) - _supported
             if unknown:
                 raise ValueError(
@@ -2868,8 +2859,8 @@ class GDSNavigator:
                 table = table.filter(
                     pc.equal(table["is_anomaly"], bool(geometry_filters["is_anomaly"]))
                 )
-            if "delta_rank_pct" in geometry_filters:
-                spec = geometry_filters["delta_rank_pct"]
+            if "score_rank_pct" in geometry_filters:
+                spec = geometry_filters["score_rank_pct"]
                 _ops = {
                     "gt": pc.greater,
                     "gte": pc.greater_equal,
@@ -2884,11 +2875,11 @@ class GDSNavigator:
                             raise ValueError(
                                 f"Unknown comparison op '{op_name}'. Supported: {list(_ops)}"
                             )
-                        pred = _ops[op_name](table["delta_rank_pct"], value)
+                        pred = _ops[op_name](table["score_rank_pct"], value)
                         mask = pred if mask is None else pc.and_(mask, pred)
                     table = table.filter(mask)
                 else:
-                    table = table.filter(pc.equal(table["delta_rank_pct"], float(spec)))
+                    table = table.filter(pc.equal(table["score_rank_pct"], float(spec)))
             if "delta_dim" in geometry_filters and table.num_rows > 0:
                 sphere = self._storage.read_sphere()
                 event_pattern = sphere.patterns[event_pattern_id]
@@ -2946,9 +2937,10 @@ class GDSNavigator:
                     edges=edges,
                     last_refresh_at=row["last_refresh_at"],
                     updated_at=row["updated_at"],
-                    delta_rank_pct=(
-                        None if row.get("delta_rank_pct") is None else float(row["delta_rank_pct"])
+                    score_rank_pct=(
+                        None if row.get("score_rank_pct") is None else float(row["score_rank_pct"])
                     ),
+                    **_score_fields(row),
                 )
             )
 
@@ -2972,23 +2964,13 @@ class GDSNavigator:
         pattern_id: str,
         direction: Literal["in", "out", "both"] = "both",
         top_n: int = 10,
-        fdr_alpha: float | None = None,
-        fdr_method: str = "bh",
-        p_value_method: str = "chi2",
         select: str = "top_norm",
     ) -> list[tuple[Polygon, float]]:
         """Find entities closest to an alias segment boundary (cutting plane).
 
         Returns (polygon, signed_distance) pairs sorted by |signed_distance|.
         signed_distance >= 0 → inside segment, < 0 → outside segment.
-
-        ``fdr_alpha`` (optional) filters the boundary set by BH/Storey FDR on
-        χ² model p-values of ``||delta||²`` (``p_value_method='chi2'``, the
-        only accepted value).
         """
-        _validate_p_value_method(p_value_method)
-        if fdr_method not in ("bh", "storey"):
-            raise ValueError(f"fdr_method must be 'bh' or 'storey', got {fdr_method!r}")
         sphere = self._storage.read_sphere()
         alias = sphere.aliases.get(alias_id)
         if alias is None:
@@ -3073,37 +3055,17 @@ class GDSNavigator:
                 edges=edges,
                 last_refresh_at=row["last_refresh_at"],
                 updated_at=row["updated_at"],
-                delta_rank_pct=(
-                    None if row.get("delta_rank_pct") is None else float(row["delta_rank_pct"])
+                score_rank_pct=(
+                    None if row.get("score_rank_pct") is None else float(row["score_rank_pct"])
                 ),
+                **_score_fields(row),
             )
             results.append((polygon, signed_dist))
         results.sort(key=lambda x: abs(x[1]))
 
-        # --- FDR + diverse selection post-processing ---
-        if fdr_alpha is not None or select != "top_norm":
-            polygons = [p for p, _ in results]
-            # Boundary candidates are not the most-extreme prefix, so the
-            # population-sized BH is conservative here (rank_offset = 0).
-            _n_tests, _pi0 = self._fdr_population(
-                pattern_id,
-                pattern,
-                fdr_alpha=fdr_alpha,
-                fdr_method=fdr_method,
-                n_candidates=len(polygons),
-            )
-            polygons = self._apply_fdr_select_polygons(
-                polygons,
-                fdr_alpha=fdr_alpha,
-                select=select,
-                top_n=top_n,
-                fdr_method=fdr_method,
-                p_value_method=p_value_method,
-                pattern_df=len(pattern.theta),
-                fdr_axis="entity",
-                n_tests=_n_tests,
-                pi0=_pi0,
-            )
+        # --- Diverse selection post-processing ---
+        if select != "top_norm":
+            polygons = self._select_polygons([p for p, _ in results], select=select, top_n=top_n)
             dist_lookup = {p.primary_key: d for p, d in results}
             results = [(p, dist_lookup[p.primary_key]) for p in polygons]
 
@@ -3497,7 +3459,7 @@ class GDSNavigator:
         and support ANN search.
 
         filter_expr: optional Lance SQL predicate applied at ANN time, enabling single-pass
-        ANN + scalar filter (e.g. 'is_anomaly = true', 'delta_rank_pct > 95').
+        ANN + scalar filter (e.g. 'is_anomaly = true', 'score_rank_pct > 95').
 
         missing_edge_to: optional line_id — post-filter that keeps only entities WITHOUT
         an edge to the target line. Over-fetches 5x from ANN to compensate for attrition.
@@ -3612,11 +3574,11 @@ class GDSNavigator:
     ) -> dict[str, Any]:
         """Read stored geometry metadata for a single entity.
 
-        Returns dict with delta_norm (float), is_anomaly (bool), delta_rank_pct (float | None).
+        Returns dict with delta_norm (float), is_anomaly (bool), score_rank_pct (float | None).
         Raises KeyError if entity not found in the geometry dataset.
         """
         version = self._resolve_version(pattern_id)
-        cols = ["delta_norm", "is_anomaly", "delta_rank_pct"]
+        cols = ["delta_norm", "is_anomaly", "score_rank_pct"]
         table = self._storage.read_geometry(
             pattern_id,
             version,
@@ -3625,11 +3587,11 @@ class GDSNavigator:
         )
         if table.num_rows == 0:
             raise KeyError(f"Entity '{primary_key}' not found in {pattern_id} v{version}")
-        pct = table["delta_rank_pct"][0].as_py()
+        pct = table["score_rank_pct"][0].as_py()
         return {
             "delta_norm": float(table["delta_norm"][0].as_py()),
             "is_anomaly": bool(table["is_anomaly"][0].as_py()),
-            "delta_rank_pct": float(pct) if pct is not None else None,
+            "score_rank_pct": float(pct) if pct is not None else None,
         }
 
     def compare_entities_intraclass(
@@ -3643,12 +3605,12 @@ class GDSNavigator:
         Reads delta from the geometry Lance dataset via primary_key BTREE index —
         never uses ANN. This guarantees correctness even when the ANN index is stale.
 
-        Returns a dict with keys: distance, delta_norm_a, delta_rank_pct_a,
-        is_anomaly_a, delta_norm_b, delta_rank_pct_b, is_anomaly_b.
+        Returns a dict with keys: distance, delta_norm_a, score_rank_pct_a,
+        is_anomaly_a, delta_norm_b, score_rank_pct_b, is_anomaly_b.
         Raises KeyError if either entity is not found in the geometry dataset.
         """
         version = self._resolve_version(pattern_id)
-        cols = ["primary_key", "delta", "delta_norm", "delta_rank_pct", "is_anomaly"]
+        cols = ["primary_key", "delta", "delta_norm", "score_rank_pct", "is_anomaly"]
 
         table_a = self._storage.read_geometry(
             pattern_id,
@@ -3674,9 +3636,9 @@ class GDSNavigator:
 
         def _pct(tbl: Any) -> float | None:
             col_names = tbl.schema.names
-            if "delta_rank_pct" not in col_names:
+            if "score_rank_pct" not in col_names:
                 return None
-            val = tbl["delta_rank_pct"][0].as_py()
+            val = tbl["score_rank_pct"][0].as_py()
             return float(val) if val is not None else None
 
         interpretation = (
@@ -3695,10 +3657,10 @@ class GDSNavigator:
             "distance": distance,
             "interpretation": interpretation,
             "delta_norm_a": float(table_a["delta_norm"][0].as_py()),
-            "delta_rank_pct_a": _pct(table_a),
+            "score_rank_pct_a": _pct(table_a),
             "is_anomaly_a": bool(table_a["is_anomaly"][0].as_py()),
             "delta_norm_b": float(table_b["delta_norm"][0].as_py()),
-            "delta_rank_pct_b": _pct(table_b),
+            "score_rank_pct_b": _pct(table_b),
             "is_anomaly_b": bool(table_b["is_anomaly"][0].as_py()),
         }
 
@@ -3885,22 +3847,22 @@ class GDSNavigator:
                     geo = self._storage.read_geometry(
                         scoring_pattern,
                         geo_version,
-                        columns=["primary_key", "is_anomaly", "delta_rank_pct"],
+                        columns=["primary_key", "is_anomaly", "score_rank_pct"],
                     )
                 else:
                     geo = self._storage.read_geometry(
                         scoring_pattern,
                         geo_version,
                         point_keys=list(all_cp_keys),
-                        columns=["primary_key", "is_anomaly", "delta_rank_pct"],
+                        columns=["primary_key", "is_anomaly", "score_rank_pct"],
                     )
 
                 for i in range(geo.num_rows):
                     pk = geo["primary_key"][i].as_py()
                     _data = {
                         "is_anomaly": bool(geo["is_anomaly"][i].as_py()),
-                        "delta_rank_pct": round(
-                            float(geo["delta_rank_pct"][i].as_py()),
+                        "score_rank_pct": round(
+                            float(geo["score_rank_pct"][i].as_py()),
                             2,
                         ),
                     }
@@ -3961,7 +3923,7 @@ class GDSNavigator:
         per counterparty.  Falls back to full points scan otherwise.
 
         If *pattern_id* is provided, each counterparty is enriched with ``is_anomaly``
-        and ``delta_rank_pct`` from that pattern's geometry.
+        and ``score_rank_pct`` from that pattern's geometry.
 
         Each direction is ordered by ``tx_count`` descending; ties are broken
         by ``amount_sum`` descending (edge-table path only) and then by
@@ -4067,15 +4029,15 @@ class GDSNavigator:
             geo = self._storage.read_geometry(
                 pattern_id,
                 geo_version,
-                columns=["primary_key", "is_anomaly", "delta_rank_pct"],
+                columns=["primary_key", "is_anomaly", "score_rank_pct"],
             )
             geo_pks = geo["primary_key"].to_pylist()
             geo_anom = geo["is_anomaly"].to_pylist()
-            geo_rank = geo["delta_rank_pct"].to_pylist()
+            geo_rank = geo["score_rank_pct"].to_pylist()
             for pk, anom, rank in zip(geo_pks, geo_anom, geo_rank, strict=False):
                 _data = {
                     "is_anomaly": bool(anom),
-                    "delta_rank_pct": (round(float(rank), 2) if rank is not None else None),
+                    "score_rank_pct": (round(float(rank), 2) if rank is not None else None),
                 }
                 if pk in all_cp_keys:
                     geo_lookup[pk] = _data
@@ -4865,7 +4827,7 @@ class GDSNavigator:
                 pattern_id,
                 version,
                 point_keys=event_keys,
-                columns=["primary_key", "delta_norm", "is_anomaly", "delta_rank_pct"],
+                columns=["primary_key", "delta_norm", "is_anomaly", "score_rank_pct"],
             )
             geo_map: dict[str, dict[str, Any]] = {}
             for i in range(geo.num_rows):
@@ -4873,7 +4835,7 @@ class GDSNavigator:
                 geo_map[pk] = {
                     "delta_norm": round(float(geo["delta_norm"][i].as_py()), 4),
                     "is_anomaly": bool(geo["is_anomaly"][i].as_py()),
-                    "delta_rank_pct": round(float(geo["delta_rank_pct"][i].as_py()), 2),
+                    "score_rank_pct": round(float(geo["score_rank_pct"][i].as_py()), 2),
                 }
         except GDSNavigationError:
             geo_map = {}
@@ -4882,7 +4844,7 @@ class GDSNavigator:
             geo_data = geo_map.get(edge["event_key"], {})
             edge["delta_norm"] = geo_data.get("delta_norm", 0.0)
             edge["is_anomaly"] = geo_data.get("is_anomaly", False)
-            edge["delta_rank_pct"] = geo_data.get("delta_rank_pct", 0.0)
+            edge["score_rank_pct"] = geo_data.get("score_rank_pct", 0.0)
 
         # Sort by delta_norm desc, cap at top_n
         all_edges.sort(key=lambda e: e["delta_norm"], reverse=True)
@@ -7011,7 +6973,7 @@ class GDSNavigator:
           When the reference has no vector, the trajectory component is removed
           for the entire call and weights renormalize across the remaining
           three signals.
-        * ``anomaly_bonus``: graded by ``delta_rank_pct / 100`` — a candidate
+        * ``anomaly_bonus``: graded by ``score_rank_pct / 100`` — a candidate
           at the 99th percentile contributes much more than one at the 90th
 
         Candidates already connected to ``primary_key`` via the resolved edge
@@ -7079,7 +7041,7 @@ class GDSNavigator:
             pattern_id,
             version,
             primary_key=primary_key,
-            columns=["delta", "delta_norm", "is_anomaly", "delta_rank_pct"],
+            columns=["delta", "delta_norm", "is_anomaly", "score_rank_pct"],
         )
         if ref_table.num_rows == 0:
             raise KeyError(f"Entity '{primary_key}' not found in {pattern_id} v{version}")
@@ -7161,13 +7123,13 @@ class GDSNavigator:
             pattern_id,
             version,
             point_keys=candidate_keys,
-            columns=["primary_key", "delta", "delta_norm", "is_anomaly", "delta_rank_pct"],
+            columns=["primary_key", "delta", "delta_norm", "is_anomaly", "score_rank_pct"],
         )
         cand_pk = cand_geo["primary_key"].to_pylist()
         cand_delta = cand_geo["delta"].to_pylist()
         cand_norm = cand_geo["delta_norm"].to_pylist()
         cand_anom = cand_geo["is_anomaly"].to_pylist()
-        cand_rank = cand_geo["delta_rank_pct"].to_pylist()
+        cand_rank = cand_geo["score_rank_pct"].to_pylist()
         geo_row = {
             cand_pk[i]: (cand_delta[i], cand_norm[i], cand_anom[i], cand_rank[i])
             for i in range(cand_geo.num_rows)
@@ -7259,7 +7221,7 @@ class GDSNavigator:
                     witness_overlap=round(witness_overlap, 4),
                     trajectory_alignment=(round(traj_align, 4) if traj_align is not None else None),
                     is_anomaly=bool(is_anom_y),
-                    delta_rank_pct=round(float(rank_y), 2),
+                    score_rank_pct=round(float(rank_y), 2),
                     explanation=explanation,
                     component_scores={k: round(v, 4) for k, v in components.items()},
                 )
@@ -8350,20 +8312,17 @@ class GDSNavigator:
             theta_norm = round(float(np.linalg.norm(pattern.theta)), 4)
             stats = self._storage.read_geometry_stats(pid, version)
             total = stats["total_entities"] if stats else self._storage.count_geometry_rows(pid)
-            # Count anomalies by delta_norm >= theta_norm to match
-            # anomaly_summary / find_anomalies semantics.
-            # The is_anomaly column uses per-group thetas for grouped
-            # patterns, which diverges from the global theta_norm used
-            # by find_anomalies — leading to contradictory counts.
-            theta_norm_raw = float(np.linalg.norm(pattern.theta))
-            if theta_norm_raw > 0.0:
-                anomaly_count = self._storage.count_geometry_rows(
-                    pid, filter=f"delta_norm >= {theta_norm_raw}"
-                )
-            else:
-                anomaly_count = 0
+            # The anomaly rule anomaly_summary / find_anomalies count by.
+            anomaly_filter = _anomaly_filter(pattern)
+            anomaly_count = (
+                self._storage.count_geometry_rows(pid, filter=anomaly_filter)
+                if anomaly_filter is not None
+                else 0
+            )
             anomaly_rate = round(anomaly_count / total, 4) if total > 0 else 0.0
-            anomaly_rate_source = "delta_norm_scan"
+            anomaly_rate_source = (
+                "is_anomaly" if _uses_calibrated_score(pattern) else "delta_norm_scan"
+            )
             calibration_health = _classify_calibration_health(anomaly_rate, total)
             geometry_mode = self._detect_geometry_mode(pid, version, total)
             entry: dict[str, Any] = {
@@ -8452,19 +8411,6 @@ class GDSNavigator:
           and asks for a re-declare; this rule narrows the action to
           gaussian-only cases where the kind itself is the bug.
 
-        - **non_normal_dim**: a dim declared with ``kind='gaussian'``
-          whose build-time Shapiro-Wilk / KS p-value is below
-          ``_NON_NORMAL_DIM_PVALUE_THRESHOLD`` — the gaussian z-score
-          assumes the dim distribution is approximately normal. When
-          the empirical distribution is heavy-tailed (Pareto, log-normal
-          income / amount data), z-scoring concentrates the delta mass
-          in a few extreme rows and poorly discriminates the bulk of
-          the population. Test family is picked per-dim at build time
-          by sample size (Shapiro-Wilk for N <= 5000, KS otherwise).
-          Suppressed when ``negative_space`` already fires on the same
-          dim — that warning's remediation (re-declare kind) supersedes
-          the normality complaint, and double-flagging is noise.
-
         - **kind_mismatch**: a dim declared with ``kind='gaussian'``
           whose Fisher LDA direction component is below
           ``_KIND_MISMATCH_DIRECTION_THRESHOLD`` (the global axis
@@ -8478,7 +8424,7 @@ class GDSNavigator:
           must be non-None; patterns built without the
           ``label_audit:`` block in sphere.yaml are skipped silently.
           Suppressed when ``negative_space`` already fires on the same
-          dim — same dedup convention as ``non_normal_dim``.
+          dim.
 
         - **signed_tail_concentration**: pattern-level warning fired
           when ``Pattern.signed_percentiles`` shows
@@ -8494,7 +8440,7 @@ class GDSNavigator:
 
         All warnings are computed from cached pattern state
         (``sigma_diag``, ``dim_percentiles``, ``mu``,
-        ``dimension_kinds``, ``dim_normality_pvalues``,
+        ``dimension_kinds``,
         ``label_aware_calibration``, ``signed_percentiles``,
         ``label_aware_n_pos``) — sub-millisecond, no storage scan.
         """
@@ -8758,19 +8704,6 @@ class GDSNavigator:
         negative_space_warnings = _compute_negative_space_warnings(pattern)
         warnings.extend(negative_space_warnings)
 
-        # Per-dim normality test outcome. Gaussian-only (z-score assumes
-        # normality, so the test is meaningless on bernoulli / poisson
-        # kinds). Suppress for dims already flagged by `negative_space`
-        # because that warning's remediation ("re-declare kind") is the
-        # right action and the normality complaint is downstream noise.
-        negative_space_labels = {w["dim_label"] for w in negative_space_warnings}
-        warnings.extend(
-            GDSNavigator._compute_non_normal_dim_warnings(
-                pattern,
-                suppress_labels=negative_space_labels,
-            ),
-        )
-
         # Kind-tag mismatch — gaussian dims with near-zero Fisher LDA
         # direction component but raw class separation, signalling that
         # the dim's variance is captured by another dim's axis. Skipped
@@ -8811,136 +8744,7 @@ class GDSNavigator:
         if signed_tail is not None:
             warnings.append(signed_tail)
 
-        # Heteroscedasticity — Brown-Forsythe p-value persisted by the
-        # builder when the pattern carries `group_by_property`. The
-        # dim_label here references the grouping variable (a categorical
-        # line property), not a δ-dim — the warning's role is to flag
-        # that the global θ / Cohen's d pooled-σ / APS global-percentile
-        # assumptions are violated for this pattern, not that any one
-        # δ-dim is misbehaving.
-        het_diag = getattr(pattern, "heteroscedasticity_diagnostic", None) or {}
-        for prop_name, entry in het_diag.items():
-            p_value = entry.get("p_value")
-            # None: < 2 qualifying groups (low-N skip exhausted the test).
-            # NaN: every qualifying group had zero residual variance
-            # (degenerate distribution — typical of event-line shapes
-            # with one in-relation, but also a bug-screen surface). In
-            # neither case is the global-θ assumption "violated" — the
-            # diagnostic simply could not be computed.
-            if p_value is None or not np.isfinite(p_value):
-                continue
-            if p_value >= _HETEROSCEDASTICITY_P_THRESHOLD:
-                continue
-            w_stat = entry.get("W_statistic")
-            warnings.append(
-                {
-                    "type": "heteroscedasticity",
-                    "dim_label": prop_name,
-                    "reason": (
-                        f"Levene W={float(w_stat):.2f} p={float(p_value):.2e} "
-                        f"on group_by={prop_name} — global θ assumption "
-                        f"violated"
-                    ),
-                    "advice": (
-                        "Per-group θ calibration is statistically warranted "
-                        "on this grouping; if per-group θ is undesirable "
-                        "downstream consider a variance-stabilizing "
-                        "transform (log1p) on delta_norm before "
-                        "thresholding."
-                    ),
-                    "evidence_value": float(p_value),
-                    "threshold": _HETEROSCEDASTICITY_P_THRESHOLD,
-                }
-            )
-
         return warnings
-
-    @staticmethod
-    def _compute_non_normal_dim_warnings(
-        pattern: Any,
-        *,
-        suppress_labels: set[str],
-    ) -> list[dict[str, Any]]:
-        """Emit ``non_normal_dim`` warnings for gaussian dims that failed
-        the build-time normality test (Shapiro-Wilk for N <= 5000, KS
-        otherwise). Returns an empty list when the pattern lacks
-        ``dim_normality_pvalues`` (pre-diagnostic build), when no
-        gaussian dim has a p-value below the alpha threshold, or when
-        every below-threshold dim is already covered by a
-        ``negative_space`` warning.
-        """
-        pvalues = getattr(pattern, "dim_normality_pvalues", None)
-        if not pvalues:
-            return []
-
-        dimension_kinds = getattr(pattern, "dimension_kinds", None)
-        dim_labels = pattern.dim_labels if pattern.dim_labels else []
-        if dimension_kinds is None or len(dimension_kinds) != len(dim_labels):
-            # Legacy / mis-shaped pattern — no reliable way to confirm
-            # the dim is gaussian, so do not emit.
-            return []
-
-        # Reuse the navigator's keying convention: raw column / line_id
-        # without `_d_` prefix / prop name → delta-vector index. Same
-        # build as the `negative_space` auditor so a dim's normality
-        # entry resolves to the same kind slot.
-        def _raw_to_idx(pattern: Any) -> dict[str, int]:
-            mapping: dict[str, int] = {}
-            for i, rel in enumerate(pattern.relations):
-                if rel.line_id.startswith("_d_"):
-                    stripped = rel.line_id[3:]
-                    mapping[stripped] = i
-                    parts = stripped.split("_", 1)
-                    if len(parts) > 1:
-                        mapping.setdefault(parts[1], i)
-                else:
-                    mapping[rel.line_id] = i
-            k = len(pattern.relations)
-            for j, ed in enumerate(pattern.event_dimensions):
-                mapping[ed.column] = k + j
-            k2 = k + len(pattern.event_dimensions)
-            for j, prop in enumerate(pattern.prop_columns):
-                mapping[prop] = k2 + j
-            return mapping
-
-        raw_to_idx = _raw_to_idx(pattern)
-        out: list[dict[str, Any]] = []
-        for raw_name, p_value in pvalues.items():
-            if raw_name in suppress_labels:
-                continue
-            i = raw_to_idx.get(raw_name)
-            if i is None or i >= len(dimension_kinds):
-                continue
-            if dimension_kinds[i] != "gaussian":
-                continue
-            if not np.isfinite(p_value):
-                continue
-            if p_value >= _NON_NORMAL_DIM_PVALUE_THRESHOLD:
-                continue
-            out.append(
-                {
-                    "type": "non_normal_dim",
-                    "dim_label": raw_name,
-                    "reason": (
-                        f"normality test p={p_value:.2e} < "
-                        f"{_NON_NORMAL_DIM_PVALUE_THRESHOLD} — z-score "
-                        f"assumes normality, this dim's distribution is "
-                        f"heavy-tailed or otherwise non-normal"
-                    ),
-                    "advice": (
-                        "Consider a log1p / sqrt / rank transform of the "
-                        "raw shape values before mu/sigma computation, or "
-                        "re-declare kind as 'poisson' (discrete counts) or "
-                        "'bernoulli' (binary presence) if applicable. "
-                        "Untransformed, the gaussian z-score concentrates "
-                        "the delta mass in a few extreme rows and poorly "
-                        "discriminates the bulk of the population."
-                    ),
-                    "evidence_value": float(p_value),
-                    "threshold": _NON_NORMAL_DIM_PVALUE_THRESHOLD,
-                }
-            )
-        return out
 
     @staticmethod
     def _negative_space_indices(
@@ -9897,11 +9701,9 @@ class GDSNavigator:
                 }
             )
 
-        # ── 4. High anomaly rate — delta_norm >= theta_norm
-        theta_norm = float(np.linalg.norm(pattern.theta))
+        # ── 4. High anomaly rate — the rule find_anomalies counts by
         anomaly_count = self._storage.count_geometry_rows(
-            pattern_id,
-            filter=f"delta_norm >= {theta_norm}" if theta_norm > 0.0 else "is_anomaly = true",
+            pattern_id, filter=_anomaly_filter(pattern) or "is_anomaly = true"
         )
         anomaly_rate = anomaly_count / total
         if anomaly_rate > 0.3:
@@ -9934,9 +9736,10 @@ class GDSNavigator:
                 }
             )
 
-        # ── 6. Theta ceiling distribution (>50% entities massed near theta)
+        # ── 6. Theta ceiling distribution (>50% entities massed near theta);
+        # θ is not the anomaly boundary of a calibrated pattern.
         theta_norm = float(np.linalg.norm(pattern.theta))
-        if theta_norm > 0:
+        if theta_norm > 0 and not _uses_calibrated_score(pattern):
             ceiling_threshold = 0.75 * theta_norm
             near_ceiling = self._storage.count_geometry_rows(
                 pattern_id, filter=f"delta_norm >= {ceiling_threshold:.6f}"
@@ -9957,7 +9760,7 @@ class GDSNavigator:
                 )
 
         # ── 7. Delta-norm mismatch — verify stored delta_norm == ||delta||.
-        # Sample up to 10 entities; a mismatch means recompute_delta_rank_pct() was not
+        # Sample up to 10 entities; a mismatch means recompute_score_rank_pct() was not
         # called after the geometry was written, leaving ANN search results unreliable.
         _SAMPLE_SIZE = 10
         sample_cols = ["primary_key", "delta", "delta_norm"]
@@ -9985,7 +9788,7 @@ class GDSNavigator:
                             "message": (
                                 f"stored delta_norm {stored_norm:.4f} does not match "
                                 f"||delta|| {actual_norm:.4f} — geometry may have been written "
-                                "without calling recompute_delta_rank_pct(). "
+                                "without calling recompute_score_rank_pct(). "
                                 "ANN search results will be unreliable."
                             ),
                         }
@@ -11200,11 +11003,11 @@ class GDSNavigator:
         self,
         pattern_id: str,
     ) -> list[dict[str, Any]]:
-        """Check if calibration drift exceeds thresholds."""
+        """Check calibration drift against its thresholds and the calibration's age."""
+        alerts = self._check_calibration_age(pattern_id)
         tracker = self._storage.read_calibration_tracker(pattern_id)
         if tracker is None:
-            return []
-        alerts: list[dict[str, Any]] = []
+            return alerts
         if tracker.is_blocked:
             alerts.append(
                 {
@@ -11243,6 +11046,35 @@ class GDSNavigator:
                 }
             )
         return alerts
+
+    def _check_calibration_age(self, pattern_id: str) -> list[dict[str, Any]]:
+        """Alert when the pattern's calibration is older than ``CALIBRATION_MAX_AGE_DAYS``.
+
+        A frozen population reference keeps its p-values valid for a limited
+        time while the population moves; past that age they should be refreshed.
+        """
+        pattern = self._storage.read_sphere().patterns.get(pattern_id)
+        calibrated = getattr(pattern, "last_calibrated_at", None)
+        if calibrated is None:
+            return []
+        if calibrated.tzinfo is None:
+            calibrated = calibrated.replace(tzinfo=UTC)
+        age_days = (datetime.now(UTC) - calibrated).days
+        if age_days <= CALIBRATION_MAX_AGE_DAYS:
+            return []
+        return [
+            {
+                "severity": "MEDIUM",
+                "check_type": "calibration_age",
+                "pattern_id": pattern_id,
+                "message": (
+                    f"Calibration is {age_days} days old (limit {CALIBRATION_MAX_AGE_DAYS}); "
+                    f"p-values drift as the population moves. Call "
+                    f"recalibrate('{pattern_id}') to refresh it."
+                ),
+                "details": {"age_days": age_days, "max_age_days": CALIBRATION_MAX_AGE_DAYS},
+            }
+        ]
 
     def _check_stale_vector_index(
         self,
@@ -11434,7 +11266,7 @@ class GDSNavigator:
             source_count: int — number of patterns flagging at least one anomaly
             total_patterns: int — number of patterns the entity participates in
             signals: {pattern_id: {key_type, is_anomaly, delta_norm,
-                      delta_rank_pct, conformal_p, related_count,
+                      score_rank_pct, conformal_p, related_count,
                       anomalous_count, anomalous_keys}}
         """
         # Validate entity key - reject separator or SQL metacharacters
@@ -11522,7 +11354,7 @@ class GDSNavigator:
             anom = sig.get("anomalous_count", 0)
             risk_score += anom / related
 
-        # Connected risk: mean delta_rank_pct of counterparties in
+        # Connected risk: mean score_rank_pct of counterparties in
         # the direct pattern. Measures how anomalous the entity's
         # immediate network is (1-hop risk propagation).
         connected_risk = self._compute_connected_risk(
@@ -11581,7 +11413,7 @@ class GDSNavigator:
         combined_p = harmonic_mean_p(p_values)
         result = {
             "primary_key": primary_key,
-            "combined_p": round(float(combined_p), 6),
+            "combined_p": float(combined_p),
             "n_patterns": len(p_values),
             "per_pattern": per_pattern,
         }
@@ -11713,7 +11545,7 @@ class GDSNavigator:
         and returns the ranked list ascending by HMP. The default detector
         set spans the five orthogonal anomaly axes:
 
-            * ``delta_norm`` — population-relative geometry deviation
+            * ``delta_norm`` — the pattern's own anomaly p-value (``conformal_p``)
             * ``neighbor_contamination`` — graph-neighbour anomaly density
             * ``segment_shift`` — categorical-segment anomaly rate shift
             * ``trajectory_continuous`` — DTW distance vs median trajectory; opt-in
@@ -11724,9 +11556,12 @@ class GDSNavigator:
         Detectors that fail to produce data (e.g. no temporal solid for
         ``trajectory_continuous``, no string columns for ``segment_shift``,
         ``density_gap`` which is structurally aggregate and has no
-        per-entity attribution) are silently skipped per entity — the HMP
-        is then computed from the remaining detectors. ``delta_norm`` is
-        the always-available primary path.
+        per-entity attribution) produce no value. Every entity is combined
+        over the same family — the detectors that produced a value for any
+        entity in the call — and a family detector silent for an entity
+        counts as no evidence (p = 1), so missing coverage neither rewards
+        nor penalises it. Each p is floored at the population's resolution
+        1/(N+1). ``delta_norm`` is the always-available primary path.
 
         Args:
             pattern_id: Pattern to score.
@@ -11746,7 +11581,7 @@ class GDSNavigator:
         """
         from hypertopos.engine.composition import harmonic_mean_p
         from hypertopos.engine.p_value_calibration import (
-            detector_p_value_delta_norm,
+            detector_p_value_anomaly,
         )
 
         version = self._resolve_version(pattern_id)
@@ -11757,17 +11592,13 @@ class GDSNavigator:
                 f"Pattern '{pattern_id}' not found in sphere.",
             )
 
-        # Pattern dimensionality is the chi2 fallback df for delta_norm.
-        df = int(getattr(pattern, "mu", np.zeros(1)).shape[0])
-        if df <= 0:
-            df = max(len(getattr(pattern, "relations", []) or []), 1)
-
-        # Read the geometry once (delta_norm + anomaly_confidence path).
+        # Read the geometry once; the anomaly detector uses the stored conformal_p.
         geo_cols = [
             "primary_key",
             "delta_norm",
             "is_anomaly",
             "anomaly_confidence",
+            "conformal_p",
         ]
         try:
             geo = self._storage.read_geometry(
@@ -11802,11 +11633,7 @@ class GDSNavigator:
         per_detector_ps: dict[str, dict[str, float]] = {}
 
         if "delta_norm" in detectors:
-            per_detector_ps["delta_norm"] = detector_p_value_delta_norm(
-                geo,
-                primary_keys,
-                df=df,
-            )
+            per_detector_ps["delta_norm"] = detector_p_value_anomaly(geo, primary_keys)
 
         if "neighbor_contamination" in detectors:
             per_detector_ps["neighbor_contamination"] = self._collect_neighbor_contamination_p(
@@ -11826,23 +11653,29 @@ class GDSNavigator:
         if "density_gap" in detectors:
             per_detector_ps["density_gap"] = self._collect_density_gap_p(pattern_id)
 
-        # Apply a uniform lower-floor on every per-detector p before
-        # combining via HMP. A single detector saturating at the
-        # numeric floor (delta_norm clamped to 1e-300 when
-        # anomaly_confidence ~ 1.0; Fisher exact at p < 1e-300 on hub
-        # segments) would otherwise dominate ``sum(w_i / p_i)`` so
-        # completely that the harmonic mean collapses to ~3e-300
-        # for every saturated entity, erasing orthogonal signal and
-        # tying ranks within the saturated cohort. The
-        # ``_HMP_INPUT_P_FLOOR`` clip preserves cross-detector
-        # discrimination: entities still rank by combined evidence,
-        # not by which detector saturated first.
+        # Floor every per-detector p at the population's resolution 1/(N+1),
+        # the smallest p a calibrated (rank-based) detector can reach: an
+        # entity is at most "the most extreme of N" on any one detector. A
+        # segment-level test (Fisher exact on a hub segment) otherwise reaches
+        # p << 1e-12 for every member at once, dominates ``sum(w_i / p_i)`` and
+        # ties the whole segment, erasing entity-level evidence.
+        floor = max(_HMP_INPUT_P_FLOOR, 1.0 / (max(int(pattern.population_size or 0), 1) + 1))
         for det_name in per_detector_ps:
             per_detector_ps[det_name] = {
-                k: max(float(v), _HMP_INPUT_P_FLOOR) for k, v in per_detector_ps[det_name].items()
+                k: max(float(v), floor) for k, v in per_detector_ps[det_name].items()
             }
 
-        # Combine per-entity via HMP across the detectors that produced a value.
+        # Every entity is combined over the same family — the detectors that
+        # produced a value for anyone in this call; a family detector silent
+        # for an entity counts as no evidence (p = 1). Combining over only the
+        # detectors present per entity would give an entity's strongest
+        # detector more weight the fewer detectors could score it.
+        family = [name for name, det_dict in per_detector_ps.items() if det_dict]
+        family_weights: dict[str, float] | None = None
+        if weights is not None:
+            family_weights = {k: float(weights.get(k, 0.0)) for k in family}
+            if sum(family_weights.values()) <= 0.0:
+                family_weights = None
         combined: list[dict[str, Any]] = []
         for pk in primary_keys:
             ps_for_entity: dict[str, float] = {}
@@ -11851,12 +11684,8 @@ class GDSNavigator:
                     ps_for_entity[det_name] = float(det_dict[pk])
             if not ps_for_entity:
                 continue
-            entity_weights: dict[str, float] | None = None
-            if weights is not None:
-                entity_weights = {k: float(weights.get(k, 0.0)) for k in ps_for_entity}
-                if sum(entity_weights.values()) <= 0.0:
-                    entity_weights = None
-            hmp_value = float(harmonic_mean_p(ps_for_entity, weights=entity_weights))
+            family_ps = {name: ps_for_entity.get(name, 1.0) for name in family}
+            hmp_value = float(harmonic_mean_p(family_ps, weights=family_weights))
             if not math.isfinite(hmp_value):
                 hmp_value = 1.0
             combined.append(
@@ -12473,10 +12302,10 @@ class GDSNavigator:
         signals: dict[str, dict[str, Any]],
         pattern_map: dict[str, str],
     ) -> float | None:
-        """Compute mean delta_rank_pct of counterparties (1-hop risk).
+        """Compute mean score_rank_pct of counterparties (1-hop risk).
 
         Uses the composite pattern's anomalous_keys to find counterparty
-        account keys, then looks up their delta_rank_pct in the direct
+        account keys, then looks up their score_rank_pct in the direct
         pattern. Returns mean rank (0-100) or None if no composite signal.
         """
         # Find the direct pattern for this entity's line
@@ -12514,8 +12343,8 @@ class GDSNavigator:
         for ck in sample:
             try:
                 meta = self.get_entity_geometry_meta(ck, direct_pat_id)
-                if meta.get("delta_rank_pct") is not None:
-                    ranks.append(meta["delta_rank_pct"])
+                if meta.get("score_rank_pct") is not None:
+                    ranks.append(meta["score_rank_pct"])
             except KeyError:
                 continue
 
@@ -12530,7 +12359,7 @@ class GDSNavigator:
         version: int,
     ) -> dict[str, Any] | None:
         """Profile entity in a direct pattern (same key space)."""
-        cols = ["delta_norm", "is_anomaly", "delta_rank_pct", "conformal_p"]
+        cols = ["delta_norm", "is_anomaly", "score_rank_pct", "conformal_p"]
         geo = self._storage.read_geometry(
             pattern_id,
             version,
@@ -12542,12 +12371,12 @@ class GDSNavigator:
 
         is_anom = bool(geo["is_anomaly"][0].as_py())
         dn = float(geo["delta_norm"][0].as_py())
-        pct = geo["delta_rank_pct"][0].as_py()
+        pct = geo["score_rank_pct"][0].as_py()
         result = {
             "key_type": "direct",
             "is_anomaly": is_anom,
             "delta_norm": round(dn, 4),
-            "delta_rank_pct": round(float(pct), 2) if pct is not None else None,
+            "score_rank_pct": round(float(pct), 2) if pct is not None else None,
             "related_count": 1,
             "anomalous_count": 1 if is_anom else 0,
             "anomalous_keys": [primary_key] if is_anom else [],
@@ -12717,7 +12546,7 @@ class GDSNavigator:
             "key_type": "composite",
             "is_anomaly": anom_count > 0,
             "delta_norm": round(float(max_norm), 4),
-            "delta_rank_pct": None,
+            "score_rank_pct": None,
             "related_count": total,
             "anomalous_count": anom_count,
             "anomalous_keys": anom_keys,
@@ -12808,7 +12637,7 @@ class GDSNavigator:
             "key_type": "chain",
             "is_anomaly": anom_count > 0,
             "delta_norm": round(float(max_norm), 4),
-            "delta_rank_pct": None,
+            "score_rank_pct": None,
             "related_count": matched,
             "anomalous_count": anom_count,
             "anomalous_keys": anom_keys,
@@ -12829,7 +12658,7 @@ class GDSNavigator:
         Returns dict with:
             primary_key: str
             pattern_id: str
-            chains: list[{chain_id, is_anomaly, delta_norm, delta_rank_pct}]
+            chains: list[{chain_id, is_anomaly, delta_norm, score_rank_pct}]
             summary: {total, anomalous}
         """
         version = self._resolve_version(pattern_id)
@@ -12873,13 +12702,13 @@ class GDSNavigator:
             pattern_id,
             version,
             point_keys=chain_pks,
-            columns=["primary_key", "is_anomaly", "delta_norm", "delta_rank_pct"],
+            columns=["primary_key", "is_anomaly", "delta_norm", "score_rank_pct"],
         )
 
         pks = geo["primary_key"].to_pylist()
         anoms = geo["is_anomaly"].to_pylist()
         norms = geo["delta_norm"].to_pylist()
-        ranks = geo["delta_rank_pct"].to_pylist()
+        ranks = geo["score_rank_pct"].to_pylist()
 
         chains: list[dict[str, Any]] = []
         for pk, anom, norm, rank in zip(pks, anoms, norms, ranks, strict=False):
@@ -12890,7 +12719,7 @@ class GDSNavigator:
                     "chain_id": pk,
                     "is_anomaly": bool(anom),
                     "delta_norm": round(float(norm), 4) if norm is not None else 0.0,
-                    "delta_rank_pct": (round(float(rank), 2) if rank is not None else None),
+                    "score_rank_pct": (round(float(rank), 2) if rank is not None else None),
                 }
             )
 
@@ -13227,7 +13056,7 @@ class GDSNavigator:
         returns its hop-by-hop anomaly trace — for each entity in the
         chain's keys sequence, returns is_anomaly + delta_norm + top
         dominant dim (sigma-normalised argmax over delta) +
-        delta_rank_pct.
+        score_rank_pct.
 
         Use case: after a population sweep flags a chain as having a
         coherent anomaly run, drill into that chain's full hop
@@ -13330,7 +13159,7 @@ class GDSNavigator:
             anchor_geo = self._storage.read_geometry(
                 anchor_pattern_id,
                 anchor_version,
-                columns=["primary_key", "is_anomaly", "delta", "delta_norm", "delta_rank_pct"],
+                columns=["primary_key", "is_anomaly", "delta", "delta_norm", "score_rank_pct"],
                 point_keys=keys,
             )
         except (KeyError, ValueError) as exc:
@@ -13344,7 +13173,7 @@ class GDSNavigator:
             pks_arr = anchor_geo["primary_key"].to_pylist()
             is_anom_arr = anchor_geo["is_anomaly"].to_pylist()
             dn_arr = anchor_geo["delta_norm"].to_pylist()
-            drp_arr = anchor_geo["delta_rank_pct"].to_pylist()
+            drp_arr = anchor_geo["score_rank_pct"].to_pylist()
             delta_2d = delta_matrix_from_arrow(anchor_geo)
             n_dims = delta_2d.shape[1]
 
@@ -13378,7 +13207,7 @@ class GDSNavigator:
                     "is_anomaly": is_anom,
                     "delta_norm": (round(float(dn_arr[i]), 4) if dn_arr[i] is not None else 0.0),
                     "top_dim": top_dim,
-                    "delta_rank_pct": (
+                    "score_rank_pct": (
                         round(float(drp_arr[i]), 2) if drp_arr[i] is not None else None
                     ),
                 }
@@ -13394,7 +13223,7 @@ class GDSNavigator:
                         "is_anomaly": False,
                         "delta_norm": 0.0,
                         "top_dim": None,
-                        "delta_rank_pct": None,
+                        "score_rank_pct": None,
                     }
                 )
             else:
@@ -13783,7 +13612,7 @@ class GDSNavigator:
             "scale",
             "delta",
             "delta_norm",
-            "delta_rank_pct",
+            "score_rank_pct",
             "is_anomaly",
             "last_refresh_at",
             "updated_at",
@@ -14259,9 +14088,9 @@ class GDSNavigator:
                 return "median"
             return "low"
 
-        pre_run_rank = hops[run_start - 1].get("delta_rank_pct") if run_start > 0 else None
+        pre_run_rank = hops[run_start - 1].get("score_rank_pct") if run_start > 0 else None
         breakpoint_rank = (
-            hops[run_end_excl].get("delta_rank_pct") if run_end_excl < n_hops else None
+            hops[run_end_excl].get("score_rank_pct") if run_end_excl < n_hops else None
         )
         pre_run_bucket = _bucket(pre_run_rank) if run_start > 0 else "no-pre-run"
         breakpoint_bucket = _bucket(breakpoint_rank) if run_end_excl < n_hops else "no-breakpoint"
@@ -14458,7 +14287,7 @@ class GDSNavigator:
 
         Returns dict with `boundary_key`, `boundary_position`
         (start/end of run within original chain), `candidates[]`
-        (entity_key, is_anomaly, delta_norm, delta_rank_pct,
+        (entity_key, is_anomaly, delta_norm, score_rank_pct,
         source_chain_ids), and `summary` (`n_candidates`,
         `n_anomalous_candidates`, `n_unique_keys`).
         """
@@ -14627,7 +14456,7 @@ class GDSNavigator:
                 ),
             }
 
-        # Look up anchor anomaly + delta_norm + delta_rank_pct for
+        # Look up anchor anomaly + delta_norm + score_rank_pct for
         # candidate keys.
         candidate_keys = list(candidate_to_sources.keys())
         anchor_version = self._resolve_version(anchor_pattern_id)
@@ -14635,7 +14464,7 @@ class GDSNavigator:
             anchor_geo = self._storage.read_geometry(
                 anchor_pattern_id,
                 anchor_version,
-                columns=["primary_key", "is_anomaly", "delta_norm", "delta_rank_pct"],
+                columns=["primary_key", "is_anomaly", "delta_norm", "score_rank_pct"],
                 point_keys=candidate_keys,
             )
         except (KeyError, ValueError) as exc:
@@ -14656,12 +14485,12 @@ class GDSNavigator:
                         if anchor_geo["delta_norm"][i].as_py() is not None
                         else 0.0
                     ),
-                    "delta_rank_pct": (
+                    "score_rank_pct": (
                         round(
-                            float(anchor_geo["delta_rank_pct"][i].as_py()),
+                            float(anchor_geo["score_rank_pct"][i].as_py()),
                             2,
                         )
-                        if anchor_geo["delta_rank_pct"][i].as_py() is not None
+                        if anchor_geo["score_rank_pct"][i].as_py() is not None
                         else None
                     ),
                 }
@@ -14673,7 +14502,7 @@ class GDSNavigator:
                 {
                     "is_anomaly": False,
                     "delta_norm": 0.0,
-                    "delta_rank_pct": None,
+                    "score_rank_pct": None,
                 },
             )
             candidates.append(
@@ -14681,7 +14510,7 @@ class GDSNavigator:
                     "entity_key": k,
                     "is_anomaly": info["is_anomaly"],
                     "delta_norm": info["delta_norm"],
-                    "delta_rank_pct": info["delta_rank_pct"],
+                    "score_rank_pct": info["score_rank_pct"],
                     "n_source_chains": len(sources),
                     "source_chain_ids": sources[:5],
                 }
@@ -14734,7 +14563,7 @@ class GDSNavigator:
              summary
           2. ``classify_chain_typology`` — five-axis operational tag
           3. chain-pattern geometry lookup for the chain_id — `is_anomaly`,
-             `delta_norm`, `delta_rank_pct` (one row read; equivalent to
+             `delta_norm`, `score_rank_pct` (one row read; equivalent to
              asking ``find_anomalies(<chain_pattern>)`` for this chain
              only)
           4. ``extend_chain(direction='forward')`` — boundary candidates
@@ -14795,7 +14624,7 @@ class GDSNavigator:
                 pattern_id,
                 chain_version,
                 point_keys=[chain_id],
-                columns=["primary_key", "is_anomaly", "delta_norm", "delta_rank_pct"],
+                columns=["primary_key", "is_anomaly", "delta_norm", "score_rank_pct"],
             )
             if chain_geo.num_rows == 0:
                 raise GDSNavigationError(
@@ -14812,11 +14641,11 @@ class GDSNavigator:
                         4,
                     )
                 ),
-                "delta_rank_pct": (
+                "score_rank_pct": (
                     None
-                    if chain_geo["delta_rank_pct"][0].as_py() is None
+                    if chain_geo["score_rank_pct"][0].as_py() is None
                     else round(
-                        float(chain_geo["delta_rank_pct"][0].as_py()),
+                        float(chain_geo["score_rank_pct"][0].as_py()),
                         2,
                     )
                 ),
@@ -14947,8 +14776,8 @@ class GDSNavigator:
         # Shape evidence as rationale add-on only — does NOT contribute
         # to the score (see docstring).
         if shape_anomaly.get("ok") and shape_anomaly["data"].get("is_anomaly"):
-            rank = shape_anomaly["data"].get("delta_rank_pct")
-            signals.append(f"Chain-shape anomaly also flags (delta_rank_pct={rank}).")
+            rank = shape_anomaly["data"].get("score_rank_pct")
+            signals.append(f"Chain-shape anomaly also flags (score_rank_pct={rank}).")
 
         failed_steps = [
             name
@@ -15172,16 +15001,16 @@ class GDSNavigator:
         if shape_block.get("ok"):
             s = shape_block["data"]
             is_anom = bool(s.get("is_anomaly"))
-            rank = s.get("delta_rank_pct")
+            rank = s.get("score_rank_pct")
             anchors["chain_shape_anomaly"] = {
                 "is_anomaly": is_anom,
                 "delta_norm": s.get("delta_norm"),
-                "delta_rank_pct": rank,
+                "score_rank_pct": rank,
             }
             if is_anom:
                 paragraphs.append(
                     f"The chain-level shape (chain-feature delta) is "
-                    f"independently anomalous at delta_rank_pct={rank} "
+                    f"independently anomalous at score_rank_pct={rank} "
                     f"— corroborating evidence that the structural "
                     f"profile of the chain itself, not only the "
                     f"composition of its members, deviates from the "
@@ -15191,7 +15020,7 @@ class GDSNavigator:
                 paragraphs.append(
                     f"The chain-level shape (chain-feature delta) is "
                     f"NOT independently anomalous "
-                    f"(delta_rank_pct={rank}); the investigative signal "
+                    f"(score_rank_pct={rank}); the investigative signal "
                     f"comes from the composition of member entities, "
                     f"not the chain's own feature profile. This is the "
                     f"orthogonal-detector regime — chains that "
@@ -15707,6 +15536,11 @@ class GDSNavigator:
             except _NAVIGATION_RECOVERABLE_ERRORS:
                 pass
 
+        if _uses_calibrated_score(pattern):
+            return self._explain_calibrated(
+                primary_key, pattern_id, pattern, polygon, temporal_slices, reputation
+            )
+
         theta_norm = float(np.linalg.norm(pattern.theta)) if pattern.theta is not None else 0.0
         explanation = build_explanation(
             delta=polygon.delta,
@@ -15749,6 +15583,52 @@ class GDSNavigator:
 
         return explanation
 
+    def _explain_calibrated(
+        self,
+        primary_key: str,
+        pattern_id: str,
+        pattern: Pattern,
+        polygon: Polygon,
+        temporal_slices: int | None,
+        reputation: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """``explain_anomaly`` for a pattern ranked by its calibrated score: the
+        evidence ``-log2(conformal_p)`` split over axes and named dimensions."""
+        from hypertopos.engine.investigation import build_calibrated_explanation
+        from hypertopos.engine.robust import attribute
+
+        version = self._resolve_version(pattern_id)
+        row = self._storage.read_geometry(
+            pattern_id,
+            version,
+            primary_key=primary_key,
+            columns=["conformal_p", "anomaly_score", "axis_ranks", "score_delta"],
+        )
+        if row.num_rows == 0:
+            raise GDSNavigationError(f"Entity {primary_key!r} not found in {pattern_id!r}")
+        p = float(row["conformal_p"][0].as_py())
+        ranks = np.asarray(row["axis_ranks"][0].as_py(), dtype=np.float64)
+        z = np.asarray(row["score_delta"][0].as_py(), dtype=np.float64)
+        reference = self._storage.read_reference(pattern_id)
+        attribution = attribute(reference, z, ranks, p)
+        explanation = build_calibrated_explanation(
+            conformal_p=p,
+            anomaly_score=float(row["anomaly_score"][0].as_py()),
+            alpha=1.0 - float(pattern.anomaly_percentile) / 100.0,
+            axis_ranks={
+                a: float(r) for a, r in zip(reference.axes, ranks, strict=True) if np.isfinite(r)
+            },
+            axis_bits=attribution.axis_bits,
+            dim_bits=attribution.dim_bits,
+            score_delta=dict(zip(reference.dims, z.tolist(), strict=True)),
+            delta_norm=float(polygon.delta_norm),
+            temporal_slices=temporal_slices,
+            reputation=reputation,
+        )
+        explanation["primary_key"] = primary_key
+        explanation["pattern_id"] = pattern_id
+        return explanation
+
     def find_diverse_explanations(
         self,
         primary_key: str,
@@ -15783,7 +15663,10 @@ class GDSNavigator:
         contribution percentage, and a short narrative built from its
         top-2 dims. When ``validate=True`` each hypothesis is replayed
         through ``simulate_dimension_change`` (setting every dim in the
-        hypothesis to its population mu) so the caller can see whether
+        hypothesis to its population mu; on a calibrated pattern each score
+        dimension goes to its reference median, other dimensions are left
+        out, and the block reports ``conformal_p_after_override`` in place of
+        ``delta_norm_after_override``) so the caller can see whether
         neutralising that subset alone would clear the anomaly flag.
 
         Greedy cover is deterministic: the same ``contributions`` /
@@ -15858,6 +15741,15 @@ class GDSNavigator:
         delta_arr = np.asarray(tbl["delta"][0].as_py(), dtype=np.float64)
         delta_norm = float(tbl["delta_norm"][0].as_py())
         theta_norm = float(np.linalg.norm(pattern.theta)) if pattern.theta is not None else 0.0
+        # On a calibrated pattern a score dimension is neutral at the
+        # reference median (rank-Gaussian 0), not at its shape-space mean.
+        neutral: dict[str, float] | None = None
+        if validate and _uses_calibrated_score(pattern):
+            ref = self._storage.read_reference(pattern_id)
+            neutral = {
+                d: float(np.interp(0.5, ref.cdf_levels, ref.cdf_grid[j]))
+                for j, d in enumerate(ref.dims)
+            }
 
         n_hypotheses_original = n_hypotheses
         n_dims = len(pattern.dim_labels)
@@ -15944,18 +15836,40 @@ class GDSNavigator:
                 # primary_key is not the line_id we expect), so we
                 # catch narrowly and attach the error string rather
                 # than letting it sink the whole response.
-                set_dim = {pattern.dim_labels[i]: float(pattern.mu[i]) for i in indices}
+                if neutral is not None:
+                    # Calibrated: only score dimensions move the verdict.
+                    set_dim = {}
+                    for i in indices:
+                        name = _score_dim_name(
+                            pattern.dim_labels[i], pattern.dim_labels[i], tuple(neutral)
+                        )
+                        if name is not None:
+                            set_dim[name] = neutral[name]
+                else:
+                    set_dim = {pattern.dim_labels[i]: float(pattern.mu[i]) for i in indices}
                 try:
+                    if not set_dim:
+                        raise GDSNavigationError(
+                            "no score dimension in this hypothesis; it cannot change "
+                            "the calibrated verdict",
+                        )
                     sim = self.simulate_dimension_change(
                         primary_key,
                         pattern_id=pattern_id,
                         line_id=primary_key,
                         set_dimension=set_dim,
                     )
-                    entry["validation"] = {
-                        "delta_norm_after_override": sim["delta_norm_after"],
-                        "neutralizes_anomaly": not sim["is_anomaly_after"],
-                    }
+                    entry["validation"] = (
+                        {
+                            "neutralizes_anomaly": not sim["is_anomaly_after"],
+                            "conformal_p_after_override": sim["conformal_p_after"],
+                        }
+                        if neutral is not None
+                        else {
+                            "delta_norm_after_override": sim["delta_norm_after"],
+                            "neutralizes_anomaly": not sim["is_anomaly_after"],
+                        }
+                    )
                 except GDSNavigationError as exc:
                     entry["validation"] = {"error": str(exc)}
             hypotheses.append(entry)
@@ -16401,13 +16315,13 @@ class GDSNavigator:
                 and stats["hop_count"] < max_total_nodes
                 and "edge_counterparty" in _enabled_branches
             ):
-                # Rank counterparties: anomalous first (by delta_rank_pct desc
+                # Rank counterparties: anomalous first (by score_rank_pct desc
                 # within each group). The critical fix over sorting purely by
                 # amount_sum, which repeatedly missed the actual anomalous
                 # neighbours on AML-style continuous patterns.
                 def _cp_sort_key(c: dict[str, Any]) -> tuple[int, float]:
                     anom_flag = 1 if c.get("is_anomaly") else 0
-                    rank_pct = float(c.get("delta_rank_pct") or 0.0)
+                    rank_pct = float(c.get("score_rank_pct") or 0.0)
                     return (-anom_flag, -rank_pct)
 
                 sorted_cps = sorted(cps_data, key=_cp_sort_key)
@@ -16422,7 +16336,7 @@ class GDSNavigator:
                     cp_key = anom_cp.get("primary_key") or anom_cp.get("key")
                     if not cp_key:
                         continue
-                    rank_pct = float(anom_cp.get("delta_rank_pct") or 0.0)
+                    rank_pct = float(anom_cp.get("score_rank_pct") or 0.0)
                     if rank_pct >= 99.9:
                         cp_sev_hint = "extreme"
                     elif rank_pct >= 99.0:
@@ -16445,7 +16359,7 @@ class GDSNavigator:
                         edge_pot_evidence = None
                     inherited = {
                         "via_dim": via_dim,
-                        "witness_counterparty_delta_rank_pct": rank_pct,
+                        "witness_counterparty_score_rank_pct": rank_pct,
                     }
                     if edge_pot_evidence is not None:
                         inherited["edge_potential"] = {
@@ -16885,13 +16799,13 @@ class GDSNavigator:
             anomalous_pattern: str | None = None
             normal_patterns: list[str] = []
             delta_norm_anomalous = 0.0
-            delta_rank_pct_anomalous = 0.0
+            score_rank_pct_anomalous = 0.0
 
             for pat_id, sig in signals.items():
                 if sig.get("is_anomaly"):
                     anomalous_pattern = pat_id
                     delta_norm_anomalous = sig.get("delta_norm", 0.0) or 0.0
-                    delta_rank_pct_anomalous = sig.get("delta_rank_pct", 0.0) or 0.0
+                    score_rank_pct_anomalous = sig.get("score_rank_pct", 0.0) or 0.0
                 else:
                     normal_patterns.append(pat_id)
 
@@ -16901,7 +16815,7 @@ class GDSNavigator:
             interpretation = (
                 f"Entity {hit.primary_key} is anomalous only in "
                 f"{anomalous_pattern} (delta_norm={delta_norm_anomalous:.3f}, "
-                f"rank_pct={delta_rank_pct_anomalous:.1f}%) but normal in "
+                f"rank_pct={score_rank_pct_anomalous:.1f}%) but normal in "
                 f"{len(normal_patterns)} other pattern(s)."
             )
             output.append(
@@ -16910,7 +16824,7 @@ class GDSNavigator:
                     "anomalous_pattern": anomalous_pattern,
                     "normal_patterns": normal_patterns,
                     "delta_norm_anomalous": delta_norm_anomalous,
-                    "delta_rank_pct_anomalous": delta_rank_pct_anomalous,
+                    "score_rank_pct_anomalous": score_rank_pct_anomalous,
                     "interpretation": interpretation,
                 }
             )
@@ -18107,13 +18021,13 @@ class GDSNavigator:
             pattern_id,
             version,
             point_keys=primary_keys[:max_keys],
-            columns=["primary_key", "is_anomaly", "delta_rank_pct"],
+            columns=["primary_key", "is_anomaly", "score_rank_pct"],
         )
         results: list[dict[str, Any]] = [
             {
                 "primary_key": geo["primary_key"][i].as_py(),
                 "is_anomaly": bool(geo["is_anomaly"][i].as_py()),
-                "delta_rank_pct": round(float(geo["delta_rank_pct"][i].as_py()), 2),
+                "score_rank_pct": round(float(geo["score_rank_pct"][i].as_py()), 2),
             }
             for i in range(geo.num_rows)
         ]
@@ -18885,7 +18799,6 @@ class GDSNavigator:
             candidate_edge_ids=edge_ids,
             top_n=10**9,
             thresholds=thresholds_for_engine,
-            cholesky_inv=pattern.cholesky_inv,
             dimension_weights=pattern.dimension_weights,
         )
 
@@ -18978,9 +18891,19 @@ class GDSNavigator:
         shape-space except for one or more overridden dimensions, then
         recompute ``delta``/``delta_norm`` and re-check the anomaly flag.
 
-        Mirrors ``compute_delta`` (cholesky vs diagonal path, optional
-        ``dimension_weights``) exactly so the simulated values are
-        directly comparable to the persisted geometry row.
+        Mirrors ``compute_delta`` (optional ``dimension_weights``) exactly
+        so the simulated values are directly comparable to the persisted
+        geometry row.
+
+        On a calibrated pattern the overrides are natural values of score
+        dimensions (a ``_d_``-prefixed label names the same dimension; any
+        other dimension raises): they are rescored on the ``mahal`` axis
+        against the stored reference, the other axes keep their stored ranks
+        (``held_axes``), and the result carries ``anomaly_score_before/after``,
+        ``conformal_p_before/after``, ``top_dimensions_after`` (``{dim, z,
+        bits}``, the evidence split ``explain_anomaly`` reports) and
+        ``dimensions_overridden`` (``{dim, old_value, new_value, old_z,
+        new_z}``) in place of the shape-space ``delta_norm`` fields.
 
         ``line_id`` is kept for signature parity with
         ``simulate_edge_removal``; it is not consumed by this method.
@@ -19000,11 +18923,13 @@ class GDSNavigator:
         pattern = sphere.patterns[pattern_id]
 
         version = self._resolve_version(pattern_id)
+        calibrated = _uses_calibrated_score(pattern)
         tbl = self._storage.read_geometry(
             pattern_id,
             version,
             primary_key=primary_key,
-            columns=["primary_key", "delta", "delta_norm", "is_anomaly"],
+            columns=["primary_key", "delta", "delta_norm", "is_anomaly"]
+            + (["score_delta", "axis_ranks", "anomaly_score", "conformal_p"] if calibrated else []),
         )
         if tbl.num_rows == 0:
             raise GDSNavigationError(
@@ -19046,6 +18971,11 @@ class GDSNavigator:
                 f"set_dimension contains non-finite value(s): {offenders}",
             )
 
+        if calibrated:
+            return self._simulate_calibrated_dimension_change(
+                primary_key, pattern_id, pattern, tbl, set_dimension, resolved_indices, top_n
+            )
+
         # Reconstruct shape-space vector that produced delta_before.
         mu = np.asarray(pattern.mu, dtype=np.float64)
         shape_before = shapes_from_deltas(delta_before, pattern)
@@ -19055,17 +18985,11 @@ class GDSNavigator:
             shape_after[resolved_indices[label]] = float(value)
 
         # Recompute delta_after via the exact compute_delta formula.
-        if pattern.cholesky_inv is not None:
-            delta_after = np.asarray(
-                pattern.cholesky_inv,
-                dtype=np.float64,
-            ) @ (shape_after - mu)
-        else:
-            sigma = np.maximum(
-                np.asarray(pattern.sigma_diag, dtype=np.float64),
-                _GE.SIGMA_EPSILON,
-            )
-            delta_after = (shape_after - mu) / sigma
+        sigma = np.maximum(
+            np.asarray(pattern.sigma_diag, dtype=np.float64),
+            _GE.SIGMA_EPSILON,
+        )
+        delta_after = (shape_after - mu) / sigma
         if pattern.dimension_weights is not None:
             delta_after = delta_after * np.asarray(
                 pattern.dimension_weights,
@@ -19129,6 +19053,89 @@ class GDSNavigator:
             "is_anomaly_after": is_anomaly_after,
             "is_anomaly_change": is_anomaly_before != is_anomaly_after,
             "top_witness_dims_after": top_witness_dims_after,
+            "dimensions_overridden": dimensions_overridden,
+        }
+
+    def _simulate_calibrated_dimension_change(
+        self,
+        primary_key: str,
+        pattern_id: str,
+        pattern: Any,
+        tbl: pa.Table,
+        set_dimension: dict[str, float],
+        resolved_indices: dict[str, int],
+        top_n: int,
+    ) -> dict[str, Any]:
+        """``simulate_dimension_change`` on a calibrated pattern: overrides are
+        natural values of score dimensions, rescored against the reference; the
+        dimension breakdown is the evidence attribution ``explain_anomaly`` uses."""
+        from hypertopos.engine import robust
+
+        ref = self._storage.read_reference(pattern_id)
+        overrides: dict[int, float] = {}
+        for label, value in set_dimension.items():
+            name = _score_dim_name(pattern.dim_labels[resolved_indices[label]], label, ref.dims)
+            if name is None:
+                raise GDSNavigationError(
+                    f"dim {label!r} is not a score dimension of calibrated pattern "
+                    f"{pattern_id!r} and cannot change its verdict; score dimensions: "
+                    f"{list(ref.dims)}",
+                )
+            overrides[ref.dims.index(name)] = float(value)
+
+        score_delta = np.asarray(tbl["score_delta"][0].as_py(), dtype=np.float64)
+        axis_ranks = np.asarray(tbl["axis_ranks"][0].as_py(), dtype=np.float64)
+        p_before = float(tbl["conformal_p"][0].as_py())
+        cf = robust.counterfactual(ref, score_delta, axis_ranks, overrides)
+        is_anomaly_after = bool(
+            robust.is_anomaly(np.array([cf.conformal_p]), pattern.anomaly_percentile)[0]
+        )
+        is_anomaly_before = bool(tbl["is_anomaly"][0].as_py())
+
+        entity_line = pattern.entity_line_id or self._storage.read_sphere().entity_line(pattern_id)
+        names = [ref.dims[d] for d in overrides]
+        old_values: dict[str, Any] = {}
+        if entity_line is not None:
+            points = self._storage.read_points_batch(
+                entity_line, self._resolve_version(pattern_id), [primary_key], columns=names
+            )
+            if points.num_rows:
+                old_values = {n: points[n][0].as_py() for n in names if n in points.column_names}
+
+        attribution = robust.attribute(ref, cf.score_delta, cf.axis_ranks, cf.conformal_p)
+        ranked = sorted(attribution.dim_bits.items(), key=lambda kv: -kv[1])
+        top_dimensions_after = [
+            {
+                "dim": d,
+                "z": float(cf.score_delta[ref.dims.index(d)]),
+                "bits": float(b),
+            }
+            for d, b in ranked[: max(0, int(top_n))]
+            if b > 0.0
+        ]
+        dimensions_overridden = [
+            {
+                "dim": ref.dims[d],
+                "old_value": old_values.get(ref.dims[d]),
+                "new_value": value,
+                "old_z": float(score_delta[d]),
+                "new_z": float(cf.score_delta[d]),
+            }
+            for d, value in overrides.items()
+        ]
+        return {
+            "primary_key": primary_key,
+            "pattern_id": pattern_id,
+            "set_dimension": dict(set_dimension),
+            "is_anomaly_before": is_anomaly_before,
+            "is_anomaly_after": is_anomaly_after,
+            "is_anomaly_change": is_anomaly_before != is_anomaly_after,
+            "anomaly_score_before": float(tbl["anomaly_score"][0].as_py()),
+            "anomaly_score_after": cf.anomaly_score,
+            "conformal_p_before": p_before,
+            "conformal_p_after": cf.conformal_p,
+            "held_axes": list(cf.held_axes),
+            "top_dimensions_after": top_dimensions_after,
             "dimensions_overridden": dimensions_overridden,
         }
 
@@ -19325,7 +19332,6 @@ class GDSNavigator:
             target_drop_pct=target_drop_pct,
             k_max=k_max,
             thresholds=thresholds_for_engine,
-            cholesky_inv=pattern.cholesky_inv,
             dimension_weights=pattern.dimension_weights,
         )
         result["primary_key"] = primary_key
@@ -19575,17 +19581,17 @@ class GDSNavigator:
                     pattern_id,
                     version,
                     primary_key=primary_key,
-                    columns=["primary_key", "delta_norm", "is_anomaly", "delta_rank_pct"],
+                    columns=["primary_key", "delta_norm", "is_anomaly", "score_rank_pct"],
                 )
                 if tbl.num_rows == 0:
                     raise KeyError(
                         f"entity {primary_key!r} not found in {pattern_id!r}",
                     )
-                rank = tbl["delta_rank_pct"][0].as_py()
+                rank = tbl["score_rank_pct"][0].as_py()
                 return {
                     "delta_norm": float(tbl["delta_norm"][0].as_py()),
                     "is_anomaly": bool(tbl["is_anomaly"][0].as_py()),
-                    "delta_rank_pct": float(rank) if rank is not None else None,
+                    "score_rank_pct": float(rank) if rank is not None else None,
                 }
 
             out["polygon"] = _safe("polygon", _polygon_lookup)
@@ -19697,7 +19703,7 @@ class GDSNavigator:
         """Compare one pattern between ``branch`` and main (or branch ``other``).
 
         Each side is read at its current state: the entity scores
-        (``delta_norm``, ``is_anomaly``, ``delta_rank_pct``) joined on
+        (``delta_norm``, ``is_anomaly``, ``score_rank_pct``) joined on
         ``primary_key``, and the two current calibration fits.
         """
         from hypertopos.storage import _lance_branches
@@ -19714,46 +19720,65 @@ class GDSNavigator:
 
         def side(
             ref: str | None,
-        ) -> tuple[pa.Table, CalibrationFit, float, list[dict[str, Any]]]:
+        ) -> tuple[pa.Table, CalibrationFit, float, list[dict[str, Any]], bool]:
             recipe = recipes.get(ref, []) if ref is not None else []
             reader = GDSReader(str(base), branch=ref)
             reader.take_snapshot()
             sphere = reader.read_sphere()
             if pattern_id not in sphere.patterns:
                 raise GDSError(f"unknown pattern '{pattern_id}' on {ref or 'main'}")
+            pattern = sphere.patterns[pattern_id]
+            calibrated = _uses_calibrated_score(pattern)
+            score_col = "anomaly_score" if calibrated else "delta_norm"
             table = reader.read_geometry(
                 pattern_id,
-                sphere.patterns[pattern_id].version,
-                columns=["primary_key", "delta_norm", "delta_rank_pct"],
+                pattern.version,
+                columns=["primary_key", "delta_norm", "score_rank_pct"]
+                + (["anomaly_score", "is_anomaly", "conformal_p"] if calibrated else []),
             )
-            if "delta_rank_pct" not in table.column_names:
+            if "score_rank_pct" not in table.column_names:
                 table = table.append_column(
-                    "delta_rank_pct", pa.nulls(table.num_rows, type=pa.float32())
+                    "score_rank_pct", pa.nulls(table.num_rows, type=pa.float32())
                 )
             # One row per key (an interrupted incremental update can leave
-            # duplicates): keep the highest delta_norm, as anomaly scans do.
+            # duplicates): keep the highest score, as anomaly scans do.
             # The sort only runs when there are duplicates.
             if pa.compute.count_distinct(table["primary_key"]).as_py() < table.num_rows:
                 order = pa.compute.sort_indices(
-                    table, sort_keys=[("primary_key", "ascending"), ("delta_norm", "descending")]
+                    table, sort_keys=[("primary_key", "ascending"), (score_col, "descending")]
                 )
                 table = table.take(order)
                 keys = table["primary_key"].to_numpy(zero_copy_only=False)
                 first = np.ones(len(keys), dtype=bool)
                 first[1:] = keys[1:] != keys[:-1]
                 table = table.filter(pa.array(first))
-            # Anomalous = delta_norm at or above the global threshold, the rule
-            # anomaly_summary and find_anomalies count by (the stored
-            # is_anomaly column may use per-group thresholds).
-            theta_norm = float(np.linalg.norm(sphere.patterns[pattern_id].theta))
-            dn = table["delta_norm"].to_numpy(zero_copy_only=False)
-            table = table.append_column(
-                "is_anomaly", pa.array((theta_norm > 0.0) & (dn >= theta_norm))
-            )
-            return table, reader.read_calibration_fit(pattern_id), theta_norm, recipe
+            score = table[score_col].to_numpy(zero_copy_only=False).astype(np.float64)
+            if calibrated:
+                # The stored flag is the alarm budget; the conformal p falls
+                # with the score, so the lowest flagged score is the boundary.
+                flags = pc.fill_null(table["is_anomaly"], False)
+                table = table.drop_columns(["is_anomaly", "anomaly_score"])
+                flagged = score[np.asarray(flags.to_numpy(zero_copy_only=False), dtype=bool)]
+                if flagged.size:
+                    threshold = float(flagged.min())
+                else:  # nothing flagged: a boundary just above every score
+                    threshold = math.nextafter(float(score.max()), math.inf) if score.size else 0.0
+            else:
+                # Anomalous = delta_norm at or above the global threshold, the
+                # rule anomaly_summary and find_anomalies count by (the stored
+                # is_anomaly column may use per-group thresholds).
+                threshold = float(np.linalg.norm(pattern.theta))
+                flags = pa.array((threshold > 0.0) & (score >= threshold))
+            table = table.append_column("is_anomaly", flags).append_column("score", pa.array(score))
+            return table, reader.read_calibration_fit(pattern_id), threshold, recipe, calibrated
 
-        t_from, fit_from, theta_from, _ = side(other)
-        t_to, fit_to, theta_to, recipe = side(branch)
+        t_from, fit_from, theta_from, _, cal_from = side(other)
+        t_to, fit_to, theta_to, recipe, cal_to = side(branch)
+        # Movers rank by the change of what decides the flag: the evidence in
+        # bits (-log2 conformal_p) on a calibrated pattern, delta_norm otherwise.
+        # A relative change of anomaly_score (a mean of ranks in [0, 1]) would
+        # rank the bottom of the population first.
+        calibrated = cal_from and cal_to
 
         # Key order: the stable sorts below break equal changes by key, not by
         # the join's (call-dependent) row order.
@@ -19769,12 +19794,26 @@ class GDSNavigator:
         dn_from = joined["delta_norm_from"].to_numpy(zero_copy_only=False).astype(np.float64)
         dn_to = joined["delta_norm_to"].to_numpy(zero_copy_only=False).astype(np.float64)
         rel_change = np.abs(dn_to - dn_from) / np.maximum(np.abs(dn_from), 1e-12)
+        if calibrated:
+
+            def _bits(col: str) -> np.ndarray:
+                p = joined[col].to_numpy(zero_copy_only=False).astype(np.float64)
+                bits: np.ndarray = -np.log2(np.clip(np.nan_to_num(p, nan=1.0), 1e-300, 1.0))
+                return bits
+
+            evidence_change = _bits("conformal_p_to") - _bits("conformal_p_from")
+            mover_key = np.abs(evidence_change)
+        else:
+            mover_key = rel_change
 
         # Why an entity flipped: the threshold moved past its old score, its
         # score moved past the old threshold, or only both moves together.
-        old_side = dn_from >= theta_from
-        by_threshold = (dn_from >= theta_to) != old_side
-        by_score = (dn_to >= theta_from) != old_side
+        # The score is delta_norm, or anomaly_score on a calibrated pattern.
+        s_from = joined["score_from"].to_numpy(zero_copy_only=False)
+        s_to = joined["score_to"].to_numpy(zero_copy_only=False)
+        old_side = s_from >= theta_from
+        by_threshold = (s_from >= theta_to) != old_side
+        by_score = (s_to >= theta_from) != old_side
         causes = np.where(
             by_threshold & ~by_score,
             "threshold",
@@ -19789,11 +19828,20 @@ class GDSNavigator:
                     "primary_key": row["primary_key"],
                     "delta_norm_from": row["delta_norm_from"],
                     "delta_norm_to": row["delta_norm_to"],
+                    **(
+                        {
+                            "anomaly_score_from": row["score_from"],
+                            "anomaly_score_to": row["score_to"],
+                            "evidence_change": float(evidence_change[i]),
+                        }
+                        if calibrated
+                        else {}
+                    ),
                     "relative_change": float(rel_change[i]),
                     "is_anomaly_from": row["is_anomaly_from"],
                     "is_anomaly_to": row["is_anomaly_to"],
-                    "rank_pct_from": row["delta_rank_pct_from"],
-                    "rank_pct_to": row["delta_rank_pct_to"],
+                    "rank_pct_from": row["score_rank_pct_from"],
+                    "rank_pct_to": row["score_rank_pct_to"],
                 }
                 for i, row in zip(index.tolist(), picked, strict=True)
             ]
@@ -19802,12 +19850,12 @@ class GDSNavigator:
             idx = np.flatnonzero(mask)
             return idx[np.argsort(-margin[idx], kind="stable")][:top_n]
 
-        top_movers = rows(np.argsort(-rel_change, kind="stable")[:top_n])
+        top_movers = rows(np.argsort(-mover_key, kind="stable")[:top_n])
         flipped_in_top = rows(
-            most_past_threshold(~an_from & an_to, dn_to / max(theta_to, 1e-12)), with_cause=True
+            most_past_threshold(~an_from & an_to, s_to / max(theta_to, 1e-12)), with_cause=True
         )
         flipped_out_top = rows(
-            most_past_threshold(an_from & ~an_to, dn_from / max(theta_from, 1e-12)),
+            most_past_threshold(an_from & ~an_to, s_from / max(theta_from, 1e-12)),
             with_cause=True,
         )
         drift = (
@@ -20140,6 +20188,15 @@ class GDSNavigator:
                 f"find_calibration_influencers: pattern_type 'event' has no "
                 f"population statistics; M4 requires anchor pattern "
                 f"(got pattern_id={pattern_id!r})"
+            )
+        if _uses_calibrated_score(pattern):
+            # The classes are flips of the θ verdict under a leave-one-out μ/σ
+            # refit; a calibrated verdict comes from the rank-based reference,
+            # where one entity moves every coordinate by at most O(1/n).
+            raise ValueError(
+                f"find_calibration_influencers: pattern {pattern_id!r} is ranked by its "
+                "calibrated score, whose rank-based reference no single entity can "
+                "mask itself in; use explain_anomaly for why an entity is flagged"
             )
 
         version = self._manifest.pattern_versions[pattern_id]
@@ -20987,8 +21044,10 @@ class GDSNavigator:
     ) -> list[dict[str, Any]]:
         """M4 additive: attach total_impact + classification per π5 entry.
 
-        Resolves to None per-entry when pattern is event-type, N<2, or storage
-        backend lacks shape reconstruction prerequisites."""
+        Leaves the entries without both keys when the pattern is event-type or
+        calibrated (the classes are flips of the θ verdict, see
+        ``find_calibration_influencers``); resolves to None per-entry when N<2
+        or the storage backend lacks shape reconstruction prerequisites."""
         from hypertopos.engine.geometry import (
             _classify_influence,
             _compute_leave_one_out_impact,
@@ -20997,10 +21056,7 @@ class GDSNavigator:
 
         sphere = self._storage.read_sphere()
         pattern = sphere.patterns[pattern_id]
-        if pattern.pattern_type == "event":
-            for e in entries:
-                e["total_impact"] = None
-                e["classification"] = None
+        if pattern.pattern_type == "event" or _uses_calibrated_score(pattern):
             return entries
 
         version = self._manifest.pattern_versions[pattern_id]

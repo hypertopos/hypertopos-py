@@ -55,7 +55,7 @@ def test_main_recalibrate_keeps_the_primary_key_index(sphere_dir: Path) -> None:
     ds = lance.dataset(str(_geo(sphere_dir)))
     after = _uuids(ds)
     assert after["primary_key_idx"] == before["primary_key_idx"]
-    for name in ("delta_norm_idx", "delta_rank_pct_idx", "is_anomaly_idx"):
+    for name in ("delta_norm_idx", "score_rank_pct_idx", "is_anomaly_idx"):
         assert ds.stats.index_stats(name)["num_unindexed_rows"] == 0, name
     theta = json.loads((sphere_dir / "_gds_meta" / "sphere.json").read_text("utf-8"))
     theta_norm = float(np.linalg.norm(theta["patterns"][PID]["theta"]))

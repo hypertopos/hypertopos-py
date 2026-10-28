@@ -31,3 +31,14 @@ def test_string_conversion_skips_the_timezone_pass(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(pc, "assume_timezone", lambda *a, **k: calls.append(1))
     GDSBuilder._to_epoch_seconds(pa.array(["2022/09/01 00:20"]))
     assert calls == [], "assume_timezone(UTC) leaves epoch values unchanged and is slow"
+
+
+@pytest.mark.parametrize("unit", ["s", "ms", "us", "ns"])
+def test_timestamp_columns_of_every_unit_convert(unit: str) -> None:
+    """A nanosecond epoch (~1.7e18) is past float64's exact-integer range; the
+    conversion must not refuse it."""
+    seconds = 1735689600  # 2025-01-01 00:00:00 UTC
+    scale = {"s": 1, "ms": 10**3, "us": 10**6, "ns": 10**9}[unit]
+    col = pa.array([seconds * scale, (seconds + 90) * scale], type=pa.timestamp(unit))
+    out = GDSBuilder._to_epoch_seconds(col).to_pylist()
+    assert out == pytest.approx([seconds, seconds + 90], abs=1e-6)

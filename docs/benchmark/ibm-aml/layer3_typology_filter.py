@@ -83,13 +83,13 @@ with hs.session("ag") as s:
     # Geometry
     print("Geometry...", "%.0fs" % (time.time() - t0))
     geo = reader.read_geometry(
-        "account_pattern", 1, columns=["primary_key", "delta_rank_pct", "conformal_p", "is_anomaly"]
+        "account_pattern", 1, columns=["primary_key", "score_rank_pct", "conformal_p", "is_anomaly"]
     )
     geo_map = {}
     for i in range(geo.num_rows):
         pk = geo["primary_key"][i].as_py()
         geo_map[pk] = {
-            "rk": geo["delta_rank_pct"][i].as_py() or 0,
+            "rk": geo["score_rank_pct"][i].as_py() or 0,
             "cp": geo["conformal_p"][i].as_py() or 1.0,
             "an": 1 if geo["is_anomaly"][i].as_py() else 0,
         }
@@ -238,7 +238,7 @@ with hs.session("ag") as s:
     src_border = {
         geo["primary_key"][i].as_py()
         for i in range(geo.num_rows)
-        if not geo["is_anomaly"][i].as_py() and (geo["delta_rank_pct"][i].as_py() or 0) >= 80
+        if not geo["is_anomaly"][i].as_py() and (geo["score_rank_pct"][i].as_py() or 0) >= 80
     }
     src_struct = {
         pk_list[i]
@@ -329,7 +329,7 @@ with hs.session("ag") as s:
     # Build features
     go = len(raw_cols)
     geo_cols = [
-        "delta_rank_pct",
+        "score_rank_pct",
         "conformal_p",
         "is_anomaly",
         "multi_source_score",

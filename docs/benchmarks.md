@@ -2,6 +2,8 @@
 
 > Validation results across three domains — zero labels, zero training, same engine.
 
+> Numbers are from the pre-0.1.0 validation run and have not been re-evaluated against recent releases.
+
 ## Results Summary
 
 | Domain | Dataset | Scale | Key Result | Labels |
@@ -32,7 +34,7 @@ Synthetic transaction data. 3-layer pipeline: geometry (unsupervised) → XGBoos
 | Layer 1 (score≥2) | 59.6% | 29.0 | Multi-source confirmed |
 | Layer 2+3 (Stream B) | 40.2% | 0.6 | XGBoost + typology filter |
 
-Cold-start: 80.4% recall from day zero on any transaction dataset. No model training, no labels for Layer 1.
+Cold-start: 80.4% recall on this dataset with no training and no labels for Layer 1.
 
 Full results: [`benchmark/ibm-aml/`](benchmark/ibm-aml/)
 
@@ -56,7 +58,7 @@ Full results: [`benchmark/nyc-taxi/`](benchmark/nyc-taxi/)
 
 1. **Cross-domain** — banking, AML, transportation. Same engine, zero domain rules.
 2. **Zero labels** — population geometry calibrates itself from the data.
-3. **Reproducible** — `pip install hypertopos`, run build scripts, verify on your machine.
+3. **Reproducible with the release they were measured on** — `pip install hypertopos`, run build scripts, verify on your machine.
 4. **Measurable** — exact recall, scoring rubrics, per-run reports with full methodology.
 
 ---

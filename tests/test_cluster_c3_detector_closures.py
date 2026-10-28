@@ -56,7 +56,7 @@ def _engineered_light_table(
             "delta": pa.array(delta.tolist(), type=pa.list_(pa.float32())),
             "delta_norm": pa.array(all_norms.astype(np.float32)),
             "is_anomaly": pa.array(all_norms >= theta_norm),
-            "delta_rank_pct": pa.array(np.linspace(0.0, 1.0, n_total, dtype=np.float32)),
+            "score_rank_pct": pa.array(np.linspace(0.0, 1.0, n_total, dtype=np.float32)),
         }
     )
 

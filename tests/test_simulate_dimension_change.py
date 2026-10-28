@@ -37,7 +37,6 @@ def _make_pattern(
     sigma_diag: list[float],
     theta: list[float],
     dimension_weights: list[float] | None = None,
-    cholesky_inv: np.ndarray | None = None,
 ) -> Pattern:
     return Pattern(
         pattern_id="test_pattern",
@@ -56,7 +55,6 @@ def _make_pattern(
             if dimension_weights is not None
             else None
         ),
-        cholesky_inv=cholesky_inv,
     )
 
 
@@ -433,57 +431,6 @@ def test_top_witness_dims_after_sorted_by_abs_delta_desc():
     assert abs_deltas == sorted(abs_deltas, reverse=True)
     total_pct = sum(row["contribution_pct"] for row in result["top_witness_dims_after"])
     assert total_pct == pytest.approx(100.0, abs=0.01)
-
-
-def test_cholesky_pattern_recomputes_correctly():
-    """Engineer a 2-dim pattern with a non-diagonal cholesky_inv so cross-
-    coupling between dims is visible. Overriding a single shape dim must
-    move multiple delta dims (because L_inv is dense)."""
-    # Choose L_inv with explicit cross-term so dim 0 of shape touches BOTH
-    # delta dims.
-    cholesky_inv = np.array(
-        [[2.0, 0.0], [1.0, 0.5]],
-        dtype=np.float64,
-    )
-    pattern = _make_pattern(
-        line_ids=["A", "B"],
-        mu=[1.0, 2.0],
-        sigma_diag=[1.0, 1.0],  # ignored when cholesky_inv present
-        theta=[3.0, 3.0],
-        cholesky_inv=cholesky_inv,
-    )
-
-    # Choose shape_before = [3.0, 4.0]. Hand-compute delta_before:
-    # delta_before = L_inv @ (shape - mu)
-    #              = L_inv @ [2, 2]
-    #              = [4, 3]
-    delta_before = (cholesky_inv @ np.array([2.0, 2.0], dtype=np.float64)).tolist()
-    assert delta_before == [4.0, 3.0]
-
-    nav = _make_nav(pattern, delta=delta_before, is_anomaly=False)
-
-    # Override dim "A" (index 0) to 5.0 ⇒ shape_after = [5.0, 4.0]
-    # delta_after = L_inv @ ([5,4] - [1,2]) = L_inv @ [4, 2]
-    #             = [8.0, 5.0]
-    result = nav.simulate_dimension_change(
-        "E1",
-        pattern_id="test_pattern",
-        line_id="line_A",
-        set_dimension={"A": 5.0},
-        top_n=2,
-    )
-
-    expected_delta_after = (cholesky_inv @ np.array([4.0, 2.0], dtype=np.float64)).tolist()
-    assert expected_delta_after == [8.0, 5.0]
-    assert result["delta_norm_after"] == pytest.approx(math.sqrt(64.0 + 25.0), abs=1e-9)
-    # Both delta entries moved despite overriding only one shape dim.
-    row_a = result["dimensions_overridden"][0]
-    assert row_a["old_delta"] == pytest.approx(4.0, abs=1e-9)
-    assert row_a["new_delta"] == pytest.approx(8.0, abs=1e-9)
-    # Witness dim B (index 1) reflects the cross-coupled new delta (5.0).
-    witness_by_label = {row["dim_label"]: row for row in result["top_witness_dims_after"]}
-    assert witness_by_label["B"]["delta"] == pytest.approx(5.0, abs=1e-9)
-    assert witness_by_label["A"]["delta"] == pytest.approx(8.0, abs=1e-9)
 
 
 def test_determinism():

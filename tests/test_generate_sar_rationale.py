@@ -328,7 +328,7 @@ def test_no_contradiction_strong_plus_one_failed_surface():
             "ok": True,
             "data": {
                 "is_anomaly": False,
-                "delta_rank_pct": 50.0,
+                "score_rank_pct": 50.0,
             },
         },
         "extension_forward": {

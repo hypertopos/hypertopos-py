@@ -13,6 +13,74 @@ import numpy as np
 from hypertopos.engine.geometry import GDSEngine, _per_dim_anomaly_contributions
 
 
+def calibrated_severity(conformal_p: float, alpha: float) -> str:
+    """Severity of a calibrated anomaly from its p-value and the alarm budget ``alpha``.
+
+    ``normal`` above the budget; inside it ``low`` / ``medium`` / ``high`` /
+    ``extreme`` at ``alpha``, ``alpha/2``, ``alpha/5`` and ``alpha/50``.
+    """
+    if conformal_p > alpha:
+        return "normal"
+    if conformal_p <= alpha / 50:
+        return "extreme"
+    if conformal_p <= alpha / 5:
+        return "high"
+    if conformal_p <= alpha / 2:
+        return "medium"
+    return "low"
+
+
+def build_calibrated_explanation(
+    *,
+    conformal_p: float,
+    anomaly_score: float,
+    alpha: float,
+    axis_ranks: dict[str, float],
+    axis_bits: dict[str, float],
+    dim_bits: dict[str, float],
+    score_delta: dict[str, float],
+    delta_norm: float,
+    temporal_slices: int | None = None,
+    reputation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Explanation of an entity on a pattern ranked by its calibrated evidence score.
+
+    ``bits = -log2(conformal_p)`` is split exactly over the axes (``axes``) and,
+    within the Mahalanobis axis, over the named dimensions (``top_dimensions``,
+    each with its rank-Gaussian coordinate ``z``). ``delta_norm`` is the
+    shape-space norm, reported for reference only — the boundary is the
+    alarm budget ``alpha`` on ``conformal_p``.
+    """
+    severity = calibrated_severity(conformal_p, alpha)
+    result: dict[str, Any] = {
+        "severity": severity,
+        "conformal_p": float(conformal_p),
+        "anomaly_score": float(anomaly_score),
+        "delta_norm": round(delta_norm, 4),
+    }
+    if severity != "normal":
+        bits = sum(axis_bits.values())
+        result["bits"] = round(bits, 4)
+        result["axes"] = {
+            a: {"rank": round(axis_ranks[a], 4), "bits": round(b, 4)} for a, b in axis_bits.items()
+        }
+        result["top_dimensions"] = [
+            {
+                "dim": d,
+                "z": round(score_delta[d], 4),
+                "bits": round(b, 4),
+                "pct_of_total": round(b / bits, 4) if bits > 0 else 0.0,
+            }
+            for d, b in sorted(dim_bits.items(), key=lambda kv: -kv[1])
+            if b > 0
+        ]
+    if temporal_slices is not None:
+        result["temporal_slices"] = temporal_slices
+    if reputation is not None:
+        result["reputation"] = reputation
+    return result
+
+
 def build_explanation(
     delta: np.ndarray | list[float],
     dim_labels: list[str],

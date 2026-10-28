@@ -23,7 +23,7 @@ def _aml_sphere_unavailable() -> bool:
         return True
     import json
 
-    return json.loads(sphere_json.read_text()).get("format_version", "").split(".")[0] != "3"
+    return json.loads(sphere_json.read_text()).get("format_version", "").split(".")[0] != "4"
 
 
 pytestmark = pytest.mark.skipif(

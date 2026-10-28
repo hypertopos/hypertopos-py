@@ -104,7 +104,7 @@ def test_read_geometry_sample_size(tmp_path):
             "scale": pa.array([1] * n_total, type=pa.int32()),
             "delta": pa.array([[0.1, 0.2]] * n_total, type=pa.list_(pa.float32())),
             "delta_norm": pa.array([0.22] * n_total, type=pa.float32()),
-            "delta_rank_pct": pa.array([50.0] * n_total, type=pa.float32()),
+            "score_rank_pct": pa.array([50.0] * n_total, type=pa.float32()),
             "is_anomaly": [False] * n_total,
             "edges": pa.array(
                 [[]] * n_total,
@@ -131,7 +131,7 @@ def test_read_geometry_sample_size(tmp_path):
         json_mod.dumps(
             {
                 "sphere_id": "test",
-                "format_version": "3.0",
+                "format_version": "4.0",
                 "name": "Test",
                 "lines": {},
                 "patterns": {},
@@ -1066,7 +1066,7 @@ def test_parse_sphere_with_storage_config(tmp_path):
         _json.dumps(
             {
                 "sphere_id": "test",
-                "format_version": "3.0",
+                "format_version": "4.0",
                 "name": "test",
                 "lines": {},
                 "patterns": {},
@@ -1102,7 +1102,7 @@ def test_parse_sphere_without_storage_config(tmp_path):
         _json.dumps(
             {
                 "sphere_id": "test",
-                "format_version": "3.0",
+                "format_version": "4.0",
                 "name": "test",
                 "lines": {},
                 "patterns": {},
@@ -1124,7 +1124,7 @@ def test_parse_sphere_partial_storage_config(tmp_path):
         _json.dumps(
             {
                 "sphere_id": "test",
-                "format_version": "3.0",
+                "format_version": "4.0",
                 "name": "test",
                 "lines": {},
                 "patterns": {},
@@ -1398,7 +1398,7 @@ class TestLanceGeometry:
                 "delta": [[0.5, 0.5], [0.1, 0.9]],
                 "delta_norm": pa.array([0.7, 0.9], type=pa.float32()),
                 "is_anomaly": [False, True],
-                "delta_rank_pct": pa.array([40.0, 90.0], type=pa.float32()),
+                "score_rank_pct": pa.array([40.0, 90.0], type=pa.float32()),
                 "edges": pa.array(
                     [[], []],
                     type=pa.list_(
@@ -1424,7 +1424,7 @@ class TestLanceGeometry:
         meta_dir.mkdir(parents=True, exist_ok=True)
         sphere_json = {
             "sphere_id": "test",
-            "format_version": "3.0",
+            "format_version": "4.0",
             "name": "Test",
             "lines": {},
             "patterns": {},
@@ -1449,7 +1449,7 @@ class TestLanceGeometry:
                 "delta": [[float(i % 10), float((i * 2) % 10)] for i in range(256)],
                 "delta_norm": pa.array([float(i) * 0.01 for i in range(256)], type=pa.float32()),
                 "is_anomaly": [False] * 256,
-                "delta_rank_pct": pa.array(
+                "score_rank_pct": pa.array(
                     [float(i) / 2.56 for i in range(256)], type=pa.float32()
                 ),
                 "edges": pa.array(
@@ -1487,7 +1487,7 @@ class TestLanceGeometry:
                 "delta": [[float(i % 10), float((i * 2) % 10)] for i in range(256)],
                 "delta_norm": pa.array([float(i) * 0.01 for i in range(256)], type=pa.float32()),
                 "is_anomaly": [False] * 128 + [True] * 128,
-                "delta_rank_pct": pa.array(
+                "score_rank_pct": pa.array(
                     [float(i) / 2.56 for i in range(256)], type=pa.float32()
                 ),
                 "edges": pa.array(
@@ -1514,8 +1514,8 @@ class TestLanceGeometry:
         indexed_fields = {f for idx in indices for f in idx.field_names}
         assert "delta_norm" in indexed_fields, f"No index on delta_norm. Fields: {indexed_fields}"
         assert "is_anomaly" in indexed_fields, f"No index on is_anomaly. Fields: {indexed_fields}"
-        assert "delta_rank_pct" in indexed_fields, (
-            f"No index on delta_rank_pct. Fields: {indexed_fields}"
+        assert "score_rank_pct" in indexed_fields, (
+            f"No index on score_rank_pct. Fields: {indexed_fields}"
         )  # noqa: E501
 
     def test_write_lance_geometry_creates_label_list_index(self, tmp_path):
@@ -1530,7 +1530,7 @@ class TestLanceGeometry:
                 "delta": [[float(i % 10), float((i * 2) % 10)] for i in range(n)],
                 "delta_norm": pa.array([float(i) * 0.01 for i in range(n)], type=pa.float32()),
                 "is_anomaly": [False] * n,
-                "delta_rank_pct": pa.array([float(i) / 2.56 for i in range(n)], type=pa.float32()),
+                "score_rank_pct": pa.array([float(i) / 2.56 for i in range(n)], type=pa.float32()),
                 "edges": pa.array(
                     [[] for _ in range(n)],
                     type=pa.list_(
@@ -1569,7 +1569,7 @@ class TestLanceGeometry:
                 "delta": [[0.1, 0.2] for _ in range(n)],
                 "delta_norm": pa.array([0.22] * n, type=pa.float32()),
                 "is_anomaly": [False] * n,
-                "delta_rank_pct": pa.array([50.0] * n, type=pa.float32()),
+                "score_rank_pct": pa.array([50.0] * n, type=pa.float32()),
                 "edges": pa.array(
                     [[] for _ in range(n)],
                     type=pa.list_(
@@ -1595,7 +1595,7 @@ class TestLanceGeometry:
             json_mod.dumps(
                 {
                     "sphere_id": "test",
-                    "format_version": "3.0",
+                    "format_version": "4.0",
                     "name": "Test",
                     "lines": {},
                     "patterns": {},
@@ -1622,7 +1622,7 @@ class TestLanceGeometry:
                 "delta": [[0.1, 0.2] for _ in range(n)],
                 "delta_norm": pa.array([0.22] * n, type=pa.float32()),
                 "is_anomaly": [False] * n,
-                "delta_rank_pct": pa.array([50.0] * n, type=pa.float32()),
+                "score_rank_pct": pa.array([50.0] * n, type=pa.float32()),
                 "edges": pa.array(
                     [[] for _ in range(n)],
                     type=pa.list_(
@@ -1649,7 +1649,7 @@ class TestLanceGeometry:
             json_mod.dumps(
                 {
                     "sphere_id": "test",
-                    "format_version": "3.0",
+                    "format_version": "4.0",
                     "name": "Test",
                     "lines": {},
                     "patterns": {},
@@ -1680,7 +1680,7 @@ class TestLanceGeometry:
                 "delta": [[0.1, 0.2] for _ in range(n)],
                 "delta_norm": pa.array([0.22] * n, type=pa.float32()),
                 "is_anomaly": [False] * n,
-                "delta_rank_pct": pa.array([50.0] * n, type=pa.float32()),
+                "score_rank_pct": pa.array([50.0] * n, type=pa.float32()),
                 "edges": pa.array(
                     [[] for _ in range(n)],
                     type=pa.list_(
@@ -1709,7 +1709,7 @@ class TestLanceGeometry:
             json_mod.dumps(
                 {
                     "sphere_id": "test",
-                    "format_version": "3.0",
+                    "format_version": "4.0",
                     "name": "Test",
                     "lines": {},
                     "patterns": {},
@@ -1761,7 +1761,7 @@ class TestLanceGeometry:
                 "scale": pa.array([1] * n, type=pa.int32()),
                 "delta": pa.array(deltas.tolist(), type=fixed_type),
                 "delta_norm": pa.array(np.linalg.norm(deltas, axis=1).tolist(), type=pa.float32()),
-                "delta_rank_pct": pa.array([50.0] * n, type=pa.float32()),
+                "score_rank_pct": pa.array([50.0] * n, type=pa.float32()),
                 "is_anomaly": pa.array([False] * n, type=pa.bool_()),
                 "edges": pa.array(
                     [[] for _ in range(n)],
@@ -1824,7 +1824,7 @@ class TestLanceGeometry:
                 "scale": pa.array([1] * n, type=pa.int32()),
                 "delta": pa.array(deltas.tolist(), type=fixed_type),
                 "delta_norm": pa.array(np.linalg.norm(deltas, axis=1).tolist(), type=pa.float32()),
-                "delta_rank_pct": pa.array([50.0] * n, type=pa.float32()),
+                "score_rank_pct": pa.array([50.0] * n, type=pa.float32()),
                 "is_anomaly": pa.array(is_anomaly, type=pa.bool_()),
                 "edges": pa.array(
                     [[] for _ in range(n)],
@@ -1905,7 +1905,7 @@ class TestLanceGeometry:
                 "scale": pa.array([1] * n, type=pa.int32()),
                 "delta": pa.array(deltas.tolist(), type=fixed_type),
                 "delta_norm": pa.array(np.linalg.norm(deltas, axis=1).tolist(), type=pa.float32()),
-                "delta_rank_pct": pa.array([50.0] * n, type=pa.float32()),
+                "score_rank_pct": pa.array([50.0] * n, type=pa.float32()),
                 "is_anomaly": pa.array([False] * n, type=pa.bool_()),
                 "edges": pa.array(edges_per_row, type=pa.list_(EDGE_STRUCT_TYPE)),
                 "entity_keys": pa.array(entity_keys_per_row, type=pa.list_(pa.string())),
@@ -1932,7 +1932,7 @@ class TestLanceGeometry:
             json_mod.dumps(
                 {
                     "sphere_id": "test",
-                    "format_version": "3.0",
+                    "format_version": "4.0",
                     "name": "test",
                     "storage": {"geometry": {"format": "lance"}},
                     "lines": {},
@@ -1980,7 +1980,7 @@ class TestLanceGeometry:
                 "scale": pa.array([1] * n, type=pa.int32()),
                 "delta": pa.array(deltas.tolist(), type=fixed_type),
                 "delta_norm": pa.array(np.linalg.norm(deltas, axis=1).tolist(), type=pa.float32()),
-                "delta_rank_pct": pa.array([50.0] * n, type=pa.float32()),
+                "score_rank_pct": pa.array([50.0] * n, type=pa.float32()),
                 "is_anomaly": pa.array([False] * n, type=pa.bool_()),
                 "edges": pa.array(edges_per_row, type=pa.list_(EDGE_STRUCT_TYPE)),
                 "entity_keys": pa.array(entity_keys_per_row, type=pa.list_(pa.string())),
@@ -2005,7 +2005,7 @@ class TestLanceGeometry:
             json_mod.dumps(
                 {
                     "sphere_id": "t",
-                    "format_version": "3.0",
+                    "format_version": "4.0",
                     "name": "t",
                     "storage": {"geometry": {"format": "lance"}},
                     "lines": {},
@@ -2032,7 +2032,7 @@ class TestLanceGeometry:
                 "delta": [[0.5, 0.5], [0.1, 0.9]],
                 "delta_norm": pa.array([0.7, 0.9], type=pa.float32()),
                 "is_anomaly": [False, True],
-                "delta_rank_pct": pa.array([40.0, 90.0], type=pa.float32()),
+                "score_rank_pct": pa.array([40.0, 90.0], type=pa.float32()),
                 "edges": pa.array(
                     [[], []],
                     type=pa.list_(
@@ -2058,7 +2058,7 @@ class TestLanceGeometry:
             json_mod.dumps(
                 {
                     "sphere_id": "test",
-                    "format_version": "3.0",
+                    "format_version": "4.0",
                     "name": "Test",
                     "lines": {},
                     "patterns": {},
@@ -2114,7 +2114,7 @@ class TestLanceGeometry:
                 ),
                 "delta_norm": pa.array(np.linalg.norm(deltas, axis=1), type=pa.float32()),
                 "is_anomaly": pa.array([False] * n, type=pa.bool_()),
-                "delta_rank_pct": pa.array(np.linspace(0, 100, n), type=pa.float32()),
+                "score_rank_pct": pa.array(np.linspace(0, 100, n), type=pa.float32()),
                 "edges": pa.array(edges_per_row, type=pa.list_(EDGE_STRUCT_TYPE)),
                 "entity_keys": pa.array(entity_keys_per_row, type=pa.list_(pa.string())),
                 "last_refresh_at": pa.array(
@@ -2138,7 +2138,7 @@ class TestLanceGeometry:
             json_mod.dumps(
                 {
                     "sphere_id": "t",
-                    "format_version": "3.0",
+                    "format_version": "4.0",
                     "name": "t",
                     "storage": {"geometry": {"format": "lance"}},
                     "lines": {},
@@ -2169,7 +2169,7 @@ class TestLanceGeometry:
                 "delta": [[0.1, 0.1], [0.5, 0.5], [0.9, 0.9]],
                 "delta_norm": pa.array([0.14, 0.71, 1.27], type=pa.float32()),
                 "is_anomaly": [False, False, True],
-                "delta_rank_pct": pa.array([10.0, 50.0, 95.0], type=pa.float32()),
+                "score_rank_pct": pa.array([10.0, 50.0, 95.0], type=pa.float32()),
                 "edges": pa.array(
                     [[], [], []],
                     type=pa.list_(
@@ -2195,7 +2195,7 @@ class TestLanceGeometry:
             json_mod.dumps(
                 {
                     "sphere_id": "test",
-                    "format_version": "3.0",
+                    "format_version": "4.0",
                     "name": "Test",
                     "lines": {},
                     "patterns": {},
@@ -2240,7 +2240,7 @@ class TestLanceGeometry:
                     [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]], type=pa.list_(pa.float32())
                 ),
                 "delta_norm": pa.array([0.22, 0.5, 0.78], type=pa.float32()),
-                "delta_rank_pct": pa.array([10.0, 50.0, 90.0], type=pa.float32()),
+                "score_rank_pct": pa.array([10.0, 50.0, 90.0], type=pa.float32()),
                 "is_anomaly": [False, False, True],
                 "edges": pa.array(
                     [[], [], []],
@@ -2267,7 +2267,7 @@ class TestLanceGeometry:
             json_mod.dumps(
                 {
                     "sphere_id": "test",
-                    "format_version": "3.0",
+                    "format_version": "4.0",
                     "name": "Test",
                     "lines": {},
                     "patterns": {},
@@ -2823,7 +2823,7 @@ class TestResolveByEntityKeys:
         # sphere.json with gl_pattern having two relations: customers, company_codes
         sphere_json = {
             "sphere_id": "test",
-            "format_version": "3.0",
+            "format_version": "4.0",
             "name": "test",
             "lines": {
                 "customers": {
@@ -2876,7 +2876,7 @@ class TestResolveByEntityKeys:
                 ),
                 "delta_norm": pa.array([0.2, 0.5, 0.8], type=pa.float32()),
                 "is_anomaly": [False, True, False],
-                "delta_rank_pct": pa.array([20.0, 70.0, 90.0], type=pa.float32()),
+                "score_rank_pct": pa.array([20.0, 70.0, 90.0], type=pa.float32()),
                 "entity_keys": [
                     ["CUST-001", "CC-001"],
                     ["CUST-001", "CC-002"],
@@ -2927,7 +2927,7 @@ class TestResolveByEntityKeys:
 
         sphere_json = {
             "sphere_id": "test",
-            "format_version": "3.0",
+            "format_version": "4.0",
             "name": "test",
             "lines": {
                 "accounts": {
@@ -2972,7 +2972,7 @@ class TestResolveByEntityKeys:
                 ),
                 "delta_norm": pa.array([0.2, 0.5, 0.8], type=pa.float32()),
                 "is_anomaly": [False, True, False],
-                "delta_rank_pct": pa.array([20.0, 70.0, 90.0], type=pa.float32()),
+                "score_rank_pct": pa.array([20.0, 70.0, 90.0], type=pa.float32()),
                 "entity_keys": [
                     ["ACC-1", "ACC-2"],  # ACC-1 sends (slot 0)
                     ["ACC-3", "ACC-1"],  # ACC-1 receives (slot 1)
@@ -3299,7 +3299,7 @@ def test_parse_pattern_reads_prop_columns(tmp_path):
         _json.dumps(
             {
                 "sphere_id": "s",
-                "format_version": "3.0",
+                "format_version": "4.0",
                 "name": "s",
                 "lines": {},
                 "patterns": {
@@ -3349,7 +3349,7 @@ def test_parse_pattern_reads_dim_percentiles(tmp_path):
         _json.dumps(
             {
                 "sphere_id": "s",
-                "format_version": "3.0",
+                "format_version": "4.0",
                 "name": "s",
                 "lines": {},
                 "patterns": {
@@ -3387,7 +3387,7 @@ def test_parse_pattern_dim_percentiles_absent(tmp_path):
         _json.dumps(
             {
                 "sphere_id": "s",
-                "format_version": "3.0",
+                "format_version": "4.0",
                 "name": "s",
                 "lines": {},
                 "patterns": {

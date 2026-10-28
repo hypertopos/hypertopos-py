@@ -21,7 +21,6 @@ from typing import Any
 
 import numpy as np
 import pyarrow as pa
-from scipy.special import gammaincc
 from scipy.stats import fisher_exact, hypergeom
 
 # Lower clamp shared with engine/composition.py to keep HMP denominators finite.
@@ -41,72 +40,40 @@ def _clip_p(value: float) -> float:
     return float(value)
 
 
-def detector_p_value_delta_norm(
+def detector_p_value_anomaly(
     geo_table: pa.Table,
     primary_keys: list[str] | tuple[str, ...],
-    *,
-    use_anomaly_confidence: bool = True,
-    df: int | None = None,
 ) -> dict[str, float]:
-    """Calibrate delta_norm-based anomaly score to per-entity p-values.
+    """Per-entity p-values of the anchor-pattern anomaly score.
 
-    Primary path: ``p = 1 - anomaly_confidence`` (sphere format >= 2.4 stores
-    `anomaly_confidence` in geometry; null per-row entries fall back to chi2).
-    Fallback path: ``p = 1 - F_chi2(delta_norm**2; df)``, where df defaults to
-    the dimensionality of the polygon delta vector.
+    The geometry stores ``conformal_p``, calibrated against the pattern's
+    population, so it is used as is. A missing column or a null row carries no
+    evidence (p = 1).
 
     Args:
-        geo_table: Arrow table containing at minimum `primary_key` and
-            `delta_norm` columns; optionally `anomaly_confidence`.
+        geo_table: Arrow table with ``primary_key`` and, normally, ``conformal_p``.
         primary_keys: Subset to evaluate; ordering preserved in the output dict.
-        use_anomaly_confidence: When False, force the chi2 fallback.
-        df: Degrees of freedom for the chi2 fallback. Required when the
-            anomaly_confidence column is absent OR a row's value is null.
 
     Returns:
         ``{primary_key: p}`` for entities present in ``geo_table``.
     """
-    if not primary_keys:
+    if not primary_keys or geo_table.num_rows == 0:
         return {}
-    if geo_table.num_rows == 0:
-        return {}
-
-    pk_array = geo_table["primary_key"].to_pylist()
     pk_to_idx: dict[str, int] = {}
-    for i, pk in enumerate(pk_array):
+    for i, pk in enumerate(geo_table["primary_key"].to_pylist()):
         # First occurrence wins — guards against duplicate rows in the input table.
         pk_to_idx.setdefault(pk, i)
-
-    delta_norm = geo_table["delta_norm"]
-    has_conf = use_anomaly_confidence and "anomaly_confidence" in geo_table.schema.names
-    # Any (not Optional): only indexed under `if has_conf`, where it is set.
-    conf_col: Any = geo_table["anomaly_confidence"] if has_conf else None
-
+    has_p = "conformal_p" in geo_table.schema.names
+    p_col: Any = geo_table["conformal_p"] if has_p else None
     out: dict[str, float] = {}
     for pk in primary_keys:
         idx = pk_to_idx.get(pk)
         if idx is None:
             continue
-        conf_val: float | None = None
-        if has_conf:
-            scalar = conf_col[idx]
-            if scalar.is_valid:
-                conf_val = float(scalar.as_py())
-        if conf_val is not None:
-            out[pk] = _clip_p(1.0 - conf_val)
-            continue
-        # Fallback: chi2 survival on delta_norm**2
-        d_scalar = delta_norm[idx]
-        if not d_scalar.is_valid:
-            out[pk] = _P_CEIL
-            continue
-        dn = float(d_scalar.as_py())
-        if df is None or df <= 0:
-            # Without df, no defensible parametric mapping — return a uniform p.
-            out[pk] = _P_CEIL
-            continue
-        p = float(gammaincc(df / 2.0, (dn * dn) / 2.0))
-        out[pk] = _clip_p(p)
+        scalar = p_col[idx] if has_p else None
+        out[pk] = (
+            _clip_p(float(scalar.as_py())) if scalar is not None and scalar.is_valid else _P_CEIL
+        )
     return out
 
 

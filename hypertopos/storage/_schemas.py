@@ -23,9 +23,17 @@ GEOMETRY_SCHEMA = pa.schema(
         pa.field("scale", pa.int32()),
         pa.field("delta", pa.list_(pa.float32())),
         pa.field("delta_norm", pa.float32()),
-        pa.field("delta_rank_pct", pa.float32()),
+        pa.field("score_rank_pct", pa.float32()),
         pa.field("is_anomaly", pa.bool_()),
         pa.field("conformal_p", pa.float32()),
+        # Calibrated evidence score (mean of the axis ranks), the ranks per axis
+        # (order of the pattern's ``score_axes``) and the rank-Gaussian
+        # coordinates of the score dimensions (order of ``score_dims``).
+        # Patterns scored by ``delta_norm`` carry it as ``anomaly_score`` and
+        # null ``axis_ranks`` / ``score_delta``.
+        pa.field("anomaly_score", pa.float64()),
+        pa.field("axis_ranks", pa.list_(pa.float32())),
+        pa.field("score_delta", pa.list_(pa.float32())),
         pa.field("bregman_divergence", pa.float32()),
         pa.field("anomaly_confidence", pa.float32()),
         pa.field("n_anomalous_dims", pa.int32()),

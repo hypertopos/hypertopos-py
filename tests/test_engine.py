@@ -1244,15 +1244,15 @@ def test_centroid_map_max_groups_above_cardinality_changes_nothing():
     assert "n_groups_total" not in capped
 
 
-def test_build_polygon_includes_delta_rank_pct(sphere_path):
-    """build_polygon reads delta_rank_pct from geometry table."""
+def test_build_polygon_includes_score_rank_pct(sphere_path):
+    """build_polygon reads score_rank_pct from geometry table."""
     reader = GDSReader(base_path=sphere_path)
     cache = GDSCache()
     engine = GDSEngine(storage=reader, cache=cache)
     manifest = _make_manifest()
     polygon = engine.build_polygon("CUST-001", "customer_pattern", manifest)
-    assert polygon.delta_rank_pct is not None
-    assert 0.0 <= polygon.delta_rank_pct <= 100.0
+    assert polygon.score_rank_pct is not None
+    assert 0.0 <= polygon.score_rank_pct <= 100.0
 
 
 # --- find_nearest Lance ANN delegation ---

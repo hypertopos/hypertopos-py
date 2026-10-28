@@ -2,7 +2,7 @@
 
 Per-percentile sweep over a `delta_norm` distribution. Used at build
 time by `_BuildState._compute_population_stats` (which already sorts
-`delta_norms` for `delta_rank_pcts` + conformal p-values, so the
+`delta_norms` for `score_rank_pcts` + conformal p-values, so the
 diagnostic glues onto that existing sort at zero new I/O cost) to
 populate the `theta_sensitivity` field on `CalibrationFit` written via
 `write_calibration_history_epoch`. Surfaces to investigators via the
@@ -172,7 +172,7 @@ def compute_theta_sensitivity_from_sorted(
 
     O(P) per pattern (P = len(percentiles)). No new sort, no bootstrap.
     Glues onto the builder's existing `sorted_norms` (computed for
-    `delta_rank_pcts`), so wiring this in adds zero I/O cost to the
+    `score_rank_pcts`), so wiring this in adds zero I/O cost to the
     build path.
 
     Args:

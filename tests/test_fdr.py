@@ -7,7 +7,6 @@ import pytest
 
 from hypertopos.engine.fdr import (
     benjamini_hochberg,
-    parametric_p_values_chi2,
     q_values_from_p_values,
     storey_pi0,
     storey_q_values,
@@ -217,49 +216,3 @@ class TestBHMethodDispatch:
     def test_unknown_method_raises(self):
         with pytest.raises(ValueError):
             benjamini_hochberg(np.array([0.1, 0.2]), 0.05, method="bogus")
-
-
-class TestParametricChi2PValues:
-    def test_null_delta_norm_near_sqrt_df(self):
-        """delta_norm ~= sqrt(df) under N(0,1) null -> p-values cluster near 0.5."""
-        rng = np.random.default_rng(3)
-        df = 10
-        deltas = rng.standard_normal(size=(5000, df))
-        dn = np.linalg.norm(deltas, axis=1)
-        p = parametric_p_values_chi2(dn, df=df)
-        # Under null, p-values are uniform [0, 1] -> median ~ 0.5
-        assert 0.45 <= np.median(p) <= 0.55
-
-    def test_large_delta_norm_yields_small_p(self):
-        """||delta||^2 >> df -> p ~ 0."""
-        p = parametric_p_values_chi2(np.array([20.0]), df=4)
-        assert p[0] < 1e-6
-
-    def test_zero_delta_norm_yields_one(self):
-        p = parametric_p_values_chi2(np.array([0.0]), df=5)
-        assert p[0] == 1.0
-
-    def test_df_validation(self):
-        with pytest.raises(ValueError):
-            parametric_p_values_chi2(np.array([1.0]), df=0)
-
-    def test_storey_recovers_power_with_chi2(self):
-        """On a mix of N(0,1) null + shifted-mean alternative, chi2 p-values
-        enable Storey to shrink q-values meaningfully."""
-        rng = np.random.default_rng(4)
-        df = 10
-        # 70% null, 30% alt (mean shift gives ||delta|| larger than sqrt(df))
-        null_deltas = rng.standard_normal(size=(700, df))
-        alt_deltas = rng.standard_normal(size=(300, df)) + 2.0
-        deltas = np.concatenate([null_deltas, alt_deltas], axis=0)
-        dn = np.linalg.norm(deltas, axis=1)
-        p = parametric_p_values_chi2(dn, df=df)
-
-        # With a real null component, Storey pi0 should land roughly at 0.7
-        pi0 = storey_pi0(p, lam=0.5)
-        assert 0.5 <= pi0 <= 0.9
-
-        rej_bh, _ = benjamini_hochberg(p, 0.05, method="bh")
-        rej_st, _ = benjamini_hochberg(p, 0.05, method="storey")
-        # Storey recovers at least as many discoveries as BH
-        assert rej_st.sum() >= rej_bh.sum()

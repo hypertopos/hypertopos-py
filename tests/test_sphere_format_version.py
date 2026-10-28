@@ -2,7 +2,7 @@
 # Licensed under the Business Source License 1.1 (the "License");
 # you may not use this file except in compliance with the License.
 # See LICENSE.md in the repository root for full terms.
-"""Sphere format_version gate — major-only comparator (3.x accepted)."""
+"""Sphere format_version gate — major-only comparator (4.x accepted)."""
 
 from __future__ import annotations
 
@@ -45,23 +45,23 @@ def _build_minimal_sphere(tmp_path: Path) -> str:
     return b.build()
 
 
-def test_fresh_build_writes_format_3_0(tmp_path: Path) -> None:
+def test_fresh_build_writes_format_4_0(tmp_path: Path) -> None:
     out = _build_minimal_sphere(tmp_path)
     meta = json.loads((Path(out) / "_gds_meta" / "sphere.json").read_text())
-    assert meta["format_version"] == "3.0"
+    assert meta["format_version"] == "4.0"
 
 
-def test_open_rejects_format_2_4(tmp_path: Path) -> None:
+def test_open_rejects_format_3_1(tmp_path: Path) -> None:
     out = _build_minimal_sphere(tmp_path)
     sphere_path = Path(out) / "_gds_meta" / "sphere.json"
     meta = json.loads(sphere_path.read_text())
-    meta["format_version"] = "2.4"
+    meta["format_version"] = "3.1"
     sphere_path.write_text(json.dumps(meta, indent=2))
 
     with pytest.raises(GDSVersionError) as exc:
         HyperSphere.open(out)
     msg = str(exc.value)
-    assert "major 3" in msg
+    assert "major 4" in msg
     assert "rebuild" in msg.lower()
 
 
@@ -76,13 +76,13 @@ def test_open_rejects_format_2_3(tmp_path: Path) -> None:
         HyperSphere.open(out)
 
 
-def test_open_accepts_format_3_1(tmp_path: Path) -> None:
-    """A 3.0 reader (this code) must accept a sphere stamped 3.1 —
+def test_open_accepts_format_4_1(tmp_path: Path) -> None:
+    """A 4.0 reader (this code) must accept a sphere stamped 4.1 —
     minor bump is backward-compatible by design."""
     out = _build_minimal_sphere(tmp_path)
     sphere_path = Path(out) / "_gds_meta" / "sphere.json"
     meta = json.loads(sphere_path.read_text())
-    meta["format_version"] = "3.1"
+    meta["format_version"] = "4.1"
     sphere_path.write_text(json.dumps(meta, indent=2))
 
     # Should not raise

@@ -11,14 +11,6 @@
         "reason": "p99-tail mass share = 1.0000 (dim drives >70% of population tail variance across 1 dims with percentile coverage)",
         "threshold": 0.7,
         "type": "dominant_dim_mass"
-      },
-      {
-        "advice": "Consider a log1p / sqrt / rank transform of the raw shape values before mu/sigma computation, or re-declare kind as 'poisson' (discrete counts) or 'bernoulli' (binary presence) if applicable. Untransformed, the gaussian z-score concentrates the delta mass in a few extreme rows and poorly discriminates the bulk of the population.",
-        "dim_label": "amount",
-        "evidence_value": 2.419898932e-55,
-        "reason": "normality test p=2.42e-55 < 0.01 \u2014 z-score assumes normality, this dim's distribution is heavy-tailed or otherwise non-normal",
-        "threshold": 0.01,
-        "type": "non_normal_dim"
       }
     ],
     "dimension_kinds": "bernoulli x1, gaussian x1",
@@ -36,8 +28,8 @@
     "total_entities": 1200
   },
   {
-    "anomaly_rate": 0.05,
-    "anomaly_rate_source": "delta_norm_scan",
+    "anomaly_rate": 0.025,
+    "anomaly_rate_source": "is_anomaly",
     "calibration_health": "good",
     "dim_quality_warnings": [
       {
@@ -47,14 +39,6 @@
         "reason": "p99-tail mass share = 1.0000 (dim drives >70% of population tail variance across 4 dims with percentile coverage)",
         "threshold": 0.7,
         "type": "dominant_dim_mass"
-      },
-      {
-        "advice": "Consider a log1p / sqrt / rank transform of the raw shape values before mu/sigma computation, or re-declare kind as 'poisson' (discrete counts) or 'bernoulli' (binary presence) if applicable. Untransformed, the gaussian z-score concentrates the delta mass in a few extreme rows and poorly discriminates the bulk of the population.",
-        "dim_label": "amount_sum",
-        "evidence_value": 4.126719436e-12,
-        "reason": "normality test p=4.13e-12 < 0.01 \u2014 z-score assumes normality, this dim's distribution is heavy-tailed or otherwise non-normal",
-        "threshold": 0.01,
-        "type": "non_normal_dim"
       }
     ],
     "dimension_kinds": "poisson x3, gaussian x1",

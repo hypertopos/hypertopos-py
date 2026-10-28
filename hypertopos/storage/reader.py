@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     from lance import LanceDataset
 
     from hypertopos.engine.calibration import CalibrationTracker
+    from hypertopos.engine.robust import Reference
     from hypertopos.model.sphere import CalibrationFit
 
 _RECOVERABLE_READ_ERRORS = (
@@ -342,10 +343,10 @@ class GDSReader:
     def read_sphere(self) -> Sphere:
         raw = json.loads(self.sphere_json_text())
         fmt = raw.get("format_version")
-        # Major-only comparison: format 3.x is accepted, anything else is
+        # Major-only comparison: format 4.x is accepted, anything else is
         # rejected. New optional top-level fields ride the minor bump
         # without breaking readers older than the bump (e.g. label_audit
-        # added in 3.1 is invisible to readers that don't look for it).
+        # in 4.1 is invisible to readers that don't look for it).
         try:
             major = int(str(fmt).split(".", 1)[0])
         except (ValueError, AttributeError):
@@ -354,10 +355,10 @@ class GDSReader:
                 "version string, expected major.minor. Rebuild the sphere "
                 "from source.",
             ) from None
-        if major != 3:
+        if major != 4:
             raise GDSVersionError(
-                f"Unsupported sphere format_version {fmt!r}: native Lance MVCC "
-                "geometry requires format major 3. Rebuild the sphere from "
+                f"Unsupported sphere format_version {fmt!r}: the calibrated "
+                "evidence score requires format major 4. Rebuild the sphere from "
                 "source.",
             )
         lines = {k: self._parse_line(v) for k, v in raw.get("lines", {}).items()}
@@ -550,11 +551,6 @@ class GDSReader:
             group_stats=group_stats,
             group_by_property=raw.get("group_by_property"),
             dimension_weights=dim_weights,
-            cholesky_inv=(
-                np.array(raw["cholesky_inv"], dtype=np.float32)
-                if "cholesky_inv" in raw and raw["cholesky_inv"] is not None
-                else None
-            ),
             gmm_components=(
                 [
                     GMMComponent(
@@ -573,14 +569,10 @@ class GDSReader:
             dim_percentiles=raw.get("dim_percentiles"),
             timestamp_col=raw.get("timestamp_col"),
             dimension_kinds=raw.get("dimension_kinds"),
-            dim_normality_pvalues=raw.get("dim_normality_pvalues"),
             edge_dim_aggregations=edge_dim_aggregations,
             fdr_hierarchy=fdr_hierarchy,
             fdr_temporal_hierarchy=fdr_temporal_hierarchy,
             conformance_rules=conformance_rules,
-            heteroscedasticity_diagnostic=raw.get(
-                "heteroscedasticity_diagnostic",
-            ),
             edge_dim_names=list(raw.get("edge_dim_names") or []),
             dim_block_names=list(raw.get("dim_block_names") or []),
             label_aware_calibration=label_aware_calibration,
@@ -593,6 +585,10 @@ class GDSReader:
             extrinsic_displacement_mean=raw.get(
                 "extrinsic_displacement_mean",
             ),
+            score_dims=tuple(raw["score_dims"]) if raw.get("score_dims") else None,
+            score_axes=tuple(raw["score_axes"]) if raw.get("score_axes") else None,
+            reference_epoch=raw.get("reference_epoch"),
+            anomaly_percentile=float(raw.get("anomaly_percentile", 95.0)),
         )
 
     def _parse_alias(self, raw: dict[str, Any]) -> Alias:
@@ -1345,6 +1341,29 @@ class GDSReader:
     # Calibration history reader API
     # ------------------------------------------------------------------
 
+    def read_reference(self, pattern_id: str, epoch: int | None = None) -> Reference:
+        """Load the frozen score reference of a pattern.
+
+        ``epoch=None`` resolves to the pattern's ``reference_epoch`` in sphere.json.
+        Raises ``GDSStorageError`` when the pattern has no reference (patterns
+        scored by ``delta_norm``) or the epoch file is missing.
+        """
+        from hypertopos.engine.robust import reference_from_arrays
+
+        if epoch is None:
+            node = json.loads(self.sphere_json_text()).get("patterns", {}).get(pattern_id, {})
+            epoch = node.get("reference_epoch")
+            if epoch is None:
+                raise GDSStorageError(f"pattern '{pattern_id}' has no score reference")
+        rel = Path("_gds_meta") / "reference" / pattern_id / f"v={epoch}.npz"
+        path = next(
+            (root / rel for root in (self.meta_root, self._base) if (root / rel).exists()), None
+        )
+        if path is None:
+            raise GDSStorageError(f"score reference {rel.as_posix()} not found")
+        with np.load(path, allow_pickle=False) as data:
+            return reference_from_arrays({name: data[name] for name in data.files})
+
     def read_calibration_fit(self, pattern_id: str, version: int | None = None) -> CalibrationFit:
         """Load one calibration epoch as a CalibrationFit.
 
@@ -1422,7 +1441,6 @@ class GDSReader:
             last_calibrated_at=_parse_dt(
                 pattern_node.get("last_calibrated_at") or pattern_node["computed_at"]
             ),
-            dim_normality_pvalues=pattern_node.get("dim_normality_pvalues"),
         )
 
     def read_calibration_history_policy(self) -> dict[str, int]:

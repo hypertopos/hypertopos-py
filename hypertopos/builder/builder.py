@@ -16,6 +16,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from hypertopos.engine.robust import AXES_ALL, AXES_DEFAULT, EventArrays, Reference
 from hypertopos.storage._schemas import (  # noqa: F401,E501
     EDGE_STRUCT_TYPE,
     GEOMETRY_EVENT_SCHEMA,
@@ -37,6 +38,38 @@ GEOMETRY_CHUNK_SIZE: int = 500_000  # entities above this threshold trigger chun
 _BOOTSTRAP_MAX_N: int = 50_000  # bootstrap skipped for populations above this size
 
 _INTERNAL_COLUMNS = {"version", "status", "created_at", "changed_at"}
+# Graph features whose values are labels (component / community ids), not
+# magnitudes: never an input of the calibrated evidence score.
+_LABEL_GRAPH_FEATURES = frozenset({"connected_component", "community", "community_id"})
+
+
+def _list_column(matrix: np.ndarray | None, start: int, end: int) -> pa.Array:
+    """Rows ``[start:end)`` of ``matrix`` as a ``list<float32>`` column; all null for None."""
+    if matrix is None:
+        return pa.nulls(end - start, type=pa.list_(pa.float32()))
+    rows = np.ascontiguousarray(matrix[start:end], dtype=np.float32)
+    return pa.FixedSizeListArray.from_arrays(
+        pa.array(rows.ravel(), type=pa.float32()), list_size=rows.shape[1]
+    ).cast(pa.list_(pa.float32()))
+
+
+def validate_score_axes(
+    pattern_id: str, axes: list[str] | tuple[str, ...] | None
+) -> tuple[str, ...]:
+    """The pattern's ``score_axes`` (default ``AXES_DEFAULT``) after validation.
+
+    Axes are a subset of ``AXES_ALL`` and always contain ``mahal``.
+    """
+    if axes is None:
+        return AXES_DEFAULT
+    unknown = [a for a in axes if a not in AXES_ALL]
+    if unknown:
+        raise ValueError(
+            f"Pattern '{pattern_id}': unknown score_axes {unknown}; valid axes are {list(AXES_ALL)}"
+        )
+    if "mahal" not in axes:
+        raise ValueError(f"Pattern '{pattern_id}': score_axes must contain 'mahal'")
+    return tuple(a for a in AXES_ALL if a in axes)
 
 
 def _compute_schema_hash_for_pattern_def(
@@ -342,15 +375,14 @@ def compute_entity_geometry(
     dimension_weights: np.ndarray | None = None,
     prop_columns: list[str] | None = None,
     edge_dim_agg_labels: list[str] | None = None,
-    cholesky_inv: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute deltas, norms, and shape vectors for entities using existing pattern stats.
 
     Builds shape vectors from entity_table columns based on relations, event
     dimensions, edge_dim_aggregation, and prop_columns metadata (from
     sphere.json), then calibrates them in the pattern's saved metric
-    (``cholesky_inv`` when set, else ``sigma`` floored at ``SIGMA_EPSILON``,
-    then ``dimension_weights``) to produce delta vectors.
+    (``sigma`` floored at ``SIGMA_EPSILON``, then ``dimension_weights``) to
+    produce delta vectors.
 
     Block layout matches the full-build concatenation order: relations →
     event_dimensions → edge_dim_aggregations → prop_columns. The aggregated
@@ -498,7 +530,6 @@ def compute_entity_geometry(
         shape_vectors,
         mu=np.asarray(mu, dtype=np.float32),
         sigma_diag=np.asarray(sigma, dtype=np.float32),
-        cholesky_inv=cholesky_inv,
         dimension_weights=dimension_weights,
     ).astype(np.float32)
 
@@ -611,7 +642,7 @@ class _PatternReg:
     group_by_property: str | None = None
     dimension_weights: list[float] | str | None = None  # None/"uniform"/list/"auto"
     gmm_n_components: int | None = None  # None = disabled, int = fit GMM with k components
-    use_mahalanobis: bool = False
+    score_axes: tuple[str, ...] = AXES_DEFAULT
     event_dimensions: list[EventDimSpec] = field(default_factory=list)
     description: str | None = None
     edge_table: EdgeTableConfig | None = None  # None = auto-detect or skip
@@ -656,7 +687,7 @@ class PopulationStats:
     theta: np.ndarray
     deltas: np.ndarray
     delta_norms: np.ndarray
-    delta_rank_pcts: np.ndarray
+    score_rank_pcts: np.ndarray
     conformal_p: np.ndarray
     fk_arrays: list[pa.ChunkedArray | np.ndarray | None]
     prop_columns: list[str]
@@ -665,7 +696,6 @@ class PopulationStats:
     is_anomaly_arr: np.ndarray | None
     dim_weights: np.ndarray | None
     gmm_components: list[Any] | None
-    cholesky_inv: np.ndarray | None
     n_anom_dims: np.ndarray
     bregman_norms: np.ndarray | None = None
     dimension_kinds: list[str] | None = None
@@ -679,13 +709,6 @@ class PopulationStats:
     # matching ``Pattern._edge_dim_aggregation_names`` at read time.
     edge_dim_agg_matrix: np.ndarray | None = None
     edge_dim_agg_labels: list[str] = field(default_factory=list)
-    # Brown-Forsythe (median-centred Levene) diagnostic of delta_norm
-    # variance equality across the levels of `group_by_property`. None
-    # when the pattern has no group_by_property or when fewer than two
-    # groups survive the low-N filter inside the diagnostic. Keyed by
-    # the grouping column name to leave room for future multi-group
-    # variants without a schema break.
-    heteroscedasticity_diagnostic: dict[str, dict[str, Any]] | None = None
     # Edge-derived per-event dim names emitted on event patterns when
     # ``edge_dimensions:`` is declared. Order matches the shape-vector
     # concatenation between event_dim_matrix and prop_fill_matrix; empty
@@ -693,6 +716,16 @@ class PopulationStats:
     edge_dim_names: list[str] = field(default_factory=list)
     # Per-dim |delta| thresholds behind n_anom_dims (P99 of the population).
     n_anom_dims_thresholds: np.ndarray | None = None
+    # Calibrated evidence score: fused score per entity (``delta_norm`` for
+    # patterns without a reference), axis ranks and rank-Gaussian coordinates
+    # of the score dimensions (None without a reference).
+    anomaly_score: np.ndarray | None = None
+    axis_ranks: np.ndarray | None = None
+    score_delta: np.ndarray | None = None
+    reference: Reference | None = None
+    # Exact min / max of each score dimension (the sketch grid holds quantiles).
+    score_min: np.ndarray | None = None
+    score_max: np.ndarray | None = None
 
 
 @dataclass
@@ -708,15 +741,13 @@ class PatternBuildResult:
     group_stats: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, int]] | None
     dimension_weights: np.ndarray | None
     gmm_components: list[Any] | None
-    cholesky_inv: np.ndarray | None
     dim_percentiles: dict[str, dict[str, float]] | None = None
     dimension_kinds: list[str] | None = None
     dim_block_names: list[str] = field(default_factory=list)
     dim_block_stats: dict[str, Any] | None = None
     edge_dim_thresholds: dict[str, float] | None = None
     theta_sensitivity: dict[str, dict[str, float]] | None = None
-    heteroscedasticity_diagnostic: dict[str, dict[str, Any]] | None = None
-    dim_normality_pvalues: dict[str, float] | None = None
+    reference: Reference | None = None
     # Edge-derived per-event dim names — populated on event patterns with
     # ``edge_dimensions:`` declared, empty otherwise.
     edge_dim_names: list[str] = field(default_factory=list)
@@ -827,7 +858,6 @@ def _build_traj_chunk(
     bkt_ts: list[Any],
     mu_a: np.ndarray | None,
     sig_a: np.ndarray | None,
-    chol_a: np.ndarray | None,
     weights_a: np.ndarray | None,
 ) -> None:
     from hypertopos.engine.geometry import active_window_trajectories, calibrated_deltas
@@ -841,7 +871,6 @@ def _build_traj_chunk(
             tensor,
             mu=mu_a,
             sigma_diag=sig_a,
-            cholesky_inv=chol_a,
             dimension_weights=weights_a,
         )
         if mu_a is not None and sig_a is not None
@@ -934,6 +963,10 @@ class GDSBuilder:
         # path planned). Persisted into the calibration epoch JSON so
         # `compare_calibrations` can surface threshold drift across epochs.
         self._edge_dim_thresholds: dict[str, dict[str, float]] = {}
+        # Extracted edge tables per (pattern, edge config): the event pattern's
+        # own edge write, anchor edge-dim aggregations and the score's event
+        # arrays read the same table once. Each pattern writes a distinct key.
+        self._edge_table_cache: dict[tuple[str | None, ...], pa.Table] = {}
 
     def _resolve_and_persist_edge_dim_thresholds(
         self,
@@ -1180,7 +1213,7 @@ class GDSBuilder:
         group_by_property: str | None = None,
         dimension_weights: list[float] | str | None = None,
         gmm_n_components: int | None = None,
-        use_mahalanobis: bool = False,
+        score_axes: list[str] | tuple[str, ...] | None = None,
         description: str | None = None,
         edge_table: EdgeTableConfig | None = None,
         geo_properties: list[str] | None = None,
@@ -1199,10 +1232,7 @@ class GDSBuilder:
                 f"Pattern '{pattern_id}': dimension_weights='{dimension_weights}' "
                 f"is not valid. Expected one of {_VALID_DW}, an explicit list, or None."
             )
-        if use_mahalanobis and isinstance(dimension_weights, list):
-            from hypertopos.builder._stats import validate_mahalanobis_weights
-
-            validate_mahalanobis_weights(pattern_id, dimension_weights)
+        axes = validate_score_axes(pattern_id, score_axes)
         self._patterns[pattern_id] = _PatternReg(
             pattern_id=pattern_id,
             pattern_type=pattern_type,
@@ -1213,7 +1243,7 @@ class GDSBuilder:
             group_by_property=group_by_property,
             dimension_weights=dimension_weights,
             gmm_n_components=gmm_n_components,
-            use_mahalanobis=use_mahalanobis,
+            score_axes=axes,
             description=description,
             edge_table=edge_table,
             bootstrap_iterations=bootstrap_iterations,
@@ -2162,15 +2192,8 @@ class GDSBuilder:
 
         # 4. Compute stats + deltas
         group_stats_dict: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, int]] | None = None
-        mah_cov_inv: np.ndarray | None = None
-        heteroscedasticity_diagnostic: dict[str, dict[str, Any]] | None = None
 
         if pat.group_by_property:
-            if pat.use_mahalanobis:
-                logger.warning(
-                    "use_mahalanobis is ignored when group_by_property is set for %s",
-                    pat.pattern_id,
-                )
             from hypertopos.builder._stats import compute_stats_grouped
 
             # Read group column from entity table
@@ -2184,7 +2207,7 @@ class GDSBuilder:
             group_ids = group_col.to_numpy(zero_copy_only=False).astype(str)
 
             # Global stats (for backward compat + fallback)
-            mu, sigma, theta, global_deltas, global_norms, _ = compute_stats(
+            mu, sigma, theta, _, _ = compute_stats(
                 full_shape_vectors,
                 pat.anomaly_percentile,
             )
@@ -2213,41 +2236,20 @@ class GDSBuilder:
                 sigma[prop_start : prop_start + len(prop_columns)] = np.maximum(
                     sigma[prop_start : prop_start + len(prop_columns)], SIGMA_EPS_PROP
                 )
-                global_deltas = ((full_shape_vectors - mu) / sigma).astype(np.float32)
-                global_norms = np.sqrt(
-                    np.einsum("ij,ij->i", global_deltas, global_deltas),
-                ).astype(np.float32)
+                global_norms = np.linalg.norm((full_shape_vectors - mu) / sigma, axis=1).astype(
+                    np.float32
+                )
                 theta_scalar = float(np.percentile(global_norms, pat.anomaly_percentile))
                 D_full = full_shape_vectors.shape[1]
                 component = theta_scalar / np.sqrt(D_full) if D_full > 0 else 0.0
                 theta = np.full(D_full, component, dtype=np.float32)
-
-            # Brown-Forsythe homoscedasticity diagnostic on the global-
-            # normalised delta_norms across `group_by_property` levels.
-            # The diagnostic answers "is global θ statistically valid
-            # for this pattern given the grouping it carries?", so the
-            # array fed must be the GLOBAL-mu/sigma norms, not the
-            # per-group-normalised ones (which would silently test
-            # residual heteroscedasticity after calibration — a
-            # different question).
-            from hypertopos.engine.diagnostics import levene_test_per_group
-
-            heteroscedasticity_diagnostic = {
-                pat.group_by_property: levene_test_per_group(
-                    global_norms,
-                    group_ids,
-                ),
-            }
         else:
-            mu, sigma, theta, deltas, delta_norms, mah_cov_inv = compute_stats(
+            mu, sigma, theta, deltas, delta_norms = compute_stats(
                 full_shape_vectors,
                 pat.anomaly_percentile,
-                use_mahalanobis=bool(pat.use_mahalanobis),
             )
 
-            # Prop_columns are binary (0/1) — use higher sigma floor. Under
-            # Mahalanobis the stored deltas are whitened by the saved
-            # cholesky_inv and do not use sigma, so they stay as computed.
+            # Prop_columns are binary (0/1) — use higher sigma floor.
             n_rel = len(pat.relations)
             n_event = len(pat.event_dimensions) if pat.event_dimensions else 0
             if prop_columns:
@@ -2257,7 +2259,7 @@ class GDSBuilder:
                 sigma[prop_start : prop_start + len(prop_columns)] = np.maximum(
                     sigma[prop_start : prop_start + len(prop_columns)], SIGMA_EPS_PROP
                 )
-            if prop_columns and mah_cov_inv is None:
+            if prop_columns:
                 deltas = ((full_shape_vectors - mu) / sigma).astype(np.float32)
                 delta_norms = np.sqrt(np.einsum("ij,ij->i", deltas, deltas)).astype(np.float32)
                 theta_scalar = float(np.percentile(delta_norms, pat.anomaly_percentile))
@@ -2393,13 +2395,33 @@ class GDSBuilder:
                             weights=dim_weights,
                         ).astype(np.float32)
 
-        # 5. Compute delta_rank_pct (population-level percentile rank)
+        # 5. Calibrated evidence score on the point-property dimensions, or
+        # the delta_norm rank and conformal p for the other pattern kinds.
         sorted_norms = np.sort(delta_norms)
-        ranks = population_left_ranks(delta_norms)
-        delta_rank_pcts = (ranks / n * 100).astype(np.float32)
+        score_input = self._score_input(pat, entity_table)
+        reference: Reference | None = None
+        robust_scores = None
+        score_min = score_max = None
+        if score_input is not None:
+            from hypertopos.engine.robust import fit_reference
 
-        # 6. Compute conformal p-values (reuse the ranks from step 5)
-        conformal_p = compute_conformal_p(delta_norms, left_ranks=ranks)
+            x, score_dims = score_input
+            reference, robust_scores = fit_reference(
+                x,
+                score_dims,
+                axes=pat.score_axes,
+                events=self._score_events(pat, entity_table),
+            )
+            anomaly_score = robust_scores.anomaly_score
+            score_rank_pcts = robust_scores.score_rank_pct.astype(np.float32)
+            conformal_p = robust_scores.conformal_p
+            score_min = x.min(axis=0)
+            score_max = x.max(axis=0)
+        else:
+            ranks = population_left_ranks(delta_norms)
+            anomaly_score = delta_norms.astype(np.float64)
+            score_rank_pcts = (ranks / n * 100).astype(np.float32)
+            conformal_p = compute_conformal_p(delta_norms, left_ranks=ranks)
 
         # 6b. Theta sensitivity surface — calibration-quality diagnostic.
         # Glues onto the same sorted_norms (no new sort, O(P) per pattern).
@@ -2425,14 +2447,17 @@ class GDSBuilder:
                 g_theta_norm = float(np.linalg.norm(g_theta))
                 mask = group_mask_map[gid]
                 is_anomaly_arr[mask] = (g_theta_norm > 0.0) & (delta_norms[mask] >= g_theta_norm)
+        if robust_scores is not None:
+            from hypertopos.engine.robust import is_anomaly as _score_is_anomaly
+
+            # The calibrated score is global by design: theta (and per-group
+            # theta) stay stored but are not the boundary of this pattern.
+            is_anomaly_arr = _score_is_anomaly(conformal_p, pat.anomaly_percentile)
 
         # 7b. Bregman-based anomaly flag — computed and stored on
         #     PopulationStats for downstream use (geometry columns, navigator),
         #     but does NOT override the delta_norms-based is_anomaly yet.
         #     Full switchover deferred until threshold calibration is validated.
-
-        # Mahalanobis cholesky_inv (only set in non-grouped path)
-        cov_inv = mah_cov_inv if not pat.group_by_property else None
 
         # 8. Per-dimension anomaly count
         from hypertopos.builder._stats import (
@@ -2449,7 +2474,7 @@ class GDSBuilder:
             theta=theta,
             deltas=deltas,
             delta_norms=delta_norms,
-            delta_rank_pcts=delta_rank_pcts,
+            score_rank_pcts=score_rank_pcts,
             conformal_p=conformal_p,
             fk_arrays=fk_arrays,
             prop_columns=prop_columns,
@@ -2458,7 +2483,6 @@ class GDSBuilder:
             is_anomaly_arr=is_anomaly_arr,
             dim_weights=dim_weights,
             gmm_components=gmm_components_result,
-            cholesky_inv=cov_inv,
             n_anom_dims=n_anom_dims,
             bregman_norms=bregman_norms_arr,
             dimension_kinds=dimension_kinds,
@@ -2468,9 +2492,142 @@ class GDSBuilder:
             theta_sensitivity=theta_sensitivity,
             edge_dim_agg_matrix=(edge_dim_agg_matrix if edge_dim_agg_matrix.shape[1] > 0 else None),
             edge_dim_agg_labels=edge_dim_agg_labels,
-            heteroscedasticity_diagnostic=heteroscedasticity_diagnostic,
             edge_dim_names=edge_dim_names,
             n_anom_dims_thresholds=n_anom_dims_thresholds,
+            anomaly_score=anomaly_score,
+            axis_ranks=robust_scores.axis_ranks if robust_scores is not None else None,
+            score_delta=robust_scores.delta if robust_scores is not None else None,
+            reference=reference,
+            score_min=score_min,
+            score_max=score_max,
+        )
+
+    def _score_input(
+        self,
+        pat: _PatternReg,
+        entity_table: pa.Table,
+    ) -> tuple[np.ndarray, tuple[str, ...]] | None:
+        """Inputs of the calibrated evidence score: ``(x (n, D) natural units, dims)``.
+
+        The score dimensions of a continuous anchor pattern are its point
+        properties (the entity-table columns named by ``_d_*`` relations) in
+        their natural units. Discrete relations, label-valued graph features,
+        edge-dim aggregates, event dimensions, tracked-property fill and
+        dimension blocks are not inputs. None for event and GMM patterns and
+        when no dimension qualifies; those keep the ``delta_norm`` score.
+        """
+        if not self._score_candidate(pat):
+            return None
+        labels = self._label_features(pat)
+        schema = entity_table.schema
+        cols: list[np.ndarray] = []
+        dims: list[str] = []
+        for rel in pat.relations:
+            name = rel.fk_col
+            if (
+                not rel.line_id.startswith("_d_")
+                or rel.line_id.startswith("_d_chain_")
+                or rel.edge_max is None
+                or name is None
+                or name in labels
+                or name not in schema.names
+            ):
+                continue
+            kind = schema.field(name).type
+            if not (pa.types.is_integer(kind) or pa.types.is_floating(kind)):
+                continue
+            values = pc.fill_null(entity_table[name], 0).to_numpy(zero_copy_only=False)
+            cols.append(np.asarray(values, dtype=np.float64))
+            dims.append(name)
+        # A metric block's columns are point properties in their own units too.
+        for name in pat.metric_properties or []:
+            if name in dims or name not in schema.names:
+                continue
+            kind = schema.field(name).type
+            if not (pa.types.is_integer(kind) or pa.types.is_floating(kind)):
+                continue
+            values = pc.fill_null(entity_table[name], 0).to_numpy(zero_copy_only=False)
+            cols.append(np.asarray(values, dtype=np.float64))
+            dims.append(name)
+        if not cols:
+            return None
+        return np.column_stack(cols), tuple(dims)
+
+    def _label_features(self, pat: _PatternReg) -> set[str]:
+        return {
+            f
+            for gf in self._graph_features
+            if gf.anchor_line == pat.entity_line
+            for f in gf.features
+            if f in _LABEL_GRAPH_FEATURES
+        }
+
+    def _score_candidate(self, pat: _PatternReg) -> bool:
+        """Whether ``pat`` can carry the calibrated evidence score (structure only, no data)."""
+        if pat.pattern_type != "anchor" or pat.gmm_n_components:
+            return False
+        # Composite-line and chain patterns keep the delta_norm score.
+        if pat.entity_line in self._chain_lines or any(
+            cs.line_id == pat.entity_line for cs in self._composite_lines
+        ):
+            return False
+        if pat.metric_properties:
+            return True
+        labels = self._label_features(pat)
+        return any(
+            rel.line_id.startswith("_d_")
+            and not rel.line_id.startswith("_d_chain_")
+            and rel.edge_max is not None
+            and rel.fk_col not in labels
+            for rel in pat.relations
+        )
+
+    def _score_events(self, pat: _PatternReg, entity_table: pa.Table) -> EventArrays | None:
+        """Event rows of the anchor's event line for the score's ``current`` axis.
+
+        The event line is the one event pattern whose relations reference the
+        anchor line; its edge table gives one out row (``from_key``) and one in
+        row (``to_key``) per event, mapped to entity row indices. None when
+        ``current`` is not requested, there is no single such pattern, or its
+        events carry no time spread.
+        """
+        if "current" not in pat.score_axes:
+            return None
+        candidates = [
+            p
+            for p in self._patterns.values()
+            if p.pattern_type == "event" and any(r.line_id == pat.entity_line for r in p.relations)
+        ]
+        if len(candidates) != 1:
+            return None
+        cfg = self._resolve_edge_table_config(candidates[0])
+        if cfg is None:
+            return None
+        edges = self._extract_edge_table(candidates[0], cfg)
+        if edges.num_rows == 0:
+            return None
+        ts = edges["timestamp"].to_numpy(zero_copy_only=False).astype(np.float64)
+        if float(ts.min()) == float(ts.max()):
+            return None
+        keys = pc.cast(entity_table["primary_key"], pa.string())
+        amount = edges["amount"].to_numpy(zero_copy_only=False).astype(np.float64)
+        codes = []
+        directions = []
+        times = []
+        amounts = []
+        for direction, col in ((0, "from_key"), (1, "to_key")):
+            idx = pc.index_in(edges[col], value_set=keys)
+            code = pc.fill_null(idx, -1).to_numpy(zero_copy_only=False).astype(np.int64)
+            keep = code >= 0
+            codes.append(code[keep])
+            directions.append(np.full(int(keep.sum()), direction, dtype=np.int8))
+            times.append(ts[keep])
+            amounts.append(amount[keep])
+        return EventArrays(
+            code=np.concatenate(codes),
+            direction=np.concatenate(directions),
+            ts=np.concatenate(times),
+            amount=np.concatenate(amounts),
         )
 
     def _build_geometry_slice(
@@ -2480,7 +2637,7 @@ class GDSBuilder:
         end: int,
         deltas: np.ndarray,
         delta_norms: np.ndarray,
-        delta_rank_pcts: np.ndarray,
+        score_rank_pcts: np.ndarray,
         theta_norm: float,
         fk_arrays: list[pa.ChunkedArray | np.ndarray | None],
         conformal_p: np.ndarray | None = None,
@@ -2489,6 +2646,9 @@ class GDSBuilder:
         bregman_norms_arr: np.ndarray | None = None,
         anomaly_confidence_arr: np.ndarray | None = None,
         entity_table_override: pa.Table | None = None,
+        anomaly_score: np.ndarray | None = None,
+        axis_ranks: np.ndarray | None = None,
+        score_delta: np.ndarray | None = None,
     ) -> pa.Table:
         """Build a geometry Arrow table for entities [start:end).
 
@@ -2506,7 +2666,7 @@ class GDSBuilder:
 
         chunk_deltas = deltas[start:end]
         chunk_norms = delta_norms[start:end]
-        chunk_ranks = delta_rank_pcts[start:end]
+        chunk_ranks = score_rank_pcts[start:end]
         if is_anomaly_precomputed is not None:
             is_anomaly_arr = is_anomaly_precomputed[start:end]
         else:
@@ -2659,9 +2819,15 @@ class GDSBuilder:
             "scale": _const_i32(1),
             "delta": delta_col,
             "delta_norm": pa.array(chunk_norms, type=pa.float32()),
-            "delta_rank_pct": pa.array(chunk_ranks, type=pa.float32()),
+            "score_rank_pct": pa.array(chunk_ranks, type=pa.float32()),
             "is_anomaly": pa.array(is_anomaly_arr, type=pa.bool_()),
             "conformal_p": chunk_conformal,
+            "anomaly_score": pa.array(
+                anomaly_score[start:end] if anomaly_score is not None else chunk_norms,
+                type=pa.float64(),
+            ),
+            "axis_ranks": _list_column(axis_ranks, start, end),
+            "score_delta": _list_column(score_delta, start, end),
             "bregman_divergence": (
                 pa.array(bregman_norms_arr[start:end], type=pa.float32())
                 if bregman_norms_arr is not None
@@ -2725,14 +2891,14 @@ class GDSBuilder:
         lac = self._run_label_aware_calibration(pat, ps)
 
         # Bootstrap confidence — requires full shape vectors in memory.
-        # Skip when: use_mahalanobis, population > _BOOTSTRAP_MAX_N
-        # (conformal_p sufficient), or bootstrap_iterations=0.
+        # Skip when: the pattern is on the calibrated evidence score, population
+        # > _BOOTSTRAP_MAX_N (conformal_p sufficient), or bootstrap_iterations=0.
         confidence_arr: np.ndarray | None = None
         n = len(ps.deltas)
         if (
             pat.bootstrap_iterations > 0
             and ps.dimension_kinds is not None
-            and not pat.use_mahalanobis
+            and ps.reference is None
             and not pat.group_by_property
             and n <= _BOOTSTRAP_MAX_N
         ):
@@ -2768,7 +2934,7 @@ class GDSBuilder:
             n,
             ps.deltas,
             ps.delta_norms,
-            ps.delta_rank_pcts,
+            ps.score_rank_pcts,
             theta_norm,
             ps.fk_arrays,
             ps.conformal_p,
@@ -2776,6 +2942,9 @@ class GDSBuilder:
             ps.n_anom_dims,
             bregman_norms_arr=ps.bregman_norms,
             anomaly_confidence_arr=confidence_arr,
+            anomaly_score=ps.anomaly_score,
+            axis_ranks=ps.axis_ranks,
+            score_delta=ps.score_delta,
         )
         return table, ps, lac
 
@@ -2887,7 +3056,20 @@ class GDSBuilder:
         pat: _PatternReg,
         cfg: EdgeTableConfig,
     ) -> pa.Table:
-        """Build edge Arrow table from the event line's source data."""
+        """Build edge Arrow table from the event line's source data (memoised per config)."""
+        key = (pat.pattern_id, cfg.from_col, cfg.to_col, cfg.timestamp_col, cfg.amount_col)
+        cached = self._edge_table_cache.get(key)
+        if cached is not None:
+            return cached
+        table = self._extract_edge_table_uncached(pat, cfg)
+        self._edge_table_cache[key] = table
+        return table
+
+    def _extract_edge_table_uncached(
+        self,
+        pat: _PatternReg,
+        cfg: EdgeTableConfig,
+    ) -> pa.Table:
         import pyarrow.compute as pc
 
         from hypertopos.storage._schemas import EDGE_TABLE_SCHEMA
@@ -3055,7 +3237,9 @@ class GDSBuilder:
             divisors = {"s": 1.0, "ms": 1e3, "us": 1e6, "ns": 1e9}
             d = divisors.get(col.type.unit, 1e6)
             epoch = pc.cast(col, pa.int64())
-            return pc.divide(pc.cast(epoch, pa.float64()), d)
+            # Unsafe: a nanosecond epoch (~1.7e18) is past float64's exact-integer
+            # range; the rounding (< 1 µs after the division) is harmless.
+            return pc.divide(pc.cast(epoch, pa.float64(), safe=False), d)
         if pa.types.is_floating(col.type):
             return pc.cast(col, pa.float64())
         if pa.types.is_integer(col.type):
@@ -3287,13 +3471,47 @@ class GDSBuilder:
             float(extrinsic.mean()),
         )
 
+    def _dim_percentiles_for(
+        self, pat: _PatternReg, ps: PopulationStats
+    ) -> dict[str, dict[str, float]] | None:
+        """Per-dim percentile cache; score dimensions read off the score's CDF sketch."""
+        ref = ps.reference
+        if ref is None or ps.score_min is None or ps.score_max is None:
+            return self._compute_dim_percentiles(
+                pat.entity_line,
+                edge_dim_agg_matrix=ps.edge_dim_agg_matrix,
+                edge_dim_agg_labels=ps.edge_dim_agg_labels,
+            )
+        out = (
+            self._compute_dim_percentiles(
+                pat.entity_line,
+                edge_dim_agg_matrix=ps.edge_dim_agg_matrix,
+                edge_dim_agg_labels=ps.edge_dim_agg_labels,
+                skip=frozenset(ref.dims),
+            )
+            or {}
+        )
+        quantiles = np.array([0.25, 0.5, 0.75, 0.99])
+        for d, name in enumerate(ref.dims):
+            p25, p50, p75, p99 = np.interp(quantiles, ref.cdf_levels, ref.cdf_grid[d])
+            out[name] = {
+                "min": round(float(ps.score_min[d]), 4),
+                "p25": round(float(p25), 4),
+                "p50": round(float(p50), 4),
+                "p75": round(float(p75), 4),
+                "p99": round(float(p99), 4),
+                "max": round(float(ps.score_max[d]), 4),
+            }
+        return out or None
+
     def _compute_dim_percentiles(
         self,
         entity_line_id: str,
         edge_dim_agg_matrix: np.ndarray | None = None,
         edge_dim_agg_labels: list[str] | None = None,
+        skip: frozenset[str] = frozenset(),
     ) -> dict[str, dict[str, float]] | None:
-        """Compute per-dim percentile cache.
+        """Compute per-dim percentile cache (columns / labels in ``skip`` are left out).
 
         Walks ``entity_table`` float columns for event_dims / prop_cols
         (legacy path) and, when ``edge_dim_agg_matrix`` is supplied,
@@ -3309,7 +3527,7 @@ class GDSBuilder:
         entity_table = self._lines[entity_line_id].table
         percentiles: dict[str, dict[str, float]] = {}
         for col_field in entity_table.schema:
-            if col_field.name == "primary_key":
+            if col_field.name == "primary_key" or col_field.name in skip:
                 continue
             if col_field.type not in (pa.float32(), pa.float64()):
                 continue
@@ -3343,6 +3561,8 @@ class GDSBuilder:
                     f"1:1 with matrix columns",
                 )
             for col_idx, label in enumerate(edge_dim_agg_labels):
+                if label in skip:
+                    continue
                 col_arr = edge_dim_agg_matrix[:, col_idx]
                 valid = col_arr[~np.isnan(col_arr)]
                 if len(valid) == 0:
@@ -3356,70 +3576,6 @@ class GDSBuilder:
                     "max": round(float(np.max(valid)), 4),
                 }
         return percentiles if percentiles else None
-
-    def _compute_dim_normality_pvalues(
-        self,
-        entity_line_id: str,
-        edge_dim_agg_matrix: np.ndarray | None = None,
-        edge_dim_agg_labels: list[str] | None = None,
-    ) -> dict[str, float] | None:
-        """Compute per-dim normality test p-values.
-
-        Mirrors ``_compute_dim_percentiles`` — walks the same float
-        columns on the entity table plus aggregated edge-dim matrix
-        columns, keyed by the same raw column / label name so the
-        navigator's ``_build_raw_dim_name_to_index`` mapping can look
-        up the entry at warning time. Stores only the p-value (caller
-        compares against alpha); the test family + statistic are
-        diagnostic detail the warning path does not need to surface.
-
-        The test family (Shapiro-Wilk vs Kolmogorov-Smirnov) is picked
-        per-dim by sample size inside ``normality_test_per_dim`` — no
-        per-dim plumbing required here. Dims with fewer than three
-        finite values, or zero variance, return ``nan`` from the
-        primitive; we skip those keys so the persisted dict only
-        carries actionable p-values.
-
-        Kind filtering (gaussian-only) is deferred to the navigator
-        warning emitter — keeping the persisted blob test-everything
-        means a future re-declaration of a column's kind does not
-        require a rebuild to surface the appropriate warning.
-        """
-        from hypertopos.engine.dim_audit import normality_test_per_dim
-
-        entity_table = self._lines[entity_line_id].table
-        pvalues: dict[str, float] = {}
-        for col_field in entity_table.schema:
-            if col_field.name == "primary_key":
-                continue
-            if col_field.type not in (pa.float32(), pa.float64()):
-                continue
-            arr = entity_table[col_field.name].to_numpy(zero_copy_only=False)
-            result = normality_test_per_dim(np.asarray(arr, dtype=np.float64))
-            p = result["p_value"]
-            if np.isfinite(p):
-                pvalues[col_field.name] = float(p)
-        if (
-            edge_dim_agg_matrix is not None
-            and edge_dim_agg_labels is not None
-            and edge_dim_agg_matrix.shape[1] > 0
-        ):
-            if len(edge_dim_agg_labels) != edge_dim_agg_matrix.shape[1]:
-                raise ValueError(
-                    f"edge_dim_agg_labels length ({len(edge_dim_agg_labels)}) "
-                    f"does not match matrix column count "
-                    f"({edge_dim_agg_matrix.shape[1]}) — label list must be "
-                    f"1:1 with matrix columns",
-                )
-            for col_idx, label in enumerate(edge_dim_agg_labels):
-                col_arr = edge_dim_agg_matrix[:, col_idx]
-                result = normality_test_per_dim(
-                    np.asarray(col_arr, dtype=np.float64),
-                )
-                p = result["p_value"]
-                if np.isfinite(p):
-                    pvalues[label] = float(p)
-        return pvalues if pvalues else None
 
     def _build_sphere_json(
         self,
@@ -3544,18 +3700,18 @@ class GDSBuilder:
                     }
                     for c_mu, c_sig, c_th, c_pop in pbr.gmm_components
                 ]
-            if pbr.cholesky_inv is not None:
-                pat_dict["cholesky_inv"] = pbr.cholesky_inv.tolist()
             if pbr.dimension_kinds is not None:
                 pat_dict["dimension_kinds"] = pbr.dimension_kinds
             if pbr.dim_percentiles:
                 pat_dict["dim_percentiles"] = pbr.dim_percentiles
             if pbr.n_anomalous_dims_thresholds is not None:
                 pat_dict["n_anomalous_dims_thresholds"] = pbr.n_anomalous_dims_thresholds.tolist()
-            if pbr.heteroscedasticity_diagnostic:
-                pat_dict["heteroscedasticity_diagnostic"] = pbr.heteroscedasticity_diagnostic
-            if pbr.dim_normality_pvalues:
-                pat_dict["dim_normality_pvalues"] = pbr.dim_normality_pvalues
+            if pbr.reference is not None:
+                pat_dict["score_axes"] = list(pbr.reference.axes)
+                pat_dict["score_dims"] = list(pbr.reference.dims)
+                pat_dict["reference_epoch"] = self._calibration_state.get(pat_id, {}).get(
+                    "calibration_epoch", 1
+                )
             if pbr.label_aware_calibration:
                 # Flatten DimCalibration dataclasses to JSON-safe dicts.
                 # Reader hydrates each entry back to a SimpleNamespace
@@ -3637,10 +3793,10 @@ class GDSBuilder:
             pat_dict["schema_hash"] = cal_state.get("schema_hash")
             patterns_dict[pat_id] = pat_dict
 
-        # Sphere format minor-bump: 3.1 when a label_audit block is
-        # registered, else 3.0. Readers compare on major only, so 3.0
-        # readers transparently load 3.1 spheres.
-        fmt_version = "3.1" if self._label_audit_block is not None else "3.0"
+        # Sphere format minor-bump: 4.1 when a label_audit block is
+        # registered, else 4.0. Readers compare on major only, so 4.0
+        # readers transparently load 4.1 spheres.
+        fmt_version = "4.1" if self._label_audit_block is not None else "4.0"
         sphere_dict: dict[str, Any] = {
             "sphere_id": self.sphere_id,
             "format_version": fmt_version,
@@ -4112,10 +4268,13 @@ class GDSBuilder:
                 has_dim_blocks = bool(
                     pat.geo_properties or pat.metric_properties or pat.semantic_dim
                 )
+                # The calibrated evidence score's fit needs the whole population
+                # in memory, as the chunked path holds it; the streaming path
+                # never does.
                 if (
                     pat.group_by_property
                     or pat.gmm_n_components
-                    or pat.use_mahalanobis
+                    or self._score_candidate(pat)
                     or has_dim_blocks
                 ):
                     pat_id_out, pbr = self._build_and_write_chunked(
@@ -4193,22 +4352,12 @@ class GDSBuilder:
                 group_stats=ps.group_stats_dict,
                 dimension_weights=ps.dim_weights,
                 gmm_components=ps.gmm_components,
-                cholesky_inv=ps.cholesky_inv,
-                dim_percentiles=self._compute_dim_percentiles(
-                    pat.entity_line,
-                    edge_dim_agg_matrix=ps.edge_dim_agg_matrix,
-                    edge_dim_agg_labels=ps.edge_dim_agg_labels,
-                ),
+                dim_percentiles=self._dim_percentiles_for(pat, ps),
                 dimension_kinds=ps.dimension_kinds,
                 dim_block_names=ps.dim_block_names,
                 dim_block_stats=ps.dim_block_stats,
                 theta_sensitivity=ps.theta_sensitivity,
-                heteroscedasticity_diagnostic=ps.heteroscedasticity_diagnostic,
-                dim_normality_pvalues=self._compute_dim_normality_pvalues(
-                    pat.entity_line,
-                    edge_dim_agg_matrix=ps.edge_dim_agg_matrix,
-                    edge_dim_agg_labels=ps.edge_dim_agg_labels,
-                ),
+                reference=ps.reference,
                 edge_dim_names=ps.edge_dim_names,
                 n_anomalous_dims_thresholds=ps.n_anom_dims_thresholds,
                 **self._unpack_lac_bundle(lac, ps.deltas),
@@ -4474,7 +4623,6 @@ class GDSBuilder:
             last_calibrated_at=now,
             edge_dim_thresholds=self._edge_dim_thresholds.get(pat.pattern_id),
             theta_sensitivity=pbr.theta_sensitivity,
-            dim_normality_pvalues=pbr.dim_normality_pvalues,
         )
         write_calibration_history_epoch(
             self.output_path,
@@ -4486,6 +4634,13 @@ class GDSBuilder:
             "calibration_epoch": new_epoch,
             "schema_hash": new_schema_hash,
         }
+        if pbr.reference is not None:
+            from hypertopos.engine.robust import reference_to_arrays
+            from hypertopos.storage.writer import GDSWriter
+
+            GDSWriter(str(self.output_path)).write_reference(
+                pat.pattern_id, new_epoch, reference_to_arrays(pbr.reference)
+            )
 
     def _prepare_temporal_context(
         self,
@@ -4742,10 +4897,10 @@ class GDSBuilder:
                 Call ``finalize_incremental`` to force a final rebuild at
                 session end.
             recompute_ranks: When True (default), recompute the global
-                delta_rank_pct percentile for the whole population on every
+                score_rank_pct percentile for the whole population on every
                 call, so each call is standalone-correct. When False, defer the
                 O(N) recompute — existing rows keep their prior (now stale)
-                delta_rank_pct until ``finalize_incremental`` is called, while
+                score_rank_pct until ``finalize_incremental`` is called, while
                 new rows carry a batch-local rank. Use False for batched
                 ingestion of many small appends, then call
                 ``finalize_incremental`` once at the end of the session.
@@ -4781,8 +4936,6 @@ class GDSBuilder:
         event_dims_meta = pat_meta.get("event_dimensions") or None
         dim_weights_raw = pat_meta.get("dimension_weights")
         dim_weights = np.array(dim_weights_raw, dtype=np.float32) if dim_weights_raw else None
-        chol_raw = pat_meta.get("cholesky_inv")
-        cholesky_inv = np.array(chol_raw, dtype=np.float32) if chol_raw else None
 
         # 2. Read calibration tracker
         reader = GDSReader(str(self.output_path), branch=branch)
@@ -4858,7 +5011,6 @@ class GDSBuilder:
                 dim_weights,
                 prop_columns=prop_cols,
                 edge_dim_agg_labels=edge_dim_agg_labels,
-                cholesky_inv=cholesky_inv,
             )
 
             # Incremental ingest reconstructs geometry from the GLOBAL
@@ -4915,14 +5067,50 @@ class GDSBuilder:
             # which would invert the polarity. This batch-local value is a
             # provisional placeholder; recompute_conformal_p rewrites it against
             # the full population on the default path / at finalize_incremental,
-            # exactly like delta_rank_pct. delta_rank_pcts keeps its own
+            # exactly like score_rank_pct. score_rank_pcts keeps its own
             # higher = more anomalous convention (left-rank × 100).
             from hypertopos.builder._stats import population_left_ranks
 
             ranks = population_left_ranks(delta_norms)
             right_ranks = n_new - ranks
             conformal_p = (right_ranks / max(n_new, 1)).astype(np.float32)
-            delta_rank_pcts = (ranks / max(n_new, 1) * 100).astype(np.float32)
+            score_rank_pcts = (ranks / max(n_new, 1) * 100).astype(np.float32)
+            anomaly_score = delta_norms.astype(np.float64)
+            axis_ranks: np.ndarray | None = None
+            score_delta: np.ndarray | None = None
+
+            # Patterns on the calibrated evidence score: new rows are scored
+            # against the frozen reference of the current epoch, without a
+            # refit. Ingested rows carry no event history, so the ``current``
+            # axis is dropped and they are calibrated on the remaining axes.
+            score_dims = pat_meta.get("score_dims")
+            if score_dims:
+                from hypertopos.engine.robust import is_anomaly as _score_is_anomaly
+                from hypertopos.engine.robust import score as _score
+
+                missing = [d for d in score_dims if d not in changed_entities.schema.names]
+                if missing:
+                    raise ValueError(
+                        f"incremental_update: pattern {pattern_id!r} is scored on "
+                        f"{list(score_dims)}; the ingested rows lack {missing}"
+                    )
+                x_new = np.column_stack(
+                    [
+                        pc.fill_null(changed_entities[d], 0)
+                        .to_numpy(zero_copy_only=False)
+                        .astype(np.float64)
+                        for d in score_dims
+                    ]
+                )
+                scored = _score(reader.read_reference(pattern_id), x_new)
+                anomaly_score = scored.anomaly_score
+                axis_ranks = scored.axis_ranks
+                score_delta = scored.delta
+                conformal_p = scored.conformal_p.astype(np.float32)
+                score_rank_pcts = scored.score_rank_pct.astype(np.float32)
+                is_anomaly = _score_is_anomaly(
+                    scored.conformal_p, float(pat_meta.get("anomaly_percentile", 95.0))
+                )
 
             # Per-dimension anomaly count against the thresholds the full build
             # used (population P99 of |delta| per dim). Spheres built before the
@@ -4973,9 +5161,12 @@ class GDSBuilder:
                 "scale": pa.array([1] * n_new, type=pa.int32()),
                 "delta": delta_col,
                 "delta_norm": pa.array(delta_norms, type=pa.float32()),
-                "delta_rank_pct": pa.array(delta_rank_pcts, type=pa.float32()),
+                "score_rank_pct": pa.array(score_rank_pcts, type=pa.float32()),
                 "is_anomaly": pa.array(is_anomaly, type=pa.bool_()),
                 "conformal_p": pa.array(conformal_p, type=pa.float32()),
+                "anomaly_score": pa.array(anomaly_score, type=pa.float64()),
+                "axis_ranks": _list_column(axis_ranks, 0, n_new),
+                "score_delta": _list_column(score_delta, 0, n_new),
                 "bregman_divergence": pa.array(
                     self._compute_incremental_bregman(
                         shape_vectors,
@@ -5043,13 +5234,13 @@ class GDSBuilder:
         # Metadata goes to the branch directory on a branch.
         meta_writer = GDSWriter(str(meta_root)) if branch else writer
 
-        # 10. Recompute delta_rank_pct (O(N) global population percentile).
-        # delta_rank_pct is a whole-population rank, so adding rows shifts the
+        # 10. Recompute score_rank_pct (O(N) global population percentile).
+        # score_rank_pct is a whole-population rank, so adding rows shifts the
         # percentile of every existing row — there is no correct sub-O(N) fast
         # path. recompute_ranks=False defers it (existing rows keep stale ranks
         # until finalize_incremental); the new rows still carry their
         # batch-local rank from step 6. The default recomputes every call so
-        # each call is standalone-correct for all delta_rank_pct consumers.
+        # each call is standalone-correct for all score_rank_pct consumers.
         if recompute_ranks:
             writer.recompute_rank_stats(pattern_id)
 
@@ -5085,13 +5276,14 @@ class GDSBuilder:
         write_sphere_json(sphere_path.parent, sphere_data)
 
         # 14. Rewrite geometry_stats
-        all_norms_tbl = ds.to_table(columns=["delta_norm"])
+        all_norms_tbl = ds.to_table(columns=["delta_norm", "is_anomaly"])
         all_norms = all_norms_tbl["delta_norm"].to_numpy(zero_copy_only=False)
         meta_writer.write_geometry_stats(
             pattern_id,
             version=version,
             delta_norms=all_norms,
             theta_norm=theta_norm,
+            is_anomaly_arr=all_norms_tbl["is_anomaly"].to_numpy(zero_copy_only=False),
         )
 
         # 15. Persist updated calibration tracker
@@ -5187,7 +5379,7 @@ class GDSBuilder:
     def finalize_incremental(self, pattern_id: str, branch: str | None = None) -> None:
         """Finalize a batched incremental-ingest session for one pattern.
 
-        Recomputes the global ``delta_rank_pct`` percentile once across the
+        Recomputes the global ``score_rank_pct`` percentile once across the
         whole population (making every row standalone-correct again after a run
         of ``incremental_update(recompute_ranks=False)`` calls) and rebuilds the
         ANN (IVF_FLAT) vector index so all appended rows are indexed. Call once
@@ -5271,13 +5463,14 @@ class GDSBuilder:
         theta_norm = float(np.linalg.norm(ps.theta))
 
         # 1b. Bootstrap confidence (chunked path keeps full deltas in memory)
-        # Skip when: use_mahalanobis, population > _BOOTSTRAP_MAX_N,
+        # Skip when: the pattern is on the calibrated evidence score,
+        # population > _BOOTSTRAP_MAX_N,
         # group_by_property, or bootstrap_iterations=0
         confidence_arr: np.ndarray | None = None
         if (
             pat.bootstrap_iterations > 0
             and ps.dimension_kinds is not None
-            and not pat.use_mahalanobis
+            and ps.reference is None
             and not pat.group_by_property
             and n <= _BOOTSTRAP_MAX_N
         ):
@@ -5309,7 +5502,7 @@ class GDSBuilder:
                     end,
                     ps.deltas,
                     ps.delta_norms,
-                    ps.delta_rank_pcts,
+                    ps.score_rank_pcts,
                     theta_norm,
                     ps.fk_arrays,
                     ps.conformal_p,
@@ -5317,6 +5510,9 @@ class GDSBuilder:
                     ps.n_anom_dims,
                     bregman_norms_arr=ps.bregman_norms,
                     anomaly_confidence_arr=confidence_arr,
+                    anomaly_score=ps.anomaly_score,
+                    axis_ranks=ps.axis_ranks,
+                    score_delta=ps.score_delta,
                 )
                 chunk_table = self._inject_fdr_hierarchy_carriers(pat, chunk_table)
                 chunk_table = self._inject_fdr_temporal_buckets(pat, chunk_table)
@@ -5369,22 +5565,12 @@ class GDSBuilder:
             group_stats=ps.group_stats_dict,
             dimension_weights=ps.dim_weights,
             gmm_components=ps.gmm_components,
-            cholesky_inv=ps.cholesky_inv,
-            dim_percentiles=self._compute_dim_percentiles(
-                pat.entity_line,
-                edge_dim_agg_matrix=ps.edge_dim_agg_matrix,
-                edge_dim_agg_labels=ps.edge_dim_agg_labels,
-            ),
+            dim_percentiles=self._dim_percentiles_for(pat, ps),
             dimension_kinds=ps.dimension_kinds,
             dim_block_names=ps.dim_block_names,
             dim_block_stats=ps.dim_block_stats,
             theta_sensitivity=ps.theta_sensitivity,
-            heteroscedasticity_diagnostic=ps.heteroscedasticity_diagnostic,
-            dim_normality_pvalues=self._compute_dim_normality_pvalues(
-                pat.entity_line,
-                edge_dim_agg_matrix=ps.edge_dim_agg_matrix,
-                edge_dim_agg_labels=ps.edge_dim_agg_labels,
-            ),
+            reference=ps.reference,
             edge_dim_names=ps.edge_dim_names,
             n_anomalous_dims_thresholds=ps.n_anom_dims_thresholds,
             **self._unpack_lac_bundle(lac, ps.deltas),
@@ -6100,10 +6286,11 @@ class GDSBuilder:
         theta = np.full(D_full, component_val, dtype=np.float32)
         theta_norm = float(np.linalg.norm(theta))
 
-        # Delta rank pcts (sorted_norms also feeds theta sensitivity below)
+        # Score rank pcts of delta_norm, the score of the patterns this path
+        # builds (sorted_norms also feeds theta sensitivity below)
         sorted_norms = np.sort(all_norms)
         ranks = population_left_ranks(all_norms)
-        delta_rank_pcts = (ranks / n * 100).astype(np.float32)
+        score_rank_pcts = (ranks / n * 100).astype(np.float32)
 
         # Conformal p-values
         conformal_p = compute_conformal_p(all_norms, left_ranks=ranks)
@@ -6162,7 +6349,7 @@ class GDSBuilder:
                 if dim_weights is not None:
                     chunk_deltas = (chunk_deltas * dim_weights).astype(np.float32)
                 chunk_norms = all_norms[start:end]
-                chunk_ranks = delta_rank_pcts[start:end]
+                chunk_ranks = score_rank_pcts[start:end]
                 chunk_conformal = conformal_p[start:end]
 
                 is_anomaly_arr = (theta_norm > 0.0) & (chunk_norms >= theta_norm)
@@ -6188,7 +6375,7 @@ class GDSBuilder:
                     end=cn,
                     deltas=chunk_deltas,
                     delta_norms=chunk_norms,
-                    delta_rank_pcts=chunk_ranks,
+                    score_rank_pcts=chunk_ranks,
                     theta_norm=theta_norm,
                     fk_arrays=fk_slices,
                     conformal_p=chunk_conformal,
@@ -6255,7 +6442,6 @@ class GDSBuilder:
             group_stats=None,
             dimension_weights=dim_weights,
             gmm_components=None,
-            cholesky_inv=None,
             dim_percentiles=self._compute_dim_percentiles(
                 pat.entity_line,
                 edge_dim_agg_matrix=(
@@ -6265,13 +6451,6 @@ class GDSBuilder:
             ),
             dimension_kinds=dimension_kinds,
             theta_sensitivity=compute_theta_sensitivity_from_sorted(sorted_norms),
-            dim_normality_pvalues=self._compute_dim_normality_pvalues(
-                pat.entity_line,
-                edge_dim_agg_matrix=(
-                    edge_dim_agg_matrix if edge_dim_agg_matrix.shape[1] > 0 else None
-                ),
-                edge_dim_agg_labels=(edge_dim_agg_labels if edge_dim_agg_labels else None),
-            ),
             edge_dim_names=edge_dim_names,
             n_anomalous_dims_thresholds=per_dim_thresholds,
         )
@@ -6336,7 +6515,6 @@ class GDSBuilder:
             "dimension_weights": (
                 pbr.dimension_weights.tolist() if pbr.dimension_weights is not None else None
             ),
-            "cholesky_inv": pbr.cholesky_inv.tolist() if pbr.cholesky_inv is not None else None,
         }
 
     def _build_temporal_one(
@@ -6398,11 +6576,6 @@ class GDSBuilder:
             if pat_meta.get("sigma_diag")
             else None
         )
-        _chol_arr = (
-            np.array(pat_meta["cholesky_inv"], dtype=np.float32)
-            if pat_meta.get("cholesky_inv")
-            else None
-        )
         _w_arr = (
             np.array(pat_meta["dimension_weights"], dtype=np.float32)
             if pat_meta.get("dimension_weights")
@@ -6414,12 +6587,11 @@ class GDSBuilder:
         _sig_full = np.array(pat_meta["sigma_diag"], dtype=np.float32)
 
         def _deltas(shapes: np.ndarray) -> np.ndarray:
-            # Same metric as the stored polygon delta (Mahalanobis / weights).
+            # Shape-space metric of the pattern (sigma / weights).
             return calibrated_deltas(
                 shapes,
                 mu=_mu_full,
                 sigma_diag=_sig_full,
-                cholesky_inv=_chol_arr,
                 dimension_weights=_w_arr,
             )
 
@@ -6615,7 +6787,6 @@ class GDSBuilder:
                             stored_bkt_ts,
                             _mu_arr,
                             _sig_arr,
-                            _chol_arr,
                             _w_arr,
                         )
 

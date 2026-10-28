@@ -8,7 +8,7 @@ _FAILED = {"ok": False, "error": "GDSNavigationError: ambiguous chain_id"}
 
 
 def _shape_ok() -> dict:
-    return {"ok": True, "data": {"is_anomaly": True, "delta_rank_pct": 99.2}}
+    return {"ok": True, "data": {"is_anomaly": True, "score_rank_pct": 99.2}}
 
 
 class TestInvestigationSummaryWithFailedSteps:

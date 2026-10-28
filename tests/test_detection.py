@@ -134,12 +134,12 @@ class TestDetectCrossPatternDiscrepancy:
                     "pat_a": {
                         "is_anomaly": True,
                         "delta_norm": 3.5,
-                        "delta_rank_pct": 95.0,
+                        "score_rank_pct": 95.0,
                     },
                     "pat_b": {
                         "is_anomaly": False,
                         "delta_norm": 0.8,
-                        "delta_rank_pct": 40.0,
+                        "score_rank_pct": 40.0,
                     },
                 },
             }
@@ -195,7 +195,7 @@ class TestDetectNeighborContamination:
             {
                 "primary_key": ["A001", "A002", "A003"],
                 "is_anomaly": [False, False, False],
-                "delta_rank_pct": [30.0, 50.0, 60.0],
+                "score_rank_pct": [30.0, 50.0, 60.0],
             }
         )
         nav._storage.read_geometry.return_value = geo
@@ -212,7 +212,7 @@ class TestDetectNeighborContamination:
             {
                 "primary_key": ["A001", "A002", "A003", "A004"],
                 "is_anomaly": [True, True, False, False],
-                "delta_rank_pct": [99.0, 98.0, 40.0, 50.0],
+                "score_rank_pct": [99.0, 98.0, 40.0, 50.0],
             }
         )
         # First call: full geometry read, second call: neighbour batch read
@@ -311,7 +311,6 @@ class TestDetectTrajectoryAnomaly:
         fake_pattern.relations = [MagicMock(line_id="dim_a")]
         fake_pattern.sigma_diag = np.array([1.0], dtype=np.float32)
         fake_pattern.mu = np.array([0.0], dtype=np.float32)
-        fake_pattern.cholesky_inv = None
         fake_pattern.dimension_weights = None
 
         fake_sphere = MagicMock()

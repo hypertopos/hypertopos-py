@@ -1238,7 +1238,7 @@ class TestFindCounterparties:
         assert s["anomalous_incoming"] == 0
 
     def test_anomaly_enrichment(self, tmp_path):
-        """With pattern_id, counterparties get is_anomaly + delta_rank_pct."""
+        """With pattern_id, counterparties get is_anomaly + score_rank_pct."""
         from hypertopos.sphere import HyperSphere
 
         sphere_path = _build_counterparty_sphere(tmp_path)
@@ -1253,10 +1253,10 @@ class TestFindCounterparties:
             pattern_id="acct_pattern",
         )
         out = result["outgoing"]
-        # With enrichment, entries should have is_anomaly and delta_rank_pct
+        # With enrichment, entries should have is_anomaly and score_rank_pct
         for entry in out:
             assert "is_anomaly" in entry
-            assert "delta_rank_pct" in entry
+            assert "score_rank_pct" in entry
             assert isinstance(entry["is_anomaly"], bool)
 
     def test_top_n_limits(self, tmp_path):

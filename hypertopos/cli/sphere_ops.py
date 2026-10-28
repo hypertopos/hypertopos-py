@@ -468,7 +468,7 @@ def run_sphere_ingest(
     Loads the points table (Arrow IPC / Parquet / CSV), resolves the target
     pattern, then calls ``GDSBuilder.incremental_update`` to append the rows to
     that pattern's geometry. With ``--finalize`` it additionally calls
-    ``finalize_incremental`` to recompute the global ``delta_rank_pct`` and
+    ``finalize_incremental`` to recompute the global ``score_rank_pct`` and
     rebuild the ANN index once at the end of a batch.
 
     Emits a ``{pattern_id, added, modified, deleted, population_size,

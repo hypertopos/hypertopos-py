@@ -145,7 +145,7 @@ class _MockStorageStaleNorm(_MockStorage):
                 "delta": [[1.0, 1.0], [3.0, 3.0]],
                 "delta_norm": [3.5, 4.0],
                 "is_anomaly": [True, True],
-                "delta_rank_pct": pa.array([50.0, 90.0], type=pa.float64()),
+                "score_rank_pct": pa.array([50.0, 90.0], type=pa.float64()),
                 "edges": pa.array([[], []], type=pa.list_(_EDGE_STRUCT)),
                 "last_refresh_at": [dt, dt],
                 "updated_at": [dt, dt],
@@ -224,7 +224,7 @@ class _MockStorageWithDelta(_MockStorage):
             "delta": [[0.1, 0.2]],
             "delta_norm": [0.224],
             "is_anomaly": [False],
-            "delta_rank_pct": [25.0],
+            "score_rank_pct": [25.0],
         }
         wanted = set(columns) if columns else {"delta"}
         return pa.table({k: v for k, v in all_cols.items() if k in wanted})
@@ -994,7 +994,7 @@ class TestEventPolygonsForDeltaDim:
                 "scale": [1, 1],
                 "delta": [[0.1, 0.2], [0.5, 0.6]],
                 "delta_norm": [0.22, 0.78],
-                "delta_rank_pct": [20.0, 80.0],
+                "score_rank_pct": [20.0, 80.0],
                 "is_anomaly": [False, True],
                 "delta_dim_0": pa.array([0.1, 0.5], type=pa.float32()),
                 "delta_dim_1": pa.array([0.2, 0.6], type=pa.float32()),
@@ -1283,7 +1283,7 @@ class TestAnomalySummary:
                 "delta": deltas,
                 "delta_norm": norms,
                 "is_anomaly": [True] * n_unique,
-                "delta_rank_pct": pa.array([90.0] * n_unique, type=pa.float64()),
+                "score_rank_pct": pa.array([90.0] * n_unique, type=pa.float64()),
                 "edges": pa.array([[]] * n_unique, type=pa.list_(_EDGE_STRUCT)),
                 "last_refresh_at": [dt] * n_unique,
                 "updated_at": [dt] * n_unique,
@@ -1853,7 +1853,7 @@ def test_find_anomalies_linf_metric():
 
 
 def test_get_entity_geometry_meta_returns_stored_values():
-    """get_entity_geometry_meta reads delta_norm, is_anomaly, delta_rank_pct from storage."""
+    """get_entity_geometry_meta reads delta_norm, is_anomaly, score_rank_pct from storage."""
     from unittest.mock import MagicMock
 
     manifest = Manifest(
@@ -1876,7 +1876,7 @@ def test_get_entity_geometry_meta_returns_stored_values():
 
     assert meta["delta_norm"] == pytest.approx(0.224)
     assert meta["is_anomaly"] is False
-    assert meta["delta_rank_pct"] == pytest.approx(25.0)
+    assert meta["score_rank_pct"] == pytest.approx(25.0)
 
 
 def test_get_entity_geometry_meta_raises_key_error_when_not_found():
@@ -1889,7 +1889,7 @@ def test_get_entity_geometry_meta_raises_key_error_when_not_found():
                 {
                     "delta_norm": pa.array([], type=pa.float32()),
                     "is_anomaly": pa.array([], type=pa.bool_()),
-                    "delta_rank_pct": pa.array([], type=pa.float32()),
+                    "score_rank_pct": pa.array([], type=pa.float32()),
                 }
             )
 
@@ -1957,7 +1957,7 @@ class TestPi6AttractBoundary:
                 "scale": [1, 1],
                 "delta": [[0.8, 0.0], [0.2, 0.0]],
                 "delta_norm": [0.8, 0.2],
-                "delta_rank_pct": [80.0, 20.0],
+                "score_rank_pct": [80.0, 20.0],
                 "is_anomaly": [False, False],
                 "edges": pa.array([[], []], type=pa.list_(_EDGE_STRUCT)),
                 "last_refresh_at": [now_str, now_str],
@@ -2128,7 +2128,7 @@ class TestPi6AttractBoundary:
                 "scale": [1] * n,
                 "delta": deltas,
                 "delta_norm": [0.5] * n,
-                "delta_rank_pct": [50.0] * n,
+                "score_rank_pct": [50.0] * n,
                 "is_anomaly": [False] * n,
                 "edges": pa.array([[] for _ in range(n)], type=pa.list_(_EDGE_STRUCT)),
                 "last_refresh_at": [now_str] * n,
@@ -4099,65 +4099,6 @@ class TestPi9AttractDrift:
         assert z["num_inactive_slices"] == 1
         assert z["path_length"] == pytest.approx(z["displacement"])
 
-    def test_drift_uses_mahalanobis_metric(self):
-        """Slice deltas follow the pattern's Mahalanobis metric, like the solid."""
-        from hypertopos.model.sphere import Pattern, RelationDef
-
-        pattern = Pattern(
-            pattern_id="cust_pattern",
-            entity_type="customer",
-            pattern_type="anchor",
-            relations=[
-                RelationDef("company_codes", "in", True),
-                RelationDef("profit_centers", "in", False),
-            ],
-            mu=np.array([0.0, 0.0], dtype=np.float32),
-            sigma_diag=np.array([1.0, 1.0], dtype=np.float32),
-            theta=np.array([0.3, 0.3], dtype=np.float32),
-            population_size=2,
-            computed_at=datetime(2024, 1, 1, tzinfo=UTC),
-            version=1,
-            status="production",
-            cholesky_inv=np.array([[2.0, 0.0], [0.0, 3.0]], dtype=np.float32),
-        )
-        geometry = pa.table(
-            {
-                "primary_key": ["CUST-001"],
-                "scale": [1],
-                "delta": [[2.0, 3.0]],
-                "delta_norm": [3.606],
-                "is_anomaly": [False],
-                "edges": pa.array([[]], type=pa.list_(_EDGE_STRUCT)),
-                "last_refresh_at": [datetime(2024, 1, 1, tzinfo=UTC)],
-                "updated_at": [datetime(2024, 1, 1, tzinfo=UTC)],
-            }
-        )
-        temporal = _make_temporal_table(
-            [
-                {
-                    "pk": "CUST-001",
-                    "idx": 0,
-                    "ts": datetime(2024, 1, 1, tzinfo=UTC),
-                    # Both windows active (an all-zero shape is a window without events).
-                    "delta": [1.0, 1.0],
-                },
-                {
-                    "pk": "CUST-001",
-                    "idx": 1,
-                    "ts": datetime(2024, 6, 1, tzinfo=UTC),
-                    "delta": [2.0, 2.0],
-                },
-            ]
-        )
-        storage = _MockStorageWithPatterns({"cust_pattern": pattern}, geometry, temporal)
-        nav = GDSNavigator(_MockEngine(), storage, _make_manifest(), Contract("m-001", []))
-
-        results = nav.π9_attract_drift("cust_pattern", top_n=10)
-
-        assert abs(results[0]["displacement"] - float(np.hypot(2.0, 3.0))) < 1e-4
-        assert abs(results[0]["dimension_diffs"]["company_codes"] - 2.0) < 1e-4
-        assert abs(results[0]["dimension_diffs"]["profit_centers"] - 3.0) < 1e-4
-
     def test_includes_displacement_current(self):
         """displacement_current uses stored geometry delta, not slices[-1]."""
         from hypertopos.model.sphere import Pattern, RelationDef
@@ -5303,7 +5244,7 @@ def test_current_solid_non_relation_line_raises_navigation_error():
 
 
 def test_current_polygon_uses_stored_delta():
-    """current_polygon patches delta/delta_norm/is_anomaly/delta_rank_pct from geometry dataset."""
+    """current_polygon patches delta/delta_norm/is_anomaly/score_rank_pct from geometry dataset."""
     from unittest.mock import MagicMock
 
     # build_polygon returns wrong (recomputed) values
@@ -5318,7 +5259,7 @@ def test_current_polygon_uses_stored_delta():
         delta=recomputed_delta,
         delta_norm=recomputed_norm,
         is_anomaly=False,
-        delta_rank_pct=None,
+        score_rank_pct=None,
         edges=[],
         last_refresh_at=datetime(2024, 1, 1, tzinfo=UTC),
         updated_at=datetime(2024, 1, 1, tzinfo=UTC),
@@ -5335,7 +5276,7 @@ def test_current_polygon_uses_stored_delta():
             "delta": pa.array([stored_delta], type=pa.list_(pa.float32())),
             "delta_norm": pa.array([stored_norm], type=pa.float64()),
             "is_anomaly": pa.array([True], type=pa.bool_()),
-            "delta_rank_pct": pa.array([92.5], type=pa.float64()),
+            "score_rank_pct": pa.array([92.5], type=pa.float64()),
         }
     )
 
@@ -5367,14 +5308,14 @@ def test_current_polygon_uses_stored_delta():
     assert polygon.delta == pytest.approx(stored_delta, abs=1e-4)
     assert polygon.delta_norm == pytest.approx(stored_norm, abs=1e-4)
     assert polygon.is_anomaly is True
-    assert polygon.delta_rank_pct == pytest.approx(92.5, abs=1e-4)
+    assert polygon.score_rank_pct == pytest.approx(92.5, abs=1e-4)
 
     # read_geometry called with primary_key filter and correct columns
     storage.read_geometry.assert_called_once_with(
         "customer_pattern",
         1,
         primary_key="E-001",
-        columns=["delta", "delta_norm", "is_anomaly", "delta_rank_pct"],
+        columns=["delta", "delta_norm", "is_anomaly", "score_rank_pct"],
     )
 
 
@@ -5392,7 +5333,7 @@ def test_current_polygon_no_stored_row_keeps_built_values():
         delta=recomputed_delta,
         delta_norm=float(np.linalg.norm(recomputed_delta)),
         is_anomaly=False,
-        delta_rank_pct=None,
+        score_rank_pct=None,
         edges=[],
         last_refresh_at=datetime(2024, 1, 1, tzinfo=UTC),
         updated_at=datetime(2024, 1, 1, tzinfo=UTC),
@@ -5406,7 +5347,7 @@ def test_current_polygon_no_stored_row_keeps_built_values():
             "delta": pa.array([], type=pa.list_(pa.float32())),
             "delta_norm": pa.array([], type=pa.float64()),
             "is_anomaly": pa.array([], type=pa.bool_()),
-            "delta_rank_pct": pa.array([], type=pa.float64()),
+            "score_rank_pct": pa.array([], type=pa.float64()),
         }
     )
 
@@ -5437,7 +5378,7 @@ def test_current_polygon_no_stored_row_keeps_built_values():
     # No stored row → built values unchanged
     assert polygon.delta == pytest.approx(recomputed_delta.tolist(), abs=1e-4)
     assert polygon.is_anomaly is False
-    assert polygon.delta_rank_pct is None
+    assert polygon.score_rank_pct is None
 
 
 def _make_π8_nav(n_entities: int = 12, n_relations: int = 2) -> GDSNavigator:
@@ -5468,7 +5409,7 @@ def _make_π8_nav(n_entities: int = 12, n_relations: int = 2) -> GDSNavigator:
             "delta": deltas,
             "delta_norm": [float(np.linalg.norm(d)) for d in deltas],
             "is_anomaly": [False] * (n_entities // 2) + [True] * (n_entities - n_entities // 2),
-            "delta_rank_pct": pa.array([50.0] * n_entities, type=pa.float64()),
+            "score_rank_pct": pa.array([50.0] * n_entities, type=pa.float64()),
             "edges": pa.array([[] for _ in range(n_entities)], type=pa.list_(_EDGE_STRUCT)),
             "last_refresh_at": ["2024-01-01T00:00:00"] * n_entities,
             "updated_at": ["2024-01-01T00:00:00"] * n_entities,
@@ -5558,7 +5499,7 @@ class TestPi8AttractCluster:
                 "delta": pa.array([], type=pa.list_(pa.float32())),
                 "delta_norm": pa.array([], type=pa.float64()),
                 "is_anomaly": pa.array([], type=pa.bool_()),
-                "delta_rank_pct": pa.array([], type=pa.float64()),
+                "score_rank_pct": pa.array([], type=pa.float64()),
                 "edges": pa.array([], type=pa.list_(_EDGE_STRUCT)),
                 "last_refresh_at": pa.array([], type=pa.string()),
                 "updated_at": pa.array([], type=pa.string()),
@@ -5973,7 +5914,7 @@ def test_compare_entities_intraclass_ignores_ann_index():
                 "primary_key": pa.array([pk], type=pa.string()),
                 "delta": pa.array([delta.tolist()], type=pa.list_(pa.float32())),
                 "delta_norm": pa.array([float(np.linalg.norm(delta))], type=pa.float32()),
-                "delta_rank_pct": pa.array([50.0], type=pa.float32()),
+                "score_rank_pct": pa.array([50.0], type=pa.float32()),
                 "is_anomaly": pa.array([False], type=pa.bool_()),
             }
         )
@@ -6165,20 +6106,6 @@ class TestTemporalQualitySummary:
             for i in range(4)
         ]
 
-    def test_uses_mahalanobis_metric(self):
-        """Slices at [1, 1] sit inside theta under the diagonal metric (norm ≈ 1.41
-        < 2.83) but far outside it under the pattern's Mahalanobis metric
-        (L⁻¹ = 10·I → norm ≈ 14.1); the summary must use the stored metric."""
-        pattern = self._make_pattern(theta=np.array([2.0, 2.0], dtype=np.float32))
-        pattern.cholesky_inv = np.diag([10.0, 10.0]).astype(np.float32)
-        nav = self._make_nav(pattern, _make_temporal_table(self._always_one_rows()))
-
-        result = nav.temporal_quality_summary("test_pattern")
-
-        assert result is not None
-        assert result["signal_quality"] == "persistent"
-        assert result["n_anomaly_transitions"] > 0
-
     def test_theta_clamped_to_snapshot_width(self):
         """Snapshots carry 2 of 3 pattern dims; θ must be clamped to the same 2."""
         pattern = self._make_pattern(
@@ -6322,7 +6249,7 @@ def _make_continuous_mode_nav(n: int = 3):
             "delta": [[0.5, 0.4]] * n,
             "delta_norm": [float(np.linalg.norm([0.5, 0.4]))] * n,
             "is_anomaly": [True] * n,
-            "delta_rank_pct": [95.0] * n,
+            "score_rank_pct": [95.0] * n,
             "edges": pa.array([cont_edges] * n, type=pa.list_(_EDGE_STRUCT)),
             "last_refresh_at": [now_str] * n,
             "updated_at": [now_str] * n,
@@ -6899,7 +6826,7 @@ def test_anomaly_summary_top_driving_dimensions():
             "delta": deltas,
             "delta_norm": norms,
             "is_anomaly": [True] * n,
-            "delta_rank_pct": pa.array([90.0] * n, type=pa.float64()),
+            "score_rank_pct": pa.array([90.0] * n, type=pa.float64()),
             "edges": pa.array([[]] * n, type=pa.list_(_EDGE_STRUCT)),
             "last_refresh_at": [dt] * n,
             "updated_at": [dt] * n,
@@ -6968,7 +6895,7 @@ def test_anomaly_summary_count_matches_find_anomalies():
             "delta": deltas.tolist(),
             "delta_norm": norms.tolist(),
             "is_anomaly": is_anomaly.tolist(),
-            "delta_rank_pct": pa.array([50.0] * n, type=pa.float64()),
+            "score_rank_pct": pa.array([50.0] * n, type=pa.float64()),
             "edges": pa.array([[]] * n, type=pa.list_(_EDGE_STRUCT)),
             "last_refresh_at": [dt] * n,
             "updated_at": [dt] * n,
@@ -7751,7 +7678,7 @@ def test_compare_entities_interpretation():
                         "primary_key": ["A"],
                         "delta": [delta_a.tolist()],
                         "delta_norm": [float(np.linalg.norm(delta_a))],
-                        "delta_rank_pct": [50.0],
+                        "score_rank_pct": [50.0],
                         "is_anomaly": [False],
                     }
                 )
@@ -7760,7 +7687,7 @@ def test_compare_entities_interpretation():
                     "primary_key": ["B"],
                     "delta": [delta_b.tolist()],
                     "delta_norm": [0.0],
-                    "delta_rank_pct": [10.0],
+                    "score_rank_pct": [10.0],
                     "is_anomaly": [False],
                 }
             )
@@ -7851,8 +7778,8 @@ class _ChainMockStorage(_MockStorage):
                 "primary_key": [r["primary_key"] for r in self._geometry_rows],
                 "is_anomaly": [r["is_anomaly"] for r in self._geometry_rows],
                 "delta_norm": [r["delta_norm"] for r in self._geometry_rows],
-                "delta_rank_pct": pa.array(
-                    [r["delta_rank_pct"] for r in self._geometry_rows],
+                "score_rank_pct": pa.array(
+                    [r["score_rank_pct"] for r in self._geometry_rows],
                     type=pa.float64(),
                 ),
             }
@@ -7929,19 +7856,19 @@ def test_find_chains_for_entity_happy_path():
             "primary_key": "CH-001",
             "is_anomaly": True,
             "delta_norm": 12.3,
-            "delta_rank_pct": 97.2,
+            "score_rank_pct": 97.2,
         },
         {
             "primary_key": "CH-002",
             "is_anomaly": False,
             "delta_norm": 2.1,
-            "delta_rank_pct": 34.5,
+            "score_rank_pct": 34.5,
         },
         {
             "primary_key": "CH-003",
             "is_anomaly": True,
             "delta_norm": 8.0,
-            "delta_rank_pct": 85.0,
+            "score_rank_pct": 85.0,
         },
     ]
     storage = _ChainMockStorage(chain_keys_map, geometry_rows)
@@ -7961,11 +7888,11 @@ def test_find_chains_for_entity_happy_path():
     assert result["chains"][0]["chain_id"] == "CH-001"
     assert result["chains"][0]["is_anomaly"] is True
     assert result["chains"][0]["delta_norm"] == 12.3
-    assert result["chains"][0]["delta_rank_pct"] == 97.2
+    assert result["chains"][0]["score_rank_pct"] == 97.2
     assert result["chains"][1]["chain_id"] == "CH-002"
     assert result["chains"][1]["is_anomaly"] is False
     assert result["chains"][1]["delta_norm"] == 2.1
-    assert result["chains"][1]["delta_rank_pct"] == 34.5
+    assert result["chains"][1]["score_rank_pct"] == 34.5
     # CH-003 not included (ACCT-001 not in CH-003)
     assert result["summary"]["total"] == 2
     assert result["summary"]["anomalous"] == 1
@@ -7982,7 +7909,7 @@ def test_find_chains_for_entity_not_in_any_chain():
             "primary_key": "CH-001",
             "is_anomaly": False,
             "delta_norm": 1.0,
-            "delta_rank_pct": 10.0,
+            "score_rank_pct": 10.0,
         },
     ]
     storage = _ChainMockStorage(chain_keys_map, geometry_rows)
@@ -8036,13 +7963,13 @@ def test_find_chains_for_entity_cyclic_chain_dedup():
             "primary_key": "CH-CYCLE",
             "is_anomaly": True,
             "delta_norm": 5.5,
-            "delta_rank_pct": 92.0,
+            "score_rank_pct": 92.0,
         },
         {
             "primary_key": "CH-NORMAL",
             "is_anomaly": False,
             "delta_norm": 1.2,
-            "delta_rank_pct": 25.0,
+            "score_rank_pct": 25.0,
         },
     ]
     storage = _ChainMockStorage(chain_keys_map, geometry_rows)
@@ -8076,7 +8003,7 @@ def test_find_chains_for_entity_self_loop_dedup():
             "primary_key": "CH-SELF",
             "is_anomaly": False,
             "delta_norm": 0.7,
-            "delta_rank_pct": 12.0,
+            "score_rank_pct": 12.0,
         },
     ]
     storage = _ChainMockStorage(chain_keys_map, geometry_rows)
@@ -8326,7 +8253,7 @@ class _MockStorageSibling(_MockStorage):
             "primary_key": ["ACC-001", "ACC-002"],
             "delta_norm": [4.5, 1.0],
             "is_anomaly": [True, False],
-            "delta_rank_pct": pa.array([95.0, 30.0], type=pa.float64()),
+            "score_rank_pct": pa.array([95.0, 30.0], type=pa.float64()),
             "conformal_p": pa.array([0.02, 0.85], type=pa.float64()),
         }
         if primary_key is not None:
@@ -8556,7 +8483,7 @@ class _MockStorageMultiDetector(_MockStorage):
             "primary_key": ["A", "B", "C", "D", "E"],
             "delta_norm": pa.array([0.5, 1.0, 2.0, 3.0, 5.0], type=pa.float64()),
             "is_anomaly": [False, False, True, True, True],
-            "delta_rank_pct": pa.array([10.0, 30.0, 60.0, 80.0, 99.0], type=pa.float64()),
+            "score_rank_pct": pa.array([10.0, 30.0, 60.0, 80.0, 99.0], type=pa.float64()),
             "conformal_p": pa.array([0.9, 0.7, 0.4, 0.2, 0.05], type=pa.float64()),
             "anomaly_confidence": pa.array(
                 [0.1, 0.3, 0.6, 0.8, 0.95],
@@ -8735,7 +8662,7 @@ def _aml_sphere_unavailable() -> bool:
         return True
     import json
 
-    return json.loads(sphere_json.read_text()).get("format_version", "").split(".")[0] != "3"
+    return json.loads(sphere_json.read_text()).get("format_version", "").split(".")[0] != "4"
 
 
 @pytest.mark.skipif(
@@ -8777,23 +8704,10 @@ def test_combine_anomaly_pvalues_on_aml_hi_small_multi_detector():
             assert math.isfinite(p)
             assert 0.0 <= p <= 1.0
 
-    # Discrimination check: at least 3 distinct HMP values across top-50.
-    # Pre-fix every entry collapsed to a single ``hmp = 0.0`` (3e-300 from
-    # delta_norm clamped at ``_P_FLOOR = 1e-300`` dominating the
-    # harmonic-mean denominator). The uniform ``_HMP_INPUT_P_FLOOR`` clip
-    # in ``combine_anomaly_pvalues`` plus the 15-decimal display precision
-    # restore cross-detector discrimination so saturated entities at
-    # different L (number of detectors firing) sit at different HMP
-    # values, and unsaturated entities sit on top.
-    # Saturation discrimination: saturated entities cluster by L (number of
-    # detectors firing). On AML HI-small ``account_pattern``, top-K typically
-    # sees L=2 (delta_norm + segment_shift) and L=3 (+ neighbor_contamination)
-    # at the saturation floor — that's two distinct HMP buckets at minimum.
-    # Random sampling occasionally surfaces a third bucket (single saturated
-    # detector) but it's not guaranteed at any given seed, so the regression
-    # threshold is "≥2 distinct HMP values" not "≥3" — that is sufficient to
-    # validate the saturation guard does its job (the pre-fix bug collapsed
-    # everything to a single HMP=0.0 value across all 50 entries).
+    # Discrimination check: a segment-level detector saturating for a whole
+    # hub segment must not tie the top-K. Every p is floored at the
+    # population's resolution 1/(N+1), so entity-level evidence (delta_norm,
+    # neighbour contamination) still separates members of one segment.
     distinct_hmps = {round(e["hmp"], 15) for e in result}
     assert len(distinct_hmps) >= 2, (
         f"expected ≥2 distinct HMP values across top-50 (saturation "

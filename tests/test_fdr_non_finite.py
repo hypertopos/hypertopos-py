@@ -25,9 +25,3 @@ def test_bh_rejections_survive_a_nan_p_value() -> None:
 def test_storey_q_values_ignore_a_nan_p_value() -> None:
     q = fdr.storey_q_values(np.array([0.001, 0.02, 0.5, math.nan] * 5))
     assert np.isfinite(q).all()
-
-
-def test_chi2_p_value_of_nan_delta_norm_is_one() -> None:
-    p = fdr.parametric_p_values_chi2(np.array([1.0, math.nan]), df=3)
-    assert np.isfinite(p).all()
-    assert p[1] == 1.0

@@ -326,6 +326,99 @@ class HyperSession:
             latest_versions=latest,
         )
 
+    def _refit_score_reference(
+        self,
+        pattern: Any,
+        geo_table: Any,
+        fit_mask: np.ndarray,
+    ) -> tuple[Any, Any]:
+        """Refit the calibrated evidence score of ``pattern`` on its current rows.
+
+        The score dimensions (point properties) are read from the entity
+        line's points in natural units. Events come from the edge table of the
+        event pattern that references the entity line, as at build time. Rows outside
+        ``fit_mask`` are scored against the refitted reference. Returns
+        ``(reference, scores)`` in the row order of ``geo_table``.
+        """
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        from hypertopos.engine.robust import EventArrays, fit_reference, score
+
+        sphere = self._reader.read_sphere()
+        line_id = pattern.entity_line_id
+        keys = pc.cast(geo_table.column("primary_key"), pa.string())
+        points = self._reader.read_points(
+            line_id,
+            self._manifest.line_versions[line_id],
+            columns=["primary_key", *pattern.score_dims],
+        )
+        rows = pc.index_in(keys, value_set=pc.cast(points["primary_key"], pa.string()))
+        x = np.column_stack(
+            [
+                pc.fill_null(pc.take(points[dim], rows), 0)
+                .to_numpy(zero_copy_only=False)
+                .astype(np.float64)
+                for dim in pattern.score_dims
+            ]
+        )
+
+        events = None
+        sources = [
+            pid
+            for pid, p in sphere.patterns.items()
+            if p.pattern_type == "event" and any(r.line_id == line_id for r in p.relations)
+        ]
+        if "current" in (pattern.score_axes or ()) and len(sources) == 1:
+            edges = self._reader.read_edges(
+                sources[0], columns=["from_key", "to_key", "timestamp", "amount"]
+            )
+            parts = []
+            for direction, col in ((0, "from_key"), (1, "to_key")):
+                code = pc.fill_null(pc.index_in(edges[col], value_set=keys), -1)
+                code_np = code.to_numpy(zero_copy_only=False).astype(np.int64)
+                keep = code_np >= 0
+                parts.append(
+                    (
+                        code_np[keep],
+                        np.full(int(keep.sum()), direction, dtype=np.int8),
+                        edges["timestamp"].to_numpy(zero_copy_only=False)[keep],
+                        edges["amount"].to_numpy(zero_copy_only=False)[keep],
+                    )
+                )
+            if edges.num_rows > 0:
+                events = EventArrays(*(np.concatenate(cols_) for cols_ in zip(*parts, strict=True)))
+
+        def _subset(ev: EventArrays | None, mask: np.ndarray) -> EventArrays | None:
+            if ev is None:
+                return None
+            new = np.cumsum(mask) - 1
+            keep = mask[ev.code]
+            return EventArrays(new[ev.code[keep]], ev.direction[keep], ev.ts[keep], ev.amount[keep])
+
+        axes = pattern.score_axes or ("mahal",)
+        if fit_mask.all():
+            return fit_reference(x, pattern.score_dims, axes=axes, events=events)
+        reference, fitted = fit_reference(
+            x[fit_mask], pattern.score_dims, axes=axes, events=_subset(events, fit_mask)
+        )
+        rest = score(reference, x[~fit_mask], _subset(events, ~fit_mask))
+        merged = {}
+        for name in (
+            "delta",
+            "delta_norm",
+            "axis_ranks",
+            "anomaly_score",
+            "conformal_p",
+            "score_rank_pct",
+        ):
+            a = getattr(fitted, name)
+            out = np.empty((len(x), *a.shape[1:]), dtype=a.dtype)
+            out[fit_mask] = a
+            out[~fit_mask] = getattr(rest, name)
+            merged[name] = out
+        return reference, dataclasses.replace(fitted, **merged, axis_values={}, sample_index=None)
+
     def recalibrate(
         self,
         pattern_id: str,
@@ -424,8 +517,8 @@ class HyperSession:
                     f"exclude_keys leaves no entity left to fit pattern '{pattern_id}'"
                 )
 
-        # 3. Recompute stats in the pattern's metric: a Mahalanobis pattern
-        # gets a fresh cholesky_inv; stored dimension_weights are kept as-is.
+        # 3. Recompute stats in the pattern's metric; stored dimension_weights
+        # are kept as-is.
         # The anomaly percentile is the one the pattern was built with
         # (spheres that predate the stored value use the 95.0 default).
         meta_root = self._reader.meta_root
@@ -435,10 +528,9 @@ class HyperSession:
                 "anomaly_percentile", 95.0
             )
         )
-        new_mu, new_sigma, _, _, _, new_cholesky_inv = compute_stats(
+        new_mu, new_sigma, _, _, _ = compute_stats(
             shape_vectors[fit_mask],
             anomaly_percentile=pct,
-            use_mahalanobis=pattern.cholesky_inv is not None,
         )
 
         # Apply higher sigma floor for prop_column dimensions (same slice as
@@ -457,7 +549,6 @@ class HyperSession:
             shape_vectors.astype(np.float32),
             mu=new_mu,
             sigma_diag=new_sigma,
-            cholesky_inv=new_cholesky_inv,
             dimension_weights=pattern.dimension_weights,
         ).astype(np.float32)
         new_delta_norms = np.sqrt(
@@ -476,10 +567,16 @@ class HyperSession:
         # Same per-dim rule as the build: P99 of |delta| over the fitted entities.
         n_anom_dims_thresholds = per_dim_anomaly_thresholds(new_deltas[fit_mask])
 
-        # 4. Compute delta_rank_pct
+        # 4. Score layer: patterns on the calibrated evidence score refit their
+        # reference (a new epoch, below); the others rank delta_norm.
         sorted_norms = np.sort(new_delta_norms)
         ranks = np.searchsorted(sorted_norms, new_delta_norms, side="left")
-        delta_rank_pct = (ranks / max(n, 1) * 100).astype(np.float32)
+        score_rank_pct = (ranks / max(n, 1) * 100).astype(np.float32)
+        refit = (
+            self._refit_score_reference(pattern, geo_table, fit_mask)
+            if pattern.score_dims
+            else None
+        )
 
         # 5. The calibration-dependent columns, built from numpy buffers in the
         # row order of step 1's read. Every other column is left as stored.
@@ -490,6 +587,15 @@ class HyperSession:
         # stored with the pattern) cannot be, so they become null and readers
         # fall back to delta_norm.
         conformal_p = ((n - ranks) / max(n, 1)).astype(np.float32)
+        anomaly_score = new_delta_norms.astype(np.float64)
+        if refit is not None:
+            from hypertopos.engine.robust import is_anomaly as _score_is_anomaly
+
+            _, scores = refit
+            conformal_p = scores.conformal_p.astype(np.float32)
+            score_rank_pct = scores.score_rank_pct.astype(np.float32)
+            anomaly_score = scores.anomaly_score
+            is_anomaly = _score_is_anomaly(scores.conformal_p, pct)
         dim_kinds = getattr(pattern, "dimension_kinds", None)
         if dim_kinds is not None:
             from hypertopos.builder._bregman import bregman_norms
@@ -509,8 +615,9 @@ class HyperSession:
             ),
             "delta_norm": pa.array(new_delta_norms.astype(np.float32)),
             "is_anomaly": pa.array(is_anomaly.astype(np.bool_)),
-            "delta_rank_pct": pa.array(delta_rank_pct.astype(np.float32)),
+            "score_rank_pct": pa.array(score_rank_pct),
             "conformal_p": pa.array(conformal_p),
+            "anomaly_score": pa.array(anomaly_score, type=pa.float64()),
             "bregman_divergence": pa.array(bregman),
             "n_anomalous_dims": pa.array(
                 compute_per_dim_anomaly_count(new_deltas, thresholds=n_anom_dims_thresholds)
@@ -518,6 +625,13 @@ class HyperSession:
             "anomaly_confidence": pa.nulls(n, type=pa.float32()),
             "delta_norm_signed": pa.nulls(n, type=pa.float32()),
         }
+        if refit is not None:
+            _, scores = refit
+            for name, matrix in (("axis_ranks", scores.axis_ranks), ("score_delta", scores.delta)):
+                rows = np.ascontiguousarray(matrix, dtype=np.float32)
+                values[name] = pa.FixedSizeListArray.from_arrays(
+                    pa.array(rows.ravel(), type=pa.float32()), rows.shape[1]
+                )
         for col_name in geo_columns:
             if col_name.startswith("delta_dim_") and int(col_name.split("_")[-1]) < d:
                 values[col_name] = pa.array(
@@ -574,13 +688,17 @@ class HyperSession:
         pat_dict["sigma_diag"] = new_sigma.tolist()
         pat_dict["theta"] = new_theta.tolist()
         pat_dict["n_anomalous_dims_thresholds"] = n_anom_dims_thresholds.tolist()
-        if new_cholesky_inv is not None:
-            pat_dict["cholesky_inv"] = new_cholesky_inv.tolist()
-        else:
-            pat_dict.pop("cholesky_inv", None)
         pat_dict["last_calibrated_at"] = now.isoformat()
         pat_dict["population_size"] = n
         pat_dict["calibration_epoch"] = new_epoch
+        if refit is not None:
+            from hypertopos.engine.robust import reference_to_arrays
+
+            reference, _ = refit
+            meta_writer.write_reference(pattern_id, new_epoch, reference_to_arrays(reference))
+            pat_dict["reference_epoch"] = new_epoch
+            pat_dict["score_axes"] = list(reference.axes)
+            pat_dict["score_dims"] = list(reference.dims)
         write_sphere_json(sphere_path.parent, sphere_data)
 
         # 8. Update geometry_stats cache
@@ -589,6 +707,7 @@ class HyperSession:
             version,
             new_delta_norms,
             new_theta_norm,
+            is_anomaly_arr=is_anomaly,
         )
 
         # 9. Invalidate temporal centroid cache (stale after recalibration)

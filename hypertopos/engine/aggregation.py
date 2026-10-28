@@ -630,16 +630,16 @@ def aggregate(
                     if "is_anomaly" in geometry_filters:
                         val = "true" if bool(geometry_filters["is_anomaly"]) else "false"
                         parts.append(f"is_anomaly = {val}")
-                    if "delta_rank_pct" in geometry_filters:
-                        spec = geometry_filters["delta_rank_pct"]
+                    if "score_rank_pct" in geometry_filters:
+                        spec = geometry_filters["score_rank_pct"]
                         if isinstance(spec, dict):
                             for op_name, value in spec.items():
                                 if op_name in _SQL_OPS:
                                     parts.append(
-                                        f"delta_rank_pct {_SQL_OPS[op_name]} {float(value)}"
+                                        f"score_rank_pct {_SQL_OPS[op_name]} {float(value)}"
                                     )
                         else:
-                            parts.append(f"delta_rank_pct = {float(spec)}")
+                            parts.append(f"score_rank_pct = {float(spec)}")
                     if "delta_dim" in geometry_filters:
                         for dim_name, predicates in geometry_filters["delta_dim"].items():
                             idx = dims_pattern.dim_index(dim_name)
@@ -692,16 +692,16 @@ def aggregate(
                     if "is_anomaly" in geometry_filters:
                         _d_val = "true" if bool(geometry_filters["is_anomaly"]) else "false"
                         _d_gf_parts.append(f"is_anomaly = {_d_val}")
-                    if "delta_rank_pct" in geometry_filters:
-                        _d_spec = geometry_filters["delta_rank_pct"]
+                    if "score_rank_pct" in geometry_filters:
+                        _d_spec = geometry_filters["score_rank_pct"]
                         if isinstance(_d_spec, dict):
                             for _d_op, _d_v in _d_spec.items():
                                 if _d_op in _SQL_OPS:
                                     _d_gf_parts.append(
-                                        f"delta_rank_pct {_SQL_OPS[_d_op]} {float(_d_v)}"
+                                        f"score_rank_pct {_SQL_OPS[_d_op]} {float(_d_v)}"
                                     )
                         else:
-                            _d_gf_parts.append(f"delta_rank_pct = {float(_d_spec)}")
+                            _d_gf_parts.append(f"score_rank_pct = {float(_d_spec)}")
                     if "delta_dim" in geometry_filters:
                         for _d_dim, _d_preds in geometry_filters["delta_dim"].items():
                             _d_idx = dims_pattern.dim_index(_d_dim)
@@ -766,12 +766,12 @@ def aggregate(
     if geometry_filters:
         if "is_anomaly" in geometry_filters:
             columns.append("is_anomaly")
-        if "delta_rank_pct" in geometry_filters:
-            columns.append("delta_rank_pct")
+        if "score_rank_pct" in geometry_filters:
+            columns.append("score_rank_pct")
         if "alias_inside" in geometry_filters:
             columns.append("delta")
 
-    # --- B2: Lance scalar-index prefilter for is_anomaly / delta_rank_pct / delta_dim ---
+    # --- B2: Lance scalar-index prefilter for is_anomaly / score_rank_pct / delta_dim ---
     # Pushes predicates into Lance before materialising rows — uses scalar indices
     # built by GDSWriter. alias_inside requires full-vector ops and is handled
     # in Python after the read (see geometry pre-filter below).
@@ -782,14 +782,14 @@ def aggregate(
         if "is_anomaly" in geometry_filters:
             val = "true" if bool(geometry_filters["is_anomaly"]) else "false"
             _lance_parts.append(f"is_anomaly = {val}")
-        if "delta_rank_pct" in geometry_filters:
-            spec = geometry_filters["delta_rank_pct"]
+        if "score_rank_pct" in geometry_filters:
+            spec = geometry_filters["score_rank_pct"]
             if isinstance(spec, dict):
                 for op_name, value in spec.items():
                     if op_name in _SQL_OPS:
-                        _lance_parts.append(f"delta_rank_pct {_SQL_OPS[op_name]} {float(value)}")
+                        _lance_parts.append(f"score_rank_pct {_SQL_OPS[op_name]} {float(value)}")
             else:
-                _lance_parts.append(f"delta_rank_pct = {float(spec)}")
+                _lance_parts.append(f"score_rank_pct = {float(spec)}")
         if "delta_dim" in geometry_filters:
             for dim_name, predicates in geometry_filters["delta_dim"].items():
                 idx = dims_pattern.dim_index(dim_name)
@@ -813,8 +813,8 @@ def aggregate(
         if geometry_filters:
             if "is_anomaly" in geometry_filters:
                 fallback_cols.append("is_anomaly")
-            if "delta_rank_pct" in geometry_filters:
-                fallback_cols.append("delta_rank_pct")
+            if "score_rank_pct" in geometry_filters:
+                fallback_cols.append("score_rank_pct")
             if "alias_inside" in geometry_filters:
                 fallback_cols.append("delta")
         geo = reader.read_geometry(
@@ -832,18 +832,18 @@ def aggregate(
     if geometry_filters:
         import pyarrow.compute as pc
 
-        supported = {"is_anomaly", "delta_rank_pct", "delta_dim", "alias_inside"}
+        supported = {"is_anomaly", "score_rank_pct", "delta_dim", "alias_inside"}
         unknown = set(geometry_filters) - supported
         if unknown:
             raise RuntimeError(f"Unknown geometry_filters keys: {unknown}")
         if "is_anomaly" in geometry_filters:
             geo = geo.filter(pc.equal(geo["is_anomaly"], bool(geometry_filters["is_anomaly"])))
-        if "delta_rank_pct" in geometry_filters:
-            spec = geometry_filters["delta_rank_pct"]
+        if "score_rank_pct" in geometry_filters:
+            spec = geometry_filters["score_rank_pct"]
             if isinstance(spec, dict):
-                geo = _apply_comparison_filter(geo, "delta_rank_pct", spec)
+                geo = _apply_comparison_filter(geo, "score_rank_pct", spec)
             else:
-                geo = geo.filter(pc.equal(geo["delta_rank_pct"], float(spec)))
+                geo = geo.filter(pc.equal(geo["score_rank_pct"], float(spec)))
         # delta_dim: Lance pushdown applied above; Arrow post-filter ensures
         # correctness when reader doesn't execute Lance predicates (e.g. mocked storage).
         if "delta_dim" in geometry_filters:
@@ -2286,9 +2286,9 @@ def aggregate(
     if _gbl_edge_warning_final:
         result["warning"] = _gbl_edge_warning_final
     elif result.get("total_groups") == 0 and geometry_filters:
-        if "delta_rank_pct" in geometry_filters:
+        if "score_rank_pct" in geometry_filters:
             result["warning"] = (
-                "delta_rank_pct filter matched 0 polygons. "
+                "score_rank_pct filter matched 0 polygons. "
                 "In binary-mode or discretized patterns, percentile values cluster "
                 "at a few levels — many entities share identical delta vectors. "
                 "Use anomaly_summary to inspect the actual percentile distribution. "

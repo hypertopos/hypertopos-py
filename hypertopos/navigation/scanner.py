@@ -7,10 +7,14 @@
 from __future__ import annotations
 
 import logging
+import math
+import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, cast
+
+import numpy as np
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -174,7 +178,7 @@ class PassiveScanner:
                 pattern_id=pattern_id,
                 key_type="borderline",
                 weight=weight,
-                filter_expr=f"delta_rank_pct >= {rank_threshold} AND is_anomaly = false",
+                filter_expr=f"score_rank_pct >= {rank_threshold} AND is_anomaly = false",
                 rank_threshold=rank_threshold,
             )
         )
@@ -428,24 +432,48 @@ class PassiveScanner:
         source: ScanSource,
         version: int,
     ) -> dict[str, ScanSourceHit]:
-        """Scan direct pattern — entity keys = geometry primary_keys."""
+        """Scan direct pattern — entity keys = geometry primary_keys.
+
+        ``anomaly_intensity`` is 1 at the anomaly boundary: ``delta_norm / θ``,
+        or ``log(conformal_p) / log(alpha)`` on a calibrated pattern, where θ is
+        not the boundary and ``alpha = 1 - anomaly_percentile / 100`` is the
+        alarm budget.
+        """
         filt = source.filter_expr or "is_anomaly = true"
+        pattern = self._sphere.patterns[source.pattern_id]
+        calibrated = bool(pattern.score_dims)
         geo = self._reader.read_geometry(
             source.pattern_id,
             version,
-            columns=["primary_key", "delta_norm"],
+            columns=["primary_key", "delta_norm", "conformal_p"]
+            if calibrated
+            else ["primary_key", "delta_norm"],
             filter=filt,
         )
-        pattern = self._sphere.patterns[source.pattern_id]
         theta_norm = pattern.theta_norm
+        alpha = 1.0 - pattern.anomaly_percentile / 100.0
+        # conformal_p is stored as float32 while is_anomaly is decided in float64;
+        # rounding alpha the same way keeps a p flagged at the budget at >= 1.
+        log_alpha = math.log(float(np.float32(alpha))) if 0.0 < alpha < 1.0 else 0.0
+        p_values = geo["conformal_p"].to_pylist() if calibrated else [None] * geo.num_rows
         result: dict[str, ScanSourceHit] = {}
-        for pk, norm in zip(
+        for pk, norm, p in zip(
             geo["primary_key"].to_pylist(),
             geo["delta_norm"].to_pylist(),
+            p_values,
             strict=False,
         ):
             dn = float(norm) if norm is not None else 0.0
-            intensity = dn / theta_norm if theta_norm > 0 else 1.0
+            if not calibrated:
+                intensity = dn / theta_norm if theta_norm > 0 else 1.0
+            elif log_alpha == 0.0:
+                intensity = 1.0
+            elif p is None:
+                intensity = 0.0
+            else:
+                # A p-value of 0 would give an infinite intensity; floor it.
+                p_clipped = min(max(float(p), sys.float_info.min), 1.0)
+                intensity = math.log(p_clipped) / log_alpha
             result[pk] = ScanSourceHit(
                 anomalous_count=1,
                 related_count=1,

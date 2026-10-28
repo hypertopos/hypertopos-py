@@ -55,9 +55,17 @@ class Polygon:
     alias_ver: int | None = None
     delta_alias: np.ndarray | None = None
     is_anomaly_alias: bool | None = None
-    delta_rank_pct: float | None = None
+    # Calibrated evidence score layer: rank of anomaly_score in the population
+    # (0-100), the fused score, its conformal p-value and the rank-Gaussian
+    # coordinates of the score dimensions (``Pattern.score_dims``). Patterns
+    # scored by ``delta_norm`` carry ``anomaly_score == delta_norm`` and no
+    # ``score_delta``.
+    score_rank_pct: float | None = None
     bregman_divergence: float | None = None
     anomaly_confidence: float | None = None
+    anomaly_score: float | None = None
+    conformal_p: float | None = None
+    score_delta: np.ndarray | None = None
 
     def is_event(self) -> bool:
         return self.pattern_type == "event"

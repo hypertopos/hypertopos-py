@@ -33,7 +33,6 @@ BASELINE = {
     "builder/dim_blocks.py": 2,
     "engine/counterfactual.py": 5,
     "engine/dim_audit.py": 1,
-    "engine/fdr.py": 1,
     "model/sphere.py": 1,
     "navigation/navigator.py": 5,
 }

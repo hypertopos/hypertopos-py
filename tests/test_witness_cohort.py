@@ -31,7 +31,7 @@ class TestCohortMemberDataclass:
             witness_overlap=0.67,
             trajectory_alignment=0.71,
             is_anomaly=True,
-            delta_rank_pct=97.2,
+            score_rank_pct=97.2,
             explanation="Similar profile, shared witness {a, b}, converging.",
             component_scores={
                 "delta": 0.368,
@@ -53,7 +53,7 @@ class TestCohortMemberDataclass:
             witness_overlap=0.5,
             trajectory_alignment=None,
             is_anomaly=False,
-            delta_rank_pct=50.0,
+            score_rank_pct=50.0,
             explanation="",
             component_scores={},
         )
@@ -68,7 +68,7 @@ class TestCohortMemberDataclass:
             witness_overlap=0.5,
             trajectory_alignment=None,
             is_anomaly=False,
-            delta_rank_pct=50.0,
+            score_rank_pct=50.0,
             explanation="",
             component_scores={"delta": 0.5},
         )

@@ -12,7 +12,7 @@ re-declaring kind or splitting the dim is recommended.
 
 Suppressed by index when ``negative_space`` already fires on the same
 dim — the negative_space remediation supersedes the kind_mismatch
-complaint (same pattern as ``non_normal_dim``).
+complaint.
 """
 
 from __future__ import annotations

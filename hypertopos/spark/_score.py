@@ -30,9 +30,10 @@ def score(df: DataFrame, like: DataFrame | Sphere) -> DataFrame:
     Returns:
         The ``find_anomalies`` columns for the entities in ``df``, measured
         against the frozen population: no recalibration, so ``p_value`` and
-        ``rank_pct`` place each entity within the original population. The
-        aggregation and the scoring both run on the executors; only the
-        calibration (a few arrays) travels with the tasks. ``sphere_of`` on the
+        ``score_rank_pct`` place each entity within the original population. The
+        aggregation and the scoring both run on the executors; the calibration
+        travels with the tasks, and its sorted reference scores grow with the
+        fitted population. ``sphere_of`` on the
         result gives the calibration; ``explain(result, events=df)`` explains its
         entities from the events they were scored on.
     """
@@ -66,10 +67,11 @@ def _scorer(
 def _result_schema(calibration: FrozenCalibration) -> str:
     fields = [
         f"{KEY} string",
-        "delta_norm double",
+        "anomaly_score double",
         "is_anomaly boolean",
         "p_value double",
-        "rank_pct double",
+        "score_rank_pct double",
+        "delta_norm double",
     ]
     for i in range(1, min(TOP_REASONS, len(calibration.dims)) + 1):
         fields += [f"reason_{i}_dim string", f"reason_{i}_delta double", f"reason_{i}_pct double"]

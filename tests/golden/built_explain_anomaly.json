@@ -1,71 +1,42 @@
 {
-  "conformal_p": 0.025,
-  "delta_norm": 5.9249,
+  "anomaly_score": 0.9875,
+  "axes": {
+    "mahal": {
+      "bits": 4.3576,
+      "rank": 0.9875
+    }
+  },
+  "bits": 4.3576,
+  "conformal_p": 0.04878,
+  "delta_norm": 0.8962,
   "pattern_id": "account_pattern",
-  "primary_key": "A029",
-  "ratio": 1.5,
-  "reliability_flags": {
-    "confidence": null,
-    "dominant_dim": "_d_amount_sum",
-    "dominant_dim_share": 0.5007,
-    "flags": [],
-    "low_confidence_bucket": false,
-    "single_dim_driven": false
-  },
-  "repair": {
-    "repair_dims": [
-      {
-        "delta_value": 4.1926,
-        "dim": 1,
-        "label": "_d_amount_sum"
-      },
-      {
-        "delta_value": 3.9337,
-        "dim": 3,
-        "label": "_d_burst_7d"
-      }
-    ],
-    "repair_size": 2,
-    "residual_norm": 1.4327
-  },
-  "severity": "high",
+  "primary_key": "A032",
+  "severity": "low",
   "temporal_slices": 7,
-  "theta_norm": 3.9372,
   "top_dimensions": [
     {
-      "delta": 4.1926,
-      "dim": "_d_amount_sum",
-      "kind": "gaussian",
-      "pct_of_total": 0.5007
+      "bits": 3.4498,
+      "dim": "amount_sum",
+      "pct_of_total": 0.7917,
+      "z": -3.6684
     },
     {
-      "delta": 3.9337,
-      "dim": "_d_burst_7d",
-      "kind": "poisson",
-      "pct_of_total": 0.4408
+      "bits": 0.6211,
+      "dim": "burst_7d",
+      "pct_of_total": 0.1425,
+      "z": 0.5441
     },
     {
-      "delta": 1.1307,
-      "dim": "_d_n_cpty",
-      "kind": "poisson",
-      "pct_of_total": 0.0364
+      "bits": 0.205,
+      "dim": "n_cpty",
+      "pct_of_total": 0.0471,
+      "z": 0.6847
     },
     {
-      "delta": 0.88,
-      "dim": "_d_tx_count",
-      "kind": "poisson",
-      "pct_of_total": 0.0221
+      "bits": 0.0816,
+      "dim": "tx_count",
+      "pct_of_total": 0.0187,
+      "z": -0.1286
     }
-  ],
-  "witness": {
-    "delta_norm": 5.9249,
-    "witness_dims": [
-      {
-        "delta_value": 4.1926,
-        "dim": 1,
-        "label": "_d_amount_sum"
-      }
-    ],
-    "witness_size": 1
-  }
+  ]
 }

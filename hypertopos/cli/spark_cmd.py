@@ -133,7 +133,7 @@ def run(args: argparse.Namespace, spark_p: argparse.ArgumentParser) -> None:
 
 def _write(result: Any, args: argparse.Namespace, mode: str) -> None:
     if args.show is not None:
-        result.orderBy("delta_norm", ascending=False).show(args.show, truncate=False)
+        result.orderBy("anomaly_score", ascending=False).show(args.show, truncate=False)
     elif args.output_table:
         result.write.mode(mode).saveAsTable(args.output_table)
     else:

@@ -140,7 +140,7 @@ reconstruct from (relations, event dimensions, edge-dim aggregations, or
 property columns). `--pattern` is optional when the sphere has a single
 pattern and required otherwise. `--reindex` forces an ANN index rebuild so the
 appended rows are immediately searchable; `--finalize` recomputes the global
-`delta_rank_pct` and rebuilds the ANN index once at the end of a batched
+`score_rank_pct` and rebuilds the ANN index once at the end of a batched
 ingest session. JSON payload: `{pattern_id, added, modified, deleted,
 population_size, drift_pct, geometry_version_before, geometry_version_after,
 reindexed, finalized}`. Patterns carrying generalized dimension blocks (geo /
@@ -451,20 +451,21 @@ patterns:
 | `relations` | list or `"auto"` | `null` | Explicit relation list, or `"auto"` for derived-dim patterns. |
 | `event_dimensions` | list | `null` | Numeric columns for continuous event geometry (event patterns only). |
 | `derived_dimensions` | list | `null` | Aggregated features from event data (anchor patterns only). |
-| `anomaly_percentile` | float | `95.0` | Theta threshold: entities above this percentile are anomalous. |
+| `anomaly_percentile` | float | `95.0` | Sets the alarm budget `1 − anomaly_percentile/100`. On a pattern with the calibrated score an entity is anomalous when its `conformal_p` is at most the budget; on other patterns, when `delta_norm` is above theta at this percentile. |
+| `score_axes` | list | `[mahal, current]` | Axes of the calibrated evidence score for continuous anchor patterns whose dimensions are point properties. A subset of `mahal` (shrunk-covariance Mahalanobis on rank-Gaussian coordinates), `current` (motion against the population's velocity field, from the pattern's event line) and `knn` (distance to nearest peers; opt-in, adds a nearest-neighbour pass to the build). Must contain `mahal`. `current` is fitted when exactly one event pattern references the pattern's entity line and carries an edge table (from / to keys, timestamp, amount) whose events span more than one moment; otherwise the pattern scores without it. The fitted axes are listed in `score_axes` in sphere.json. |
 | `dimension_weights` | string or list | `null` | `"kurtosis"` (recommended), `"auto"`, or explicit weight list. |
 | `gmm_n_components` | int | `null` | Gaussian mixture components for multi-modal calibration. |
 | `group_by_property` | string | `null` | Column for per-group calibration (e.g. per-country theta). |
 | `tracked_properties` | list | `null` | Entity properties tracked as fill/no-fill dimensions. |
-| `use_mahalanobis` | bool | `false` | Use Mahalanobis distance for anomaly detection (accounts for correlations). Cannot be combined with `group_by_property` (grouped calibration is per-dimension); the config is rejected if both are set. An explicit `dimension_weights` list used with it must be all > 0 (a zero weight would erase information the whitened coordinates depend on). |
+| `use_mahalanobis` | — | — | Removed: the key is rejected at config load. The calibrated score already accounts for correlated dimensions (`mahal` axis), and the stored `delta` stays a per-dimension z-score. |
 | `precomputed_dimensions` | list | `null` | Columns already on entity table to use as geometry dimensions. |
 | `graph_features` | dict | `null` | Auto-compute graph structural features from event from/to columns. |
 | `description` | string | `null` | Human-readable description. Stored in sphere.json — visible to agents via `get_sphere_info`. |
 | `edge_table` | dict | `null` | Explicit edge table config (see below). Auto-emitted for event patterns with 2+ FK relations to same anchor line. |
-| `edge_dimensions` | list | `null` | Build-time per-edge dims for event patterns. Each item is either a bare dim name or a single-key dict with overrides. Five dims available: `pair_edge_count`, `position_in_chain` (`min_position` ≥ 3, default 5), `time_since_pair_last_edge`, `pair_amount_zscore` (LOW_VAR pairs only), `find_motif_structuring`. |
+| `edge_dimensions` | list | `null` | Build-time per-edge dims for event patterns. Each item is either a bare dim name or a single-key dict with overrides. Six dims available: `pair_edge_count`, `position_in_chain` (`min_position` ≥ 3, default 5), `time_since_pair_last_edge`, `pair_amount_zscore` (LOW_VAR pairs only), `find_motif_structuring`, `edge_curvature_frc` (Forman-Ricci curvature; no params). |
 | `edge_dim_aggregations` | dict | `null` | **Anchor patterns only.** Aggregate per-edge sidecar dims of an event pattern up to per-anchor `_mean` / `_max` columns baked into the anchor polygon. `from: <event_pid>` is required and must reference an event pattern that declares `edge_dimensions:`. `dims: [...]` is required — must be a non-empty list of source dim names from the referenced sidecar (the previous "omit `dims` to aggregate everything" shorthand was removed; explicit declaration prevents build-vs-runtime label drift). Anchor regimes: `single` (account-style, anchor PK matches edge `from_key` OR `to_key`) and `pair` (composite-key, anchor PK = `<from>__<to>`); `chain` raises `NotImplementedError`. Builder switches to a two-phase build (events first, anchors second) when this block is present. |
 | `conformance_rules` | list | `null` | Declarative compliance predicates evaluated at build time against the entity-line points table. Each entry has shape `{rule_id?, severity, description?, violates_when}` where `severity` is one of `low` / `medium` / `high` / `critical` and `violates_when` is a predicate AST. `rule_id` is auto-assigned as `r0`, `r1`, ... when omitted; duplicate `rule_id`s are rejected. Predicate ops: `and`, `or`, `not` (logical compounds carry `terms`), `==`, `!=`, `<`, `<=`, `>`, `>=` (carry `prop` + scalar `value`), and `in` (carries `prop` + list `value`). The `prop` field references a raw column on the entity-line points table — unknown columns fail the build immediately. Violators land in a sidecar Lance dataset read by `find_conformance_violations`. |
-| `bootstrap_iterations` | int | `200` | Number of bootstrap resamples used to compute `anomaly_confidence` per entity. Skipped automatically for N > 50K, `group_by_property`, or `use_mahalanobis`. |
+| `bootstrap_iterations` | int | `200` | Number of bootstrap resamples used to compute `anomaly_confidence` per entity. Skipped automatically for N > 50K, `group_by_property`, and on patterns with the calibrated score. |
 
 ### Edge Table
 
@@ -1189,21 +1190,13 @@ hypertopos build --config sphere.yaml --force --verbose --no-chains
 hypertopos build --config sphere.yaml --force --verbose
 ```
 
-### Reference benchmarks
+### Example sphere configurations
 
-| Sphere | First run | Cached run |
-|--------|-----------|-----------|
-| Berka (4.5K accounts, 1M tx) | ~35s | ~25s |
-| NYC Taxi (265 zones, 7.5M trips) | ~3.2 min | ~2.8 min |
-| AML HI-Small (515K accts, 5M tx, 300K chains) | ~5.3 min | ~6.7 min |
-
-### Benchmark sphere configurations
-
-| Sphere | Edge table | Chains | Temporal | Composites | Key features |
-|--------|-----------|--------|----------|------------|--------------|
-| Berka | none | none | 3 patterns (90d) | account×bank pairs | NB-Split (accounts + accounts_stress + loan_accounts), precomputed dims, group_by_property |
-| NYC Taxi | auto-detected (trip_pattern: pu_zone → do_zone) | none | 2 patterns (7d) | none | NB-Split (zones_pickup + zones_dropoff), 6 event dims, 2 anchor patterns |
-| AML HI-Small | explicit (tx_pattern: from_account → to_account, timestamp, amount) | 300K (seeded BFS) | 3 patterns (2d) | account pairs | graph_features, precomputed ratios, IET metrics, Mahalanobis |
+| Scale | Edge table | Chains | Temporal | Composites | Key features |
+|-------|-----------|--------|----------|------------|--------------|
+| Small (~thousands of entities) | none | none | 3 patterns (90d) | entity×group pairs | NB-Split (multiple isolated entity lines), precomputed dims, group_by_property |
+| Medium (~hundreds of zones, millions of events) | auto-detected | none | 2 patterns (7d) | none | NB-Split (origin + destination lines), 6 event dims, 2 anchor patterns |
+| Large (~hundreds of thousands of entities, millions of events) | explicit (from_account → to_account, timestamp, amount) | yes (seeded BFS) | 3 patterns (2d) | entity pairs | graph_features, precomputed ratios, IET metrics |
 
 ### Chain extraction
 

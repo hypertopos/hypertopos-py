@@ -479,7 +479,6 @@ def test_validation_consistent_with_share(theta):
     delta_norm²`` — so ``neutralizes_anomaly`` follows from the share.
     Runs the real ``simulate_dimension_change`` (no mock)."""
     pattern = _poisson_pattern(theta)
-    assert pattern.cholesky_inv is None
     assert pattern.dimension_weights is None
     nav = _make_nav(pattern, delta=_POISSON_DELTA)
 

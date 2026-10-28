@@ -11,7 +11,7 @@ import pyarrow as pa
 import pytest
 
 from hypertopos.engine.p_value_calibration import (
-    detector_p_value_delta_norm,
+    detector_p_value_anomaly,
     detector_p_value_density_gap,
     detector_p_value_neighbor_contamination,
     detector_p_value_segment_shift,
@@ -19,104 +19,45 @@ from hypertopos.engine.p_value_calibration import (
 )
 
 
-class TestDeltaNormAdapter:
-    def test_uses_anomaly_confidence_when_present(self):
-        # primary path: p = 1 - anomaly_confidence
+class TestAnomalyAdapter:
+    def test_uses_stored_conformal_p(self):
         tbl = pa.table(
             {
                 "primary_key": ["A", "B", "C"],
-                "delta_norm": [1.0, 2.0, 3.0],
-                "anomaly_confidence": [0.1, 0.5, 0.99],
+                "conformal_p": [0.9, 0.5, 0.01],
+                "anomaly_confidence": [0.1, 0.1, 0.1],  # stability, never read as a p-value
             }
         )
-        result = detector_p_value_delta_norm(tbl, ["A", "B", "C"])
-        assert set(result.keys()) == {"A", "B", "C"}
-        assert abs(result["A"] - 0.9) < 1e-6
-        assert abs(result["B"] - 0.5) < 1e-6
-        assert abs(result["C"] - 0.01) < 1e-6
-        # All in (0, 1]
-        for p in result.values():
-            assert 0.0 < p <= 1.0
+        result = detector_p_value_anomaly(tbl, ["A", "B", "C"])
+        assert result == pytest.approx({"A": 0.9, "B": 0.5, "C": 0.01})
 
-    def test_falls_back_to_chi2_when_no_anomaly_confidence(self):
-        # fallback: 1 - chi2.cdf(delta_norm**2, df=D)
+    def test_null_or_missing_conformal_p_carries_no_evidence(self):
         tbl = pa.table(
             {
                 "primary_key": ["A", "B"],
-                "delta_norm": [0.5, 5.0],
+                "conformal_p": pa.array([None, 0.02], type=pa.float32()),
             }
         )
-        result = detector_p_value_delta_norm(tbl, ["A", "B"], df=4)
-        assert "A" in result and "B" in result
-        # high delta_norm => low p-value
-        assert result["A"] > result["B"]
-        # All in (0, 1]
-        for p in result.values():
-            assert 0.0 < p <= 1.0
-
-    def test_handles_null_anomaly_confidence_with_chi2_fallback(self):
-        tbl = pa.table(
-            {
-                "primary_key": ["A", "B"],
-                "delta_norm": pa.array([1.0, 4.0], type=pa.float64()),
-                "anomaly_confidence": pa.array([None, 0.99], type=pa.float32()),
-            }
-        )
-        result = detector_p_value_delta_norm(tbl, ["A", "B"], df=3)
-        # B uses 1 - 0.99 = 0.01
-        assert abs(result["B"] - 0.01) < 1e-3
-        # A falls back to chi2 path
-        assert 0.0 < result["A"] <= 1.0
-
-    def test_disable_anomaly_confidence_path(self):
-        tbl = pa.table(
-            {
-                "primary_key": ["A"],
-                "delta_norm": [2.0],
-                "anomaly_confidence": [0.99],
-            }
-        )
-        result = detector_p_value_delta_norm(
-            tbl,
-            ["A"],
-            use_anomaly_confidence=False,
-            df=2,
-        )
-        # Should not be 0.01; should follow chi2 path with df=2
-        assert result["A"] != pytest.approx(0.01)
-        assert 0.0 < result["A"] <= 1.0
+        assert detector_p_value_anomaly(tbl, ["A", "B"]) == pytest.approx({"A": 1.0, "B": 0.02})
+        no_column = pa.table({"primary_key": ["A"], "delta_norm": [9.0]})
+        assert detector_p_value_anomaly(no_column, ["A"]) == {"A": 1.0}
 
     def test_empty_input(self):
         tbl = pa.table(
             {
                 "primary_key": pa.array([], type=pa.string()),
-                "delta_norm": pa.array([], type=pa.float64()),
+                "conformal_p": pa.array([], type=pa.float64()),
             }
         )
-        result = detector_p_value_delta_norm(tbl, [])
-        assert result == {}
+        assert detector_p_value_anomaly(tbl, []) == {}
 
     def test_filters_to_primary_keys(self):
-        tbl = pa.table(
-            {
-                "primary_key": ["A", "B", "C"],
-                "delta_norm": [1.0, 2.0, 3.0],
-                "anomaly_confidence": [0.5, 0.5, 0.5],
-            }
-        )
-        result = detector_p_value_delta_norm(tbl, ["A", "C"])
-        assert set(result.keys()) == {"A", "C"}
+        tbl = pa.table({"primary_key": ["A", "B", "C"], "conformal_p": [0.5, 0.5, 0.5]})
+        assert set(detector_p_value_anomaly(tbl, ["A", "C"])) == {"A", "C"}
 
     def test_no_nan_or_inf(self):
-        tbl = pa.table(
-            {
-                "primary_key": ["A", "B"],
-                "delta_norm": [0.0, 100.0],
-                "anomaly_confidence": [0.0, 1.0],
-            }
-        )
-        result = detector_p_value_delta_norm(tbl, ["A", "B"])
-        for p in result.values():
+        tbl = pa.table({"primary_key": ["A", "B"], "conformal_p": [0.0, float("nan")]})
+        for p in detector_p_value_anomaly(tbl, ["A", "B"]).values():
             assert np.isfinite(p)
             assert 0.0 < p <= 1.0
 

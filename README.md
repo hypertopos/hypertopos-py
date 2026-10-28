@@ -14,7 +14,7 @@
 Describe your tables in a YAML file, run `hypertopos build`, and every entity gets a position relative to its own population — so "out of place", "similar", "drifting" and "different between groups" become distances you read instead of queries you write.
 
 - **No model, no labels.** Every entity's anomaly score is calibrated against the population itself, with an exact alarm budget — at the 95th percentile 5 % is flagged, and 5 % of a population like it would be; nothing is trained and nothing has to be annotated.
-- **Explanations in the data's own columns.** `explain_anomaly` splits an anomaly into each dimension's share of the distance; the shares sum to 100%.
+- **Explanations in the data's own columns.** `explain_anomaly` turns an anomaly's p-value into bits of evidence and splits them over the dimensions that carry it, so the parts add up to the whole.
 - **One snapshot per reader, what-if on a branch.** A session keeps its answers while data keeps arriving; a recalibration or trial ingest runs on a copy-free branch, gets compared with main, then is promoted or deleted.
 
 <p align="center">
@@ -321,15 +321,15 @@ Every capability below comes from one decision: an entity is a point in a space 
 | Population-relative coordinates | `delta = (shape − μ) / σ` per dimension; one vector serves anomaly, clustering, drift and comparison | Learned embeddings with latent dimensions that need retraining when the data shifts |
 | Calibrated anomaly score | Continuous anchor patterns score each entity on rank-Gaussian, shrunk-covariance Mahalanobis distance plus, when an event line with an edge table exists, its motion against the population's velocity field (`score_axes`, nearest-peer distance opt-in); a split-conformal p-value against a stored reference makes `is_anomaly` an exact alarm budget | Choosing a contamination rate or a hand-tuned cut-off, or trusting a p-value from a Gaussian null the data does not follow |
 | Self-calibrating threshold | θ is a percentile of the population's own `delta_norm` — per group when a pattern declares `group_by_property` — for event, mixture and discrete patterns | Choosing a contamination rate or a hand-tuned cut-off |
-| Distribution-aware dimensions | Each dimension declares a kind (gaussian, poisson, bernoulli), detected or set with `kind:` on precomputed dimensions; `sphere_overview` flags dead, sparse, non-normal and dominant dimensions with concrete advice | One metric for every feature, and silent garbage when a feature breaks its assumption |
-| Calibration epochs | Every build and `recalibrate` records an epoch; `compare_calibrations` shows per-dimension μ / σ / θ drift, `theta_sensitivity` shows whether θ sits near a cliff | No record of how the coordinate system itself moved |
-| Hidden influencers | `find_calibration_influencers` measures each entity's leave-one-out impact on the calibration and names the ones that distort it | Explaining predictions while the baseline itself is contaminated |
+| Distribution-aware dimensions | Each dimension declares a kind (gaussian, poisson, bernoulli), detected or set with `kind:` on precomputed dimensions; `sphere_overview` flags dead, sparse and dominant dimensions with concrete advice | One metric for every feature, and silent garbage when a feature breaks its assumption |
+| Calibration epochs | Every build and `recalibrate` records an epoch and its calibration reference; `compare_calibrations` shows per-dimension μ / σ / θ drift, and on patterns that θ decides `theta_sensitivity` shows whether it sits near a cliff | No record of how the coordinate system itself moved |
+| Hidden influencers | On patterns that θ decides, `find_calibration_influencers` measures each entity's leave-one-out impact on the calibration and names the ones that distort it; on calibrated patterns a branch recalibration with `exclude_keys` shows what a suspect does to the reference | Explaining predictions while the baseline itself is contaminated |
 
 ### Explanations and confidence
 
 | Capability | What it does | Instead of |
 |---|---|---|
-| Named attribution | `explain_anomaly` ranks real dimensions by their share of `delta_norm²`; shares sum to 100% | SHAP / LIME approximations over a trained model |
+| Named attribution | `explain_anomaly` turns the p-value into bits of evidence (`−log2 conformal_p`) and splits them exactly over the scoring axes and the real dimensions; on patterns that θ decides, by each dimension's share of `delta_norm²` | SHAP / LIME approximations over a trained model |
 | Alternative hypotheses | `find_diverse_explanations` returns disjoint dimension sets that each explain the anomaly | One explanation and a manual search for "what else could it be" |
 | Error-controlled detection | The alarm budget on every calibrated pattern; a cell gate (hypergeometric enrichment, Benjamini-Hochberg or Storey over cells) that names the regions holding more anomalies than their size predicts; a `calibration_age` alert when the reference gets old | A ranked list with no statement about false alarms or where they concentrate |
 | Verdicts an agent can act on | `assess_anomaly_certainty`, `consensus_classification`, `calibration_drift_report`, `theta_sensitivity_report` return a verdict with its rationale | Stitching several low-level calls and interpreting them by hand |
@@ -368,7 +368,7 @@ Every capability below comes from one decision: an entity is a point in a space 
 | Incremental ingest | `incremental_update` adds, changes and removes entities without a full rebuild | Rebuilding from source for every batch |
 | Operations CLI | `hypertopos sphere health`, `validate` and `diff` give CI gates and drift between two builds; vector-index health is reported before trajectory tools rely on it | Hand-rolled validation scripts |
 | An agent surface | The MCP server runs over stdio or HTTP with a session per agent and compact, strict-JSON responses sized for a context window | Wrapping a database in ad-hoc tools |
-| On Spark | `hypertopos.spark.find_anomalies(df, entity=…, …)` aggregates events per entity on the executors and returns a DataFrame with distance, flag, p-value and reasons; `explain` breaks it down, `sphere_of` hands it to an agent. Runs on classic clusters and Spark Connect, including Databricks serverless | Exporting events, building features by hand and running a detector outside the cluster |
+| On Spark | `hypertopos.spark.find_anomalies(df, entity=…, …)` aggregates events per entity on the executors and returns a DataFrame with the calibrated anomaly score, flag, conformal p-value and the dimensions behind each score; `explain` breaks it down, `sphere_of` hands it to an agent. Runs on classic clusters and Spark Connect, including Databricks serverless | Exporting events, building features by hand and running a detector outside the cluster |
 | Frozen scoring | `FrozenCalibration` (and `hypertopos.spark.score` on executors) scores new data against a fixed population without recalibrating; a calibration saved on persistent storage serves later scheduled jobs (`sphere_of(path)`, `hypertopos spark score`), and `explain` names the dimensions behind each alert | Refitting the detector on every batch, so yesterday's and today's scores are not comparable |
 | Data to try it on | `hypertopos.datasets.synthetic_aml` generates a labelled payments dataset with six laundering patterns | Hunting for a public dataset before the first call |
 
@@ -377,7 +377,7 @@ Every capability below comes from one decision: an entity is a point in a space 
 | Problem | Typical approach | With hypertopos |
 |---|---|---|
 | Find what is unusual | Engineer features, train a model, pick a contamination rate, retrain on shift | Build from YAML, call `find_anomalies` — the score is calibrated on the population |
-| Say why it is unusual | Feature importance from a model you have to trust | `explain_anomaly` — real dimensions, shares that sum to 100%; `find_diverse_explanations` for alternatives |
+| Say why it is unusual | Feature importance from a model you have to trust | `explain_anomaly` — the evidence in bits, split over real dimensions; `find_diverse_explanations` for alternatives |
 | Know it is not a fluke | Rerun with other thresholds, ask a domain expert | `find_witness_cohort` for unconnected look-alikes, `conformal_p` and the alarm budget for every flag, the cell gate for where they cluster |
 | Find the cause | Explain, then counterparties, then contagion, then hubs | `trace_root_cause` in one call |
 | Catch layering and typologies | Rule engines and rare-pair SQL | `score_edge`, `find_high_potential_motifs`, `find_motif_by_hops`, and chain investigation with a verdict |

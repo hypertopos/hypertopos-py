@@ -72,3 +72,27 @@ def test_score_shares_match_dim_shares_row_by_row(fitted):
         single = robust.dim_shares(ref, np.asarray(scores.score_delta[i], np.float64))
         np.testing.assert_allclose(batch[i], single, rtol=1e-9, atol=1e-12)
     np.testing.assert_allclose(batch.sum(axis=1), 1.0)
+
+
+def test_per_group_reasons_are_the_shares_of_the_groups_score(fitted):
+    table, _ = fitted
+    n = table.num_rows
+    segment = np.where(np.arange(n) < 1200, "x", "y")
+    shifted = table.set_column(
+        table.schema.get_field_index("c"),
+        "c",
+        pa.array(table["c"].to_numpy() * np.where(segment == "y", 5.0, 1.0)),
+    ).append_column("segment", pa.array(segment.tolist()))
+    calibration = FrozenCalibration.fit(shifted, DIMS, group_by="segment", score_per_group=True)
+    out = result_table(shifted, calibration, members=True)
+    scores = calibration.score(shifted, members=True)
+    for name in ("x", "y"):
+        rows = np.flatnonzero(segment == name)
+        expected = robust.dim_shares_rows(
+            calibration.groups[name].reference, scores.score_delta[rows]
+        )
+        for i, row in enumerate(rows[:30]):
+            top = np.argsort(-expected[i], kind="stable")[:TOP_REASONS]
+            got = _flat_reasons(out, int(row))
+            assert [g[0] for g in got] == [DIMS[j] for j in top]
+            np.testing.assert_allclose([g[1] for g in got], 100.0 * expected[i][top], rtol=1e-9)

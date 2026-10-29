@@ -87,6 +87,7 @@ _PATTERN_KEYS = frozenset(
         "dimension_weights",
         "gmm_n_components",
         "group_by_property",
+        "score_per_group",
         "tracked_properties",
         "score_axes",
         "description",
@@ -257,6 +258,7 @@ class PatternConfig:
     dimension_weights: str | list[float] | None = None
     gmm_n_components: int | None = None
     group_by_property: str | None = None
+    score_per_group: bool = False
     tracked_properties: list[str] | None = None
     score_axes: list[str] = field(default_factory=lambda: list(AXES_DEFAULT))
     description: str | None = None
@@ -853,6 +855,12 @@ def _parse_one_pattern(
     score_axes = list(
         validate_score_axes(pid, [str(a) for a in raw_axes] if raw_axes is not None else None)
     )
+    score_per_group = spec.get("score_per_group", False)
+    if not isinstance(score_per_group, bool):
+        raise ValueError(
+            f"Pattern '{pid}' score_per_group must be a boolean, "
+            f"got {type(score_per_group).__name__}"
+        )
 
     return PatternConfig(
         type=cast(Literal["anchor", "event"], ptype),  # validated above
@@ -867,6 +875,7 @@ def _parse_one_pattern(
         dimension_weights=dim_weights,
         gmm_n_components=spec.get("gmm_n_components"),
         group_by_property=spec.get("group_by_property"),
+        score_per_group=score_per_group,
         tracked_properties=spec.get("tracked_properties"),
         score_axes=score_axes,
         description=spec.get("description"),

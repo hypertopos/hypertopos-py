@@ -351,6 +351,10 @@ class Pattern:
     anomaly_percentile: float = 95.0
     score_axes: tuple[str, ...] | None = None
     reference_epoch: int | None = None
+    # One score reference per ``group_by_property`` group (pooled below the
+    # reference size); each row's reference key is in the ``score_group``
+    # geometry column.
+    score_per_group: bool = False
 
     def delta_dim(self) -> int:
         base = (
@@ -724,7 +728,8 @@ class BranchDiffReport:
     ``"threshold"`` (the threshold moved past its unchanged score),
     ``"score"`` (its score crossed the unchanged threshold) or ``"both"``.
     ``theta_from`` / ``theta_to`` are the two thresholds (the global θ norm,
-    or the lowest flagged score on a calibrated pattern). ``only_in_*`` count
+    or the lowest flagged score on a calibrated pattern; None on a pattern
+    with a reference per group, whose boundary is per group). ``only_in_*`` count
     keys present on one side only.
     ``calibration_drift`` compares the two current fits (None when their
     schemas differ). ``recipe`` is the
@@ -736,8 +741,8 @@ class BranchDiffReport:
     to_ref: str
     n_from: int
     n_to: int
-    theta_from: float
-    theta_to: float
+    theta_from: float | None
+    theta_to: float | None
     anomalies_from: int
     anomalies_to: int
     flipped_in: int

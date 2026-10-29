@@ -193,6 +193,10 @@ def test_fingerprint_of_in_memory_frame_is_per_object(spark, plan):
     )
     # A different pooling of small groups is a different calibration.
     assert base != fingerprint(a, plan, percentile=99.0, group_by=None, min_group_size=10)
+    grouped = fingerprint(a, plan, percentile=99.0, group_by="segment", min_group_size=199)
+    assert grouped != fingerprint(
+        a, plan, percentile=99.0, group_by="segment", min_group_size=199, score_per_group=True
+    )
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Spark file reads need winutils on Windows")

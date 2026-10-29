@@ -12,8 +12,14 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from hypertopos.engine.robust import fit_reference, is_anomaly
-from hypertopos.scoring import POOLED_GROUP, FrozenCalibration
+from hypertopos.engine.robust import dim_shares_rows, fit_reference, is_anomaly
+from hypertopos.engine.robust import score as score_reference
+from hypertopos.scoring import (
+    POOLED_GROUP,
+    FrozenCalibration,
+    effective_min_group_size,
+    score_shares,
+)
 
 DIMS = ("a", "b", "c")
 
@@ -56,7 +62,7 @@ def test_score_layer_is_the_calibrated_evidence_score():
     # values a sphere build scores; is_anomaly is the conformal p at the percentile.
     table = _table()
     calibration = FrozenCalibration.fit(table, DIMS, percentile=99.0)
-    scores = calibration.score(table)
+    scores = calibration.score(table, members=True)
     _, fitted = fit_reference(_matrix(table).astype(np.float64), DIMS)
     assert calibration.reference.axes == ("mahal",)  # no events: no current axis
     np.testing.assert_array_equal(scores.anomaly_score, fitted.anomaly_score)
@@ -136,6 +142,68 @@ def test_small_groups_are_pooled_and_unseen_groups_use_global():
     assert calibration.score(unseen).calibration_scope.tolist() == ["global"]
 
 
+@pytest.mark.parametrize(
+    ("segment", "min_group_size", "scopes"),
+    [
+        (
+            ["big"] * 2000 + ["mid"] * 600 + [f"tiny{i % 5}" for i in range(250)],
+            None,
+            {"group", "pooled"},
+        ),
+        (
+            ["big"] * 2000 + ["mid"] * 550 + [f"tiny{i % 5}" for i in range(50)],
+            None,
+            {"group", "global"},
+        ),
+        (
+            ["big"] * 2000 + ["mid"] * 550 + [f"tiny{i % 5}" for i in range(50)],
+            600,
+            {"group", "pooled"},
+        ),
+    ],
+    ids=["pool", "small-pool", "explicit-size"],
+)
+def test_per_group_calibration_matches_the_sphere_built_from_it(
+    tmp_path, segment, min_group_size, scopes
+):
+    import lance
+
+    from hypertopos.spark._build import PATTERN_ID, build_sphere
+
+    n = len(segment)
+    rng = np.random.default_rng(5)
+    table = pa.table(
+        {
+            "entity": [f"E{i}" for i in range(n)],
+            "a": rng.lognormal(0, 1.5, n),
+            "b": rng.poisson(4, n).astype(np.int64),
+            "c": rng.gamma(2.0, 1.0, n),
+            "segment": segment,
+        }
+    )
+    calibration = FrozenCalibration.fit(
+        table, DIMS, group_by="segment", score_per_group=True, min_group_size=min_group_size
+    )
+    scores = calibration.score(table, members=True)
+    assert set(scores.calibration_scope) == scopes
+    build_sphere(table, calibration, str(tmp_path / "s"))
+    geo = lance.dataset(str(tmp_path / "s" / "geometry" / PATTERN_ID / "data.lance")).to_table()
+    order = np.argsort([int(k[1:]) for k in geo["primary_key"].to_pylist()])
+    np.testing.assert_allclose(geo["conformal_p"].to_numpy()[order], scores.conformal_p, atol=1e-6)
+    np.testing.assert_array_equal(geo["is_anomaly"].to_numpy()[order], scores.is_anomaly)
+    np.testing.assert_allclose(
+        geo["anomaly_score"].to_numpy()[order], scores.anomaly_score, rtol=1e-6, atol=1e-6
+    )
+    np.testing.assert_allclose(
+        geo["score_rank_pct"].to_numpy()[order], scores.score_rank_pct, atol=1e-4
+    )
+    np.testing.assert_allclose(
+        geo["delta_norm"].to_numpy()[order], scores.delta_norm, rtol=1e-6, atol=1e-6
+    )
+    stored = np.array(geo["score_group"].to_pylist(), dtype=object)[order]
+    assert ((stored == None) == (scores.calibration_scope == "global")).all()  # noqa: E711
+
+
 @pytest.mark.parametrize("grouped", [False, True], ids=["global", "grouped"])
 def test_calibration_matches_the_sphere_built_from_it(tmp_path, grouped):
     """The contract: a sphere built from the calibration reports the same scores."""
@@ -161,7 +229,7 @@ def test_calibration_matches_the_sphere_built_from_it(tmp_path, grouped):
     calibration = FrozenCalibration.fit(
         table, DIMS, group_by="segment" if grouped else None, shrink={"c": "n"}
     )
-    scores = calibration.score(table)
+    scores = calibration.score(table, members=True)
     build_sphere(table, calibration, str(tmp_path / "s"))
     geo = lance.dataset(str(tmp_path / "s" / "geometry" / PATTERN_ID / "data.lance")).to_table()
     order = np.argsort([int(k[1:]) for k in geo["primary_key"].to_pylist()])
@@ -224,7 +292,7 @@ def test_pickle_round_trip():
 def test_p_value_and_rank_are_exact_ratios():
     # Ratios of counts: a float32 round trip printed 0.001 as 0.0010000000474974513.
     table = _table()
-    scores = FrozenCalibration.fit(table, DIMS).score(table)
+    scores = FrozenCalibration.fit(table, DIMS).score(table, members=True)
     n = len(scores.anomaly_score)
     reference = np.sort(scores.anomaly_score)
     above = n - np.searchsorted(reference, scores.anomaly_score, side="left")
@@ -232,3 +300,114 @@ def test_p_value_and_rank_are_exact_ratios():
     assert scores.score_rank_pct.dtype == np.float64
     np.testing.assert_array_equal(scores.conformal_p, (1.0 + above) / (n + 1.0))
     np.testing.assert_array_equal(scores.score_rank_pct, 100.0 * (n - above) / n)
+
+
+def _per_group_table(tiny: int) -> tuple[pa.Table, np.ndarray]:
+    # big and mid are different kinds of entity (c shifted); ``tiny`` groups of 50 pool.
+    segment = np.array(
+        ["big"] * 2000 + ["mid"] * 600 + [f"tiny{i % tiny}" for i in range(50 * tiny)]
+    )
+    table = _table(n=len(segment), seed=7, groups=segment.tolist())
+    c = table["c"].to_numpy() + np.where(segment == "mid", 40.0, 0.0)
+    return table.set_column(table.schema.get_field_index("c"), "c", pa.array(c)), segment
+
+
+def test_per_group_score_is_each_groups_own_reference():
+    table, segment = _per_group_table(tiny=5)  # pool of 250: it gets its own reference
+    calibration = FrozenCalibration.fit(table, DIMS, group_by="segment", score_per_group=True)
+    scores = calibration.score(table, members=True)
+    x = _matrix(table).astype(np.float64)
+    pool = np.char.startswith(segment, "tiny")
+    for name, mask in (("big", segment == "big"), ("mid", segment == "mid"), (POOLED_GROUP, pool)):
+        _, fitted = fit_reference(x[mask], DIMS)
+        np.testing.assert_array_equal(scores.conformal_p[mask], fitted.conformal_p)
+        np.testing.assert_array_equal(scores.anomaly_score[mask], fitted.anomaly_score)
+        np.testing.assert_array_equal(scores.score_rank_pct[mask], fitted.score_rank_pct)
+        assert calibration.groups[name].reference is not None
+    np.testing.assert_array_equal(scores.is_anomaly, is_anomaly(scores.conformal_p, 99.0))
+    assert set(scores.calibration_scope[segment == "big"]) == {"group"}
+    assert set(scores.calibration_scope[pool]) == {"pooled"}
+    # The population reference stays the one a global fit gives.
+    population, fitted = fit_reference(x, DIMS)
+    np.testing.assert_array_equal(calibration.reference.cal_sorted, population.cal_sorted)
+    assert not np.array_equal(scores.conformal_p, fitted.conformal_p)
+
+
+def test_per_group_undersized_pool_and_unseen_group_score_globally():
+    table, segment = _per_group_table(tiny=3)  # pool of 150: below the reference size
+    calibration = FrozenCalibration.fit(table, DIMS, group_by="segment", score_per_group=True)
+    scores = calibration.score(table, members=True)
+    pool = np.char.startswith(segment, "tiny")
+    assert calibration.groups[POOLED_GROUP].reference is None
+    assert set(scores.calibration_scope[pool]) == {"global"}
+    x = _matrix(table).astype(np.float64)
+    _, population = fit_reference(x, DIMS)
+    np.testing.assert_array_equal(scores.conformal_p[pool], population.conformal_p[pool])
+    # The deviations still come from the pool's mean and spread, pooled at the same size.
+    off = FrozenCalibration.fit(table, DIMS, group_by="segment", min_group_size=199)
+    np.testing.assert_array_equal(scores.delta, off.score(table, members=True).delta)
+    unseen = pa.table(
+        {"entity": ["U"], "a": [1.0], "b": [4], "c": [10.0], "segment": ["never-seen"]}
+    )
+    new = calibration.score(unseen)
+    assert new.calibration_scope.tolist() == ["global"]
+    expected = score_reference(calibration.reference, _matrix(unseen).astype(np.float64))
+    np.testing.assert_array_equal(new.conformal_p, expected.conformal_p)
+
+
+def test_per_group_new_rows_use_the_groups_out_of_fold_calibration():
+    table, segment = _per_group_table(tiny=5)
+    calibration = FrozenCalibration.fit(table, DIMS, group_by="segment", score_per_group=True)
+    mid = table.filter(pa.array(segment == "mid"))
+    ref = calibration.groups["mid"].reference
+    assert ref.mahal_sorted_oof is not None
+    expected = score_reference(ref, _matrix(mid).astype(np.float64))
+    np.testing.assert_array_equal(calibration.score(mid).conformal_p, expected.conformal_p)
+
+
+def test_per_group_min_group_size_below_the_reference_size_raises():
+    table, _ = _per_group_table(tiny=5)
+    with pytest.raises(ValueError, match="below 199"):
+        FrozenCalibration.fit(
+            table, DIMS, group_by="segment", score_per_group=True, min_group_size=100
+        )
+    with pytest.raises(ValueError, match="group_by"):
+        FrozenCalibration.fit(table, DIMS, score_per_group=True)
+    # Off: a small explicit value pools as before.
+    off = FrozenCalibration.fit(table, DIMS, group_by="segment", min_group_size=10)
+    assert off.pooled == frozenset()
+
+
+def test_effective_min_group_size():
+    assert effective_min_group_size(None, 99.0, score_per_group=False) == 100
+    assert effective_min_group_size(10, 99.0, score_per_group=False) == 10
+    assert effective_min_group_size(None, 99.0, score_per_group=True) == 199
+    assert effective_min_group_size(500, 99.0, score_per_group=True) == 500
+    with pytest.raises(ValueError, match="below 199"):
+        effective_min_group_size(150, 99.0, score_per_group=True)
+
+
+def test_per_group_score_shares_use_the_groups_reference():
+    table, segment = _per_group_table(tiny=5)
+    calibration = FrozenCalibration.fit(table, DIMS, group_by="segment", score_per_group=True)
+    scores = calibration.score(table, members=True)
+    shares = calibration.score_shares(table, scores.score_delta)
+    mid = segment == "mid"
+    expected = dim_shares_rows(calibration.groups["mid"].reference, scores.score_delta[mid])
+    np.testing.assert_array_equal(shares[mid], expected)
+    # Off: the population reference, as the module-level function gives.
+    off = FrozenCalibration.fit(table, DIMS, group_by="segment")
+    off_scores = off.score(table, members=True)
+    np.testing.assert_array_equal(
+        off.score_shares(table, off_scores.score_delta),
+        score_shares(off.reference, off_scores.score_delta),
+    )
+
+
+def test_per_group_score_of_an_empty_table():
+    table, _ = _per_group_table(tiny=5)
+    calibration = FrozenCalibration.fit(table, DIMS, group_by="segment", score_per_group=True)
+    empty = table.slice(0, 0)
+    scores = calibration.score(empty)
+    assert len(scores.conformal_p) == 0
+    assert calibration.score_shares(empty, scores.score_delta).shape == (0, len(DIMS))

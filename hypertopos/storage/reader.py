@@ -57,7 +57,7 @@ if TYPE_CHECKING:
     from lance import LanceDataset
 
     from hypertopos.engine.calibration import CalibrationTracker
-    from hypertopos.engine.robust import Reference
+    from hypertopos.engine.robust import GroupedReference, Reference
     from hypertopos.model.sphere import CalibrationFit
 
 _RECOVERABLE_READ_ERRORS = (
@@ -588,6 +588,7 @@ class GDSReader:
             score_dims=tuple(raw["score_dims"]) if raw.get("score_dims") else None,
             score_axes=tuple(raw["score_axes"]) if raw.get("score_axes") else None,
             reference_epoch=raw.get("reference_epoch"),
+            score_per_group=bool(raw.get("score_per_group", False)),
             anomaly_percentile=float(raw.get("anomaly_percentile", 95.0)),
         )
 
@@ -1341,15 +1342,47 @@ class GDSReader:
     # Calibration history reader API
     # ------------------------------------------------------------------
 
-    def read_reference(self, pattern_id: str, epoch: int | None = None) -> Reference:
+    def read_reference(
+        self, pattern_id: str, epoch: int | None = None, *, group: str | None = None
+    ) -> Reference:
         """Load the frozen score reference of a pattern.
 
         ``epoch=None`` resolves to the pattern's ``reference_epoch`` in sphere.json.
+        ``group=None`` returns the population reference; a score group key (a
+        geometry row's ``score_group``) returns that group's reference on a
+        ``score_per_group`` pattern, reading only that group's arrays.
         Raises ``GDSStorageError`` when the pattern has no reference (patterns
-        scored by ``delta_norm``) or the epoch file is missing.
+        scored by ``delta_norm``), the epoch file is missing, or ``group`` is
+        not one of the stored score groups.
         """
-        from hypertopos.engine.robust import reference_from_arrays
+        from hypertopos.engine.robust import group_reference_from_arrays, reference_from_arrays
 
+        with np.load(self._reference_path(pattern_id, epoch), allow_pickle=False) as data:
+            if group is None:
+                return reference_from_arrays(data)
+            if "group_names" not in data.files:
+                raise GDSStorageError(f"pattern '{pattern_id}' has no per-group references")
+            names = [str(g) for g in data["group_names"]]
+            if group not in names:
+                raise GDSStorageError(
+                    f"pattern '{pattern_id}' has no score group {group!r}; stored groups: {names}"
+                )
+            return group_reference_from_arrays(data, names.index(group))
+
+    def read_grouped_reference(self, pattern_id: str, epoch: int | None = None) -> GroupedReference:
+        """Load every score reference of a ``score_per_group`` pattern.
+
+        Raises ``GDSStorageError`` like :meth:`read_reference`, and when the
+        pattern stores no per-group references.
+        """
+        from hypertopos.engine.robust import grouped_reference_from_arrays
+
+        with np.load(self._reference_path(pattern_id, epoch), allow_pickle=False) as data:
+            if "group_names" not in data.files:
+                raise GDSStorageError(f"pattern '{pattern_id}' has no per-group references")
+            return grouped_reference_from_arrays(data)
+
+    def _reference_path(self, pattern_id: str, epoch: int | None) -> Path:
         if epoch is None:
             node = json.loads(self.sphere_json_text()).get("patterns", {}).get(pattern_id, {})
             epoch = node.get("reference_epoch")
@@ -1361,8 +1394,7 @@ class GDSReader:
         )
         if path is None:
             raise GDSStorageError(f"score reference {rel.as_posix()} not found")
-        with np.load(path, allow_pickle=False) as data:
-            return reference_from_arrays({name: data[name] for name in data.files})
+        return path
 
     def read_calibration_fit(self, pattern_id: str, version: int | None = None) -> CalibrationFit:
         """Load one calibration epoch as a CalibrationFit.

@@ -140,7 +140,7 @@ def test_fit_rows_scored_inductively_match_for_non_sample_rows(monkeypatch):
     ref, fit = fit_reference(x, ("a", "b", "c"), axes=AXES_ALL, events=ev)
     assert fit.sample_index is not None
     out = ~np.isin(np.arange(3_000), fit.sample_index)
-    again = score(ref, x[out], _subset_events(ev, out))
+    again = score(ref, x[out], _subset_events(ev, out), members=True)
     np.testing.assert_allclose(fit.anomaly_score[out], again.anomaly_score, atol=1e-9)
     np.testing.assert_allclose(fit.conformal_p[out], again.conformal_p, atol=1e-12)
 
@@ -208,7 +208,7 @@ def test_counterfactual_rescoring_matches_scoring_the_changed_row():
     changed = x[i : i + 1].copy()
     changed[0, 1] = 6.0
     cf = counterfactual(ref, fit.delta[i], fit.axis_ranks[i], {1: 6.0})
-    direct = score(ref, changed)
+    direct = score(ref, changed, members=True)  # a member with a value overridden
     assert cf.anomaly_score == pytest.approx(direct.anomaly_score[0])
     assert cf.conformal_p == pytest.approx(direct.conformal_p[0])
     assert cf.conformal_p < fit.conformal_p[i]
@@ -218,7 +218,7 @@ def test_counterfactual_keeps_an_absent_current_axis_absent():
     x, ev = _population(n=2_000, seed=19)
     ref, _ = fit_reference(x, ("a", "b", "c"), events=ev)
     fresh = score(ref, x[:5])  # rows without events: current rank is NaN
-    cf = counterfactual(ref, fresh.delta[0], fresh.axis_ranks[0], {})
+    cf = counterfactual(ref, fresh.delta[0], fresh.axis_ranks[0], {}, members=False)
     assert np.isnan(cf.axis_ranks[ref.axes.index("current")])
     assert cf.conformal_p == pytest.approx(fresh.conformal_p[0])
 

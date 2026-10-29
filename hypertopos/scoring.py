@@ -9,10 +9,11 @@ pattern whose dimensions are a metric block, without writing a sphere: the
 calibrated evidence score (a frozen reference of the population on the
 dimension values, its conformal p-value and the flag at a population
 percentile) and the per-dimension mean and spread, optionally per group, that
-the deviations explaining a score are measured with. It runs the builder's own
-steps, so a sphere built from the same table reports the same ``anomaly_score``,
-``conformal_p``, ``score_rank_pct``, ``is_anomaly`` and ``delta_norm``. It is
-plain numpy and picklable: it can be broadcast to Spark executors.
+the deviations explaining a score are measured with. With ``score_per_group``
+each group also gets its own reference, so a row is scored within its group. It
+runs the builder's own steps, so a sphere built from the same table reports the
+same ``anomaly_score``, ``conformal_p``, ``score_rank_pct``, ``is_anomaly`` and
+``delta_norm``. It is plain numpy and picklable: it can be broadcast to Spark executors.
 """
 
 from __future__ import annotations
@@ -27,13 +28,24 @@ import pyarrow.compute as pc
 from hypertopos.builder._stats import compute_stats, compute_stats_grouped
 from hypertopos.builder.dim_blocks import normalize_metric_block
 from hypertopos.engine.geometry import calibrated_deltas
-from hypertopos.engine.robust import Reference, dim_shares_rows, fit_reference, is_anomaly
+from hypertopos.engine.robust import POOLED_GROUP as POOLED_GROUP  # re-exported
+from hypertopos.engine.robust import (
+    Reference,
+    RobustScores,
+    dim_shares_rows,
+    fit_grouped_reference,
+    fit_reference,
+    is_anomaly,
+    min_reference_size,
+    pool_groups,
+)
 from hypertopos.engine.robust import score as score_reference
 
 MIN_GROUP_SIZE = 100
 """Groups smaller than this are calibrated together as ``POOLED_GROUP``: a
-group's mean and spread need enough members to measure a deviation against."""
-POOLED_GROUP = "(small groups)"
+group's mean and spread need enough members to measure a deviation against.
+With ``score_per_group`` the default is the reference size instead
+(:func:`hypertopos.engine.robust.min_reference_size`)."""
 SHRINK_WEIGHT = 3.0
 """Pseudo-count of a shrunk dimension: a share or spread measured on ``n`` events
 becomes ``(n * value + SHRINK_WEIGHT * population_mean) / (n + SHRINK_WEIGHT)``,
@@ -45,6 +57,7 @@ class GroupCalibration:
     mu: np.ndarray  # standardised units
     sigma: np.ndarray
     size: int
+    reference: Reference | None = None  # the group's own score; None: the population's
 
 
 @dataclass(frozen=True)
@@ -76,6 +89,8 @@ class FrozenCalibration:
     pooled: frozenset[str] = frozenset()  # groups calibrated inside POOLED_GROUP
     # dim -> (sample-size column, frozen population mean) for small-count shrinkage
     shrink: dict[str, tuple[str, float]] | None = None
+    score_per_group: bool = False  # each group scored against its own reference
+    min_group_size: int | None = None  # the pooling size, with score_per_group
 
     @classmethod
     def fit(
@@ -85,8 +100,9 @@ class FrozenCalibration:
         *,
         percentile: float = 99.0,
         group_by: str | None = None,
-        min_group_size: int = MIN_GROUP_SIZE,
+        min_group_size: int | None = None,
         shrink: Mapping[str, str] | None = None,
+        score_per_group: bool = False,
     ) -> FrozenCalibration:
         """Calibrate on ``table``; nulls in a dimension count as 0, as in a build.
 
@@ -101,23 +117,50 @@ class FrozenCalibration:
         ``shrink`` maps a dimension to the column holding its sample size; the
         value is pulled toward the population mean with weight ``SHRINK_WEIGHT``
         (the mean is frozen here, so scoring new rows uses the same prior).
+
+        ``score_per_group`` (needs ``group_by``): each group is scored against
+        a reference fitted on its own rows, so its p-values, ranks and flags
+        are within the group. Groups under ``min_group_size`` (default and
+        lower bound: the reference size at ``percentile``) are pooled for both
+        the score and the deviations; a pool still under it, and a group
+        unseen at fit time, are scored against the population. Without it,
+        groups under ``min_group_size`` (default ``MIN_GROUP_SIZE``) are pooled
+        for the deviations only.
         """
+        if score_per_group and group_by is None:
+            raise ValueError("score_per_group needs group_by")
+        group_size = effective_min_group_size(min_group_size, percentile, score_per_group)
         priors = {
             dim: (count, float(_column(table, dim).mean())) for dim, count in (shrink or {}).items()
         }
         shapes = _shapes(table, dims, priors)
-        reference, _ = fit_reference(shapes.astype(np.float64), tuple(dims))
+        x = shapes.astype(np.float64)
+        references: dict[str, Reference] = {}
+        if score_per_group and group_by is not None:
+            grouped, _, _ = fit_grouped_reference(
+                x,
+                tuple(dims),
+                _group_ids(table, group_by),
+                percentile=percentile,
+                min_group_size=group_size,
+            )
+            reference, references = grouped.population, grouped.groups
+        else:
+            reference, _ = fit_reference(x, tuple(dims))
         standard, pre_mu, pre_sigma = normalize_metric_block(shapes)
         mu, sigma, _, _, _ = compute_stats(standard, percentile)
         groups: dict[str, GroupCalibration] | None = None
         pooled: frozenset[str] = frozenset()
         if group_by is not None:
             raw_ids = _group_ids(table, group_by)
-            ids = pool_small_groups(raw_ids, min_group_size)
-            pooled = frozenset(raw_ids[ids != raw_ids].tolist())
+            if score_per_group:
+                ids, pooled = pool_groups(raw_ids, percentile, group_size)
+            else:
+                ids = pool_small_groups(raw_ids, group_size)
+                pooled = frozenset(raw_ids[ids != raw_ids].tolist())
             stats, _, _ = compute_stats_grouped(standard, ids, percentile)
             groups = {
-                gid: GroupCalibration(g_mu, g_sigma, size)
+                gid: GroupCalibration(g_mu, g_sigma, size, references.get(gid))
                 for gid, (g_mu, g_sigma, _, size) in stats.items()
             }
         return cls(
@@ -133,19 +176,27 @@ class FrozenCalibration:
             groups=groups,
             pooled=pooled,
             shrink=priors or None,
+            score_per_group=score_per_group,
+            min_group_size=group_size if score_per_group else None,
         )
 
-    def score(self, table: pa.Table) -> Scores:
-        """Score ``table`` against the frozen population (no recalibration)."""
+    def score(self, table: pa.Table, *, members: bool = False) -> Scores:
+        """Score ``table`` against the frozen population (no recalibration).
+
+        New entities (the default) are calibrated against out-of-fold scores of
+        the population, so they keep the alarm budget; ``members=True`` rescores
+        the fitted table itself with its in-sample p-values, as a build stores.
+        """
         shapes = self.shapes(table)
-        evidence = score_reference(self.reference, shapes.astype(np.float64))
+        assignments = self._assignments(table)
+        evidence = self._evidence(shapes.astype(np.float64), assignments, members)
         standard = _deltas(shapes, self.pre_mu, self.pre_sigma)
         n = table.num_rows
         delta = np.empty_like(standard)
         scope: np.ndarray | None = (
             np.empty(n, dtype=object) if self.groups is not None and self.group_by else None
         )
-        for mask, cal, label in self._assignments(table):
+        for mask, cal, label in assignments:
             delta[mask] = _deltas(standard[mask], cal.mu, cal.sigma)
             if scope is not None:
                 scope[mask] = label
@@ -160,6 +211,54 @@ class FrozenCalibration:
             score_delta=evidence.delta,
             calibration_scope=scope,
         )
+
+    def score_shares(self, table: pa.Table, score_delta: np.ndarray) -> np.ndarray:
+        """:func:`score_shares` of each row of ``table`` against the reference
+        that scored it (its group's with ``score_per_group``)."""
+        if not self.score_per_group:
+            return score_shares(self.reference, score_delta)
+        out = np.zeros(np.shape(score_delta), dtype=np.float64)
+        for mask, ref in self._references(self._assignments(table)):
+            out[mask] = dim_shares_rows(ref, score_delta[mask])
+        return out
+
+    def _evidence(
+        self,
+        x: np.ndarray,
+        assignments: list[tuple[np.ndarray, GroupCalibration, str]],
+        members: bool,
+    ) -> RobustScores:
+        if not self.score_per_group or len(x) == 0:
+            return score_reference(self.reference, x, members=members)
+        # Each row's evidence from the reference that scores it: p, rank and flag
+        # are within the row's group.
+        parts = [
+            (mask, score_reference(ref, x[mask], members=members))
+            for mask, ref in self._references(assignments)
+        ]
+        merged = {}
+        for name in (
+            "delta",
+            "delta_norm",
+            "axis_ranks",
+            "anomaly_score",
+            "conformal_p",
+            "score_rank_pct",
+        ):
+            first = getattr(parts[0][1], name)
+            out = np.empty((len(x), *first.shape[1:]), dtype=first.dtype)
+            for mask, part in parts:
+                out[mask] = getattr(part, name)
+            merged[name] = out
+        return RobustScores(axis_values={}, **merged)
+
+    def _references(
+        self, assignments: list[tuple[np.ndarray, GroupCalibration, str]]
+    ) -> list[tuple[np.ndarray, Reference]]:
+        return [
+            (mask, cal.reference if cal.reference is not None else self.reference)
+            for mask, cal, _ in assignments
+        ]
 
     def shapes(self, table: pa.Table) -> np.ndarray:
         """The calibrated dimensions of ``table`` as an (n, D) float32 matrix, shrunk."""
@@ -185,7 +284,12 @@ class FrozenCalibration:
         return mu, sigma, scope
 
     def _assignments(self, table: pa.Table) -> list[tuple[np.ndarray, GroupCalibration, str]]:
-        """Row masks with the calibration each uses: its group, the pool, or global."""
+        """Row masks with the calibration each uses: its group, the pool, or global.
+
+        With ``score_per_group`` the scope names where the score came from: a
+        pool too small for its own reference is scored globally, while its
+        deviations still use the pool's mean and spread.
+        """
         everyone = GroupCalibration(self.mu, self.sigma, self.size)
         n = table.num_rows
         if self.groups is None or self.group_by is None:
@@ -195,11 +299,14 @@ class FrozenCalibration:
         for gid in np.unique(raw):
             mask = raw == gid
             if gid in self.pooled:
-                out.append((mask, self.groups[POOLED_GROUP], "pooled"))
+                cal, label = self.groups[POOLED_GROUP], "pooled"
             elif gid in self.groups:
-                out.append((mask, self.groups[gid], "group"))
+                cal, label = self.groups[gid], "group"
             else:
-                out.append((mask, everyone, "global"))  # unseen at fit time
+                cal, label = everyone, "global"  # unseen at fit time
+            if self.score_per_group and cal.reference is None:
+                label = "global"
+            out.append((mask, cal, label))
         return out
 
     def raw_params(self, table: pa.Table) -> tuple[np.ndarray, np.ndarray]:
@@ -219,6 +326,26 @@ def score_shares(reference: Reference, score_delta: np.ndarray) -> np.ndarray:
     A row at the centre of the score (zero distance) has no share.
     """
     return dim_shares_rows(reference, score_delta)
+
+
+def effective_min_group_size(
+    min_group_size: int | None, percentile: float, score_per_group: bool
+) -> int:
+    """The group size pooling uses: ``min_group_size``, or its default.
+
+    The default is ``MIN_GROUP_SIZE``; with ``score_per_group`` it is the
+    reference size at ``percentile``, and a smaller value raises, because a
+    group under it could never flag a member.
+    """
+    if not score_per_group:
+        return MIN_GROUP_SIZE if min_group_size is None else min_group_size
+    bound = min_reference_size(percentile)
+    if min_group_size is not None and min_group_size < bound:
+        raise ValueError(
+            f"min_group_size={min_group_size} is below {bound}, the smallest group "
+            f"that can flag a member at the {percentile:g}th percentile"
+        )
+    return max(bound, min_group_size or 0)
 
 
 def pool_small_groups(ids: np.ndarray, min_group_size: int) -> np.ndarray:

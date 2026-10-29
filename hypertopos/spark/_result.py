@@ -9,23 +9,26 @@ from __future__ import annotations
 import numpy as np
 import pyarrow as pa
 
-from hypertopos.scoring import FrozenCalibration, score_shares
+from hypertopos.scoring import FrozenCalibration
 from hypertopos.spark._build import KEY
 
 TOP_REASONS = 3
 
 
-def result_table(entities: pa.Table, calibration: FrozenCalibration) -> pa.Table:
+def result_table(
+    entities: pa.Table, calibration: FrozenCalibration, *, members: bool = False
+) -> pa.Table:
     """Per-entity result with flat reason columns (``reason_<i>_dim/_delta/_pct``).
 
     Reason shares are each dimension's Shapley share of the calibrated score's
     Mahalanobis evidence in percent (the split ``explain_anomaly`` reports on a
     sphere), so all shares of an entity sum to 100; a dimension with no share is
     not a reason. ``_delta`` is the dimension's deviation in standard deviations.
+    ``members=True``: ``entities`` is the table the calibration was fitted on.
     """
-    scores = calibration.score(entities)
+    scores = calibration.score(entities, members=members)
     delta = scores.delta.astype(np.float64)
-    shares = 100.0 * score_shares(calibration.reference, scores.score_delta)
+    shares = 100.0 * calibration.score_shares(entities, scores.score_delta)
     k = min(TOP_REASONS, len(calibration.dims))
     top = np.argsort(-shares, axis=1, kind="stable")[:, :k]
     rows = np.arange(len(delta))

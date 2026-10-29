@@ -82,6 +82,7 @@ class GDSEngine:
             "anomaly_score",
             "conformal_p",
             "score_delta",
+            "score_group",
             "is_anomaly",
             "last_refresh_at",
             "updated_at",
@@ -1372,6 +1373,7 @@ def _score_fields(row: dict[str, Any]) -> dict[str, Any]:
         "anomaly_score": _float("anomaly_score"),
         "conformal_p": _float("conformal_p"),
         "score_delta": None if score_delta is None else np.asarray(score_delta, dtype=np.float32),
+        "score_group": row.get("score_group"),
     }
 
 

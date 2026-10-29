@@ -163,3 +163,47 @@ def test_group_value_is_the_most_frequent_one_and_tiny_groups_are_pooled(spark, 
     assert out["E1"]["calibration_scope"] == "pooled"  # a one-entity group cannot set a threshold
     assert out["F1"]["calibration_scope"] == "group"
     assert out["X"]["seg"] == "(none)"  # seen only as a counterparty
+
+
+def test_score_per_group_needs_group_by_and_a_reference_size(events, tmp_path):
+    with pytest.raises(ValueError, match="needs group_by"):
+        find_anomalies(events, **ROLES, score_per_group=True, sphere_root=str(tmp_path))
+    with pytest.raises(ValueError, match="below 199"):
+        find_anomalies(
+            events,
+            **ROLES,
+            group_by="segment",
+            score_per_group=True,
+            min_group_size=100,
+            sphere_root=str(tmp_path),
+        )
+
+
+def test_score_per_group_flags_within_each_group(events, result, tmp_path):
+    from hypertopos.spark import sphere_of
+
+    out = find_anomalies(
+        events, **ROLES, group_by="segment", score_per_group=True, sphere_root=str(tmp_path)
+    ).cache()
+    rows = out.collect()
+    assert {r["calibration_scope"] for r in rows} == {"group"}
+    for segment, size in (("retail", 1000), ("business", 2000)):
+        members = [r for r in rows if r["segment"] == segment]
+        assert len(members) == size
+        assert sum(r["is_anomaly"] for r in members) / size == pytest.approx(0.01, abs=0.003)
+        assert min(r["p_value"] for r in members) == pytest.approx(2.0 / (size + 1))
+    calibration = sphere_of(out).calibration()
+    assert calibration.score_per_group
+    assert calibration.groups["retail"].reference is not None
+    # The default size is the reference size: an explicit 199 is the same calibration.
+    same = find_anomalies(
+        events,
+        **ROLES,
+        group_by="segment",
+        score_per_group=True,
+        min_group_size=199,
+        sphere_root=str(tmp_path),
+    )
+    path = out.schema["entity"].metadata[METADATA_PATH]
+    assert same.schema["entity"].metadata[METADATA_PATH] == path
+    assert path != result.schema["entity"].metadata[METADATA_PATH]

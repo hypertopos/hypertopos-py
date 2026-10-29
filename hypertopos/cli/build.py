@@ -616,6 +616,7 @@ def _add_pattern(
         anomaly_percentile=pat_cfg.anomaly_percentile,
         tracked_properties=pat_cfg.tracked_properties,
         group_by_property=pat_cfg.group_by_property,
+        score_per_group=pat_cfg.score_per_group,
         dimension_weights=pat_cfg.dimension_weights,
         gmm_n_components=pat_cfg.gmm_n_components,
         score_axes=pat_cfg.score_axes,

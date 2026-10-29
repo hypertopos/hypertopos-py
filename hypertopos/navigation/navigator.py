@@ -64,6 +64,10 @@ CALIBRATION_MAX_AGE_DAYS = 60
 """Age after which ``sphere_overview`` flags a pattern's calibration as stale: a
 frozen population reference keeps its p-values in range for about two months."""
 
+# Alarm-rate drift: rows written since the calibration, tested against the budget.
+ALARM_RATE_MIN_ROWS = 100
+ALARM_RATE_ALPHA = 0.01
+
 logger = logging.getLogger(__name__)
 
 
@@ -170,6 +174,7 @@ def _score_fields(row: dict[str, Any]) -> dict[str, Any]:
         "conformal_p": None if row.get("conformal_p") is None else float(row["conformal_p"]),
         "anomaly_score": None if row.get("anomaly_score") is None else float(row["anomaly_score"]),
         "score_delta": None if score_delta is None else np.array(score_delta, dtype=np.float32),
+        "score_group": row.get("score_group"),
     }
 
 
@@ -190,6 +195,19 @@ def _calibrated_order_value(p_vals: np.ndarray, scores: np.ndarray) -> np.ndarra
     new_group[1:] = (p_sorted[1:] != p_sorted[:-1]) | (s_sorted[1:] != s_sorted[:-1])
     out[order] = -np.cumsum(new_group).astype(np.float64)
     return out
+
+
+def _written_since_calibration(pattern: Any, updated_at: datetime | None) -> bool:
+    """True when a geometry row was written after the pattern's last calibration
+    (an ingested or updated row, scored against the frozen reference)."""
+    calibrated = getattr(pattern, "last_calibrated_at", None)
+    if calibrated is None or updated_at is None:
+        return False
+    if calibrated.tzinfo is not None:
+        calibrated = calibrated.astimezone(UTC).replace(tzinfo=None)
+    if updated_at.tzinfo is not None:
+        updated_at = updated_at.astimezone(UTC).replace(tzinfo=None)
+    return bool(updated_at > calibrated)
 
 
 def _uses_calibrated_score(pattern: Any) -> bool:
@@ -1138,6 +1156,7 @@ class GDSNavigator:
         "conformal_p",
         "anomaly_score",
         "score_delta",
+        "score_group",
     ]
     _CONTRAST_COLUMNS: list[str] = [
         "primary_key",
@@ -1165,6 +1184,7 @@ class GDSNavigator:
         "conformal_p",
         "anomaly_score",
         "score_delta",
+        "score_group",
         "last_refresh_at",
         "updated_at",
         "edges",
@@ -1279,11 +1299,15 @@ class GDSNavigator:
                 return
             from hypertopos.engine import robust
 
-            ref = self._storage.read_reference(pattern.pattern_id)
-            cov = np.linalg.pinv(ref.lw_precision, hermitian=True)
+            references: dict[str | None, tuple[Any, np.ndarray]] = {}
             for poly in polygons:
                 if poly.score_delta is None:
                     continue
+                group = poly.score_group if pattern.score_per_group else None
+                if group not in references:
+                    found = self._storage.read_reference(pattern.pattern_id, group=group)
+                    references[group] = (found, np.linalg.pinv(found.lw_precision, hermitian=True))
+                ref, cov = references[group]
                 z = np.asarray(poly.score_delta, dtype=np.float64)
                 shares = robust.dim_shares(ref, z, cov)
                 top = int(np.argmax(shares))
@@ -1776,6 +1800,7 @@ class GDSNavigator:
                     "conformal_p",
                     "anomaly_score",
                     "score_delta",
+                    "score_group",
                     "last_refresh_at",
                     "updated_at",
                     "bregman_divergence",
@@ -2090,6 +2115,7 @@ class GDSNavigator:
             "conformal_p",
             "anomaly_score",
             "score_delta",
+            "score_group",
             "last_refresh_at",
             "updated_at",
             "bregman_divergence",
@@ -11004,7 +11030,7 @@ class GDSNavigator:
         pattern_id: str,
     ) -> list[dict[str, Any]]:
         """Check calibration drift against its thresholds and the calibration's age."""
-        alerts = self._check_calibration_age(pattern_id)
+        alerts = self._check_calibration_age(pattern_id) + self._check_alarm_rate_drift(pattern_id)
         tracker = self._storage.read_calibration_tracker(pattern_id)
         if tracker is None:
             return alerts
@@ -11073,6 +11099,86 @@ class GDSNavigator:
                     f"recalibrate('{pattern_id}') to refresh it."
                 ),
                 "details": {"age_days": age_days, "max_age_days": CALIBRATION_MAX_AGE_DAYS},
+            }
+        ]
+
+    def _check_alarm_rate_drift(self, pattern_id: str) -> list[dict[str, Any]]:
+        """Alert when rows written since the calibration are flagged above the budget.
+
+        On a calibrated pattern, rows added or updated after the last
+        calibration are scored against the frozen reference; while the
+        population does not move, at most the alarm budget of them is flagged.
+        They share one calibration, so under exchangeability their flagged count
+        is beta-binomial (a calibration that happened to land high flags more
+        of every batch), not binomial; its one-sided tail tells when the
+        population has moved.
+        """
+        pattern = self._storage.read_sphere().patterns.get(pattern_id)
+        calibrated = getattr(pattern, "last_calibrated_at", None)
+        if pattern is None or not _uses_calibrated_score(pattern) or calibrated is None:
+            return []
+        if pattern.score_per_group:
+            # No rows are written after such a calibration (incremental ingest
+            # refuses grouped patterns), and each group has its own budget.
+            return []
+        if calibrated.tzinfo is not None:
+            calibrated = calibrated.astimezone(UTC).replace(tzinfo=None)
+        computed = pattern.computed_at
+        if computed.tzinfo is not None:
+            computed = computed.astimezone(UTC).replace(tzinfo=None)
+        if computed <= calibrated:
+            # Ingest stamps computed_at: nothing was written since the calibration.
+            return []
+        version = self._manifest.pattern_versions.get(pattern_id)
+        if version is None:
+            return []
+        geo = self._storage.read_geometry(pattern_id, version, columns=["updated_at", "is_anomaly"])
+        updated = geo["updated_at"]
+        if pa.types.is_timestamp(updated.type) and updated.type.tz is not None:
+            updated = pc.cast(updated, pa.timestamp(updated.type.unit))
+        since = pc.fill_null(pc.greater(updated, pa.scalar(calibrated, updated.type)), False)
+        n_new = int(pc.sum(since).as_py() or 0)
+        if n_new < ALARM_RATE_MIN_ROWS:
+            return []
+        flagged = int(pc.sum(pc.and_(since, pc.fill_null(geo["is_anomaly"], False))).as_py() or 0)
+        budget = 1.0 - float(pattern.anomaly_percentile) / 100.0
+        from hypertopos.engine import robust
+
+        ref = self._storage.read_reference(pattern_id)
+        n_ref = int(ref.n_fitted)
+        if (
+            ref.mahal_sorted_oof is None
+            and 2 * robust.OOF_FOLDS <= n_ref <= robust.OOF_MAX_ROWS_PER_DIM * len(ref.dims)
+        ):
+            # Built before out-of-fold calibration: its new rows were calibrated
+            # in sample and over-flag, so the budget below does not hold.
+            return []
+        # A new row is flagged when it ranks among the top ``a`` of the n + 1.
+        a = int(np.floor(budget * (n_ref + 1)))
+        if a < 1:
+            return []
+        from scipy.stats import betabinom
+
+        p_value = float(betabinom.sf(flagged - 1, n_new, a, n_ref + 1 - a))
+        if p_value >= ALARM_RATE_ALPHA:
+            return []
+        return [
+            {
+                "severity": "MEDIUM",
+                "check_type": "alarm_rate_drift",
+                "pattern_id": pattern_id,
+                "message": (
+                    f"{flagged} of {n_new} rows written since the calibration are flagged, "
+                    f"against an alarm budget of {budget:.1%} (expected {budget * n_new:.0f}); "
+                    f"the population has moved from its reference. Call "
+                    f"recalibrate('{pattern_id}') to refit it."
+                ),
+                "details": {
+                    "n_new": n_new,
+                    "flagged": flagged,
+                    "expected": budget * n_new,
+                    "p_value": p_value,
+                },
             }
         ]
 
@@ -15602,14 +15708,19 @@ class GDSNavigator:
             pattern_id,
             version,
             primary_key=primary_key,
-            columns=["conformal_p", "anomaly_score", "axis_ranks", "score_delta"],
+            columns=["conformal_p", "anomaly_score", "axis_ranks", "score_delta", "score_group"],
         )
         if row.num_rows == 0:
             raise GDSNavigationError(f"Entity {primary_key!r} not found in {pattern_id!r}")
         p = float(row["conformal_p"][0].as_py())
         ranks = np.asarray(row["axis_ranks"][0].as_py(), dtype=np.float64)
         z = np.asarray(row["score_delta"][0].as_py(), dtype=np.float64)
-        reference = self._storage.read_reference(pattern_id)
+        group = (
+            row["score_group"][0].as_py()
+            if pattern.score_per_group and "score_group" in row.column_names
+            else None
+        )
+        reference = self._storage.read_reference(pattern_id, group=group)
         attribution = attribute(reference, z, ranks, p)
         explanation = build_calibrated_explanation(
             conformal_p=p,
@@ -15627,6 +15738,8 @@ class GDSNavigator:
         )
         explanation["primary_key"] = primary_key
         explanation["pattern_id"] = pattern_id
+        if group is not None:
+            explanation["score_group"] = group
         return explanation
 
     def find_diverse_explanations(
@@ -15731,7 +15844,7 @@ class GDSNavigator:
             pattern_id,
             version,
             primary_key=primary_key,
-            columns=["primary_key", "delta", "delta_norm"],
+            columns=["primary_key", "delta", "delta_norm", "score_group"],
         )
         if tbl.num_rows == 0:
             raise GDSNavigationError(
@@ -15745,7 +15858,12 @@ class GDSNavigator:
         # reference median (rank-Gaussian 0), not at its shape-space mean.
         neutral: dict[str, float] | None = None
         if validate and _uses_calibrated_score(pattern):
-            ref = self._storage.read_reference(pattern_id)
+            group = (
+                tbl["score_group"][0].as_py()
+                if pattern.score_per_group and "score_group" in tbl.column_names
+                else None
+            )
+            ref = self._storage.read_reference(pattern_id, group=group)
             neutral = {
                 d: float(np.interp(0.5, ref.cdf_levels, ref.cdf_grid[j]))
                 for j, d in enumerate(ref.dims)
@@ -18929,7 +19047,18 @@ class GDSNavigator:
             version,
             primary_key=primary_key,
             columns=["primary_key", "delta", "delta_norm", "is_anomaly"]
-            + (["score_delta", "axis_ranks", "anomaly_score", "conformal_p"] if calibrated else []),
+            + (
+                [
+                    "score_delta",
+                    "axis_ranks",
+                    "anomaly_score",
+                    "conformal_p",
+                    "updated_at",
+                    "score_group",
+                ]
+                if calibrated
+                else []
+            ),
         )
         if tbl.num_rows == 0:
             raise GDSNavigationError(
@@ -19071,7 +19200,12 @@ class GDSNavigator:
         dimension breakdown is the evidence attribution ``explain_anomaly`` uses."""
         from hypertopos.engine import robust
 
-        ref = self._storage.read_reference(pattern_id)
+        group = (
+            tbl["score_group"][0].as_py()
+            if pattern.score_per_group and "score_group" in tbl.column_names
+            else None
+        )
+        ref = self._storage.read_reference(pattern_id, group=group)
         overrides: dict[int, float] = {}
         for label, value in set_dimension.items():
             name = _score_dim_name(pattern.dim_labels[resolved_indices[label]], label, ref.dims)
@@ -19086,7 +19220,14 @@ class GDSNavigator:
         score_delta = np.asarray(tbl["score_delta"][0].as_py(), dtype=np.float64)
         axis_ranks = np.asarray(tbl["axis_ranks"][0].as_py(), dtype=np.float64)
         p_before = float(tbl["conformal_p"][0].as_py())
-        cf = robust.counterfactual(ref, score_delta, axis_ranks, overrides)
+        # A row written after the calibration, or left out of its fit, was scored
+        # as a new row: its stored p and the rescored one both come from the
+        # out-of-fold calibration.
+        excluded = ref.excluded_keys if ref.excluded_keys is not None else ()
+        member = primary_key not in set(excluded) and not _written_since_calibration(
+            pattern, tbl["updated_at"][0].as_py()
+        )
+        cf = robust.counterfactual(ref, score_delta, axis_ranks, overrides, members=member)
         is_anomaly_after = bool(
             robust.is_anomaly(np.array([cf.conformal_p]), pattern.anomaly_percentile)[0]
         )
@@ -19720,7 +19861,7 @@ class GDSNavigator:
 
         def side(
             ref: str | None,
-        ) -> tuple[pa.Table, CalibrationFit, float, list[dict[str, Any]], bool]:
+        ) -> tuple[pa.Table, CalibrationFit, float | None, list[dict[str, Any]], bool]:
             recipe = recipes.get(ref, []) if ref is not None else []
             reader = GDSReader(str(base), branch=ref)
             reader.take_snapshot()
@@ -19734,7 +19875,11 @@ class GDSNavigator:
                 pattern_id,
                 pattern.version,
                 columns=["primary_key", "delta_norm", "score_rank_pct"]
-                + (["anomaly_score", "is_anomaly", "conformal_p"] if calibrated else []),
+                + (
+                    ["anomaly_score", "is_anomaly", "conformal_p", "score_group"]
+                    if calibrated
+                    else []
+                ),
             )
             if "score_rank_pct" not in table.column_names:
                 table = table.append_column(
@@ -19753,23 +19898,48 @@ class GDSNavigator:
                 first[1:] = keys[1:] != keys[:-1]
                 table = table.filter(pa.array(first))
             score = table[score_col].to_numpy(zero_copy_only=False).astype(np.float64)
+            threshold: float | None
             if calibrated:
                 # The stored flag is the alarm budget; the conformal p falls
-                # with the score, so the lowest flagged score is the boundary.
+                # with the score, so the lowest flagged score is the boundary
+                # (of each score group, on a pattern with a reference per group).
                 flags = pc.fill_null(table["is_anomaly"], False)
-                table = table.drop_columns(["is_anomaly", "anomaly_score"])
-                flagged = score[np.asarray(flags.to_numpy(zero_copy_only=False), dtype=bool)]
-                if flagged.size:
-                    threshold = float(flagged.min())
-                else:  # nothing flagged: a boundary just above every score
-                    threshold = math.nextafter(float(score.max()), math.inf) if score.size else 0.0
+                flag_mask = np.asarray(flags.to_numpy(zero_copy_only=False), dtype=bool)
+                groups = np.zeros(len(score), dtype=np.int64)
+                if pattern.score_per_group and "score_group" in table.column_names:
+                    codes = pc.fill_null(table["score_group"], "").to_numpy(zero_copy_only=False)
+                    groups = np.unique(codes.astype(str), return_inverse=True)[1]
+                bounds = np.empty(len(score))
+                for g in np.unique(groups):
+                    rows_g = groups == g
+                    flagged = score[rows_g & flag_mask]
+                    if flagged.size:
+                        bounds[rows_g] = float(flagged.min())
+                    else:  # nothing flagged: a boundary just above every score
+                        bounds[rows_g] = math.nextafter(float(score[rows_g].max()), math.inf)
+                table = table.drop_columns(
+                    [
+                        c
+                        for c in ("is_anomaly", "anomaly_score", "score_group")
+                        if c in table.column_names
+                    ]
+                )
+                if pattern.score_per_group:
+                    threshold = None
+                else:
+                    threshold = float(bounds[0]) if score.size else 0.0
             else:
                 # Anomalous = delta_norm at or above the global threshold, the
                 # rule anomaly_summary and find_anomalies count by (the stored
                 # is_anomaly column may use per-group thresholds).
                 threshold = float(np.linalg.norm(pattern.theta))
                 flags = pa.array((threshold > 0.0) & (score >= threshold))
-            table = table.append_column("is_anomaly", flags).append_column("score", pa.array(score))
+                bounds = np.full(len(score), threshold)
+            table = (
+                table.append_column("is_anomaly", flags)
+                .append_column("score", pa.array(score))
+                .append_column("threshold", pa.array(bounds))
+            )
             return table, reader.read_calibration_fit(pattern_id), threshold, recipe, calibrated
 
         t_from, fit_from, theta_from, _, cal_from = side(other)
@@ -19811,9 +19981,11 @@ class GDSNavigator:
         # The score is delta_norm, or anomaly_score on a calibrated pattern.
         s_from = joined["score_from"].to_numpy(zero_copy_only=False)
         s_to = joined["score_to"].to_numpy(zero_copy_only=False)
-        old_side = s_from >= theta_from
-        by_threshold = (s_from >= theta_to) != old_side
-        by_score = (s_to >= theta_from) != old_side
+        b_from = joined["threshold_from"].to_numpy(zero_copy_only=False)
+        b_to = joined["threshold_to"].to_numpy(zero_copy_only=False)
+        old_side = s_from >= b_from
+        by_threshold = (s_from >= b_to) != old_side
+        by_score = (s_to >= b_from) != old_side
         causes = np.where(
             by_threshold & ~by_score,
             "threshold",
@@ -19852,10 +20024,10 @@ class GDSNavigator:
 
         top_movers = rows(np.argsort(-mover_key, kind="stable")[:top_n])
         flipped_in_top = rows(
-            most_past_threshold(~an_from & an_to, s_to / max(theta_to, 1e-12)), with_cause=True
+            most_past_threshold(~an_from & an_to, s_to / np.maximum(b_to, 1e-12)), with_cause=True
         )
         flipped_out_top = rows(
-            most_past_threshold(an_from & ~an_to, s_from / max(theta_from, 1e-12)),
+            most_past_threshold(an_from & ~an_to, s_from / np.maximum(b_from, 1e-12)),
             with_cause=True,
         )
         drift = (

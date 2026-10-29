@@ -9,11 +9,11 @@
 [![PyArrow](https://img.shields.io/badge/format-PyArrow-red.svg)](https://arrow.apache.org/docs/python/)
 [![Lance](https://img.shields.io/badge/storage-Lance-blueviolet.svg)](https://github.com/lance-format/lance)
 [![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io)
-[![Version](https://img.shields.io/badge/version-0.10.0-%235500FF.svg)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.10.1-%235500FF.svg)](pyproject.toml)
 
 Describe your tables in a YAML file, run `hypertopos build`, and every entity gets a position relative to its own population — so "out of place", "similar", "drifting" and "different between groups" become distances you read instead of queries you write.
 
-- **No model, no labels.** Every entity's anomaly score is calibrated against the population itself, with an exact alarm budget — at the 95th percentile 5 % is flagged, and 5 % of a population like it would be; nothing is trained and nothing has to be annotated.
+- **No model, no labels.** Every entity's anomaly score is calibrated against the population itself — at the 95th percentile at most 5 % of the population is flagged; entities scored later against the stored calibration keep that budget while the population does not move, and `check_alerts` reports `alarm_rate_drift` when it does; nothing is trained and nothing has to be annotated.
 - **Explanations in the data's own columns.** `explain_anomaly` turns an anomaly's p-value into bits of evidence and splits them over the dimensions that carry it, so the parts add up to the whole.
 - **One snapshot per reader, what-if on a branch.** A session keeps its answers while data keeps arriving; a recalibration or trial ingest runs on a copy-free branch, gets compared with main, then is promoted or deleted.
 
@@ -121,7 +121,7 @@ Event tables that live in Spark (Databricks, a lakehouse, a cluster) need no YAM
 
 <p align="center">
   <img src="docs/images/demo-spark.svg" width="900"
-       alt="A data scientist calls find_anomalies on a Spark DataFrame of payment events grouped by segment, shows the three most distant entities, then calls explain on A000335">
+       alt="A data scientist calls find_anomalies on a Spark DataFrame of payment events grouped by segment, with each segment scored against its own accounts, shows the three most distant entities, then calls explain on A000335">
 </p>
 <p align="center"><sub><i>Real output on synthetic data. A000335 is flagged by its conformal p-value; <code>explain</code> names the dimension that drives its score.</i></sub></p>
 
@@ -139,7 +139,7 @@ accounts = spark.createDataFrame(data.accounts.to_pandas())
 events = tx.join(accounts.select("account", "segment"), tx.from_account == accounts.account)
 
 result = find_anomalies(events, entity="from_account", counterparty="to_account",
-                        amount="amount", time="ts", group_by="segment")
+                        amount="amount", time="ts", group_by="segment", score_per_group=True)
 result.orderBy("anomaly_score", ascending=False).show(3)
 explain(result, entities=["A000335"]).show(2)
 ```
@@ -150,20 +150,20 @@ Real output (local Spark, two cores):
 +-------+----------+----------+-------+--------+------------------------------------------+
 | entity|delta_norm|is_anomaly|p_value| segment|                               top_reasons|
 +-------+----------+----------+-------+--------+------------------------------------------+
-|A000335|    10.616|      true|  0.001|  retail|[{burst_max_daily, 5.31, 25.0}, ...       |
-|A000259|    10.215|      true|  0.002|  retail|[{n_out, 5.62, 30.3}, ...                 |
-|A000179|    10.208|      true|  0.003|business|[{active_days, -4.80, 22.1}, ...          |
+|A000998|     7.383|      true|  0.003|  retail|[{round_amount_share, 6.24, 68.0}, ...    |
+|A000497|     5.978|      true|  0.007|business|[{round_amount_share, 0.16, 70.5}, ...    |
+|A000335|    10.616|      true|  0.004|  retail|[{amount_min_out, 0.40, 20.7}, ...        |
 +-------+----------+----------+-------+--------+------------------------------------------+
 
 +-------+---------------+-----+-----+-----+-----+------------+---------+
 |entity |dim            |value|mu   |sigma|delta|pct_of_total|direction|
 +-------+---------------+-----+-----+-----+-----+------------+---------+
-|A000335|burst_max_daily|20.0 |7.683|2.320|5.31 |25.0        |above    |
-|A000335|amount_std_out |7.583|3.771|0.779|4.89 |21.2        |above    |
+|A000335|amount_min_out |3.122|2.811|0.779|0.40 |20.7        |above    |
+|A000335|burst_max_daily|20.0 |7.683|2.320|5.31 |12.5        |above    |
 +-------+---------------+-----+-----+-----+-----+------------+---------+
 ```
 
-`A000335` made 20 payments on its busiest day, against about 8 for retail accounts (+5.3 σ), and its payment amounts vary far more than theirs (`amount_std_out` is log-scaled). In the labels of `data.accounts` it is one of the planted fan-out accounts. The other two are not laundering, only unusual, which is what a distance from the population measures: `p_value` 0.001 means one entity in a thousand is as far out. The labels let you measure how a detector does on the same data. `explain` shows where every number comes from. `score(new_events, like=result)` scores the next batch against this calibration on the executors, and `sphere_of(result)` hands the same geometry to an agent through the MCP server.
+`A000335` made 20 payments on its busiest day, against about 8 for retail accounts (+5.3 σ), and in the labels of `data.accounts` it is one of the planted fan-out accounts. The other two are not laundering, only unusual: a larger share of their payments are round amounts than almost any account in their segment. That is what a distance from the population measures, and the labels let you measure how a detector does on the same data. With `score_per_group=True` each segment is scored against its own accounts, so `p_value` 0.003 means about three retail accounts in a thousand are as far out. `pct_of_total` is a dimension's share of the score's evidence, which is measured on ranks, so a dimension can carry a share at a modest deviation. `explain` shows where every number comes from. `score(new_events, like=result)` scores the next batch against this calibration on the executors, and `sphere_of(result)` hands the same geometry to an agent through the MCP server.
 Everything else, from column roles and the 23 dimensions to time handling, the cache and the CLI, is in [hypertopos on Spark](docs/spark.md). To run the whole flow on labelled synthetic data, open the [quickstart notebook](docs/examples/spark-quickstart.ipynb) on Databricks or locally.
 
 ## See it in action
@@ -309,6 +309,7 @@ Every `hypertopos sphere …` subcommand takes `--json` for machine-readable out
 | `promote_branch` refused: main moved since the branch was created | `compare_branches` to see what differs, then delete the branch and create it again from the current main. |
 | `delete_branch` / `promote_branch` refused: a session reads the branch | Close every session opened with `branch=` first. |
 | Lance warns `KMeans: more than 10% of clusters are empty` during build | The dataset is too small for a meaningful vector index; the warning is informational and the build is complete. |
+| Rebuilding the sphere after a data update | Keep the old sphere until you have compared alarms and rankings on the rebuilt one — calibrated scores depend on the reference population. `compare_calibrations` shows what moved. |
 
 ## What's different
 
@@ -319,8 +320,9 @@ Every capability below comes from one decision: an entity is a point in a space 
 | Capability | What it does | Instead of |
 |---|---|---|
 | Population-relative coordinates | `delta = (shape − μ) / σ` per dimension; one vector serves anomaly, clustering, drift and comparison | Learned embeddings with latent dimensions that need retraining when the data shifts |
-| Calibrated anomaly score | Continuous anchor patterns score each entity on rank-Gaussian, shrunk-covariance Mahalanobis distance plus, when an event line with an edge table exists, its motion against the population's velocity field (`score_axes`, nearest-peer distance opt-in); a split-conformal p-value against a stored reference makes `is_anomaly` an exact alarm budget | Choosing a contamination rate or a hand-tuned cut-off, or trusting a p-value from a Gaussian null the data does not follow |
+| Calibrated anomaly score | Continuous anchor patterns score each entity on rank-Gaussian, shrunk-covariance Mahalanobis distance plus, when an event line with an edge table exists, its motion against the population's velocity field (`score_axes`, nearest-peer distance opt-in); a conformal p-value against the fitted population makes `is_anomaly` an alarm budget: at the 95th percentile at most 5 % of the population is flagged; entities scored later keep that budget (on smaller calibrations via out-of-fold scores; on larger ones the difference is within noise); `check_alerts` reports `alarm_rate_drift` when later rows exceed it | Choosing a contamination rate or a hand-tuned cut-off, or trusting a p-value from a Gaussian null the data does not follow |
 | Self-calibrating threshold | θ is a percentile of the population's own `delta_norm` — per group when a pattern declares `group_by_property` — for event, mixture and discrete patterns | Choosing a contamination rate or a hand-tuned cut-off |
+| Per-group calibrated references | `score_per_group` (Spark `find_anomalies`, pattern YAML) scores each `group_by` group against its own calibrated reference, so `is_anomaly` means rare within the group and each group keeps its own alarm budget; groups too small to flag anyone are pooled, `score_group` / `calibration_scope` name the reference, and `recalibrate` refits every group | One global cut-off that floods the alarms with the largest or most volatile group, or one model per segment maintained by hand |
 | Distribution-aware dimensions | Each dimension declares a kind (gaussian, poisson, bernoulli), detected or set with `kind:` on precomputed dimensions; `sphere_overview` flags dead, sparse and dominant dimensions with concrete advice | One metric for every feature, and silent garbage when a feature breaks its assumption |
 | Calibration epochs | Every build and `recalibrate` records an epoch and its calibration reference; `compare_calibrations` shows per-dimension μ / σ / θ drift, and on patterns that θ decides `theta_sensitivity` shows whether it sits near a cliff | No record of how the coordinate system itself moved |
 | Hidden influencers | On patterns that θ decides, `find_calibration_influencers` measures each entity's leave-one-out impact on the calibration and names the ones that distort it; on calibrated patterns a branch recalibration with `exclude_keys` shows what a suspect does to the reference | Explaining predictions while the baseline itself is contaminated |

@@ -32,7 +32,7 @@ accounts = spark.createDataFrame(data.accounts.to_pandas())
 events = tx.join(accounts.select("account", "segment"), tx.from_account == accounts.account)
 
 result = find_anomalies(events, entity="from_account", counterparty="to_account",
-                        amount="amount", time="ts", group_by="segment")
+                        amount="amount", time="ts", group_by="segment", score_per_group=True)
 result.orderBy("anomaly_score", ascending=False).show(10, truncate=False)
 explain(result, top_n=3).show(15, truncate=False)
 ```
@@ -59,14 +59,14 @@ One row per entity, sender or receiver:
 | Column | Meaning |
 |---|---|
 | `entity` | The entity key, as a string |
-| `anomaly_score` | The calibrated evidence score — the same score the sphere builder gives continuous anchor patterns; higher = more unusual. Rank by it |
-| `is_anomaly` | `true` when `p_value` is at most `1 − percentile/100` (99 by default): the alarm budget — about 1 % of the population is flagged, and about 1 % of a population like it would be |
+| `anomaly_score` | The calibrated evidence score — the same score the sphere builder gives continuous anchor patterns on the Mahalanobis axis; higher = more unusual. Rank by it |
+| `is_anomaly` | `true` when `p_value` is at most `1 − percentile/100` (99 by default): the alarm budget — at most 1 % of the population is flagged; entities scored later against the stored calibration keep that budget while the population does not move |
 | `p_value` | Conformal p-value of `anomaly_score`: the share of the calibration population scoring at least as high (0.01 means 1 % score as high or higher) |
 | `score_rank_pct` | Rank of `anomaly_score` in the population, 0–100 |
 | `delta_norm` | Distance from the (group's) centre, in standard deviations across all dimensions — the shape, for reference; it does not decide the flag |
 | `top_reasons` | Up to three `{dim, delta, pct_of_total}`: the dimensions that drive `anomaly_score` most, with the signed deviation and each one's share of the score in percent — the same Shapley split of the Mahalanobis evidence that `explain_anomaly` reports on a sphere, so dimensions that move together share the deviation they make together, and a dimension can lead with a moderate `delta`. Empty for an entity exactly at the centre of the score |
 
-The score is the Mahalanobis axis alone: Spark has no event-motion axis (`current`), so a sphere built from the same events with an event pattern can score the same entities differently and give different p-values.
+The score is the Mahalanobis axis alone: Spark has no event-motion axis (`current`), so a sphere built from the same events with an event pattern can score the same entities differently and give different p-values. `find_anomalies` scores the fitted table with its in-sample p-values (`FrozenCalibration.score(table, members=True)`), reproducing the values a sphere build would store. `score` for new data uses `members=False`: on smaller calibrations (up to about 2,000 entities per dimension) the alarm budget is kept via out-of-fold scores; on larger ones the in-sample calibration is used because the difference is within noise at that scale. `score` treats every row as a new entity, also when it rescores the calibration's own events: `anomaly_score`, `score_rank_pct` and the reasons repeat the `find_anomalies` values, while `p_value` and `is_anomaly` can differ slightly.
 
 `top_reasons` is an `array<struct>`, so it works in `display`, in SQL (`top_reasons[0].dim`) and when written to Delta:
 
@@ -154,16 +154,18 @@ The baseline stays the same from one day to the next, so the scores stay compara
 
 ### Per-group populations
 
-`group_by` names an entity property, such as a segment or a country. With groups, `delta_norm` and the reasons' `delta` are measured against the entity's own group; the score, `p_value` and `is_anomaly` stay global, so `group_by` does not change who is flagged. Use it to read deviations within a kind of entity, and filter the result by the group column to rank inside a group.
+`group_by` names an entity property, such as a segment or a country. With groups, `delta_norm` and the reasons' `delta` are always measured against the entity's own group. Two modes decide what happens to the score and the flag:
+
+**Default (`score_per_group=False`):** the score, `p_value` and `is_anomaly` stay global — every entity is scored against the whole population, so `group_by` does not change who is flagged. Use it when the groups differ in scale but not in kind, so you want group-relative deviations alongside a population-wide flag.
+
+**Per-group (`score_per_group=True`):** each group is scored against its own calibrated reference, so `anomaly_score`, `p_value`, `score_rank_pct` and `is_anomaly` all mean "unusual within this group"; each group keeps its own alarm budget. Use it when the groups are distinct kinds of entity, each with at least about 1,000 members — groups too small to flag a member (199 at the 99th percentile) are pooled, and entities whose group was not seen at calibration time are scored against the whole population. `calibration_scope` says which reference scored each entity (see below).
 
 ```python
 find_anomalies(tx, entity="from_account", counterparty="to_account", amount="amount",
-               time="ts", group_by="segment")
+               time="ts", group_by="segment", score_per_group=True)
 ```
 
-An entity takes the most frequent value of the column in its own events, and the smallest one on a tie. Entities seen only as a counterparty go to the group `"(none)"`. Groups with fewer than `min_group_size` entities (100 by default) are pooled: a mean and spread need enough members to measure a deviation against. The result gains the `group_by` column and `calibration_scope`, which is `group` or `pooled`.
-
-With groups, `delta_norm` and the reasons' `delta` are measured against the entity's own group: its mean and its spread. The score, its shares (`pct_of_total`), `p_value`, `score_rank_pct` and `is_anomaly` are global — every entity is flagged on one scale against the whole population. To see what is unusual for a group, read the group-relative reasons, or filter the result by the `group_by` column.
+An entity takes the most frequent value of the column in its own events, and the smallest one on a tie. Entities seen only as a counterparty go to the group `"(none)"`. The result gains the `group_by` column and `calibration_scope`: `"group"` when the entity was scored by its own group's reference, `"pooled"` when by the pool's, and `"global"` when by the whole population (unseen group or undersized pool — only with `score_per_group`).
 
 ### Where the work runs, and the cache
 

@@ -14,7 +14,7 @@ The score of an entity is the mean of its population ranks on a few axes:
 - ``knn`` (opt-in): mean distance to the 100 nearest reference members on 12 PCA
   dimensions of standardised sign-log1p coordinates.
 
-The p-value is split-conformal against the fitted population's scores. Everything
+The p-value is a conformal p-value against the fitted population's scores. Everything
 the score needs is held in :class:`Reference`, so rows unseen at fit time (incremental
 ingest, Spark) are scored without refitting.
 """
@@ -36,6 +36,10 @@ VELOCITY_K = 50
 KNN_K = 100
 KNN_DIMS = 12
 MAX_REFERENCE_ROWS = 100_000
+OOF_FOLDS = 5
+# Above this many rows per dimension the in-sample calibration of new rows is
+# already within noise of the budget, and the folds would cost a full refit each.
+OOF_MAX_ROWS_PER_DIM = 2_000
 _DAY = 86400.0
 
 
@@ -72,6 +76,14 @@ class Reference:
     # sorted fused scores of the fitted population over the axes other than
     # ``current``: the calibration of rows scored without events (e.g. ingest)
     cal_sorted_no_current: np.ndarray | None = None
+    # Keys of rows present at fit time but left out of it (a recalibration with
+    # excluded keys): they were scored as new rows.
+    excluded_keys: np.ndarray | None = None
+    # Out-of-fold fused scores of the population: what rows unseen at fit time
+    # are calibrated against (members keep ``cal_sorted``).
+    mahal_sorted_oof: np.ndarray | None = None
+    cal_sorted_oof: np.ndarray | None = None
+    cal_sorted_no_current_oof: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -87,7 +99,7 @@ class RobustScores:
 
 
 def conformal_p(reference_sorted: np.ndarray, scores: np.ndarray) -> np.ndarray:
-    """Split-conformal p: ``(1 + #{reference >= s}) / (n + 1)``."""
+    """Conformal p-value against the fitted population: ``(1 + #{reference >= s}) / (n + 1)``."""
     n = len(reference_sorted)
     above = n - np.searchsorted(reference_sorted, scores, side="left")
     return (1.0 + above) / (n + 1.0)
@@ -213,6 +225,10 @@ def event_states(
 
 
 def _halves(events: EventArrays) -> tuple[float, float]:
+    # A group's members may have no events at all: every row is then inactive
+    # on ``current`` and the halves are never used.
+    if not len(events.ts):
+        return 0.0, 0.0
     t0 = float(events.ts.min())
     day_max = np.floor((float(events.ts.max()) - t0) / _DAY)
     return t0, t0 + ((day_max + 1) // 2) * _DAY
@@ -331,23 +347,38 @@ def _finish(
     values: dict[str, np.ndarray],
     sample_index: np.ndarray | None = None,
     without_current: bool = False,
+    members: bool = True,
 ) -> RobustScores:
     """Fuse the axis ranks and calibrate. ``without_current``: the rows carry no
     events, so ``current`` is absent (its rank is NaN) and the rows are fused
-    over the other axes and calibrated against ``cal_sorted_no_current``."""
+    over the other axes and calibrated against ``cal_sorted_no_current``.
+    ``members=False``: the rows were not in the fit, so their p-value is taken
+    against the out-of-fold scores (when the reference has them): ``mahal``
+    ranked among the out-of-fold values, fused, compared with the out-of-fold
+    calibration. The score, axis ranks and rank percentile stay on the
+    in-sample scale, so equal values score equally for members and new rows."""
     ranks = np.column_stack([_mid_rank(ref.axis_sorted[a], values[a]) for a in ref.axes])
     cal = ref.cal_sorted
+    oof_cal = None if members else ref.cal_sorted_oof
     if without_current and ref.cal_sorted_no_current is not None:
         ranks[:, ref.axes.index("current")] = np.nan
         cal = ref.cal_sorted_no_current
+        oof_cal = None if members else ref.cal_sorted_no_current_oof
     fused = np.nanmean(ranks, axis=1)
+    if oof_cal is not None and ref.mahal_sorted_oof is not None:
+        oof_ranks = ranks.copy()
+        m = ref.axes.index("mahal")
+        oof_ranks[:, m] = _mid_rank(ref.mahal_sorted_oof, values["mahal"])
+        p = conformal_p(oof_cal, np.nanmean(oof_ranks, axis=1))
+    else:
+        p = conformal_p(cal, fused)
     return RobustScores(
         delta=delta,
         delta_norm=delta_norm,
         axis_values=values,
         axis_ranks=ranks.astype(np.float32),
         anomaly_score=fused,
-        conformal_p=conformal_p(cal, fused),
+        conformal_p=p,
         score_rank_pct=np.asarray(
             100.0 * np.searchsorted(cal, fused, side="left") / max(ref.n_fitted, 1),
             dtype=np.float64,
@@ -467,12 +498,16 @@ def counterfactual(
     score_delta: np.ndarray,
     axis_ranks: np.ndarray,
     overrides: dict[int, float],
+    *,
+    members: bool = True,
 ) -> Counterfactual:
     """Rescore one entity with ``overrides`` (score-dim index → natural value).
 
     ``mahal`` is recomputed exactly from the changed rank-Gaussian coordinates;
     the other axes (motion, peers) need the entity's events or full row, so their
     stored ranks are kept. Without overrides the stored score is returned.
+    ``members=False``: the entity was scored after the fit, so its p-value is
+    taken against the out-of-fold calibration, as when it was stored.
     """
     r = np.asarray(score_delta, dtype=np.float64).copy()
     ranks = np.asarray(axis_ranks, dtype=np.float64).copy()
@@ -493,19 +528,26 @@ def counterfactual(
     if changed:
         mahal = np.sqrt(max(float(r @ ref.lw_precision @ r), 0.0))
         ranks[ref.axes.index("mahal")] = _mid_rank(ref.axis_sorted["mahal"], np.array([mahal]))[0]
-    cal = ref.cal_sorted
-    if (
+    no_current = (
         "current" in ref.axes
-        and np.isnan(ranks[ref.axes.index("current")])
+        and bool(np.isnan(ranks[ref.axes.index("current")]))
         and ref.cal_sorted_no_current is not None
-    ):
-        cal = ref.cal_sorted_no_current
+    )
+    cal = ref.cal_sorted_no_current if no_current else ref.cal_sorted
+    oof_cal = ref.cal_sorted_no_current_oof if no_current else ref.cal_sorted_oof
     fused = float(np.nanmean(ranks))
+    if not members and oof_cal is not None and ref.mahal_sorted_oof is not None:
+        mahal = np.sqrt(max(float(r @ ref.lw_precision @ r), 0.0))
+        oof_ranks = ranks.copy()
+        oof_ranks[ref.axes.index("mahal")] = _mid_rank(ref.mahal_sorted_oof, np.array([mahal]))[0]
+        p = float(conformal_p(oof_cal, np.array([np.nanmean(oof_ranks)]))[0])
+    else:
+        p = float(conformal_p(cal, np.array([fused]))[0])  # type: ignore[arg-type]
     return Counterfactual(
         score_delta=r.astype(np.float32),
         axis_ranks=ranks.astype(np.float32),
         anomaly_score=fused,
-        conformal_p=float(conformal_p(cal, np.array([fused]))[0]),
+        conformal_p=p,
         held_axes=tuple(
             a for a in ref.axes if a != "mahal" and np.isfinite(ranks[ref.axes.index(a)])
         ),
@@ -589,15 +631,69 @@ def fit_reference(
             np.sort(ranks[:, others].mean(axis=1)) if "current" in used else None
         ),
     )
+    ref = _with_out_of_fold(ref, x, ranks, seed)
     sample_index = np.unique(np.concatenate(sampled)) if sampled else None
     return ref, _finish(ref, delta, delta_norm, values, sample_index)
 
 
-def score(ref: Reference, x: np.ndarray, events: EventArrays | None = None) -> RobustScores:
-    """Score rows unseen at fit time against the frozen reference."""
+def _with_out_of_fold(ref: Reference, x: np.ndarray, ranks: np.ndarray, seed: int) -> Reference:
+    """Add the calibration that rows unseen at fit time are compared with.
+
+    A member's ``mahal`` comes from a fit that saw it, so it runs lower than a
+    new row's. Each fold's ``mahal`` is recomputed with the CDF sketch and
+    Ledoit–Wolf fitted on the other folds; new rows rank their ``mahal`` among
+    these out-of-fold values, and the fused out-of-fold ranks are the
+    calibration. ``current`` and ``knn`` keep their member values: those
+    already leave the row out. The folds draw from their own generator, so the
+    member samples above are untouched. Large populations (more than
+    ``OOF_MAX_ROWS_PER_DIM`` rows per dimension) keep the in-sample calibration.
+    """
+    n = len(x)
+    if n < 2 * OOF_FOLDS or n > OOF_MAX_ROWS_PER_DIM * x.shape[1]:
+        return ref
+    folds = np.random.default_rng(seed + 1).permutation(n) % OOF_FOLDS
+    mahal = np.empty(n)
+    for k in range(OOF_FOLDS):
+        held = folds == k
+        grid, z_fit = _sketch_and_gauss(x[~held], None, ref.cdf_levels)
+        location, precision = ledoit_wolf(z_fit)
+        r = to_gauss(grid, ref.cdf_levels, x[held]) - location
+        mahal[held] = np.sqrt(np.maximum(np.sum((r @ precision) * r, axis=1), 0.0))
+    # New rows rank their ``mahal`` among these out-of-fold values: ranked
+    # against the in-sample values instead, the out-of-fold ones would pile up
+    # above the in-sample maximum and make the top of the calibration a tie.
+    mahal_oof_sorted = np.sort(mahal)
+    oof = ranks.copy()
+    m = ref.axes.index("mahal")
+    oof[:, m] = _mid_rank(mahal_oof_sorted, mahal)
+    others = [i for i, a in enumerate(ref.axes) if a != "current"]
+    return replace(
+        ref,
+        mahal_sorted_oof=mahal_oof_sorted,
+        cal_sorted_oof=np.sort(oof.mean(axis=1)),
+        cal_sorted_no_current_oof=(
+            np.sort(oof[:, others].mean(axis=1)) if "current" in ref.axes else None
+        ),
+    )
+
+
+def score(
+    ref: Reference,
+    x: np.ndarray,
+    events: EventArrays | None = None,
+    *,
+    members: bool = False,
+) -> RobustScores:
+    """Score rows against the frozen reference.
+
+    Rows unseen at fit time (the default) are calibrated against the
+    out-of-fold scores of the population. ``members=True`` rescores rows of the
+    fitted population itself against the in-sample calibration, which
+    reproduces their fitted p-values.
+    """
     x = np.nan_to_num(np.asarray(x, dtype=np.float64))
     delta, delta_norm, values = _axes(ref, x, events, None, None)
-    return _finish(ref, delta, delta_norm, values, without_current=events is None)
+    return _finish(ref, delta, delta_norm, values, without_current=events is None, members=members)
 
 
 _ARRAY_FIELDS = (
@@ -614,6 +710,10 @@ _ARRAY_FIELDS = (
     "pca_components",
     "knn_ref",
     "cal_sorted_no_current",
+    "excluded_keys",
+    "mahal_sorted_oof",
+    "cal_sorted_oof",
+    "cal_sorted_no_current_oof",
 )
 
 
@@ -648,4 +748,178 @@ def reference_from_arrays(arrays: Mapping[str, np.ndarray]) -> Reference:
         t0=float(arrays["t0"]) if "t0" in arrays else None,
         t_mid=float(arrays["t_mid"]) if "t_mid" in arrays else None,
         **optional,
+    )
+
+
+POOLED_GROUP = "(small groups)"
+# Each group's reference is about 33 KB per dimension (the CDF sketch) plus its
+# sorted calibration; past this many groups the stored and broadcast
+# calibration grows past what one epoch should hold.
+MAX_SCORE_GROUPS = 256
+
+
+def min_reference_size(percentile: float) -> int:
+    """Smallest group whose top member can be flagged at ``percentile``.
+
+    A fitted member's smallest p-value is ``2 / (n + 1)`` (it counts itself),
+    so a smaller group never flags anyone. Computed through :func:`is_anomaly`
+    so the bound agrees with the flag's own floating-point comparison.
+    """
+    n = max(int(np.ceil(2.0 / max(1.0 - percentile / 100.0, 1e-12))) - 3, 1)
+    while not is_anomaly(np.array([2.0 / (n + 1.0)]), percentile)[0]:
+        n += 1
+    return n
+
+
+def pool_groups(
+    ids: np.ndarray,
+    percentile: float,
+    min_group_size: int | None = None,
+    *,
+    stored_labels: bool = False,
+) -> tuple[np.ndarray, frozenset[str]]:
+    """Relabel members of groups below the reference size to ``POOLED_GROUP``.
+
+    The size is ``min_reference_size(percentile)``, or ``min_group_size`` when
+    that is larger; a smaller ``min_group_size`` would leave groups that can
+    never flag, so it raises. Returns the labels and the pooled group values.
+    A group already named ``POOLED_GROUP`` raises, unless ``stored_labels``:
+    labels read back from a sphere may hold the pool itself.
+    """
+    bound = min_reference_size(percentile)
+    if min_group_size is not None and min_group_size < bound:
+        raise ValueError(
+            f"min_group_size={min_group_size} is below {bound}, the smallest group "
+            f"that can flag a member at the {percentile:g}th percentile"
+        )
+    threshold = max(bound, min_group_size or 0)
+    ids = np.asarray(ids).astype(object)
+    values, counts = np.unique(ids, return_counts=True)
+    small = values[counts < threshold]
+    if len(small) == 0:
+        return ids, frozenset()
+    if not stored_labels and POOLED_GROUP in values and set(small) - {POOLED_GROUP}:
+        raise ValueError(
+            f"a group is named {POOLED_GROUP!r}, the label small groups are pooled under; rename it"
+        )
+    out = ids.copy()
+    out[np.isin(ids, small)] = POOLED_GROUP
+    return out, frozenset(str(v) for v in small)
+
+
+def subset_events(events: EventArrays | None, mask: np.ndarray) -> EventArrays | None:
+    """The events of the rows in ``mask``, with ``code`` renumbered to the subset."""
+    if events is None:
+        return None
+    new = np.cumsum(mask) - 1
+    keep = mask[events.code]
+    return EventArrays(
+        new[events.code[keep]], events.direction[keep], events.ts[keep], events.amount[keep]
+    )
+
+
+@dataclass(frozen=True)
+class GroupedReference:
+    """A reference per group, with the population's for rows outside every group."""
+
+    population: Reference  # unseen groups, and pooled rows when the pool is too small
+    groups: dict[str, Reference]  # own groups, and POOLED_GROUP when it is large enough
+    pooled: frozenset[str]  # group values folded into POOLED_GROUP
+
+    def resolve(self, gid: str) -> tuple[Reference, str | None, str]:
+        """``(reference, score group key or None, scope)`` for a row of group ``gid``."""
+        key = POOLED_GROUP if gid in self.pooled else gid
+        ref = self.groups.get(key)
+        if ref is None:
+            return self.population, None, "global"
+        return ref, key, "pooled" if key == POOLED_GROUP else "group"
+
+
+def fit_grouped_reference(
+    x: np.ndarray,
+    dims: Sequence[str],
+    ids: np.ndarray,
+    *,
+    percentile: float,
+    min_group_size: int | None = None,
+    axes: Sequence[str] = AXES_DEFAULT,
+    events: EventArrays | None = None,
+    seed: int = 0,
+    stored_labels: bool = False,
+) -> tuple[GroupedReference, RobustScores, np.ndarray]:
+    """Fit one reference per group (``ids`` per row) and the population's.
+
+    Groups below the reference size are pooled (:func:`pool_groups`); the pool
+    gets a reference when it reaches the size, otherwise its rows are scored
+    with the population. Returns the references, every row's scores against
+    its own reference and the per-row score group key (None: the population).
+    """
+    x = np.nan_to_num(np.asarray(x, dtype=np.float64))
+    labels, pooled = pool_groups(ids, percentile, min_group_size, stored_labels=stored_labels)
+    names, counts = np.unique(labels, return_counts=True)
+    bound = max(min_reference_size(percentile), min_group_size or 0)
+    own = [str(g) for g, c in zip(names, counts, strict=True) if c >= bound]
+    if len(own) > MAX_SCORE_GROUPS:
+        raise ValueError(
+            f"{len(own)} score groups exceed {MAX_SCORE_GROUPS}: group by a coarser "
+            "property or raise min_group_size"
+        )
+    population, fitted = fit_reference(x, dims, axes=axes, events=events, seed=seed)
+    keys = np.full(len(x), None, dtype=object)
+    groups: dict[str, Reference] = {}
+    parts: list[tuple[np.ndarray, RobustScores]] = []
+    for gid in own:
+        mask = labels == gid
+        ref, scores = fit_reference(
+            x[mask], dims, axes=axes, events=subset_events(events, mask), seed=seed
+        )
+        groups[gid] = ref
+        keys[mask] = gid
+        parts.append((mask, scores))
+    merged = {}
+    for name in (
+        "delta",
+        "delta_norm",
+        "axis_ranks",
+        "anomaly_score",
+        "conformal_p",
+        "score_rank_pct",
+    ):
+        out = np.array(getattr(fitted, name), copy=True)
+        for mask, scores in parts:
+            out[mask] = getattr(scores, name)
+        merged[name] = out
+    grouped = GroupedReference(population=population, groups=groups, pooled=pooled)
+    return grouped, replace(fitted, **merged, axis_values={}, sample_index=None), keys
+
+
+def grouped_reference_to_arrays(grouped: GroupedReference) -> dict[str, np.ndarray]:
+    """The population's arrays at the top level (what a reader unaware of groups
+    loads), each group's under ``g<k>__`` keyed by index, not by value."""
+    out = reference_to_arrays(grouped.population)
+    names = sorted(grouped.groups)
+    out["group_names"] = np.array(names, dtype=np.str_)
+    out["pooled"] = np.array(sorted(grouped.pooled), dtype=np.str_)
+    for k, gid in enumerate(names):
+        for field, value in reference_to_arrays(grouped.groups[gid]).items():
+            out[f"g{k}__{field}"] = value
+    return out
+
+
+def grouped_reference_from_arrays(arrays: Mapping[str, np.ndarray]) -> GroupedReference:
+    return GroupedReference(
+        population=reference_from_arrays(arrays),
+        groups={
+            str(gid): group_reference_from_arrays(arrays, k)
+            for k, gid in enumerate(arrays["group_names"])
+        },
+        pooled=frozenset(str(g) for g in arrays["pooled"]),
+    )
+
+
+def group_reference_from_arrays(arrays: Mapping[str, np.ndarray], k: int) -> Reference:
+    """The reference of the ``k``-th stored group; only its own members are read."""
+    prefix = f"g{k}__"
+    return reference_from_arrays(
+        {name[len(prefix) :]: arrays[name] for name in arrays if name.startswith(prefix)}
     )

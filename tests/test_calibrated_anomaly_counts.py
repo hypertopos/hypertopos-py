@@ -11,6 +11,8 @@ not with ``delta_norm >= θ``.
 
 from __future__ import annotations
 
+import dataclasses
+from datetime import timedelta
 from pathlib import Path
 
 import lance
@@ -196,6 +198,98 @@ def test_find_anomalies_entries_carry_no_theta_influence_class(nav) -> None:  # 
     entries = nav._attach_influence_fields_to_anomaly_entries([{"primary_key": "A000"}], PID)
     assert entries == [{"primary_key": "A000"}]
     assert not nav._influence_cache
+
+
+def test_freshly_built_sphere_raises_no_alarm_rate_alert(nav, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # Nothing was written since the calibration: the check reads no geometry.
+    def _no_scan(*a, **k):  # type: ignore[no-untyped-def]
+        raise AssertionError("geometry scanned")
+
+    monkeypatch.setattr(nav._storage, "read_geometry", _no_scan)
+    assert nav._check_alarm_rate_drift(PID) == []
+
+
+def _ingested(nav, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Make the pattern look ingested into after its calibration."""
+    sphere = nav._storage.read_sphere()
+    pattern = sphere.patterns[PID]
+    later = dataclasses.replace(pattern, computed_at=pattern.last_calibrated_at + timedelta(days=3))
+    patched = dataclasses.replace(sphere, patterns={**sphere.patterns, PID: later})
+    monkeypatch.setattr(nav._storage, "read_sphere", lambda *a, **k: patched)
+
+
+def test_rows_since_calibration_flagged_above_the_budget_raise_an_alert(nav, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    pattern = nav._storage.read_sphere().patterns[PID]
+    later = pattern.last_calibrated_at.replace(tzinfo=None) + timedelta(days=3)
+    n = 400
+    flagged = np.zeros(n, dtype=bool)
+    flagged[:40] = True  # 10 % against a 5 % budget
+    table = pa.table(
+        {
+            "updated_at": pa.array([later] * n, type=pa.timestamp("us")),
+            "is_anomaly": pa.array(flagged),
+        }
+    )
+    _ingested(nav, monkeypatch)
+    monkeypatch.setattr(nav._storage, "read_geometry", lambda *a, **k: table)
+    (alert,) = nav._check_alarm_rate_drift(PID)
+    assert alert["check_type"] == "alarm_rate_drift"
+    assert alert["details"]["n_new"] == n
+    assert alert["details"]["flagged"] == 40
+    assert alert["details"]["p_value"] < 0.01
+    within = table.set_column(1, "is_anomaly", pa.array(np.arange(n) < 20))
+    monkeypatch.setattr(nav._storage, "read_geometry", lambda *a, **k: within)
+    assert nav._check_alarm_rate_drift(PID) == []
+
+
+def test_alarm_rate_alert_is_quiet_on_a_population_that_did_not_move(nav, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # Many more new rows than the calibration holds: their flags share one
+    # calibration, so a test that treats them as independent fires far too often.
+    from hypertopos.engine.robust import fit_reference, is_anomaly, score
+
+    _ingested(nav, monkeypatch)
+    pattern = nav._storage.read_sphere().patterns[PID]
+    later = pattern.last_calibrated_at.replace(tzinfo=None) + timedelta(days=3)
+    fires = 0
+    for seed in range(40):
+        rng = np.random.default_rng(seed)
+        ref, _ = fit_reference(rng.normal(size=(500, 10)), tuple(f"d{i}" for i in range(10)))
+        p = score(ref, rng.normal(size=(5_000, 10))).conformal_p
+        table = pa.table(
+            {
+                "updated_at": pa.array([later] * len(p), type=pa.timestamp("us")),
+                "is_anomaly": pa.array(is_anomaly(p, pattern.anomaly_percentile)),
+            }
+        )
+        monkeypatch.setattr(nav._storage, "read_geometry", lambda *a, t=table, **k: t)
+        monkeypatch.setattr(nav._storage, "read_reference", lambda *a, r=ref, **k: r)
+        fires += bool(nav._check_alarm_rate_drift(PID))
+    assert fires <= 3  # nominal 1 % of 40; a binomial test fires on ~18 %
+
+
+def test_alarm_rate_alert_skips_a_reference_without_out_of_fold_calibration(
+    nav, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    # Built before out-of-fold calibration: its new rows were calibrated in
+    # sample and over-flag, so the budget test would fire on an unmoved population.
+    _ingested(nav, monkeypatch)
+    pattern = nav._storage.read_sphere().patterns[PID]
+    later = pattern.last_calibrated_at.replace(tzinfo=None) + timedelta(days=3)
+    n = 400
+    table = pa.table(
+        {
+            "updated_at": pa.array([later] * n, type=pa.timestamp("us")),
+            "is_anomaly": pa.array(np.arange(n) < 40),
+        }
+    )
+    ref = nav._storage.read_reference(PID)
+    assert ref.mahal_sorted_oof is not None
+    old = dataclasses.replace(
+        ref, mahal_sorted_oof=None, cal_sorted_oof=None, cal_sorted_no_current_oof=None
+    )
+    monkeypatch.setattr(nav._storage, "read_geometry", lambda *a, **k: table)
+    monkeypatch.setattr(nav._storage, "read_reference", lambda *a, **k: old)
+    assert nav._check_alarm_rate_drift(PID) == []
 
 
 def test_find_anomalies_reports_no_theta_forecast_as_emerging(nav) -> None:  # type: ignore[no-untyped-def]

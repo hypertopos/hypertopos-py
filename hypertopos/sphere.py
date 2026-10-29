@@ -18,7 +18,12 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from hypertopos.engine.geometry import GDSEngine, calibrated_deltas, shapes_from_deltas
+from hypertopos.engine.geometry import (
+    GDSEngine,
+    calibrated_deltas,
+    calibrated_shapes,
+    shapes_from_deltas,
+)
 from hypertopos.model.manifest import Contract, Manifest
 from hypertopos.model.sphere import Sphere
 from hypertopos.navigation.navigator import GDSNavigator
@@ -326,24 +331,54 @@ class HyperSession:
             latest_versions=latest,
         )
 
+    def _group_ids(self, pattern: Any, geo_table: Any) -> np.ndarray:
+        """Each geometry row's ``group_by_property`` value, as the build reads it."""
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        line_id = pattern.entity_line_id
+        points = self._reader.read_points(
+            line_id,
+            self._manifest.line_versions[line_id],
+            columns=["primary_key", pattern.group_by_property],
+        )
+        keys = pc.cast(geo_table.column("primary_key"), pa.string())
+        rows = pc.index_in(keys, value_set=pc.cast(points["primary_key"], pa.string()))
+        values = pc.take(points[pattern.group_by_property], rows)
+        return np.asarray(values.to_numpy(zero_copy_only=False).astype(str))
+
     def _refit_score_reference(
         self,
         pattern: Any,
         geo_table: Any,
         fit_mask: np.ndarray,
-    ) -> tuple[Any, Any]:
+        groups: np.ndarray | None = None,
+        percentile: float = 95.0,
+        min_group_size: int | None = None,
+    ) -> tuple[Any, Any, np.ndarray | None]:
         """Refit the calibrated evidence score of ``pattern`` on its current rows.
 
         The score dimensions (point properties) are read from the entity
         line's points in natural units. Events come from the edge table of the
         event pattern that references the entity line, as at build time. Rows outside
-        ``fit_mask`` are scored against the refitted reference. Returns
-        ``(reference, scores)`` in the row order of ``geo_table``.
+        ``fit_mask`` are scored against the refitted reference. A
+        ``score_per_group`` pattern fits one reference per group of ``groups``
+        (pooled as at build time) and scores each row outside ``fit_mask``
+        against its group's. Returns ``(reference, scores, score_group)`` in
+        the row order of ``geo_table``; the reference is a ``GroupedReference``
+        and ``score_group`` the per-row score group key under
+        ``score_per_group``, ``score_group`` is None otherwise.
         """
         import pyarrow as pa
         import pyarrow.compute as pc
 
-        from hypertopos.engine.robust import EventArrays, fit_reference, score
+        from hypertopos.engine.robust import (
+            EventArrays,
+            fit_grouped_reference,
+            fit_reference,
+            score,
+            subset_events,
+        )
 
         sphere = self._reader.read_sphere()
         line_id = pattern.entity_line_id
@@ -389,20 +424,61 @@ class HyperSession:
             if edges.num_rows > 0:
                 events = EventArrays(*(np.concatenate(cols_) for cols_ in zip(*parts, strict=True)))
 
-        def _subset(ev: EventArrays | None, mask: np.ndarray) -> EventArrays | None:
-            if ev is None:
-                return None
-            new = np.cumsum(mask) - 1
-            keep = mask[ev.code]
-            return EventArrays(new[ev.code[keep]], ev.direction[keep], ev.ts[keep], ev.amount[keep])
-
         axes = pattern.score_axes or ("mahal",)
-        if fit_mask.all():
-            return fit_reference(x, pattern.score_dims, axes=axes, events=events)
-        reference, fitted = fit_reference(
-            x[fit_mask], pattern.score_dims, axes=axes, events=_subset(events, fit_mask)
-        )
-        rest = score(reference, x[~fit_mask], _subset(events, ~fit_mask))
+        if pattern.score_per_group:
+            assert groups is not None
+            fit_events = events if fit_mask.all() else subset_events(events, fit_mask)
+            grouped, fitted, fit_keys = fit_grouped_reference(
+                x[fit_mask],
+                pattern.score_dims,
+                groups[fit_mask],
+                percentile=percentile,
+                min_group_size=min_group_size,
+                axes=axes,
+                events=fit_events,
+                stored_labels=True,
+            )
+            score_group = np.full(len(x), None, dtype=object)
+            score_group[fit_mask] = fit_keys
+            if fit_mask.all():
+                return grouped, fitted, score_group
+            # Each excluded row is scored as a new row of its own group.
+            rest_masks = []
+            group_refs = dict(grouped.groups)
+            for gid in np.unique(groups[~fit_mask]):
+                ref, key, _ = grouped.resolve(str(gid))
+                mask = ~fit_mask & (groups == gid)
+                score_group[mask] = key
+                rest_masks.append((mask, score(ref, x[mask], subset_events(events, mask))))
+                if key is not None:
+                    left_out = keys.filter(pa.array(mask)).to_numpy(zero_copy_only=False)
+                    prior = group_refs[key].excluded_keys
+                    group_refs[key] = dataclasses.replace(
+                        group_refs[key],
+                        excluded_keys=np.concatenate(
+                            [prior if prior is not None else [], left_out]
+                        ).astype(np.str_),
+                    )
+            excluded = keys.filter(pa.array(~fit_mask)).to_numpy(zero_copy_only=False)
+            reference: Any = dataclasses.replace(
+                grouped,
+                population=dataclasses.replace(
+                    grouped.population, excluded_keys=excluded.astype(np.str_)
+                ),
+                groups=group_refs,
+            )
+        else:
+            score_group = None
+            if fit_mask.all():
+                reference, fitted = fit_reference(x, pattern.score_dims, axes=axes, events=events)
+                return reference, fitted, None
+            reference, fitted = fit_reference(
+                x[fit_mask], pattern.score_dims, axes=axes, events=subset_events(events, fit_mask)
+            )
+            rest = score(reference, x[~fit_mask], subset_events(events, ~fit_mask))
+            rest_masks = [(~fit_mask, rest)]
+            excluded = keys.filter(pa.array(~fit_mask)).to_numpy(zero_copy_only=False)
+            reference = dataclasses.replace(reference, excluded_keys=excluded.astype(np.str_))
         merged = {}
         for name in (
             "delta",
@@ -415,9 +491,11 @@ class HyperSession:
             a = getattr(fitted, name)
             out = np.empty((len(x), *a.shape[1:]), dtype=a.dtype)
             out[fit_mask] = a
-            out[~fit_mask] = getattr(rest, name)
+            for mask, rest in rest_masks:
+                out[mask] = getattr(rest, name)
             merged[name] = out
-        return reference, dataclasses.replace(fitted, **merged, axis_values={}, sample_index=None)
+        scores = dataclasses.replace(fitted, **merged, axis_values={}, sample_index=None)
+        return reference, scores, score_group
 
     def recalibrate(
         self,
@@ -440,9 +518,22 @@ class HyperSession:
         recalibration on that branch (created when absent) and leaves main and
         this session untouched; on a branch session it must name the session's
         branch. A recalibration on a branch is recorded in its recipe log.
+
+        A pattern with ``group_by_property`` is recalibrated per group, as the
+        build calibrates it: each group's statistics are refitted on its
+        members, every row is measured and flagged against its own group, and
+        with ``score_per_group`` each group's score reference is refitted
+        (``exclude_keys`` that leave a group empty raise ``ValueError``).
+        A pattern with ``gmm_n_components`` raises ``ValueError``: rebuild it.
         """
         if isinstance(exclude_keys, str):
             raise TypeError("exclude_keys must be a collection of keys, not a string")
+        if self._reader.read_sphere().patterns[pattern_id].gmm_components:
+            raise ValueError(
+                f"pattern '{pattern_id}' has gmm_n_components: its statistics are fitted "
+                "per mixture component, which recalibrate does not refit; rebuild the "
+                "sphere to recalibrate it"
+            )
         if branch is not None and branch != self._reader.branch:
             if self._reader.branch:
                 raise ValueError(
@@ -501,9 +592,29 @@ class HyperSession:
         )
         n = geo_table.num_rows
 
-        # 2. Back-compute shape vectors from stored deltas
+        # 2. Back-compute shape vectors from stored deltas: a group_by_property
+        # pattern stores them relative to each group's mu/sigma.
         deltas_old = delta_matrix_from_arrow(geo_table)
-        shape_vectors = shapes_from_deltas(deltas_old, pattern)
+        groups = self._group_ids(pattern, geo_table) if pattern.group_by_property else None
+        if groups is None:
+            shape_vectors = shapes_from_deltas(deltas_old, pattern)
+        else:
+            stored = pattern.group_stats or {}
+            missing = sorted(set(groups.tolist()) - set(stored))
+            if missing:
+                raise ValueError(
+                    f"pattern '{pattern_id}' has rows of groups without stored "
+                    f"statistics: {missing[:10]}"
+                )
+            shape_vectors = np.empty(deltas_old.shape, dtype=np.float32)
+            for gid, gs in stored.items():
+                mask = groups == gid
+                shape_vectors[mask] = calibrated_shapes(
+                    deltas_old[mask],
+                    mu=gs.mu,
+                    sigma_diag=gs.sigma_diag,
+                    dimension_weights=pattern.dimension_weights,
+                )
         excluded = sorted(set(exclude_keys or ()))
         fit_mask = np.ones(n, dtype=bool)
         if excluded:
@@ -523,11 +634,8 @@ class HyperSession:
         # (spheres that predate the stored value use the 95.0 default).
         meta_root = self._reader.meta_root
         sphere_path = meta_root / "_gds_meta" / "sphere.json"
-        pct = float(
-            json.loads(self._reader.sphere_json_text())["patterns"][pattern_id].get(
-                "anomaly_percentile", 95.0
-            )
-        )
+        pattern_node = json.loads(self._reader.sphere_json_text())["patterns"][pattern_id]
+        pct = float(pattern_node.get("anomaly_percentile", 95.0))
         new_mu, new_sigma, _, _, _ = compute_stats(
             shape_vectors[fit_mask],
             anomaly_percentile=pct,
@@ -545,24 +653,88 @@ class HyperSession:
                 new_sigma[prop_start:prop_end], SIGMA_EPS_PROP
             )
 
-        new_deltas = calibrated_deltas(
-            shape_vectors.astype(np.float32),
-            mu=new_mu,
-            sigma_diag=new_sigma,
-            dimension_weights=pattern.dimension_weights,
-        ).astype(np.float32)
+        D = shape_vectors.shape[1]
+        group_stats: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, int]] = {}
+        if groups is None:
+            new_deltas = calibrated_deltas(
+                shape_vectors.astype(np.float32),
+                mu=new_mu,
+                sigma_diag=new_sigma,
+                dimension_weights=pattern.dimension_weights,
+            ).astype(np.float32)
+        else:
+            # Per-group statistics exactly as the build computes them, fitted
+            # on the rows left in; every row is measured against its group's.
+            from hypertopos.builder._stats import compute_stats_grouped
+
+            group_stats, _, _ = compute_stats_grouped(
+                shape_vectors[fit_mask],
+                groups[fit_mask],
+                pct,
+                prop_dim_start=prop_start if prop_columns else None,
+            )
+            emptied = sorted(set(groups.tolist()) - set(group_stats))
+            if emptied:
+                raise ValueError(
+                    f"exclude_keys leaves no entity left to fit group(s) {emptied[:10]} "
+                    f"of pattern '{pattern_id}'"
+                )
+            new_deltas = np.empty(shape_vectors.shape, dtype=np.float32)
+            for gid, (mu_g, sigma_g, _, _) in group_stats.items():
+                mask = groups == gid
+                new_deltas[mask] = calibrated_deltas(
+                    shape_vectors[mask],
+                    mu=mu_g,
+                    sigma_diag=sigma_g,
+                    dimension_weights=pattern.dimension_weights,
+                )
         new_delta_norms = np.sqrt(
             np.einsum("ij,ij->i", new_deltas, new_deltas),
         ).astype(np.float32)
-        D = shape_vectors.shape[1]
-        theta_scalar = float(np.percentile(new_delta_norms[fit_mask], pct))
-        component = theta_scalar / np.sqrt(D) if D > 0 else 0.0
-        new_theta = np.full(D, component, dtype=np.float32)
+
+        def _theta(norms: np.ndarray) -> np.ndarray:
+            scalar = float(np.percentile(norms, pct))
+            return np.full(D, scalar / np.sqrt(D) if D > 0 else 0.0, dtype=np.float32)
+
+        if groups is not None and pattern.dimension_weights is None:
+            # Unweighted, the build keeps the population theta of the
+            # population-wide deltas.
+            global_deltas = calibrated_deltas(
+                shape_vectors[fit_mask], mu=new_mu, sigma_diag=new_sigma, dimension_weights=None
+            )
+            new_theta = _theta(np.sqrt(np.einsum("ij,ij->i", global_deltas, global_deltas)))
+        else:
+            new_theta = _theta(new_delta_norms[fit_mask])
+        if groups is not None and pattern.dimension_weights is not None:
+            # Weighted, each group's theta is taken in the weighted space too.
+            for gid, (mu_g, sigma_g, _, pop_g) in group_stats.items():
+                g_norms = new_delta_norms[fit_mask & (groups == gid)]
+                g_theta = _theta(g_norms) if len(g_norms) > 1 else np.zeros(D, dtype=np.float32)
+                group_stats[gid] = (mu_g, sigma_g, g_theta, pop_g)
+
+        group_stats_json = (
+            {
+                gid: {
+                    "mu": g_mu.tolist(),
+                    "sigma_diag": g_sigma.tolist(),
+                    "theta": g_theta.tolist(),
+                    "population_size": int(g_pop),
+                }
+                for gid, (g_mu, g_sigma, g_theta, g_pop) in group_stats.items()
+            }
+            if groups is not None
+            else None
+        )
 
         new_theta_norm = float(np.linalg.norm(new_theta))
         # Use >= (boundary inclusive) to match builder.py and geometry.py is_anomaly semantics.
         # Entities at exactly delta_norm == theta_norm are anomalous (on the boundary).
+        # A grouped pattern flags each row against its own group's theta.
         is_anomaly = (new_theta_norm > 0.0) & (new_delta_norms >= new_theta_norm)
+        for gid, (_, _, g_theta, _) in group_stats.items():
+            mask = groups == gid
+            g_theta_norm = float(np.linalg.norm(g_theta))
+            is_anomaly[mask] = (g_theta_norm > 0.0) & (new_delta_norms[mask] >= g_theta_norm)
 
         # Same per-dim rule as the build: P99 of |delta| over the fitted entities.
         n_anom_dims_thresholds = per_dim_anomaly_thresholds(new_deltas[fit_mask])
@@ -573,7 +745,14 @@ class HyperSession:
         ranks = np.searchsorted(sorted_norms, new_delta_norms, side="left")
         score_rank_pct = (ranks / max(n, 1) * 100).astype(np.float32)
         refit = (
-            self._refit_score_reference(pattern, geo_table, fit_mask)
+            self._refit_score_reference(
+                pattern,
+                geo_table,
+                fit_mask,
+                groups,
+                pct,
+                pattern_node.get("score_min_group_size"),
+            )
             if pattern.score_dims
             else None
         )
@@ -591,7 +770,7 @@ class HyperSession:
         if refit is not None:
             from hypertopos.engine.robust import is_anomaly as _score_is_anomaly
 
-            _, scores = refit
+            _, scores, _ = refit
             conformal_p = scores.conformal_p.astype(np.float32)
             score_rank_pct = scores.score_rank_pct.astype(np.float32)
             anomaly_score = scores.anomaly_score
@@ -626,7 +805,9 @@ class HyperSession:
             "delta_norm_signed": pa.nulls(n, type=pa.float32()),
         }
         if refit is not None:
-            _, scores = refit
+            _, scores, score_group = refit
+            if score_group is not None:
+                values["score_group"] = pa.array(score_group.tolist(), type=pa.string())
             for name, matrix in (("axis_ranks", scores.axis_ranks), ("score_delta", scores.delta)):
                 rows = np.ascontiguousarray(matrix, dtype=np.float32)
                 values[name] = pa.FixedSizeListArray.from_arrays(
@@ -672,6 +853,7 @@ class HyperSession:
             sigma_diag=np.asarray(new_sigma, dtype=np.float32),
             theta=new_theta,
             population_size=n,
+            group_stats=group_stats_json,
             last_calibrated_at=now,
             theta_sensitivity=compute_theta_sensitivity_from_sorted(
                 np.sort(new_delta_norms[fit_mask])
@@ -691,11 +873,18 @@ class HyperSession:
         pat_dict["last_calibrated_at"] = now.isoformat()
         pat_dict["population_size"] = n
         pat_dict["calibration_epoch"] = new_epoch
+        if group_stats_json is not None:
+            pat_dict["group_stats"] = group_stats_json
         if refit is not None:
-            from hypertopos.engine.robust import reference_to_arrays
+            from hypertopos.engine.robust import grouped_reference_to_arrays, reference_to_arrays
 
-            reference, _ = refit
-            meta_writer.write_reference(pattern_id, new_epoch, reference_to_arrays(reference))
+            reference, _, score_group = refit
+            if score_group is not None:
+                arrays = grouped_reference_to_arrays(reference)
+                reference = reference.population
+            else:
+                arrays = reference_to_arrays(reference)
+            meta_writer.write_reference(pattern_id, new_epoch, arrays)
             pat_dict["reference_epoch"] = new_epoch
             pat_dict["score_axes"] = list(reference.axes)
             pat_dict["score_dims"] = list(reference.dims)

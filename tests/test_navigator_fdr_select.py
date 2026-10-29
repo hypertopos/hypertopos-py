@@ -471,7 +471,7 @@ class _MockStorageCalibrated(_MockStoragePi5):
         )
         return sphere
 
-    def read_reference(self, pattern_id, epoch=None):
+    def read_reference(self, pattern_id, epoch=None, *, group=None):
         from hypertopos.engine.robust import fit_reference
 
         rng = np.random.default_rng(0)

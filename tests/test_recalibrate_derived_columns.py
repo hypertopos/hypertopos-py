@@ -8,6 +8,7 @@ from pathlib import Path
 import lance
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pytest
 
 _ACCOUNTS = [f"A-{i:02d}" for i in range(30)]
@@ -68,8 +69,44 @@ def test_recalibrate_refreshes_every_calibration_dependent_column(built_sphere: 
 
     ref = GDSReader(str(built_sphere)).read_reference("acct_pattern")
     assert ref.n_fitted == len(_ACCOUNTS) - 12
+    # Fitted rows carry their in-sample p; the excluded rows are scored as new
+    # rows (out-of-fold calibration), so they are checked separately.
+    fitted = ~np.isin(t["primary_key"].to_numpy(zero_copy_only=False), _ACCOUNTS[:12])
     expected_p = conformal_p(ref.cal_sorted, t["anomaly_score"].to_numpy())
-    np.testing.assert_allclose(t["conformal_p"].to_numpy(), expected_p, rtol=1e-6)
+    np.testing.assert_allclose(t["conformal_p"].to_numpy()[fitted], expected_p[fitted], rtol=1e-6)
+    from hypertopos.engine.robust import counterfactual
+
+    assert set(ref.excluded_keys.tolist()) == set(_ACCOUNTS[:12])
+    for i in np.flatnonzero(~fitted):
+        again = counterfactual(
+            ref,
+            np.asarray(t["score_delta"][int(i)].as_py()),
+            np.asarray(t["axis_ranks"][int(i)].as_py()),
+            {},
+            members=False,
+        )
+        assert again.conformal_p == pytest.approx(t["conformal_p"][int(i)].as_py())
+
+    # simulate_dimension_change on an excluded entity rescores it as the new row
+    # it was: setting a score dimension to its own value leaves its p unchanged.
+    assert ref.cal_sorted_oof is not None  # otherwise both paths agree trivially
+    session = HyperSphere.open(str(built_sphere)).session("t2")
+    try:
+        pattern = session._reader.read_sphere().patterns["acct_pattern"]
+        line = pattern.entity_line_id
+        dim = ref.dims[0]
+        points = session._reader.read_points(
+            line, session._manifest.line_versions[line], columns=["primary_key", dim]
+        )
+        key = _ACCOUNTS[0]
+        value = float(points.filter(pc.equal(points["primary_key"], key))[dim][0].as_py())
+        out = session.navigator().simulate_dimension_change(
+            key, pattern_id="acct_pattern", line_id=line, set_dimension={dim: value}
+        )
+    finally:
+        session.close()
+    stored = float(t.filter(pc.equal(t["primary_key"], key))["conformal_p"][0].as_py())
+    assert out["conformal_p_after"] == pytest.approx(stored)
     # n_anomalous_dims counts against the per-dim thresholds stored on the
     # pattern node, the same rule as a full build.
     import json

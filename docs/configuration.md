@@ -439,6 +439,7 @@ patterns:
     dimension_weights: kurtosis
     gmm_n_components: 3               # Gaussian mixture components for calibration.
     group_by_property: segment         # Per-group mu/sigma/theta calibration.
+    score_per_group: true              # Score each group against its own calibrated reference.
     tracked_properties: [segment, region]  # Property completeness dimensions.
 ```
 
@@ -454,8 +455,9 @@ patterns:
 | `anomaly_percentile` | float | `95.0` | Sets the alarm budget `1 − anomaly_percentile/100`. On a pattern with the calibrated score an entity is anomalous when its `conformal_p` is at most the budget; on other patterns, when `delta_norm` is above theta at this percentile. |
 | `score_axes` | list | `[mahal, current]` | Axes of the calibrated evidence score for continuous anchor patterns whose dimensions are point properties. A subset of `mahal` (shrunk-covariance Mahalanobis on rank-Gaussian coordinates), `current` (motion against the population's velocity field, from the pattern's event line) and `knn` (distance to nearest peers; opt-in, adds a nearest-neighbour pass to the build). Must contain `mahal`. `current` is fitted when exactly one event pattern references the pattern's entity line and carries an edge table (from / to keys, timestamp, amount) whose events span more than one moment; otherwise the pattern scores without it. The fitted axes are listed in `score_axes` in sphere.json. |
 | `dimension_weights` | string or list | `null` | `"kurtosis"` (recommended), `"auto"`, or explicit weight list. |
-| `gmm_n_components` | int | `null` | Gaussian mixture components for multi-modal calibration. |
+| `gmm_n_components` | int | `null` | Gaussian mixture components for multi-modal calibration. `recalibrate` and `incremental_update` refuse such a pattern; rebuild it instead. |
 | `group_by_property` | string | `null` | Column for per-group calibration (e.g. per-country theta). |
+| `score_per_group` | bool | `false` | When `true`, each group identified by `group_by_property` is scored against its own calibrated reference: `anomaly_score`, `conformal_p`, `score_rank_pct` and `is_anomaly` are within-group. Groups below the minimum reference size are pooled; the geometry column `score_group` names the reference used. Requires `group_by_property`. `recalibrate` refits every group's reference with the same pooling. |
 | `tracked_properties` | list | `null` | Entity properties tracked as fill/no-fill dimensions. |
 | `use_mahalanobis` | — | — | Removed: the key is rejected at config load. The calibrated score already accounts for correlated dimensions (`mahal` axis), and the stored `delta` stays a per-dimension z-score. |
 | `precomputed_dimensions` | list | `null` | Columns already on entity table to use as geometry dimensions. |

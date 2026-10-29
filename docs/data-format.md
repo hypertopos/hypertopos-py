@@ -23,7 +23,7 @@ gds_{sphere_id}/
 │   │       └── data.lance       # event_key + 5 dim columns; same values baked into polygon shape
 │   ├── reference/               # calibrated-score reference per pattern per calibration epoch
 │   │   └── {pattern_id}/
-│   │       └── v={epoch}.npz    # CDF sketches, Ledoit–Wolf location/precision, event halves, velocity-field sample, optional kNN sample + basis, sorted calibration scores
+│   │       └── v={epoch}.npz    # CDF sketches, Ledoit–Wolf location/precision, event halves, velocity-field sample, optional kNN sample + basis, sorted calibration scores. Per-group calibrated patterns store the population reference at the top level plus per-group arrays under g<k>__<field> prefixes, with group_names and pooled string arrays listing the groups and the pooled group names.
 │   ├── contagion_stats/         # per-pattern (primary_key, neighbor_count, anomalous_neighbor_count, contagion_ratio) — feeds the graph contagion scanner directly, BTREE-indexed on primary_key
 │   └── branches/                # one directory per sphere branch (see "Branches" below)
 │       └── {branch}/
@@ -84,12 +84,12 @@ The central config file. Loaded once on `open_sphere` (typically a few KB). Cont
 | Field | Type | Description |
 |-------|------|-------------|
 | `sphere_id` | string | Unique sphere identifier |
-| `format_version` | string | On-disk layout version, written as `"<major>.<minor>"`. Major `4` is required (the calibrated evidence score layer); minor bumps (e.g. `"4.1"`) ride a backward-compatible field addition and load on any major-4 reader. Pre-4.x and malformed values are rejected with a rebuild hint — rebuild the sphere from source. |
+| `format_version` | string | On-disk layout version, written as `"<major>.<minor>"`. Major `4` is required (the calibrated evidence score layer); minor bumps ride a backward-compatible field addition and load on any major-4 reader. `"4.1"` stamps when a `label_audit` block is present; `"4.2"` stamps when any pattern has `score_per_group: true`. Pre-4.x and malformed values are rejected with a rebuild hint — rebuild the sphere from source. |
 | `lines` | dict | Line definitions: versions, columns, partition config, descriptions |
-| `patterns` | dict | Pattern stats: `mu`, `sigma_diag`, `theta`, `edge_max`, `dimension_weights`, `group_stats`, `anomaly_percentile`; calibrated patterns add `score_dims` (scored dimensions), `score_axes` (fitted axes, order of `axis_ranks`) and `reference_epoch` (epoch of the file under `_gds_meta/reference/{pattern_id}/`) |
+| `patterns` | dict | Pattern stats: `mu`, `sigma_diag`, `theta`, `edge_max`, `dimension_weights`, `group_stats`, `anomaly_percentile`; calibrated patterns add `score_dims` (scored dimensions), `score_axes` (fitted axes, order of `axis_ranks`) and `reference_epoch` (epoch of the file under `_gds_meta/reference/{pattern_id}/`); per-group calibrated patterns additionally carry `score_per_group: true`, `group_by_property` (the entity column used for grouping) and, when set, `score_min_group_size` |
 | `aliases` | dict | Alias definitions: `base_pattern`, cutting plane (`normal` vector, `bias`) |
 | `storage` | dict | Storage config per layer (format, partition mode) |
-| `label_audit` | dict, optional | Top-level label-aware calibration metadata — `{label_column, label_positive_value, patterns: [...]}`. Present only when the build registered a YAML `label_audit:` block; absent on spheres built without one. When present, `format_version` is stamped `"4.1"`. |
+| `label_audit` | dict, optional | Top-level label-aware calibration metadata — `{label_column, label_positive_value, patterns: [...]}`. Present only when the build registered a YAML `label_audit:` block; absent on spheres built without one. Presence stamps `format_version` at least `"4.1"`. |
 
 Example (abridged pattern entry):
 
@@ -151,12 +151,13 @@ Single Lance dataset per pattern. Calibration epochs are not separate directorie
 | `delta_norm` | float32 | L2 norm of delta (distance from population center -- used for scoring, clustering, and similarity) |
 | `is_anomaly` | bool | The stored verdict: `conformal_p <= 1 − anomaly_percentile/100` on a calibrated pattern, `delta_norm >= θ` otherwise |
 | `score_rank_pct` | float32 | Percentile rank of `anomaly_score` in the population (0--100) |
-| `conformal_p` | float32 | Split-conformal p-value of the score against the stored reference |
+| `conformal_p` | float32 | Conformal p-value against the fitted population — the fraction of the calibration reference scoring at least as high |
 | `anomaly_score` | float64 | Calibrated patterns: the fused evidence score (mean of the axis ranks). Patterns scored by `delta_norm` carry `delta_norm` here |
 | `axis_ranks` | list\<float32\> | Calibrated patterns: population rank of each axis, in the order of `score_axes`. Null otherwise |
 | `score_delta` | list\<float32\> | Calibrated patterns: rank-Gaussian coordinates of the `score_dims`. Null otherwise |
 | `bregman_divergence` | float32 | Sum of per-dimension Bregman terms (distribution-aware anomaly distance). |
 | `anomaly_confidence` | float32 | Bootstrap stability score: fraction of bootstrap resamples in which entity is anomalous. Null when bootstrap was skipped. |
+| `score_group` | string | Per-group calibrated patterns only (absent otherwise): the key of the group reference that scored this entity — the group's own value, or `"(small groups)"` for the pool; null when the whole-population reference scored it. |
 | `edges` | list\<struct\> | Edge list: line_id, point_key, direction, status |
 
 `delta`, `delta_norm` and θ (in sphere.json) form the shape layer: `delta` is always the diagonal z-score per named dimension. `anomaly_score`, `axis_ranks`, `conformal_p`, `score_rank_pct` and `score_delta` form the score layer; on a calibrated pattern `is_anomaly = conformal_p <= 1 − anomaly_percentile/100`. The `delta` vector length equals the number of dimensions in the pattern. Geometry datasets carry an IVF-PQ ANN index on the `delta` column for trajectory similarity search.

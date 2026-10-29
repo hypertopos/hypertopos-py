@@ -86,6 +86,7 @@ def fingerprint(
     percentile: float,
     group_by: str | None,
     min_group_size: int,
+    score_per_group: bool = False,
 ) -> str:
     """Same input, same settings, same hypertopos version -> same fingerprint.
 
@@ -106,6 +107,8 @@ def fingerprint(
         f"min_group_size={min_group_size!r}",
         f"hypertopos={hypertopos.__version__}",
     ]
+    if score_per_group:
+        parts.append("score_per_group=True")
     return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
 
 
@@ -120,7 +123,8 @@ def build_sphere(entities: pa.Table, calibration: FrozenCalibration, path: str) 
     One anchor pattern whose dimensions are a metric block over the entity
     table, holding the values the calibration scores (small counts already
     shrunk). With ``group_by``, the build groups by the calibration's own groups
-    (small ones already pooled), so flags agree with ``find_anomalies``.
+    (small ones already pooled), and with ``score_per_group`` scores each group
+    against its own reference, so flags agree with ``find_anomalies``.
     """
     shapes = calibration.shapes(entities)
     for j, dim in enumerate(calibration.dims):
@@ -143,5 +147,7 @@ def build_sphere(entities: pa.Table, calibration: FrozenCalibration, path: str) 
         anomaly_percentile=calibration.percentile,
         group_by_property=group_column,
         metric_properties=list(calibration.dims),
+        score_per_group=calibration.score_per_group,
+        score_min_group_size=calibration.min_group_size,
     )
     return builder.build()

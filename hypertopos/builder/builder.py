@@ -16,7 +16,13 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from hypertopos.engine.robust import AXES_ALL, AXES_DEFAULT, EventArrays, Reference
+from hypertopos.engine.robust import (
+    AXES_ALL,
+    AXES_DEFAULT,
+    EventArrays,
+    GroupedReference,
+    Reference,
+)
 from hypertopos.storage._schemas import (  # noqa: F401,E501
     EDGE_STRUCT_TYPE,
     GEOMETRY_EVENT_SCHEMA,
@@ -643,6 +649,8 @@ class _PatternReg:
     dimension_weights: list[float] | str | None = None  # None/"uniform"/list/"auto"
     gmm_n_components: int | None = None  # None = disabled, int = fit GMM with k components
     score_axes: tuple[str, ...] = AXES_DEFAULT
+    score_per_group: bool = False  # one calibrated score reference per group
+    score_min_group_size: int | None = None  # pooling size of those groups (None: derived)
     event_dimensions: list[EventDimSpec] = field(default_factory=list)
     description: str | None = None
     edge_table: EdgeTableConfig | None = None  # None = auto-detect or skip
@@ -726,6 +734,10 @@ class PopulationStats:
     # Exact min / max of each score dimension (the sketch grid holds quantiles).
     score_min: np.ndarray | None = None
     score_max: np.ndarray | None = None
+    # ``score_per_group``: every group's reference (``reference`` is its
+    # population one) and each row's score group key (None: the population).
+    grouped_reference: GroupedReference | None = None
+    score_group: np.ndarray | None = None
 
 
 @dataclass
@@ -748,6 +760,7 @@ class PatternBuildResult:
     edge_dim_thresholds: dict[str, float] | None = None
     theta_sensitivity: dict[str, dict[str, float]] | None = None
     reference: Reference | None = None
+    grouped_reference: GroupedReference | None = None
     # Edge-derived per-event dim names — populated on event patterns with
     # ``edge_dimensions:`` declared, empty otherwise.
     edge_dim_names: list[str] = field(default_factory=list)
@@ -1225,6 +1238,8 @@ class GDSBuilder:
         fdr_hierarchy: list[Any] | None = None,
         fdr_temporal_hierarchy: list[Any] | None = None,
         conformance_rules: list[Any] | None = None,
+        score_per_group: bool = False,
+        score_min_group_size: int | None = None,
     ) -> GDSBuilder:
         _VALID_DW = ("auto", "kurtosis", "uniform")
         if isinstance(dimension_weights, str) and dimension_weights not in _VALID_DW:
@@ -1233,6 +1248,8 @@ class GDSBuilder:
                 f"is not valid. Expected one of {_VALID_DW}, an explicit list, or None."
             )
         axes = validate_score_axes(pattern_id, score_axes)
+        if score_per_group and not group_by_property:
+            raise ValueError(f"Pattern '{pattern_id}': score_per_group requires group_by_property")
         self._patterns[pattern_id] = _PatternReg(
             pattern_id=pattern_id,
             pattern_type=pattern_type,
@@ -1244,6 +1261,8 @@ class GDSBuilder:
             dimension_weights=dimension_weights,
             gmm_n_components=gmm_n_components,
             score_axes=axes,
+            score_per_group=score_per_group,
+            score_min_group_size=score_min_group_size,
             description=description,
             edge_table=edge_table,
             bootstrap_iterations=bootstrap_iterations,
@@ -2402,16 +2421,34 @@ class GDSBuilder:
         reference: Reference | None = None
         robust_scores = None
         score_min = score_max = None
+        grouped_reference: GroupedReference | None = None
+        score_group: np.ndarray | None = None
+        if pat.score_per_group and score_input is None:
+            raise ValueError(
+                f"Pattern '{pat.pattern_id}': score_per_group needs the calibrated "
+                "evidence score (an anchor pattern with continuous point-property "
+                "dimensions)"
+            )
         if score_input is not None:
-            from hypertopos.engine.robust import fit_reference
+            from hypertopos.engine.robust import fit_grouped_reference, fit_reference
 
             x, score_dims = score_input
-            reference, robust_scores = fit_reference(
-                x,
-                score_dims,
-                axes=pat.score_axes,
-                events=self._score_events(pat, entity_table),
-            )
+            events = self._score_events(pat, entity_table)
+            if pat.score_per_group:
+                grouped_reference, robust_scores, score_group = fit_grouped_reference(
+                    x,
+                    score_dims,
+                    group_ids,
+                    percentile=pat.anomaly_percentile,
+                    min_group_size=pat.score_min_group_size,
+                    axes=pat.score_axes,
+                    events=events,
+                )
+                reference = grouped_reference.population
+            else:
+                reference, robust_scores = fit_reference(
+                    x, score_dims, axes=pat.score_axes, events=events
+                )
             anomaly_score = robust_scores.anomaly_score
             score_rank_pcts = robust_scores.score_rank_pct.astype(np.float32)
             conformal_p = robust_scores.conformal_p
@@ -2450,8 +2487,10 @@ class GDSBuilder:
         if robust_scores is not None:
             from hypertopos.engine.robust import is_anomaly as _score_is_anomaly
 
-            # The calibrated score is global by design: theta (and per-group
-            # theta) stay stored but are not the boundary of this pattern.
+            # The calibrated score is the boundary of this pattern: global, or
+            # each row's own group's under score_per_group (the p-values above
+            # come from that group's reference). Theta and per-group theta stay
+            # stored but do not flag.
             is_anomaly_arr = _score_is_anomaly(conformal_p, pat.anomaly_percentile)
 
         # 7b. Bregman-based anomaly flag — computed and stored on
@@ -2500,6 +2539,8 @@ class GDSBuilder:
             reference=reference,
             score_min=score_min,
             score_max=score_max,
+            grouped_reference=grouped_reference,
+            score_group=score_group,
         )
 
     def _score_input(
@@ -2649,10 +2690,13 @@ class GDSBuilder:
         anomaly_score: np.ndarray | None = None,
         axis_ranks: np.ndarray | None = None,
         score_delta: np.ndarray | None = None,
+        score_group: np.ndarray | None = None,
     ) -> pa.Table:
         """Build a geometry Arrow table for entities [start:end).
 
         Uses pre-computed deltas/norms/ranks from full population stats.
+        ``score_group`` (``score_per_group`` patterns only) adds the column of
+        each row's score group key, null for rows scored by the population.
         """
         entity_table = (
             entity_table_override
@@ -2848,7 +2892,7 @@ class GDSBuilder:
 
         if pat.pattern_type == "event":
             # Event patterns: skip edges — reconstruct from entity_keys + relations at read time
-            return pa.table(
+            table = pa.table(
                 {
                     **common_cols,
                     "entity_keys": entity_keys_col,
@@ -2859,7 +2903,7 @@ class GDSBuilder:
             )
         else:
             # Anchor patterns: keep edges (small population, needed for display)
-            return pa.table(
+            table = pa.table(
                 {
                     **common_cols,
                     "edges": edges_col,
@@ -2869,6 +2913,11 @@ class GDSBuilder:
                 },
                 schema=GEOMETRY_SCHEMA,
             )
+        if score_group is not None:
+            table = table.append_column(
+                "score_group", pa.array(score_group[start:end].tolist(), type=pa.string())
+            )
+        return table
 
     def _build_geometry_table(
         self,
@@ -2945,6 +2994,7 @@ class GDSBuilder:
             anomaly_score=ps.anomaly_score,
             axis_ranks=ps.axis_ranks,
             score_delta=ps.score_delta,
+            score_group=ps.score_group,
         )
         return table, ps, lac
 
@@ -3688,6 +3738,10 @@ class GDSBuilder:
                     }
                     for gid, (g_mu, g_sigma, g_theta, g_pop) in pbr.group_stats.items()
                 }
+            if pat.score_per_group:
+                pat_dict["score_per_group"] = True
+                if pat.score_min_group_size is not None:
+                    pat_dict["score_min_group_size"] = pat.score_min_group_size
             if pbr.dimension_weights is not None:
                 pat_dict["dimension_weights"] = pbr.dimension_weights.tolist()
             if pbr.gmm_components is not None:
@@ -3796,7 +3850,12 @@ class GDSBuilder:
         # Sphere format minor-bump: 4.1 when a label_audit block is
         # registered, else 4.0. Readers compare on major only, so 4.0
         # readers transparently load 4.1 spheres.
-        fmt_version = "4.1" if self._label_audit_block is not None else "4.0"
+        # Minor bumps mark optional additions a 4.0 reader ignores safely:
+        # per-group score references (4.2), the label_audit block (4.1).
+        if any(p.score_per_group for p in self._patterns.values()):
+            fmt_version = "4.2"
+        else:
+            fmt_version = "4.1" if self._label_audit_block is not None else "4.0"
         sphere_dict: dict[str, Any] = {
             "sphere_id": self.sphere_id,
             "format_version": fmt_version,
@@ -4358,6 +4417,7 @@ class GDSBuilder:
                 dim_block_stats=ps.dim_block_stats,
                 theta_sensitivity=ps.theta_sensitivity,
                 reference=ps.reference,
+                grouped_reference=ps.grouped_reference,
                 edge_dim_names=ps.edge_dim_names,
                 n_anomalous_dims_thresholds=ps.n_anom_dims_thresholds,
                 **self._unpack_lac_bundle(lac, ps.deltas),
@@ -4635,11 +4695,15 @@ class GDSBuilder:
             "schema_hash": new_schema_hash,
         }
         if pbr.reference is not None:
-            from hypertopos.engine.robust import reference_to_arrays
+            from hypertopos.engine.robust import grouped_reference_to_arrays, reference_to_arrays
             from hypertopos.storage.writer import GDSWriter
 
             GDSWriter(str(self.output_path)).write_reference(
-                pat.pattern_id, new_epoch, reference_to_arrays(pbr.reference)
+                pat.pattern_id,
+                new_epoch,
+                grouped_reference_to_arrays(pbr.grouped_reference)
+                if pbr.grouped_reference is not None
+                else reference_to_arrays(pbr.reference),
             )
 
     def _prepare_temporal_context(
@@ -4944,6 +5008,44 @@ class GDSBuilder:
         # 3. Resolve geometry Lance path (native MVCC — flat directory).
         lance_path = str(self.output_path / "geometry" / pattern_id / "data.lance")
 
+        if changed_entities is not None and len(changed_entities) > 0:
+            # Incremental ingest reconstructs geometry from the GLOBAL
+            # mu/sigma/theta in sphere.json. Patterns calibrated per-group
+            # (group_by_property / GMM) or carrying build-time FDR hierarchy
+            # columns cannot be reproduced on this path: the global stats would
+            # write delta / delta_norm / is_anomaly that disagree with build(),
+            # and the appended rows would lack the FDR carrier columns the stored
+            # dataset has. Refuse loudly instead of corrupting the sphere.
+            _unsupported = [
+                name
+                for name, declared in (
+                    ("group_by_property", pat_meta.get("group_by_property")),
+                    ("gmm", pat_meta.get("gmm_components")),
+                    ("fdr_hierarchy", pat_meta.get("fdr_hierarchy")),
+                    ("fdr_temporal_hierarchy", pat_meta.get("fdr_temporal_hierarchy")),
+                )
+                if declared
+            ]
+            if _unsupported:
+                raise ValueError(
+                    f"incremental_update cannot reconstruct geometry for pattern "
+                    f"{pattern_id!r}: it declares {', '.join(_unsupported)}, which "
+                    f"require per-group / per-cluster calibration or build-time FDR "
+                    f"carrier columns that the incremental path computes against the "
+                    f"global population only. Re-run a full build for this pattern.",
+                )
+
+        # recalibrate refuses gmm patterns; refuse here, before any row is deleted.
+        if pat_meta.get("gmm_components") and (
+            recalibrate == "force"
+            or (recalibrate == "auto" and tracker is not None and tracker.is_stale)
+        ):
+            raise ValueError(
+                f"incremental_update cannot recalibrate pattern {pattern_id!r}: it "
+                "declares gmm, whose per-component calibration recalibrate does not "
+                "refit. Pass recalibrate='never' or re-run a full build."
+            )
+
         # 4. Classify changed entity keys
         added_count = 0
         modified_count = 0
@@ -5012,32 +5114,6 @@ class GDSBuilder:
                 prop_columns=prop_cols,
                 edge_dim_agg_labels=edge_dim_agg_labels,
             )
-
-            # Incremental ingest reconstructs geometry from the GLOBAL
-            # mu/sigma/theta in sphere.json. Patterns calibrated per-group
-            # (group_by_property / GMM) or carrying build-time FDR hierarchy
-            # columns cannot be reproduced on this path: the global stats would
-            # write delta / delta_norm / is_anomaly that disagree with build(),
-            # and the appended rows would lack the FDR carrier columns the stored
-            # dataset has. Refuse loudly instead of corrupting the sphere.
-            _unsupported = [
-                name
-                for name, declared in (
-                    ("group_by_property", pat_meta.get("group_by_property")),
-                    ("gmm", pat_meta.get("gmm_n_components")),
-                    ("fdr_hierarchy", pat_meta.get("fdr_hierarchy")),
-                    ("fdr_temporal_hierarchy", pat_meta.get("fdr_temporal_hierarchy")),
-                )
-                if declared
-            ]
-            if _unsupported:
-                raise ValueError(
-                    f"incremental_update cannot reconstruct geometry for pattern "
-                    f"{pattern_id!r}: it declares {', '.join(_unsupported)}, which "
-                    f"require per-group / per-cluster calibration or build-time FDR "
-                    f"carrier columns that the incremental path computes against the "
-                    f"global population only. Re-run a full build for this pattern.",
-                )
 
             # Hard-guard against a silent width mismatch. compute_entity_geometry
             # supports the relations + event_dimensions + edge_dim_aggregations +
@@ -5384,7 +5460,8 @@ class GDSBuilder:
         of ``incremental_update(recompute_ranks=False)`` calls) and rebuilds the
         ANN (IVF_FLAT) vector index so all appended rows are indexed. Call once
         at the end of an ingestion session instead of paying the O(N) rank
-        recompute on every individual append.
+        recompute on every individual append. A ``score_per_group`` pattern
+        keeps its built ranks (each row's rank within its own reference).
 
         Idempotent and safe to call after ``recompute_ranks=True`` updates too.
         With ``branch`` it finalizes the branch and is recorded in its recipe log.
@@ -5513,6 +5590,7 @@ class GDSBuilder:
                     anomaly_score=ps.anomaly_score,
                     axis_ranks=ps.axis_ranks,
                     score_delta=ps.score_delta,
+                    score_group=ps.score_group,
                 )
                 chunk_table = self._inject_fdr_hierarchy_carriers(pat, chunk_table)
                 chunk_table = self._inject_fdr_temporal_buckets(pat, chunk_table)
@@ -5571,6 +5649,7 @@ class GDSBuilder:
             dim_block_stats=ps.dim_block_stats,
             theta_sensitivity=ps.theta_sensitivity,
             reference=ps.reference,
+            grouped_reference=ps.grouped_reference,
             edge_dim_names=ps.edge_dim_names,
             n_anomalous_dims_thresholds=ps.n_anom_dims_thresholds,
             **self._unpack_lac_bundle(lac, ps.deltas),

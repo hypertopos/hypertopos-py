@@ -515,7 +515,14 @@ class GDSWriter:
             return
         ds = self._dataset(lance_path)
         field_names = {f.name for f in ds.schema}
-        rank = rank and "score_rank_pct" in field_names and "anomaly_score" in field_names
+        # A per-group pattern's ranks are each row's rank in its own score
+        # reference, which the stored scores cannot reproduce; they stay as built.
+        rank = (
+            rank
+            and "score_rank_pct" in field_names
+            and "anomaly_score" in field_names
+            and "score_group" not in field_names
+        )
         conformal = conformal and "conformal_p" in field_names
         if conformal and "axis_ranks" in field_names:
             head = ds.to_table(columns=["axis_ranks"], limit=1)
@@ -1131,7 +1138,9 @@ class GDSWriter:
     ) -> Path:
         """Persist a frozen score reference to ``_gds_meta/reference/{pattern_id}/v={epoch}.npz``.
 
-        ``arrays`` is :func:`hypertopos.engine.robust.reference_to_arrays` output.
+        ``arrays`` is :func:`hypertopos.engine.robust.reference_to_arrays` output, or
+        :func:`~hypertopos.engine.robust.grouped_reference_to_arrays` output for a
+        ``score_per_group`` pattern (every group's reference in the same file).
         Each calibration epoch gets its own file; existing files are not rewritten.
         """
         ref_dir = self._base / "_gds_meta" / "reference" / pattern_id

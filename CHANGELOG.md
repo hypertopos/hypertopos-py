@@ -7,6 +7,25 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.10.1] — 2026-10-29
+
+### Added
+
+- `check_alerts` raises `alarm_rate_drift` (MEDIUM) on a calibrated pattern when the rows written since its calibration are flagged above the alarm budget (one-sided beta-binomial test — the rows share one calibration — at least 100 rows; `details`: `n_new`, `flagged`, `expected`, `p_value`). Without writes since the calibration the check reads only sphere metadata; it is skipped on spheres built before new rows were calibrated out of fold.
+- `FrozenCalibration.score(table, members=True)` rescores the fitted table itself with its in-sample p-values; the default scores new entities.
+- `score_per_group=True` (Spark `find_anomalies`, builder pattern YAML / `add_pattern`) scores each `group_by` group against its own calibrated reference: the score, its p-value, rank and flag mean "rare within its group", and each group keeps its own alarm budget. Use it when the groups are distinct kinds of entity with at least about 1,000 members each; the default stays one population-wide score. Groups below the smallest size that can flag a member (199 at the 99th percentile) are pooled, and rows of a group not seen at calibration time are scored against the whole population; a group named `(small groups)` (the pool's label) is refused. A group whose members have no events is scored neutrally on the event axis. The new geometry column `score_group` names the reference that scored each row; `GDSReader.read_reference(..., group=...)` and `read_grouped_reference(...)` load the per-group references; and `explain_anomaly`, `simulate_dimension_change`, `find_diverse_explanations`, reliability flags and `compare_branches` use it.
+
+### Changed
+
+- Requires `pylance` 14 (`>=14.0,<15.0`). Spheres written with Lance 13 open and query unchanged, including their scalar indexes.
+
+### Fixed
+
+- Entities scored against a stored calibration without a refit — incremental ingest, rows left out of a `recalibrate` fit, `FrozenCalibration.score` and Spark `score` on new data — keep the alarm budget: they are calibrated against out-of-fold scores of the fitted population on calibrations with up to about 2,000 entities per dimension (above that the in-sample calibration is already within noise of the budget). Before, they were compared with scores of entities the fit had seen and were flagged above the budget on small calibrations. Spheres built before keep the earlier calibration until rebuilt or recalibrated.
+- `HyperSession.recalibrate` now recalibrates patterns with `group_by_property` per group: it refits each group's statistics on its members and stores them, measures every entity against its own group and flags it against its group's threshold, and on `score_per_group` patterns refits each group's score reference and rewrites `score_group`. Before, it inverted their group-relative deviations with population-wide statistics and wrote wrong scores.
+- `HyperSession.recalibrate` refuses patterns with `gmm_n_components` with a `ValueError` that says to rebuild, before touching the sphere or creating a branch. Before, it refitted them as one population and overwrote their per-component statistics with wrong scores.
+- `GDSBuilder.incremental_update` refuses patterns with `gmm_n_components` (the check never matched before, so ingest wrote rows scored against the population-wide statistics), and it refuses patterns it cannot update (`group_by_property`, `gmm_n_components`, FDR hierarchies) before writing anything: before, the old rows of modified entities were already deleted when the error came.
+
 ## [0.10.0] — 2026-10-28
 
 ### Added

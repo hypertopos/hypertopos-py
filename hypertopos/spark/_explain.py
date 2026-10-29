@@ -24,7 +24,7 @@ import pyarrow.parquet as pq
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
-from hypertopos.scoring import FrozenCalibration, score_shares
+from hypertopos.scoring import FrozenCalibration
 from hypertopos.spark._api import (
     CALIBRATION_FILE,
     ENTITIES_FILE,
@@ -60,7 +60,7 @@ class Sphere:
         """Per entity: every dimension's value and deviation, plus the scores."""
         entities = self.entities()
         calibration = self.calibration()
-        scores = calibration.score(entities)
+        scores = calibration.score(entities, members=True)
         columns: dict[str, pa.Array] = {KEY: entities[KEY].combine_chunks()}
         shapes = calibration.shapes(entities)
         for j, dim in enumerate(calibration.dims):
@@ -207,7 +207,8 @@ def explain(
         ]
     else:
         keys = [str(k) for k in entities]
-    if KEY in result.columns and result.schema[KEY].metadata.get(METADATA_SCORED):
+    scored = bool(KEY in result.columns and result.schema[KEY].metadata.get(METADATA_SCORED))
+    if scored:
         if events is None:
             raise ValueError(
                 "this is a score() result: its entities are not in the calibration; "
@@ -221,11 +222,11 @@ def explain(
     if missing:
         raise ValueError(f"not in this result: {sorted(missing)[:10]}")
 
-    scores = calibration.score(table)
+    scores = calibration.score(table, members=not scored)
     shapes = calibration.shapes(table)
     mu, sigma = calibration.raw_params(table)
     delta = scores.delta.astype(np.float64)
-    shares = 100.0 * score_shares(calibration.reference, scores.score_delta)
+    shares = 100.0 * calibration.score_shares(table, scores.score_delta)
     wanted = [calibration.dims.index(d) for d in (dims or calibration.dims)]
     names = table[KEY].to_pylist()
     rank = {k: i for i, k in enumerate(keys)}

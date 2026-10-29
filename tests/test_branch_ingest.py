@@ -224,3 +224,28 @@ def test_flip_report_carries_thresholds_and_causes(sphere_dir: Path) -> None:
     flipped = report.flipped_in_top + report.flipped_out_top
     assert flipped
     assert {row["cause"] for row in flipped} <= {"threshold", "score", "both"}
+
+
+def test_alarm_rate_alert_counts_exactly_the_rows_ingested_since_calibration(
+    sphere_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hypertopos.navigation import navigator as nav_mod
+
+    monkeypatch.setattr(nav_mod, "ALARM_RATE_MIN_ROWS", 1)
+    # Any counted row fires the alert, so silence below can only mean n_new == 0.
+    monkeypatch.setattr(nav_mod, "ALARM_RATE_ALPHA", 1.1)
+    builder = GDSBuilder("branch_ingest", str(sphere_dir))
+    builder.incremental_update(PID, changed_entities=_new_rows(), recalibrate="never")
+    builder.finalize_incremental(PID)
+    session = HyperSphere.open(str(sphere_dir)).session("t")
+    try:
+        (alert,) = session.navigator()._check_alarm_rate_drift(PID)
+        assert alert["details"]["n_new"] == 10  # the ten ingested rows, all far out
+        session.recalibrate(PID)
+    finally:
+        session.close()
+    session = HyperSphere.open(str(sphere_dir)).session("t2")
+    try:
+        assert session.navigator()._check_alarm_rate_drift(PID) == []
+    finally:
+        session.close()

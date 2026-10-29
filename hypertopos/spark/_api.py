@@ -18,7 +18,7 @@ from pyspark.errors import AnalysisException, PySparkException
 from pyspark.sql import Column, DataFrame, Window
 from pyspark.sql import functions as F
 
-from hypertopos.scoring import MIN_GROUP_SIZE, FrozenCalibration
+from hypertopos.scoring import FrozenCalibration, effective_min_group_size
 from hypertopos.spark._build import KEY, collect_entities, fingerprint, sphere_dir
 from hypertopos.spark._plan import Plan, aggregate, build_plan, count_entities
 from hypertopos.spark._result import TOP_REASONS, result_table
@@ -63,7 +63,8 @@ def find_anomalies(
     dims: str | Sequence[str] = "auto",
     extra_dims: Mapping[str, str] | None = None,
     log_amounts: bool = True,
-    min_group_size: int = MIN_GROUP_SIZE,
+    min_group_size: int | None = None,
+    score_per_group: bool = False,
     sphere_root: str | None = None,
     cache: bool = True,
     max_entities: int = MAX_ENTITIES,
@@ -78,15 +79,24 @@ def find_anomalies(
         time: Timestamp, timestamp_ntz, date or epoch-seconds column.
         group_by: Column of an entity property (e.g. segment, country); the
             deviations behind ``delta_norm`` and the reasons' ``delta`` are
-            computed per group (the score and the reasons' shares stay
-            population-wide). An entity takes the most frequent value in its own
-            events (ties: the smallest); entities seen only as a counterparty go
-            to ``"(none)"``.
+            computed per group. By default the score, its p-value, flag and the
+            reasons' shares stay population-wide; see ``score_per_group``. An
+            entity takes the most frequent value in its own events (ties: the
+            smallest); entities seen only as a counterparty go to ``"(none)"``.
         percentile: Population percentile above which an entity is flagged.
         dims: ``"auto"`` or the dimension names to use (see ``docs/spark.md``).
         extra_dims: ``{name: Spark SQL aggregate}`` over the event rows.
         log_amounts: ``log1p`` of amount and gap magnitudes.
         min_group_size: Groups smaller than this are calibrated together.
+            Default 100; with ``score_per_group`` the reference size (199 at
+            the 99th percentile), and a smaller value raises.
+        score_per_group: Score each ``group_by`` group against its own
+            population instead of the whole one, so an entity is flagged when
+            it is rare within its group. Use it when the groups are distinct
+            kinds of entity, each with at least about 1,000 members. Groups
+            under ``min_group_size`` are pooled; a pool still under it, and a
+            group not seen at calibration, are scored against the whole
+            population.
         sphere_root: Where calibrations are kept; default is the Spark conf
             ``hypertopos.sphere_root``, then ``HYPERTOPOS_SPHERE_ROOT``, then
             the driver's temp directory.
@@ -108,12 +118,18 @@ def find_anomalies(
         The score is the Mahalanobis axis only: a sphere built from the same
         events with an event pattern also scores motion (``current``), so its
         scores and p-values can differ. With ``group_by``: ``delta_norm`` and
-        the reasons' ``delta`` are measured against the entity's group while
-        the score and its shares are over the whole population; the result adds that
-        column and ``calibration_scope`` (``group`` or ``pooled``). The
+        the reasons' ``delta`` are measured against the entity's group, while
+        the score and its shares are over the whole population unless
+        ``score_per_group``, which measures them within the group too; the
+        result adds that column and ``calibration_scope`` (``group``,
+        ``pooled``, or with ``score_per_group`` ``global`` for an entity
+        scored against the whole population). The
         ``entity`` column's metadata carries the fingerprint and the
         calibration path.
     """
+    if score_per_group and group_by is None:
+        raise ValueError("score_per_group needs group_by")
+    group_size = effective_min_group_size(min_group_size, percentile, score_per_group)
     plan = build_plan(
         entity,
         counterparty,
@@ -124,7 +140,12 @@ def find_anomalies(
         log_amounts=log_amounts,
     )
     fp = fingerprint(
-        df, plan, percentile=percentile, group_by=group_by, min_group_size=min_group_size
+        df,
+        plan,
+        percentile=percentile,
+        group_by=group_by,
+        min_group_size=group_size,
+        score_per_group=score_per_group,
     )
     path = sphere_dir(_sphere_root(df, sphere_root), fp)
     if cache and (path / CALIBRATION_FILE).exists():
@@ -139,12 +160,13 @@ def find_anomalies(
             dim_names,
             percentile=percentile,
             group_by=group_by,
-            min_group_size=min_group_size,
+            min_group_size=group_size,
             shrink={d.name: d.count for d in plan.dims if d.count},
+            score_per_group=score_per_group,
         )
         _save(path, entities, plan, calibration)
 
-    table = result_table(entities, calibration)
+    table = result_table(entities, calibration, members=True)
     flat = df.sparkSession.createDataFrame(table.to_pandas())
     return shape_result(flat, len(calibration.dims), fp, path, group_by)
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hypertopos"
-version = "0.10.0"
+version = "0.10.1"
 description = "Understand the structure of your data — without training machine learning models"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -26,7 +26,7 @@ dependencies = [
     "numpy>=1.26",
     "scipy>=1.11",
     "pandas>=2.0",
-    "pylance>=13.0,<14.0",
+    "pylance>=14.0,<15.0",
     "pyyaml>=6.0",
 ]
 

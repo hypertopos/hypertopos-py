@@ -66,6 +66,9 @@ class Polygon:
     anomaly_score: float | None = None
     conformal_p: float | None = None
     score_delta: np.ndarray | None = None
+    # Key of the per-group reference that scored the polygon (``Pattern.score_per_group``);
+    # None when the population reference did.
+    score_group: str | None = None
 
     def is_event(self) -> bool:
         return self.pattern_type == "event"

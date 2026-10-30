@@ -198,6 +198,44 @@ def _principal_axes(e: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
     return mean, np.ascontiguousarray(vecs[:, order].T)
 
 
+@dataclass(frozen=True)
+class HalfStates:
+    """Per-entity states of the two calendar halves, computed outside the event arrays.
+
+    ``first`` / ``second`` (n, 5): log1p count out, log1p sum out, log1p count
+    in, log1p sum in, log1p count all of the half's events, sums of
+    ``log1p(max(amount, 0))``; the halves split at ``t_mid`` (see :func:`halves`).
+    """
+
+    first: np.ndarray
+    second: np.ndarray
+    t0: float
+    t_mid: float
+
+
+def _half_matrices(events: EventArrays, n: int, t_mid: float) -> tuple[np.ndarray, np.ndarray]:
+    second = events.ts >= t_mid
+    la = np.log1p(np.maximum(events.amount, 0.0))
+    states = []
+    for half in (False, True):
+        sel = second == half
+        cols = []
+        for d in (0, 1):
+            s = sel & (events.direction == d)
+            cols.append(np.log1p(np.bincount(events.code[s], minlength=n)))
+            cols.append(np.log1p(np.bincount(events.code[s], la[s], n)))
+        cols.append(np.log1p(np.bincount(events.code[sel], minlength=n)))
+        states.append(np.column_stack(cols))
+    return states[0], states[1]
+
+
+def _displacement(
+    first: np.ndarray, second: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    # Active: events in both halves (log1p of the count is positive iff the count is).
+    return first, second - first, (first[:, 4] > 0) & (second[:, 4] > 0)
+
+
 def event_states(
     events: EventArrays, n: int, t_mid: float
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -206,22 +244,25 @@ def event_states(
     State columns: log1p count out, log1p sum out, log1p count in, log1p sum in,
     log1p count all; sums are of ``log1p(amount)``.
     """
-    second = events.ts >= t_mid
-    la = np.log1p(np.maximum(events.amount, 0.0))
-    states = []
-    counts = []
-    for half in (False, True):
-        sel = second == half
-        cols = []
-        for d in (0, 1):
-            s = sel & (events.direction == d)
-            cols.append(np.log1p(np.bincount(events.code[s], minlength=n)))
-            cols.append(np.log1p(np.bincount(events.code[s], la[s], n)))
-        c = np.bincount(events.code[sel], minlength=n)
-        cols.append(np.log1p(c))
-        states.append(np.column_stack(cols))
-        counts.append(c)
-    return states[0], states[1] - states[0], (counts[0] > 0) & (counts[1] > 0)
+    return _displacement(*_half_matrices(events, n, t_mid))
+
+
+def half_states(events: EventArrays, n: int, t_mid: float | None = None) -> HalfStates:
+    """:class:`HalfStates` of ``events``, split at ``t_mid`` (default: their own middle day)."""
+    t0, own_mid = _halves(events)
+    mid = own_mid if t_mid is None else t_mid
+    return HalfStates(*_half_matrices(events, n, mid), t0=t0, t_mid=mid)
+
+
+def halves(first: float, last: float) -> tuple[float, float]:
+    """``(t0, t_mid)`` of events from ``first`` to ``last`` (epoch seconds).
+
+    ``t0`` is the first event; ``t_mid`` lies a whole number of days after it,
+    at the middle of the days the events span (rounded up).
+    """
+    t0 = float(first)
+    day_max = np.floor((float(last) - t0) / _DAY)
+    return t0, float(t0 + ((day_max + 1) // 2) * _DAY)
 
 
 def _halves(events: EventArrays) -> tuple[float, float]:
@@ -229,9 +270,7 @@ def _halves(events: EventArrays) -> tuple[float, float]:
     # on ``current`` and the halves are never used.
     if not len(events.ts):
         return 0.0, 0.0
-    t0 = float(events.ts.min())
-    day_max = np.floor((float(events.ts.max()) - t0) / _DAY)
-    return t0, t0 + ((day_max + 1) // 2) * _DAY
+    return halves(float(events.ts.min()), float(events.ts.max()))
 
 
 def _neighbours(
@@ -283,9 +322,13 @@ def _current(
     states: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> np.ndarray:
     out = np.full(n, np.nan)
-    if events is None or ref.vel_s0 is None or ref.vel_u is None or ref.t_mid is None:
+    if ref.vel_s0 is None or ref.vel_u is None or ref.t_mid is None:
         return out
-    s0, u, active = states if states is not None else event_states(events, n, ref.t_mid)
+    if states is None:
+        if events is None:
+            return out
+        states = event_states(events, n, ref.t_mid)
+    s0, u, active = states
     if len(ref.vel_s0) < 2 or not active.any():
         return out
     rows = np.flatnonzero(active)
@@ -561,28 +604,37 @@ def fit_reference(
     axes: Sequence[str] = AXES_DEFAULT,
     events: EventArrays | None = None,
     seed: int = 0,
+    states: HalfStates | None = None,
 ) -> tuple[Reference, RobustScores]:
     """Fit the reference on the population ``x`` (n, D) and score the population itself.
 
-    ``current`` is dropped when ``events`` is None. Rows drawn into a reference
-    sample are scored with themselves left out; the others exactly as new rows.
+    ``current`` is dropped when neither ``events`` nor ``states`` is given;
+    ``states`` (one row per row of ``x``) stand in for the events and give the
+    same reference. Rows drawn into a reference sample are scored with
+    themselves left out; the others exactly as new rows.
     """
     x = np.nan_to_num(np.asarray(x, dtype=np.float64))
     n = len(x)
     rng = np.random.default_rng(seed)
-    used = tuple(a for a in axes if a != "current" or events is not None)
+    has_motion = events is not None or states is not None
+    used = tuple(a for a in axes if a != "current" or has_motion)
     levels = _levels(CDF_POINTS)
     grid, z = _sketch_and_gauss(x, None, levels)
     lw_location, lw_precision = ledoit_wolf(z)
     fields: dict[str, Any] = {}
     vel_pos = None
     knn_pos = None
-    states = None
     sampled = []
-    if "current" in used and events is not None:
-        t0, t_mid = _halves(events)
-        states = event_states(events, n, t_mid)
-        s0, u, active = states
+    state_arrays = None
+    if "current" in used:
+        if states is not None:
+            t0, t_mid = states.t0, states.t_mid
+            state_arrays = _displacement(states.first, states.second)
+        else:
+            assert events is not None
+            t0, t_mid = _halves(events)
+            state_arrays = event_states(events, n, t_mid)
+        s0, u, active = state_arrays
         rows = _sample(rng, np.flatnonzero(active))
         vel_pos = np.full(n, -1)
         vel_pos[rows] = np.arange(len(rows))
@@ -619,7 +671,7 @@ def fit_reference(
         n_fitted=n,
         **fields,
     )
-    delta, delta_norm, values = _axes(partial, x, events, vel_pos, knn_pos, z, states)
+    delta, delta_norm, values = _axes(partial, x, events, vel_pos, knn_pos, z, state_arrays)
     axis_sorted = {a: np.sort(v[np.isfinite(v)]) for a, v in values.items()}
     ranks = np.column_stack([_mid_rank(axis_sorted[a], values[a]) for a in used])
     others = [i for i, a in enumerate(used) if a != "current"]
@@ -683,17 +735,29 @@ def score(
     events: EventArrays | None = None,
     *,
     members: bool = False,
+    states: HalfStates | None = None,
+    vel_pos: np.ndarray | None = None,
 ) -> RobustScores:
     """Score rows against the frozen reference.
 
     Rows unseen at fit time (the default) are calibrated against the
     out-of-fold scores of the population. ``members=True`` rescores rows of the
     fitted population itself against the in-sample calibration, which
-    reproduces their fitted p-values.
+    reproduces their fitted p-values. ``states`` stand in for ``events``;
+    ``vel_pos`` is each row's position in the velocity sample (-1: not in it),
+    so a rescored member is left out of its own neighbours as at fit time.
     """
     x = np.nan_to_num(np.asarray(x, dtype=np.float64))
-    delta, delta_norm, values = _axes(ref, x, events, None, None)
-    return _finish(ref, delta, delta_norm, values, without_current=events is None, members=members)
+    state_arrays = None if states is None else _displacement(states.first, states.second)
+    delta, delta_norm, values = _axes(ref, x, events, vel_pos, None, states=state_arrays)
+    return _finish(
+        ref,
+        delta,
+        delta_norm,
+        values,
+        without_current=events is None and states is None,
+        members=members,
+    )
 
 
 _ARRAY_FIELDS = (
@@ -807,6 +871,13 @@ def pool_groups(
     return out, frozenset(str(v) for v in small)
 
 
+def subset_states(states: HalfStates | None, mask: np.ndarray) -> HalfStates | None:
+    """The half states of the rows in ``mask``, split where they were computed."""
+    if states is None:
+        return None
+    return HalfStates(states.first[mask], states.second[mask], states.t0, states.t_mid)
+
+
 def subset_events(events: EventArrays | None, mask: np.ndarray) -> EventArrays | None:
     """The events of the rows in ``mask``, with ``code`` renumbered to the subset."""
     if events is None:
@@ -825,6 +896,8 @@ class GroupedReference:
     population: Reference  # unseen groups, and pooled rows when the pool is too small
     groups: dict[str, Reference]  # own groups, and POOLED_GROUP when it is large enough
     pooled: frozenset[str]  # group values folded into POOLED_GROUP
+    # fit only: rows of the fitted x drawn into each group's reference samples
+    samples: dict[str, np.ndarray] | None = None
 
     def resolve(self, gid: str) -> tuple[Reference, str | None, str]:
         """``(reference, score group key or None, scope)`` for a row of group ``gid``."""
@@ -846,6 +919,7 @@ def fit_grouped_reference(
     events: EventArrays | None = None,
     seed: int = 0,
     stored_labels: bool = False,
+    states: HalfStates | None = None,
 ) -> tuple[GroupedReference, RobustScores, np.ndarray]:
     """Fit one reference per group (``ids`` per row) and the population's.
 
@@ -853,6 +927,11 @@ def fit_grouped_reference(
     gets a reference when it reaches the size, otherwise its rows are scored
     with the population. Returns the references, every row's scores against
     its own reference and the per-row score group key (None: the population).
+    The scores' ``sample_index`` is the population fit's.
+
+    ``current`` comes from ``events`` (each group's own events, split at their
+    own middle day) or from ``states`` (each group's rows of them, split where
+    they were computed); each group fits its own velocity field.
     """
     x = np.nan_to_num(np.asarray(x, dtype=np.float64))
     labels, pooled = pool_groups(ids, percentile, min_group_size, stored_labels=stored_labels)
@@ -864,16 +943,24 @@ def fit_grouped_reference(
             f"{len(own)} score groups exceed {MAX_SCORE_GROUPS}: group by a coarser "
             "property or raise min_group_size"
         )
-    population, fitted = fit_reference(x, dims, axes=axes, events=events, seed=seed)
+    population, fitted = fit_reference(x, dims, axes=axes, events=events, seed=seed, states=states)
     keys = np.full(len(x), None, dtype=object)
     groups: dict[str, Reference] = {}
+    samples: dict[str, np.ndarray] = {}
     parts: list[tuple[np.ndarray, RobustScores]] = []
     for gid in own:
         mask = labels == gid
         ref, scores = fit_reference(
-            x[mask], dims, axes=axes, events=subset_events(events, mask), seed=seed
+            x[mask],
+            dims,
+            axes=axes,
+            events=subset_events(events, mask),
+            seed=seed,
+            states=subset_states(states, mask),
         )
         groups[gid] = ref
+        if scores.sample_index is not None:
+            samples[gid] = np.flatnonzero(mask)[scores.sample_index]
         keys[mask] = gid
         parts.append((mask, scores))
     merged = {}
@@ -889,8 +976,8 @@ def fit_grouped_reference(
         for mask, scores in parts:
             out[mask] = getattr(scores, name)
         merged[name] = out
-    grouped = GroupedReference(population=population, groups=groups, pooled=pooled)
-    return grouped, replace(fitted, **merged, axis_values={}, sample_index=None), keys
+    grouped = GroupedReference(population=population, groups=groups, pooled=pooled, samples=samples)
+    return grouped, replace(fitted, **merged, axis_values={}), keys
 
 
 def grouped_reference_to_arrays(grouped: GroupedReference) -> dict[str, np.ndarray]:

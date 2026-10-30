@@ -5062,16 +5062,21 @@ class GDSBuilder:
             # Modified keys need old rows deleted before re-insert
             keys_to_delete.extend(mod_keys)
 
-        # 5. Delete old rows (deleted_keys + modified_keys)
-        if keys_to_delete:
-            ds = _lance_branches.open_ref(lance_path, branch)
-            escaped = [k.replace("'", "''") for k in keys_to_delete]
-            in_clause = ", ".join(f"'{k}'" for k in escaped)
-            ds.delete(f"primary_key IN ({in_clause})")
+        # 5. Delete old rows (deleted_keys + modified_keys). Changed entities
+        # delete only once their geometry is computed, so an entity table the
+        # pattern cannot be computed from raises before any row is gone.
+        def _delete_old_rows() -> None:
+            if keys_to_delete:
+                ds = _lance_branches.open_ref(lance_path, branch)
+                escaped = [k.replace("'", "''") for k in keys_to_delete]
+                in_clause = ", ".join(f"'{k}'" for k in escaped)
+                ds.delete(f"primary_key IN ({in_clause})")
 
         deleted_count = len(deleted_keys) if deleted_keys else 0
 
         # 6. Compute geometry for changed entities
+        if not (changed_entities is not None and len(changed_entities) > 0):
+            _delete_old_rows()
         if changed_entities is not None and len(changed_entities) > 0:
             # Enrich relations_meta with fk_col info from sphere.json
             # Relations in sphere.json use line_id; we need to find the fk_col
@@ -5132,6 +5137,8 @@ class GDSBuilder:
                     f"(geo / metric / semantic) are not yet supported and "
                     f"require a full rebuild.",
                 )
+
+            _delete_old_rows()
 
             # 7. Build geometry rows
             n_new = len(changed_entities)
@@ -5390,11 +5397,25 @@ class GDSBuilder:
         # tracker. Local import avoids a module-level circular dependency.
         if need_recalibrate:
             from hypertopos.sphere import HyperSphere
+            from hypertopos.storage.exceptions import GDSStorageError
 
             hs = HyperSphere.open(str(self.output_path))
             session = hs.session("_recalibrate_agent", branch=branch)
             try:
-                recal_result = session.recalibrate(pattern_id)
+                # Entities the last calibration left out stay out of the refit,
+                # unless this update deleted them.
+                earlier: list[str] = []
+                try:
+                    left_out = session._reader.read_reference(pattern_id).excluded_keys
+                except GDSStorageError:
+                    left_out = None
+                if left_out is not None and len(left_out):
+                    stored = _lance_branches.open_ref(lance_path, branch).to_table(
+                        columns=["primary_key"],
+                        filter=pc.is_in(pc.field("primary_key"), pa.array(left_out.tolist())),
+                    )
+                    earlier = sorted(stored["primary_key"].to_pylist())
+                recal_result = session.recalibrate(pattern_id, exclude_keys=earlier or None)
             finally:
                 session.close()
             theta_norm = recal_result["new_theta_norm"]

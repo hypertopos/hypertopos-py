@@ -1081,3 +1081,24 @@ def test_incremental_never_recalibrate_leaves_stats_unchanged(sphere_for_recalib
     new_meta = _get_pattern_meta(sphere_path)
     assert list(new_meta["mu"]) == old_mu, "mu must not change with recalibrate='never'"
     assert list(new_meta["theta"]) == old_theta, "theta must not change with recalibrate='never'"
+
+
+def test_incremental_update_that_cannot_compute_geometry_keeps_the_old_rows(agg_sphere):
+    """A modified entity whose geometry cannot be computed (a declared
+    aggregated column is missing) raises before its stored row is deleted."""
+    reader = GDSReader(agg_sphere)
+    before = reader.read_geometry("account_pattern", version=1)
+    key = before["primary_key"][0].as_py()
+    changed = pa.table(
+        {
+            "primary_key": pa.array([key], type=pa.string()),
+            "tx_out_count": pa.array([3.0], type=pa.float64()),
+        }
+    )
+    with pytest.raises(ValueError, match="missing"):
+        GDSBuilder("test_inc_agg", agg_sphere).incremental_update(
+            "account_pattern", changed_entities=changed, recalibrate="never"
+        )
+    after = GDSReader(agg_sphere).read_geometry("account_pattern", version=1)
+    assert after.num_rows == before.num_rows
+    assert key in after["primary_key"].to_pylist()

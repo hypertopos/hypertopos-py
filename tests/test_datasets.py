@@ -76,6 +76,15 @@ def test_population_is_heterogeneous_and_mostly_normal(data):
     assert set(data.accounts["segment"].to_pylist()) == {"retail", "business"}
 
 
+def test_zero_laundering_share_has_no_laundering():
+    data = synthetic_aml(n_accounts=2_000, laundering_share=0, seed=3)
+    assert data.transactions.num_rows > 0
+    assert not pc.any(data.transactions["is_laundering"]).as_py()
+    assert pc.all(pc.is_null(data.transactions["typology"])).as_py()
+    assert not pc.any(data.accounts["is_laundering_account"]).as_py()
+    assert data.transactions.schema == synthetic_aml(n_accounts=2_000, seed=3).transactions.schema
+
+
 def test_builds_quickly():
     start = time.perf_counter()
     synthetic_aml(n_accounts=50_000, seed=2)

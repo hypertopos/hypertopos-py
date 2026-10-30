@@ -49,7 +49,8 @@ def _sorted_by_group(codes: np.ndarray, ts: np.ndarray, n_groups: int) -> np.nda
     span = int(ts.max()) - t_min + 1
     if n_groups * span < 2**63:
         combined = np.sort(codes * span + (ts - t_min))
-        return combined % span + t_min
+        restored: np.ndarray = combined % span + t_min
+        return restored
     return ts[np.lexsort((ts, codes))]
 
 

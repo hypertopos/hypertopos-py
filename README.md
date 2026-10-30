@@ -9,7 +9,7 @@
 [![PyArrow](https://img.shields.io/badge/format-PyArrow-red.svg)](https://arrow.apache.org/docs/python/)
 [![Lance](https://img.shields.io/badge/storage-Lance-blueviolet.svg)](https://github.com/lance-format/lance)
 [![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io)
-[![Version](https://img.shields.io/badge/version-0.10.1-%235500FF.svg)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.10.2-%235500FF.svg)](pyproject.toml)
 
 Describe your tables in a YAML file, run `hypertopos build`, and every entity gets a position relative to its own population — so "out of place", "similar", "drifting" and "different between groups" become distances you read instead of queries you write.
 
@@ -144,26 +144,27 @@ result.orderBy("anomaly_score", ascending=False).show(3)
 explain(result, entities=["A000335"]).show(2)
 ```
 
-Real output (local Spark, two cores):
+Real output (Databricks serverless, the snippet above as written):
 
 ```
-+-------+----------+----------+-------+--------+------------------------------------------+
-| entity|delta_norm|is_anomaly|p_value| segment|                               top_reasons|
-+-------+----------+----------+-------+--------+------------------------------------------+
-|A000998|     7.383|      true|  0.003|  retail|[{round_amount_share, 6.24, 68.0}, ...    |
-|A000497|     5.978|      true|  0.007|business|[{round_amount_share, 0.16, 70.5}, ...    |
-|A000335|    10.616|      true|  0.004|  retail|[{amount_min_out, 0.40, 20.7}, ...        |
-+-------+----------+----------+-------+--------+------------------------------------------+
-
-+-------+---------------+-----+-----+-----+-----+------------+---------+
-|entity |dim            |value|mu   |sigma|delta|pct_of_total|direction|
-+-------+---------------+-----+-----+-----+-----+------------+---------+
-|A000335|amount_min_out |3.122|2.811|0.779|0.40 |20.7        |above    |
-|A000335|burst_max_daily|20.0 |7.683|2.320|5.31 |12.5        |above    |
-+-------+---------------+-----+-----+-----+-----+------------+---------+
++-------+------------------+----------+--------------------+-----------------+------------------+--------------------+--------+-----------------+
+| entity|     anomaly_score|is_anomaly|             p_value|   score_rank_pct|        delta_norm|         top_reasons| segment|calibration_scope|
++-------+------------------+----------+--------------------+-----------------+------------------+--------------------+--------+-----------------+
+|A000998|0.9992826398852224|      true|0.002865329512893...|99.85652797704448| 7.382986545562744|[{round_amount_sh...|  retail|            group|
+|A000497|0.9983498349834984|      true|0.006578947368421052|99.66996699669967| 5.977622985839844|[{round_amount_sh...|business|            group|
+|A000335|0.9978479196556671|      true|0.004297994269340974|99.71305595408896|10.616399765014648|[{amount_min_out,...|  retail|            group|
++-------+------------------+----------+--------------------+-----------------+------------------+--------------------+--------+-----------------+
+only showing top 3 rows
++-------+---------------+------------------+-----------------+------------------+------------------+-----------------+---------+
+| entity|            dim|             value|               mu|             sigma|             delta|     pct_of_total|direction|
++-------+---------------+------------------+-----------------+------------------+------------------+-----------------+---------+
+|A000335| amount_min_out|3.1223649978637695|2.811126708984375|0.7785825133323669|0.3997499942779541|20.71021933309894|    above|
+|A000335|burst_max_daily|              20.0|7.682925224304199|2.3204309940338135| 5.308097839355469|12.53448394386512|    above|
++-------+---------------+------------------+-----------------+------------------+------------------+-----------------+---------+
+only showing top 2 rows
 ```
 
-`A000335` made 20 payments on its busiest day, against about 8 for retail accounts (+5.3 σ), and in the labels of `data.accounts` it is one of the planted fan-out accounts. The other two are not laundering, only unusual: a larger share of their payments are round amounts than almost any account in their segment. That is what a distance from the population measures, and the labels let you measure how a detector does on the same data. With `score_per_group=True` each segment is scored against its own accounts, so `p_value` 0.003 means about three retail accounts in a thousand are as far out. `pct_of_total` is a dimension's share of the score's evidence, which is measured on ranks, so a dimension can carry a share at a modest deviation. `explain` shows where every number comes from. `score(new_events, like=result)` scores the next batch against this calibration on the executors, and `sphere_of(result)` hands the same geometry to an agent through the MCP server.
+`A000335` made 20 payments on its busiest day, against about 8 for retail accounts (+5.3 σ), and in the labels of `data.accounts` it is one of the planted fan-out accounts. The other two are not laundering, only unusual: a larger share of their payments are round amounts than almost any account in their segment. That is what a distance from the population measures, and the labels let you measure how a detector does on the same data. With `score_per_group=True` each segment is scored against its own accounts, so `p_value` 0.003 means about three retail accounts in a thousand are as far out. `pct_of_total` is a dimension's share of the score's evidence, which is measured on ranks, so a dimension can carry a share at a modest deviation. `explain` shows where every number comes from. Without `score_per_group`, the default with a `time` column also scores how unusually each entity's activity changed between the two halves of the period, the same score a sphere built from the events gives (`score_axes=("mahal",)` leaves it out). `score(new_events, like=result)` scores the next batch against this calibration on the executors, and `sphere_of(result)` hands the same geometry to an agent through the MCP server.
 Everything else, from column roles and the 23 dimensions to time handling, the cache and the CLI, is in [hypertopos on Spark](docs/spark.md). To run the whole flow on labelled synthetic data, open the [quickstart notebook](docs/examples/spark-quickstart.ipynb) on Databricks or locally.
 
 ## See it in action
@@ -370,8 +371,8 @@ Every capability below comes from one decision: an entity is a point in a space 
 | Incremental ingest | `incremental_update` adds, changes and removes entities without a full rebuild | Rebuilding from source for every batch |
 | Operations CLI | `hypertopos sphere health`, `validate` and `diff` give CI gates and drift between two builds; vector-index health is reported before trajectory tools rely on it | Hand-rolled validation scripts |
 | An agent surface | The MCP server runs over stdio or HTTP with a session per agent and compact, strict-JSON responses sized for a context window | Wrapping a database in ad-hoc tools |
-| On Spark | `hypertopos.spark.find_anomalies(df, entity=…, …)` aggregates events per entity on the executors and returns a DataFrame with the calibrated anomaly score, flag, conformal p-value and the dimensions behind each score; `explain` breaks it down, `sphere_of` hands it to an agent. Runs on classic clusters and Spark Connect, including Databricks serverless | Exporting events, building features by hand and running a detector outside the cluster |
-| Frozen scoring | `FrozenCalibration` (and `hypertopos.spark.score` on executors) scores new data against a fixed population without recalibrating; a calibration saved on persistent storage serves later scheduled jobs (`sphere_of(path)`, `hypertopos spark score`), and `explain` names the dimensions behind each alert | Refitting the detector on every batch, so yesterday's and today's scores are not comparable |
+| On Spark | `hypertopos.spark.find_anomalies(df, entity=…, …)` aggregates events per entity on the executors and returns a DataFrame with the calibrated anomaly score, flag, conformal p-value and the dimensions behind each score; with a `time` column the score also weighs how unusually each entity's activity changed between the two halves of the period (`score_axes`, the `current` axis), so it equals the score a sphere built from the same events gives; `explain` breaks it down, `sphere_of` hands it to an agent. Runs on classic clusters and Spark Connect, including Databricks serverless | Exporting events, building features by hand and running a detector outside the cluster |
+| Frozen scoring | `FrozenCalibration` (and `hypertopos.spark.score` on executors) scores new data against a fixed population without recalibrating (the new window has the calibration window's length); `hypertopos.spark.calibration_status` tells from one `score(..., dimensions=True)` batch whether the data still matches the calibration (`ok`, `drift`, `window_mismatch` when the window's length differs); a calibration saved on persistent storage serves later scheduled jobs (`sphere_of(path)`, `hypertopos spark score`), and `explain` names the dimensions behind each alert | Refitting the detector on every batch, so yesterday's and today's scores are not comparable |
 | Data to try it on | `hypertopos.datasets.synthetic_aml` generates a labelled payments dataset with six laundering patterns | Hunting for a public dataset before the first call |
 
 ### What changes in practice

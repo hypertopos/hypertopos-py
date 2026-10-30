@@ -53,6 +53,11 @@ def add_parser(sub: Any) -> argparse.ArgumentParser:
         "--percentile", type=float, default=99.0, help="flag above this percentile (99)"
     )
     fa.add_argument("--dims", help="comma-separated dimension names (default: auto)")
+    fa.add_argument(
+        "--score-axes",
+        help="comma-separated score axes: mahal or mahal,current "
+        "(default: mahal,current with --time, else mahal)",
+    )
     fa.add_argument("--sphere-root", help="where calibrations are kept (default: temp dir)")
     fa.add_argument("--no-cache", action="store_true", help="recalibrate even if cached")
     out = fa.add_mutually_exclusive_group(required=True)
@@ -123,6 +128,7 @@ def run(args: argparse.Namespace, spark_p: argparse.ArgumentParser) -> None:
         group_by=args.group_by,
         percentile=args.percentile,
         dims=args.dims.split(",") if args.dims else "auto",
+        score_axes=tuple(args.score_axes.split(",")) if args.score_axes else None,
         sphere_root=args.sphere_root,
         cache=not args.no_cache,
     )

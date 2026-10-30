@@ -225,6 +225,14 @@ def test_extra_dim_name_collision_is_rejected():
         build_plan(**FULL_ROLES, extra_dims={"n_out": "count(*)"})
 
 
+@pytest.mark.parametrize(
+    "name", ["first_event", "last_event", "dimension_values", "first_half_n", "key"]
+)
+def test_extra_dims_named_like_an_output_column_are_rejected(name):
+    with pytest.raises(ValueError, match=name):
+        build_plan(**FULL_ROLES, extra_dims={name: "count(1)"})
+
+
 def test_string_time_is_rejected(spark):
     df = spark.createDataFrame(
         [("A", "B", 1.0, "2026-01-05 10:00:00")], ["src", "dst", "amt", "ts"]

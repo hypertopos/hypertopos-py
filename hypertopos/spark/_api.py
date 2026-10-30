@@ -13,14 +13,26 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from pyspark.errors import AnalysisException, PySparkException
 from pyspark.sql import Column, DataFrame, Window
 from pyspark.sql import functions as F
 
-from hypertopos.scoring import FrozenCalibration, effective_min_group_size
+from hypertopos.engine.robust import halves
+from hypertopos.scoring import FrozenCalibration, Scores, effective_min_group_size
 from hypertopos.spark._build import KEY, collect_entities, fingerprint, sphere_dir
-from hypertopos.spark._plan import Plan, aggregate, build_plan, count_entities
+from hypertopos.spark._plan import (
+    EVENT_TIMES,
+    FIRST_EVENT,
+    LAST_EVENT,
+    Plan,
+    aggregate,
+    build_plan,
+    count_entities,
+    event_span,
+    window_days,
+)
 from hypertopos.spark._result import TOP_REASONS, result_table
 
 MAX_ENTITIES = 5_000_000
@@ -33,6 +45,7 @@ METADATA_PATH = "hypertopos.path"
 METADATA_SCORED = (
     "hypertopos.scored"  # set on score() results: their entities are not in the calibration
 )
+SPARK_AXES = ("mahal", "current")
 
 
 def _sphere_root(df: DataFrame, sphere_root: str | None) -> str:
@@ -65,6 +78,7 @@ def find_anomalies(
     log_amounts: bool = True,
     min_group_size: int | None = None,
     score_per_group: bool = False,
+    score_axes: Sequence[str] | None = None,
     sphere_root: str | None = None,
     cache: bool = True,
     max_entities: int = MAX_ENTITIES,
@@ -97,6 +111,14 @@ def find_anomalies(
             under ``min_group_size`` are pooled; a pool still under it, and a
             group not seen at calibration, are scored against the whole
             population.
+        score_axes: The axes of ``anomaly_score``: ``("mahal",)``, the
+            rarity of the entity's combination of dimensions, or
+            ``("mahal", "current")``, which adds how unusually the entity's
+            activity changed between the two calendar halves of the events
+            compared with entities in the same state (needs ``time``; with
+            ``score_per_group`` each group fits its own velocity field).
+            Default ``("mahal", "current")`` when ``time`` is given, else
+            ``("mahal",)``; with ``score_per_group`` ``("mahal",)``.
         sphere_root: Where calibrations are kept; default is the Spark conf
             ``hypertopos.sphere_root``, then ``HYPERTOPOS_SPHERE_ROOT``, then
             the driver's temp directory.
@@ -112,12 +134,11 @@ def find_anomalies(
         of the population with a lower score), ``delta_norm`` (distance from
         the population centre, in standard deviations), ``top_reasons`` (up to
         three ``{dim, delta, pct_of_total}``: the dimension's deviation in
-        standard deviations and its share of ``anomaly_score`` in percent, the
-        Shapley split of the Mahalanobis evidence that ``explain_anomaly``
-        reports on a sphere; empty for an entity at the centre of the score).
-        The score is the Mahalanobis axis only: a sphere built from the same
-        events with an event pattern also scores motion (``current``), so its
-        scores and p-values can differ. With ``group_by``: ``delta_norm`` and
+        standard deviations and its share in percent of the Mahalanobis
+        evidence, the Shapley split ``explain_anomaly`` reports on a sphere;
+        empty for an entity at the centre of the score). With ``current`` the
+        score and p-value equal those of a sphere built from the same events
+        with an event pattern. With ``group_by``: ``delta_norm`` and
         the reasons' ``delta`` are measured against the entity's group, while
         the score and its shares are over the whole population unless
         ``score_per_group``, which measures them within the group too; the
@@ -130,6 +151,7 @@ def find_anomalies(
     if score_per_group and group_by is None:
         raise ValueError("score_per_group needs group_by")
     group_size = effective_min_group_size(min_group_size, percentile, score_per_group)
+    axes = _score_axes(score_axes, time, score_per_group)
     plan = build_plan(
         entity,
         counterparty,
@@ -146,16 +168,35 @@ def find_anomalies(
         group_by=group_by,
         min_group_size=group_size,
         score_per_group=score_per_group,
+        score_axes=axes,
     )
     path = sphere_dir(_sphere_root(df, sphere_root), fp)
+    scores: Scores | None = None  # a cached entry holds no member scores: they are computed below
     if cache and (path / CALIBRATION_FILE).exists():
         entities = pq.read_table(path / ENTITIES_FILE)
         with open(path / CALIBRATION_FILE, "rb") as fh:
             calibration = pickle.load(fh)
     else:
-        entities = _entity_table(df, plan, group_by, max_entities)
+        split = None
+        if "current" in axes:
+            first, last = event_span(df, plan)
+            if first is None or last is None:
+                raise ValueError(f"the time column {time!r} holds no values")
+            split = halves(first, last)
+        entities = _entity_table(
+            df, plan, group_by, max_entities, t_mid=None if split is None else split[1]
+        )
+        # Key order makes the fit independent of the order Spark returns rows in.
+        entities = entities.sort_by(KEY)
+        window = window_days(
+            pc.min(entities[FIRST_EVENT]).as_py(), pc.max(entities[LAST_EVENT]).as_py()
+        )
+        # The event times only measure the window: the saved entity table (and the
+        # sphere built from it) holds the dimensions alone.
+        entities = entities.drop_columns(list(EVENT_TIMES))
         dim_names = [d.name for d in plan.dims] + [name for name, _ in plan.extra_dims]
-        calibration = FrozenCalibration.fit(
+        # The fit's own member scores are the result's: no second scoring pass.
+        calibration, scores = FrozenCalibration.fit_scored(
             entities,
             dim_names,
             percentile=percentile,
@@ -163,10 +204,13 @@ def find_anomalies(
             min_group_size=group_size,
             shrink={d.name: d.count for d in plan.dims if d.count},
             score_per_group=score_per_group,
+            window_days=window,
+            halves=split,
+            key=KEY if split is not None else None,
         )
         _save(path, entities, plan, calibration)
 
-    table = result_table(entities, calibration, members=True)
+    table = result_table(entities, calibration, members=True, scores=scores)
     flat = df.sparkSession.createDataFrame(table.to_pandas())
     return shape_result(flat, len(calibration.dims), fp, path, group_by)
 
@@ -176,8 +220,10 @@ def _entity_table(
     plan: Plan,
     group_by: str | None,
     max_entities: int,
+    *,
+    t_mid: float | None = None,
 ) -> pa.Table:
-    entity_df = entity_frame(df, plan, group_by)
+    entity_df = entity_frame(df, plan, group_by, event_times=True, t_mid=t_mid)
     # Cached, counting the frame computes the aggregation once and the collect
     # reads the cache. Where caching is refused (serverless on older client
     # environments) every action recomputes it, so the count comes from the keys
@@ -200,13 +246,43 @@ def _entity_table(
             entity_df.unpersist()
 
 
-def entity_frame(df: DataFrame, plan: Plan, group_by: str | None) -> DataFrame:
-    """Per-entity dimensions, plus the entity's ``group_by`` value when given."""
-    entity_df = aggregate(df, plan)
+def entity_frame(
+    df: DataFrame,
+    plan: Plan,
+    group_by: str | None,
+    *,
+    event_times: bool = False,
+    t_mid: float | None = None,
+) -> DataFrame:
+    """Per-entity dimensions, plus the entity's ``group_by`` value when given.
+
+    ``event_times=True`` adds each entity's ``first_event`` / ``last_event``;
+    ``t_mid`` the half-state columns of the ``current`` axis.
+    """
+    entity_df = aggregate(df, plan, event_times=event_times, t_mid=t_mid)
     if group_by is None:
         return entity_df
     groups = _group_values(df, plan.roles["entity"], group_by)
     return entity_df.join(groups, KEY, "left").fillna({group_by: NO_GROUP})
+
+
+def _score_axes(
+    score_axes: Sequence[str] | None, time: str | None, score_per_group: bool
+) -> tuple[str, ...]:
+    if score_axes is None:
+        # As a sphere's default: current whenever there are times to split, except
+        # per group, where current is opt-in.
+        return SPARK_AXES if time is not None and not score_per_group else ("mahal",)
+    if isinstance(score_axes, str):
+        raise TypeError(f"score_axes takes a tuple of axis names, e.g. ({score_axes!r},)")
+    unknown = [a for a in score_axes if a not in SPARK_AXES]
+    if unknown or "mahal" not in score_axes:
+        raise ValueError(f"score_axes must be ('mahal',) or {SPARK_AXES}, got {tuple(score_axes)}")
+    if "current" not in score_axes:
+        return ("mahal",)
+    if time is None:
+        raise ValueError("the current axis needs time")
+    return SPARK_AXES
 
 
 def _group_values(df: DataFrame, entity: str, group_by: str) -> DataFrame:
@@ -246,6 +322,7 @@ def shape_result(
     group_by: str | None,
     *,
     scored: bool = False,
+    dimensions: bool = False,
 ) -> DataFrame:
     """Flat reason columns -> the result contract; metadata only when ``fp`` is given."""
     k = min(TOP_REASONS, n_dims)
@@ -274,4 +351,6 @@ def shape_result(
     ]
     if group_by is not None:
         columns += [group_by, "calibration_scope"]
+    if dimensions:
+        columns += ["dimension_values", *EVENT_TIMES]
     return flat.select(*columns)

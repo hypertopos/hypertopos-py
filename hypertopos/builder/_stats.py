@@ -17,6 +17,8 @@ SIGMA_EPS_PROP: float = 0.2  # minimum sigma for binary prop_columns — caps de
 def compute_stats(
     shape_vectors: np.ndarray,
     anomaly_percentile: float = 95.0,
+    *,
+    warn_rate: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Auto-compute pattern statistics from a population of shape vectors.
@@ -50,7 +52,7 @@ def compute_stats(
     # Anomaly rate guard
     expected_rate = 1.0 - anomaly_percentile / 100.0
     actual_rate = float((delta_norms >= theta_scalar).mean()) if theta_scalar > 0 else 0.0
-    if actual_rate > expected_rate * 2.5:
+    if warn_rate and actual_rate > expected_rate * 2.5:
         logger.warning(
             "Anomaly rate %.1f%% exceeds %.1f\u00d7 expected %.1f%% \u2014 "
             "discrete delta_norm distribution (unique values: %d). "
@@ -107,6 +109,8 @@ def compute_stats_grouped(
     group_ids: np.ndarray,
     anomaly_percentile: float = 95.0,
     prop_dim_start: int | None = None,
+    *,
+    warn_rate: bool = True,
 ) -> tuple[
     dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, int]],
     np.ndarray,
@@ -154,6 +158,7 @@ def compute_stats_grouped(
         mu_g, sigma_g, theta_g, group_deltas, group_norms = compute_stats(
             group_shape,
             anomaly_percentile,
+            warn_rate=warn_rate,
         )
 
         if prop_dim_start is not None:

@@ -411,3 +411,222 @@ def test_per_group_score_of_an_empty_table():
     scores = calibration.score(empty)
     assert len(scores.conformal_p) == 0
     assert calibration.score_shares(empty, scores.score_delta).shape == (0, len(DIMS))
+
+
+def _with_half_states(table: pa.Table, seed: int) -> tuple[pa.Table, tuple[float, float]]:
+    """The table plus the raw half-state columns of random events of its rows."""
+    from hypertopos.engine.robust import halves
+    from hypertopos.scoring import STATE_COLUMNS
+
+    rng = np.random.default_rng(seed)
+    n = table.num_rows
+    m = 10 * n
+    code = rng.integers(0, n, m)
+    ts = 1.7e9 + rng.uniform(0, 20 * 86400.0, m)
+    out = rng.integers(0, 2, m) == 0
+    la = np.log1p(rng.lognormal(3.0, 1.0, m))
+    t0, t_mid = halves(float(ts.min()), float(ts.max()))
+    columns = []
+    for half in (ts < t_mid, ts >= t_mid):
+        for side in (out, ~out):
+            s = half & side
+            columns += [np.bincount(code[s], minlength=n), np.bincount(code[s], la[s], n)]
+        columns.append(np.bincount(code[half], minlength=n))
+    for name, values in zip(STATE_COLUMNS, columns, strict=True):
+        table = table.append_column(name, pa.array(values))
+    return table, (t0, t_mid)
+
+
+def test_half_states_add_the_current_axis_and_members_rescore_to_the_fit():
+    from hypertopos.engine.robust import HalfStates
+    from hypertopos.scoring import STATE_COLUMNS
+
+    table, (t0, t_mid) = _with_half_states(_table(n=600, seed=3), seed=4)
+    calibration = FrozenCalibration.fit(table, DIMS, halves=(t0, t_mid), key="entity")
+    assert calibration.reference.axes == ("mahal", "current")
+    raw = np.column_stack([table[c].to_numpy().astype(np.float64) for c in STATE_COLUMNS])
+    states = HalfStates(np.log1p(raw[:, :5]), np.log1p(raw[:, 5:]), t0, t_mid)
+    _, fitted = fit_reference(_matrix(table).astype(np.float64), DIMS, states=states)
+    scores = calibration.score(table, members=True)
+    np.testing.assert_array_equal(scores.anomaly_score, fitted.anomaly_score)
+    np.testing.assert_array_equal(scores.conformal_p, fitted.conformal_p)
+    # A subset of members (explain) keeps each member's own fitted score.
+    part = calibration.score(table.slice(100, 50), members=True)
+    np.testing.assert_array_equal(part.conformal_p, fitted.conformal_p[100:150])
+
+
+def test_rows_without_half_states_are_scored_without_current():
+    table, halves_ = _with_half_states(_table(n=600, seed=5), seed=6)
+    calibration = FrozenCalibration.fit(table, DIMS, halves=halves_, key="entity")
+    plain = _table(n=300, seed=7)
+    scores = calibration.score(plain)
+    expected = score_reference(calibration.reference, _matrix(plain))
+    np.testing.assert_array_equal(scores.conformal_p, expected.conformal_p)
+
+
+def test_half_states_need_a_key():
+    table, halves_ = _with_half_states(_table(n=600, seed=8, groups=["g"] * 600), seed=9)
+    with pytest.raises(ValueError, match="key"):
+        FrozenCalibration.fit(table, DIMS, halves=halves_)
+
+
+def _half_states_of(table: pa.Table, halves_: tuple[float, float]):
+    from hypertopos.engine.robust import HalfStates
+    from hypertopos.scoring import STATE_COLUMNS
+
+    raw = np.column_stack([table[c].to_numpy().astype(np.float64) for c in STATE_COLUMNS])
+    return HalfStates(np.log1p(raw[:, :5]), np.log1p(raw[:, 5:]), *halves_)
+
+
+def test_score_per_group_fits_current_per_group(monkeypatch):
+    # Each own group fits its velocity field on its own rows' half states; a group
+    # under the reference size is scored against the population's, current included.
+    import hypertopos.engine.robust as robust
+    from hypertopos.scoring import STATE_COLUMNS
+
+    monkeypatch.setattr(robust, "MAX_REFERENCE_ROWS", 250)  # sampled velocity fields
+    groups = ["big"] * 700 + ["mid"] * 400 + ["tiny"] * 60
+    table, halves_ = _with_half_states(_table(n=len(groups), seed=13, groups=groups), seed=14)
+    calibration = FrozenCalibration.fit(
+        table, DIMS, halves=halves_, key="entity", group_by="segment", score_per_group=True
+    )
+    assert calibration.groups is not None
+    assert calibration.reference.axes == ("mahal", "current")
+    states = _half_states_of(table, halves_)
+    x = _matrix(table).astype(np.float64)
+    ids = np.array(groups, dtype=object)
+    expected_grouped, expected, _ = robust.fit_grouped_reference(
+        x, DIMS, ids, percentile=99.0, min_group_size=199, states=states
+    )
+    scores = calibration.score(table, members=True)
+    np.testing.assert_array_equal(scores.conformal_p, expected.conformal_p)
+    np.testing.assert_array_equal(scores.anomaly_score, expected.anomaly_score)
+    tiny = ids == "tiny"
+    assert set(scores.calibration_scope[tiny]) == {"global"}
+    for gid in ("big", "mid"):
+        ref = calibration.groups[gid].reference
+        assert ref is not None and ref.axes == ("mahal", "current")
+        np.testing.assert_array_equal(ref.vel_u, expected_grouped.groups[gid].vel_u)
+    # A later window: new rows with half states are scored on each group's frozen
+    # velocity field, rows without them on mahal alone.
+    later, later_halves = _with_half_states(_table(n=len(groups), seed=15, groups=groups), seed=16)
+    new = calibration.score(later)
+    lx = _matrix(later).astype(np.float64)
+    lstates = _half_states_of(later, later_halves)
+    for gid in ("big", "mid"):
+        m = ids == gid
+        ref = calibration.groups[gid].reference
+        want = score_reference(ref, lx[m], states=robust.subset_states(lstates, m))
+        np.testing.assert_array_equal(new.conformal_p[m], want.conformal_p)
+    want = score_reference(
+        calibration.reference, lx[tiny], states=robust.subset_states(lstates, tiny)
+    )
+    np.testing.assert_array_equal(new.conformal_p[tiny], want.conformal_p)
+    plain = calibration.score(later.drop_columns(list(STATE_COLUMNS)))
+    m = ids == "big"
+    want = score_reference(calibration.groups["big"].reference, lx[m])
+    np.testing.assert_array_equal(plain.conformal_p[m], want.conformal_p)
+
+
+@pytest.mark.parametrize("current", [False, True])
+@pytest.mark.parametrize("grouping", [None, "segment", "per_group"])
+def test_fit_scored_returns_the_member_scores(monkeypatch, current, grouping):
+    # The fit's own scores stand in for rescoring the members: equal to the last bit.
+    import hypertopos.engine.robust as robust
+
+    monkeypatch.setattr(robust, "MAX_REFERENCE_ROWS", 300)  # a sampled velocity field
+    groups = ["g1" if i % 3 else "g2" for i in range(1200)] if grouping else None
+    table = _table(n=1200, seed=11, groups=groups)
+    settings: dict[str, object] = {"percentile": 99.0}
+    if current:
+        table, settings["halves"] = _with_half_states(table, seed=12)
+        settings["key"] = "entity"
+    if grouping:
+        settings["group_by"] = "segment"
+        settings["score_per_group"] = grouping == "per_group"
+    calibration, scores = FrozenCalibration.fit_scored(table, DIMS, **settings)
+    rescored = calibration.score(table, members=True)
+    for name in (
+        "anomaly_score",
+        "conformal_p",
+        "score_rank_pct",
+        "is_anomaly",
+        "delta",
+        "delta_norm",
+        "score_delta",
+    ):
+        actual, expected = getattr(scores, name), getattr(rescored, name)
+        assert actual.dtype == expected.dtype, name
+        np.testing.assert_array_equal(actual, expected, name)
+    if grouping:
+        assert scores.calibration_scope is not None and rescored.calibration_scope is not None
+        assert scores.calibration_scope.tolist() == rescored.calibration_scope.tolist()
+    else:
+        assert scores.calibration_scope is None and rescored.calibration_scope is None
+    # The calibration itself is the one fit returns, to the byte (it is what is saved).
+    plain = FrozenCalibration.fit(table, DIMS, **settings)  # type: ignore[arg-type]
+    assert pickle.dumps(plain) == pickle.dumps(calibration)
+
+
+def _discrete_table(n: int = 2000) -> pa.Table:
+    rng = np.random.default_rng(3)
+    return pa.table(
+        {
+            "entity": [f"E{i}" for i in range(n)],
+            **{d: (rng.random(n) < 0.03).astype(np.int64) for d in DIMS},
+        }
+    )
+
+
+def test_discrete_population_warns_in_compute_stats(caplog: pytest.LogCaptureFixture) -> None:
+    from hypertopos.builder._stats import compute_stats
+
+    x = np.column_stack([_discrete_table().column(d).to_numpy() for d in DIMS]).astype(float)
+    with caplog.at_level("WARNING"):
+        compute_stats(x, 99.0)
+    assert any("Anomaly rate" in r.getMessage() for r in caplog.records)
+
+
+def test_frozen_calibration_does_not_warn_about_the_unused_threshold(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The calibrated score flags rows; the delta_norm threshold is never used here.
+    grouped = _discrete_table().append_column("segment", pa.array(["s1", "s2"] * 1000))
+    with caplog.at_level("WARNING"):
+        FrozenCalibration.fit(_discrete_table(), DIMS, percentile=99.0)
+        FrozenCalibration.fit(grouped, DIMS, percentile=99.0, group_by="segment")
+    assert not any("Anomaly rate" in r.getMessage() for r in caplog.records)
+
+
+def test_members_rescore_when_no_entity_is_active_in_both_halves():
+    # A window under a day puts the split at its start: nobody has first-half
+    # events, the velocity sample is empty and current is missing for every row.
+    from hypertopos.scoring import STATE_COLUMNS
+
+    table, _ = _with_half_states(_table(n=600, seed=17), seed=18)
+    for name in [c for c in STATE_COLUMNS if c.startswith("first_half")]:
+        index = table.schema.get_field_index(name)
+        table = table.set_column(index, name, pa.array(np.zeros(table.num_rows, np.int64)))
+    t0 = 1.7e9
+    calibration, fitted = FrozenCalibration.fit_scored(table, DIMS, halves=(t0, t0), key="entity")
+    assert calibration.vel_keys is not None and len(calibration.vel_keys) == 0
+    scores = calibration.score(table, members=True)
+    np.testing.assert_array_equal(scores.conformal_p, fitted.conformal_p)
+
+
+def test_members_rescore_when_a_group_has_no_active_entity():
+    from hypertopos.scoring import STATE_COLUMNS
+
+    groups = ["a"] * 400 + ["b"] * 400
+    table, halves_ = _with_half_states(_table(n=len(groups), seed=19, groups=groups), seed=20)
+    first = [c for c in STATE_COLUMNS if c.startswith("first_half")]
+    b = np.array(groups) == "b"
+    for name in first:
+        values = table[name].to_numpy().copy()
+        values[b] = 0
+        table = table.set_column(table.schema.get_field_index(name), name, pa.array(values))
+    calibration, fitted = FrozenCalibration.fit_scored(
+        table, DIMS, halves=halves_, key="entity", group_by="segment", score_per_group=True
+    )
+    scores = calibration.score(table, members=True)
+    np.testing.assert_array_equal(scores.conformal_p, fitted.conformal_p)

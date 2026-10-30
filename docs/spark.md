@@ -59,19 +59,35 @@ One row per entity, sender or receiver:
 | Column | Meaning |
 |---|---|
 | `entity` | The entity key, as a string |
-| `anomaly_score` | The calibrated evidence score — the same score the sphere builder gives continuous anchor patterns on the Mahalanobis axis; higher = more unusual. Rank by it |
+| `anomaly_score` | The calibrated evidence score — the same score the sphere builder gives continuous anchor patterns; higher = more unusual. Rank by it. It averages the entity's population ranks on its axes (see [Score axes](#score-axes)) |
 | `is_anomaly` | `true` when `p_value` is at most `1 − percentile/100` (99 by default): the alarm budget — at most 1 % of the population is flagged; entities scored later against the stored calibration keep that budget while the population does not move |
 | `p_value` | Conformal p-value of `anomaly_score`: the share of the calibration population scoring at least as high (0.01 means 1 % score as high or higher) |
 | `score_rank_pct` | Rank of `anomaly_score` in the population, 0–100 |
 | `delta_norm` | Distance from the (group's) centre, in standard deviations across all dimensions — the shape, for reference; it does not decide the flag |
-| `top_reasons` | Up to three `{dim, delta, pct_of_total}`: the dimensions that drive `anomaly_score` most, with the signed deviation and each one's share of the score in percent — the same Shapley split of the Mahalanobis evidence that `explain_anomaly` reports on a sphere, so dimensions that move together share the deviation they make together, and a dimension can lead with a moderate `delta`. Empty for an entity exactly at the centre of the score |
+| `top_reasons` | Up to three `{dim, delta, pct_of_total}`: the dimensions that drive `anomaly_score` most, with the signed deviation and each one's share in percent of the Mahalanobis part of the score — the same Shapley split of the Mahalanobis evidence that `explain_anomaly` reports on a sphere, so dimensions that move together share the deviation they make together, and a dimension can lead with a moderate `delta`. Empty for an entity exactly at the centre of the score |
 
-The score is the Mahalanobis axis alone: Spark has no event-motion axis (`current`), so a sphere built from the same events with an event pattern can score the same entities differently and give different p-values. `find_anomalies` scores the fitted table with its in-sample p-values (`FrozenCalibration.score(table, members=True)`), reproducing the values a sphere build would store. `score` for new data uses `members=False`: on smaller calibrations (up to about 2,000 entities per dimension) the alarm budget is kept via out-of-fold scores; on larger ones the in-sample calibration is used because the difference is within noise at that scale. `score` treats every row as a new entity, also when it rescores the calibration's own events: `anomaly_score`, `score_rank_pct` and the reasons repeat the `find_anomalies` values, while `p_value` and `is_anomaly` can differ slightly.
+`find_anomalies` scores the fitted table with its in-sample p-values (`FrozenCalibration.score(table, members=True)`), reproducing the values a sphere build would store. `score` for new data uses `members=False`: on smaller calibrations (up to about 2,000 entities per dimension) the alarm budget is kept via out-of-fold scores; on larger ones the in-sample calibration is used because the difference is within noise at that scale. `score` treats every row as a new entity, also when it rescores the calibration's own events: without `current` (`score_axes=("mahal",)`) `anomaly_score`, `score_rank_pct` and the reasons repeat the `find_anomalies` values, while `p_value` and `is_anomaly` can differ slightly.
 
 `top_reasons` is an `array<struct>`, so it works in `display`, in SQL (`top_reasons[0].dim`) and when written to Delta:
 
 ```python
 result.write.mode("overwrite").saveAsTable("main.aml.entity_anomalies")
+```
+
+### Score axes
+
+`anomaly_score` is the mean of the entity's population ranks on its axes, set with `score_axes`:
+
+- **`mahal`** — how rare the entity's combination of dimensions is: a shrunk-covariance Mahalanobis distance on rank-Gaussian coordinates of the dimensions. Always on.
+- **`current`** — how unusually the entity's activity changed over the period. The events are split into two calendar halves at the middle day of the whole window (the time role decides the halves); each entity gets a state per half (out and in event counts, the sum of `log1p(amount)` on each side, all events) and moves from the first state to the second. `current` is how far that move is from the average move of the 50 entities whose first-half state is nearest to its own. An entity with no event in one of the halves has no `current` and is scored on `mahal` alone. Needs `time`.
+
+The default is `("mahal", "current")` when `time` is given, and `mahal` alone without `time` or with `score_per_group=True`. `current` costs about a fifth more time per call (the half states and the velocity field); pass `score_axes=("mahal",)` to leave it out. `current` needs events on both sides of the window's middle day, so on a one-day window (a daily calibration) it changes no p-value, rank or flag; pass `score_axes=("mahal",)` there to save its cost. `current` helps when the entities you look for change their activity over the window (an account that turns busy, goes quiet or changes counterparties); when the unusual entities do not shift between the two halves, it only adds noise to the ranking, so leave it out. With `score_per_group=True`, `current` is opt-in: `score_axes=("mahal", "current")` gives each group's reference its own velocity field, fitted on that group's entities, and groups too small for their own reference are pooled: the pool gets its own reference and velocity field when it is large enough, otherwise its entities are scored against the population's, `current` included. The halves are split at the middle day of the whole window in every group; a sphere build splits each group at the middle day of that group's own events, which is the same day whenever the group's events span the whole window. Under the default, a `time` column that holds no values raises `ValueError`, as it does with an explicit `current`. With `current`, `anomaly_score`, `p_value`, `score_rank_pct` and `is_anomaly` equal those of a sphere built by the file-based builder from the same events with an event pattern (an anchor pattern on the same dimensions with `score_axes: [mahal, current]`). The half states count a self-transfer as an out and an in event, as a build does; an event without a counterparty counts as an out event, and an event without a time is in neither half. The half-state columns (`first_half_n_out` … `second_half_n`) are kept in the entity table, and the per-entity work runs on the executors in the same aggregation as the dimensions; the driver reads the first and last event time once more to place the halves.
+
+`score` scores new entities on `mahal` alone, also against a calibration with `current`, and calibrates them against the population's scores without `current`, so the alarm budget holds for a scored batch as without `current`. Rescoring a calibration's own events with `score` then gives a different `anomaly_score` than `find_anomalies`, which scores its members on both axes.
+
+```python
+result = find_anomalies(events, entity="from_account", counterparty="to_account",
+                        amount="amount", time="ts", score_axes=("mahal",))  # without current
 ```
 
 ### Why an entity stands out
@@ -91,7 +107,7 @@ explain(result, entities=["ACC-1029", "ACC-4471"], dims=["amount_sum_out", "n_di
 | `value` | The entity's value of the dimension (log-scaled where the dimension is) |
 | `mu`, `sigma` | The population mean and standard deviation it is compared with (its group's, with `group_by`) |
 | `delta` | `(value − mu) / sigma`: the signed deviation in standard deviations |
-| `pct_of_total` | The dimension's share of `anomaly_score`, in percent (`explain_anomaly` gives the same share as a fraction); an entity's rows sum to 100 |
+| `pct_of_total` | The dimension's share of the Mahalanobis part of `anomaly_score`, in percent (`explain_anomaly` gives the same share as a fraction); an entity's rows sum to 100. The `current` axis has no per-dimension split |
 | `direction` | `above`, `below` or `at` the mean |
 
 The first three rows of an entity are its `top_reasons`. `explain` runs on the driver over the cached calibration; it needs the result DataFrame itself, because renaming or selecting away the `entity` column drops the metadata that points to the calibration.
@@ -123,7 +139,7 @@ Put `mcp_config()` under `mcpServers` in an MCP client's configuration, or call 
 
 ### Score new data without recalibrating
 
-`score` measures new events against the population a result was calibrated on, for example today's transactions against last quarter's:
+`score` measures new events against the population a result was calibrated on, for example today's transactions against yesterday's. **Calibrate on a window of the same length as the one you score**: the counts, sums, distinct counterparties and active days of an entity grow with the window, so a day scored against a quarter flags almost everyone (a window a third shorter than its calibration already flags over 20 %).
 
 ```python
 from hypertopos.spark import score
@@ -139,8 +155,9 @@ It returns the same columns as `find_anomalies`. The aggregation and the scoring
 A daily job runs in a new process, so the result of the calibration run is gone. Keep the calibration on persistent storage and score against it by its path:
 
 ```python
-# Once, or whenever the baseline should move: calibrate on a reference window.
-reference = spark.table("main.aml.transactions").where("ts < '2026-10-01'")
+# Whenever the baseline should move: calibrate on a reference window of the same length
+# as the one you score — here yesterday, for scoring today.
+reference = spark.table("main.aml.transactions").where("ts >= '2026-10-28' AND ts < '2026-10-29'")
 result = find_anomalies(reference, entity="from_account", counterparty="to_account",
                         amount="amount", time="ts", sphere_root="/Volumes/main/aml/hypertopos")
 calibration_path = str(sphere_of(result).path)    # keep it, e.g. as a job parameter
@@ -150,7 +167,34 @@ today = score(spark.table("main.aml.transactions_today"), like=sphere_of(calibra
 today.where("is_anomaly").write.mode("append").saveAsTable("main.aml.daily_alerts")
 ```
 
-The baseline stays the same from one day to the next, so the scores stay comparable; it moves only when you run the calibration again. On a Databricks Volume, the entity table and the calibration are written as plain files, which a Volume accepts.
+The baseline stays the same until you run the calibration again, so the scores stay comparable. Keep the two windows the same length: a daily job scores one day against a one-day calibration (yesterday, or the same weekday a week earlier when weekdays differ), a monthly job scores a fixed number of days against the same number. On a Databricks Volume, the entity table and the calibration are written as plain files, which a Volume accepts.
+
+#### Is the calibration still valid?
+
+A frozen baseline keeps its alarm budget only while new data comes from the population it was calibrated on. `calibration_status` tests that on a scored batch:
+
+```python
+from hypertopos.spark import calibration_status, score
+
+today = score(new_events, like=result, dimensions=True).persist()
+status = calibration_status(today, like=result)
+status["status"], status["drifted_dimensions"]
+```
+
+Pass every scored row, not the alerts or another subset: the tests compare the whole batch with the whole population, so a filtered frame reads as drift. `dimensions=True` adds three columns: `dimension_values`, the values each entity was scored on, in `sphere_of(result).calibration().dims` order, and `first_event` / `last_event`, the time of the entity's first and last event in epoch seconds (UTC; a `timestamp_ntz` column is its wall clock read as UTC). Without it `score` returns exactly the columns above. `calibration_status` runs one Spark action over the scored frame: the executors count, and only the counts reach the driver. Persist or write the scored frame first, or that action computes the scoring again.
+
+It runs two tests, with a combined false-alarm rate of about 2.5 % when nothing has changed:
+
+- the batch's `p_value` against uniform (a Kolmogorov-Smirnov test, `p_distribution`), which catches a shift of the joint score;
+- each dimension against the calibrated population's distribution of that dimension (`p_dimensions`, one Kolmogorov-Smirnov test per dimension with a Bonferroni correction), which names the dimensions that moved in `drifted_dimensions`. Tied values, such as a dimension that is mostly zero, are compared correctly.
+
+Both tests account for the calibration itself being a sample, so a small calibration does not raise false alarms. The result also reports `rows`, `flagged`, `alarm_rate`, `expected_alarm_rate` (1 − `percentile` / 100) and `p_flag_count`, the tail probability of that many flags under the frozen calibration (beta-binomial). That last test is reported for reference and does not set `status`.
+
+It also checks the length of the scored window. `window_days` is the batch's calendar span, from its first to its last event, in whole days rounded up (at least 1); `calibration_window_days` is the same span of the events the calibration was fitted on, stored with the calibration. When the scored window is not between 95 % and 100 % of the calibration window's length, `status` is `window_mismatch` with a `reason` naming both windows: calibrate on a window of the same length as the scored one. Window lengths matter more than they look: a window 10 % shorter than its calibration already doubles the alarm rate, and a 5 % longer one quadruples it. Use fixed-length windows (e.g. 28 or 30 days), not calendar months: February against January is 28 / 31 = 0.90 and fails. The tests above are still computed and reported. A calibration saved before this check existed has `calibration_window_days` `None` and skips it until you calibrate again.
+
+`status` is `ok`, `drift` (recalibrate with `find_anomalies` on a recent reference window), `window_mismatch`, or `too_few_rows` below 100 rows, where the p-values are `None`. When more than one applies, `too_few_rows` comes first, then `window_mismatch`, then `drift`.
+
+Only calibrations without groups are supported. With `group_by` the result is `{"status": "unsupported", "reason": ...}`. A `find_anomalies` result has no `dimension_values`, and its p-values rank the calibrated entities themselves, so `calibration_status` raises `ValueError` for it, as for a scored frame without `dimension_values`, `first_event` or `last_event`.
 
 ### Per-group populations
 
@@ -180,7 +224,7 @@ The entity table and its calibration are stored under `sphere_root`. The default
 The driver temp directory does not survive a cluster restart. Set `sphere_root` to a persistent location, such as a Unity Catalog Volume, to keep calibrations. On serverless compute a custom Spark conf cannot be set, so pass `sphere_root=` or set `HYPERTOPOS_SPHERE_ROOT`.
 
 > [!TIP]
-> The driver holds the per-entity table, its calibration and the result. With all dimensions, the calibration step alone takes under 1 GB per million entities, and the whole call takes several times that, so size the driver at a few GB per million entities. `max_entities` (5 million by default) stops a larger run with a clear error before it starts; raise it on a bigger driver.
+> The driver holds the per-entity table, its calibration and the result. With the `current` axis, `lance_path()` also rebuilds one row per event side from the half states on the driver (about 25 bytes each) while it builds the sphere. With all dimensions, the calibration step alone takes under 1 GB per million entities, and the whole call takes several times that, so size the driver at a few GB per million entities. `max_entities` (5 million by default) stops a larger run with a clear error before it starts; raise it on a bigger driver.
 
 ### From the command line
 
@@ -193,9 +237,9 @@ hypertopos spark find-anomalies --input main.aml.transactions --entity from_acco
     --counterparty to_account --amount amount --time ts --output-table main.aml.entity_anomalies
 ```
 
-`--input` takes a Parquet or CSV file or directory, a Delta directory, or a table or view name. Exactly one of `--output` (Parquet path), `--output-table` or `--show N` is required. `hypertopos spark find-anomalies --help` lists every option.
+`--input` takes a Parquet or CSV file or directory, a Delta directory, or a table or view name. Exactly one of `--output` (Parquet path), `--output-table` or `--show N` is required. `--score-axes` takes the axes comma-separated (`mahal` or `mahal,current`); unset, it keeps the library default, so pass `--score-axes mahal` to leave `current` out. `hypertopos spark find-anomalies --help` lists every option.
 
-`find-anomalies` prints the path of its calibration (`calibration: ...`). A scheduled job scores each new batch against it with `score`, which adds no recalibration and can append only the flagged entities to an alerts table:
+`find-anomalies` prints the path of its calibration (`calibration: ...`). A scheduled job scores each new batch against it with `score`, which adds no recalibration and can append only the flagged entities to an alerts table. Calibrate on a window of the same length as each batch (a day for a daily batch):
 
 ```bash
 hypertopos spark score --input main.aml.transactions_today \

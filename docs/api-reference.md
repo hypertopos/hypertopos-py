@@ -268,7 +268,7 @@ builder = GDSBuilder(
 | `add_chain_line(line_id, chains, features)` | Create anchor line from extracted chain dicts |
 | `add_alias(alias_id, base_pattern_id, cutting_plane_dimension, cutting_plane_threshold)` | Register an alias with a cutting plane for sub-population analysis |
 | `build(temporal_configs=None)` | Validate, compute statistics, write all files. Pass `temporal_configs` to run geometry→temporal pipeline per pattern. Returns output path |
-| `incremental_update(pattern_id, changed_entities, deleted_keys, recalibrate, reindex, recompute_ranks, branch=None)` | Add/modify/delete entities without a full rebuild; new entities are immediately visible to anomaly search. Supports patterns whose dimensions are relations, event dimensions, edge-dim aggregations, and tracked properties; group-calibrated (`group_by_property`), GMM, and FDR-hierarchy patterns are rejected and must be rebuilt. `reindex=True` rebuilds the ANN index immediately; New and changed entities are scored against the pattern's stored calibration reference without a refit. `recompute_ranks=False` defers the global `score_rank_pct` recompute for batched ingestion. `branch=` applies the update to that sphere branch only and records it in the branch's recipe log (with a copy of the rows); an automatic recalibration is recorded as its own recipe |
+| `incremental_update(pattern_id, changed_entities, deleted_keys, recalibrate, reindex, recompute_ranks, branch=None)` | Add/modify/delete entities without a full rebuild; new entities are immediately visible to anomaly search. Supports patterns whose dimensions are relations, event dimensions, edge-dim aggregations, and tracked properties; group-calibrated (`group_by_property`), GMM, and FDR-hierarchy patterns are rejected and must be rebuilt. `reindex=True` rebuilds the ANN index immediately; New and changed entities are scored against the pattern's stored calibration reference without a refit. `recompute_ranks=False` defers the global `score_rank_pct` recompute for batched ingestion. `branch=` applies the update to that sphere branch only and records it in the branch's recipe log (with a copy of the rows); an automatic recalibration is recorded as its own recipe. An automatic or forced recalibration keeps out of the fit the entities the last calibration excluded (`exclude_keys`), except those this update deletes |
 | `finalize_incremental(pattern_id, branch=None)` | Recompute the global `score_rank_pct` percentile once and rebuild the ANN index. Call at the end of a batched ingestion session that used `recompute_ranks=False`. With `branch=` it finalizes that branch and is recorded in its recipe log |
 | `build_temporal(time_col, time_window)` | Generate temporal snapshots from time-windowed event data. Call after `build()` when not using pipeline mode |
 
@@ -626,6 +626,20 @@ Fields: `pattern_a`, `pattern_b`, `entity_key: str | None`, `n_epochs_used`,
 Fields: `dim_index_a`, `dim_index_b`, `dim_label_a: str | None`,
 `dim_label_b: str | None`, `lag`, `correlation`, `p_value`, `q_value`,
 `is_significant`.
+
+---
+
+## Spark -- `hypertopos.spark`
+
+Needs `pip install "hypertopos[spark]"`. The full guide is [spark.md](spark.md).
+
+| Function | Description | Returns |
+|----------|-------------|---------|
+| `find_anomalies(df, entity, counterparty=None, amount=None, time=None, *, group_by=None, percentile=99.0, score_axes=None, ...)` | Calibrate on an event table and score every entity against its population. `score_axes`: `("mahal",)` or `("mahal", "current")` (needs `time`; with `score_per_group` each group fits its own velocity field); default `("mahal", "current")` when `time` is given and `score_per_group` is off, else `("mahal",)` | Spark `DataFrame`, one row per entity |
+| `score(df, like, *, dimensions=False)` | Score new events against the frozen calibration of `like` (a result or its `Sphere`). `dimensions=True` adds `dimension_values` (`array<double>`, in `calibration().dims` order) and `first_event` / `last_event` (`double`, epoch seconds UTC) | Spark `DataFrame` with the `find_anomalies` columns |
+| `calibration_status(scored, like)` | One Spark action over a `score(..., dimensions=True)` result: KS test of `p_value` against uniform, a per-dimension KS test against the calibrated population, and a window-length check (the scored window must be 95–100 % of the calibration window). Persist `scored` first. Raises `ValueError` without `dimension_values`, `first_event` or `last_event` | `dict`: `rows`, `flagged`, `alarm_rate`, `expected_alarm_rate`, `p_distribution`, `p_dimensions`, `drifted_dimensions`, `p_flag_count`, `window_days`, `calibration_window_days` (`None` for a calibration saved before the check), `status` (`ok` / `drift` / `window_mismatch` with a `reason` / `too_few_rows`); `{status: "unsupported", reason}` with `group_by` |
+| `explain(result, entities=None, top_n=50, dims=None, events=None)` | Per-dimension explanation of entities of a result | Spark `DataFrame` |
+| `sphere_of(result_or_path)` | The calibration behind a result, or saved at a path | `Sphere` (`entities()`, `calibration()`, `geometry()`, `lance_path()`, `mcp_config()`) |
 
 ---
 

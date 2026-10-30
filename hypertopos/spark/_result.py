@@ -9,14 +9,20 @@ from __future__ import annotations
 import numpy as np
 import pyarrow as pa
 
-from hypertopos.scoring import FrozenCalibration
+from hypertopos.scoring import FrozenCalibration, Scores
 from hypertopos.spark._build import KEY
+from hypertopos.spark._plan import EVENT_TIMES
 
 TOP_REASONS = 3
 
 
 def result_table(
-    entities: pa.Table, calibration: FrozenCalibration, *, members: bool = False
+    entities: pa.Table,
+    calibration: FrozenCalibration,
+    *,
+    members: bool = False,
+    dimensions: bool = False,
+    scores: Scores | None = None,
 ) -> pa.Table:
     """Per-entity result with flat reason columns (``reason_<i>_dim/_delta/_pct``).
 
@@ -25,8 +31,14 @@ def result_table(
     sphere), so all shares of an entity sum to 100; a dimension with no share is
     not a reason. ``_delta`` is the dimension's deviation in standard deviations.
     ``members=True``: ``entities`` is the table the calibration was fitted on.
+    ``dimensions=True`` adds ``dimension_values``: the values the score was
+    computed on, in ``calibration.dims`` order, and copies ``first_event`` /
+    ``last_event`` from ``entities``. ``scores``: the rows' scores, when already
+    computed (by :meth:`FrozenCalibration.fit_scored` on this same table, so
+    row-aligned with ``entities``); otherwise they are computed here.
     """
-    scores = calibration.score(entities, members=members)
+    if scores is None:
+        scores = calibration.score(entities, members=members)
     delta = scores.delta.astype(np.float64)
     shares = 100.0 * calibration.score_shares(entities, scores.score_delta)
     k = min(TOP_REASONS, len(calibration.dims))
@@ -49,4 +61,10 @@ def result_table(
     if calibration.group_by is not None and scores.calibration_scope is not None:
         columns[calibration.group_by] = entities[calibration.group_by].combine_chunks()
         columns["calibration_scope"] = pa.array(scores.calibration_scope.tolist(), pa.string())
+    if dimensions:
+        values = calibration.shapes(entities).astype(np.float64)
+        offsets = pa.array(np.arange(len(values) + 1, dtype=np.int32) * values.shape[1])
+        columns["dimension_values"] = pa.ListArray.from_arrays(offsets, pa.array(values.ravel()))
+        for name in EVENT_TIMES:
+            columns[name] = entities[name].combine_chunks()
     return pa.table(columns)

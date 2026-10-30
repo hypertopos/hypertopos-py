@@ -131,6 +131,45 @@ def test_events_are_split_per_group() -> None:
     assert grouped.groups["business"].axes == ("mahal", "current")
 
 
+def test_half_states_are_split_per_group_at_the_population_halves(monkeypatch) -> None:
+    import hypertopos.engine.robust as robust
+
+    monkeypatch.setattr(robust, "MAX_REFERENCE_ROWS", 200)  # sampled velocity fields
+    x, ids = _population({"retail": 500, "business": 250, "t0": 50, "t1": 50})
+    rng = np.random.default_rng(2)
+    m = 8000
+    events = EventArrays(
+        code=rng.integers(0, len(x), m).astype(np.int64),
+        direction=rng.integers(0, 2, m).astype(np.int8),
+        ts=np.sort(rng.uniform(0, 86400 * 60, m)),
+        amount=rng.lognormal(3, 1, m),
+    )
+    states = robust.half_states(events, len(x))
+    grouped, scores, keys = fit_grouped_reference(x, DIMS, ids, percentile=99.0, states=states)
+    population, fitted = fit_reference(x, DIMS, states=states)
+    assert grouped.population.axes == ("mahal", "current")
+    np.testing.assert_array_equal(grouped.population.vel_s0, population.vel_s0)
+    # The pool (100 rows) is under the reference size: scored with the population.
+    small = ids != "retail"
+    small &= ids != "business"
+    np.testing.assert_array_equal(scores.conformal_p[small], fitted.conformal_p[small])
+    assert scores.sample_index is not None
+    np.testing.assert_array_equal(scores.sample_index, fitted.sample_index)
+    for gid in ("retail", "business"):
+        mask = ids == gid
+        part = robust.HalfStates(states.first[mask], states.second[mask], states.t0, states.t_mid)
+        ref, own = fit_reference(x[mask], DIMS, states=part)
+        assert grouped.groups[gid].axes == ("mahal", "current")
+        assert grouped.groups[gid].t_mid == states.t_mid
+        np.testing.assert_array_equal(grouped.groups[gid].vel_u, ref.vel_u)
+        np.testing.assert_array_equal(scores.conformal_p[mask], own.conformal_p)
+        assert own.sample_index is not None
+        # Each group's sample rows, as row numbers of the whole population.
+        assert grouped.samples is not None
+        np.testing.assert_array_equal(grouped.samples[gid], np.flatnonzero(mask)[own.sample_index])
+        assert set(keys[mask]) == {gid}
+
+
 def test_grouped_arrays_round_trip() -> None:
     x, ids = _population({"a/b": 400, "C:\\x": 300, "t0": 50, "t1": 50, "t2": 50, "t3": 50})
     grouped, _, _ = fit_grouped_reference(x, DIMS, ids, percentile=99.0, axes=("mahal",))

@@ -249,3 +249,35 @@ def test_alarm_rate_alert_counts_exactly_the_rows_ingested_since_calibration(
         assert session.navigator()._check_alarm_rate_drift(PID) == []
     finally:
         session.close()
+
+
+def test_auto_recalibration_during_ingest_keeps_earlier_exclusions(sphere_dir: Path) -> None:
+    session = HyperSphere.open(str(sphere_dir)).session("t")
+    session.recalibrate(PID, exclude_keys=["C3", "C5"])
+    session.close()
+    GDSBuilder("branch_ingest", str(sphere_dir)).incremental_update(
+        PID, changed_entities=_new_rows(), deleted_keys=["C5"], recalibrate="force"
+    )
+    from hypertopos.storage.reader import GDSReader
+
+    excluded = GDSReader(str(sphere_dir)).read_reference(PID).excluded_keys
+    # C3 stays out of the refit; C5 was deleted, so it is no longer excluded.
+    assert excluded is not None and sorted(excluded.tolist()) == ["C3"]
+
+
+def test_branch_auto_recalibration_recipe_carries_earlier_exclusions(sphere_dir: Path) -> None:
+    hs = HyperSphere.open(str(sphere_dir))
+    session = hs.session("t")
+    session.recalibrate(PID, exclude_keys=["C3"], branch="b")
+    session.close()
+    GDSBuilder("branch_ingest", str(sphere_dir)).incremental_update(
+        PID, changed_entities=_new_rows(), recalibrate="force", branch="b"
+    )
+    recipes = lb.read_branch_json(sphere_dir, "b")["recipes"]
+    assert [r["op"] for r in recipes] == ["recalibrate", "incremental_update", "recalibrate"]
+    assert recipes[-1]["exclude_keys"] == ["C3"]
+    # Promotion replays it, so main ends with the same exclusion.
+    hs.promote_branch("b")
+    from hypertopos.storage.reader import GDSReader
+
+    assert GDSReader(str(sphere_dir)).read_reference(PID).excluded_keys.tolist() == ["C3"]

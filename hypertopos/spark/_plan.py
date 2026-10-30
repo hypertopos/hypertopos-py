@@ -11,6 +11,7 @@ cannot change silently with the Spark version or the compiler.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -19,13 +20,16 @@ from pyspark.sql import Column, DataFrame, Window
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
-from hypertopos.scoring import SHRINK_WEIGHT
+from hypertopos.scoring import SHRINK_WEIGHT, STATE_COLUMNS
 
 Kind = Literal["poisson", "gaussian"]
 Stage = Literal["events", "pairs", "days", "gaps"]
 
 _ROLE_ORDER = ("entity", "counterparty", "amount", "time")
 _SECONDS_PER_DAY = 86400.0
+FIRST_EVENT = "first_event"
+LAST_EVENT = "last_event"
+EVENT_TIMES = (FIRST_EVENT, LAST_EVENT)
 
 
 @dataclass(frozen=True)
@@ -248,7 +252,9 @@ def build_plan(
         wanted = set(dims)
         chosen = tuple(d for d in DIMS if d.name in wanted)
     extras = tuple((extra_dims or {}).items())
-    clash = [n for n, _ in extras if n in _BY_NAME or n == "entity"]
+    # Columns the aggregation and the scored result add next to the dimensions.
+    reserved = {"entity", "key", "dimension_values", *EVENT_TIMES, *STATE_COLUMNS}
+    clash = [n for n, _ in extras if n in _BY_NAME or n in reserved]
     if clash:
         raise ValueError(f"extra_dims names collide with built-in names: {clash}")
     return Plan(roles=roles, dims=chosen, extra_dims=extras, log_amounts=log_amounts)
@@ -335,13 +341,37 @@ def _log1p_non_negative(col: Column) -> Column:
     return F.log1p(F.greatest(col, F.lit(0.0)))
 
 
+def window_days(first: float | None, last: float | None) -> int | None:
+    """Calendar span from ``first`` to ``last`` (epoch seconds) in whole days, at least 1."""
+    if first is None or last is None:
+        return None
+    return max(1, math.ceil((last - first) / _SECONDS_PER_DAY))
+
+
+def event_span(df: DataFrame, plan: Plan) -> tuple[float | None, float | None]:
+    """First and last event time (epoch seconds) of the events with an entity."""
+    ts = _epoch_seconds(df, plan.roles["time"])
+    row = df.where(F.col(plan.roles["entity"]).isNotNull()).select(F.min(ts), F.max(ts)).first()
+    if row is None:
+        return None, None
+    return row[0], row[1]
+
+
 def count_entities(df: DataFrame, plan: Plan) -> int:
     """Entities ``aggregate`` produces, from the keys alone (no dimensions computed)."""
     return int(_long_table(df, plan).select("key").distinct().count())
 
 
-def aggregate(df: DataFrame, plan: Plan) -> DataFrame:
-    """Compile the plan to Spark: one row per entity, ``entity`` + the plan's dims."""
+def aggregate(
+    df: DataFrame, plan: Plan, *, event_times: bool = False, t_mid: float | None = None
+) -> DataFrame:
+    """Compile the plan to Spark: one row per entity, ``entity`` + the plan's dims.
+
+    ``event_times=True`` adds ``first_event`` / ``last_event`` (epoch seconds), in
+    the same aggregation. ``t_mid`` (epoch seconds) adds the ``STATE_COLUMNS``
+    of the calendar halves before / from it, in the same aggregation; a
+    self-transfer counts as an out and an in event there, as in a sphere build.
+    """
     long = _long_table(df, plan)
     names = {d.name for d in plan.dims}
     out = F.col("side") == "out"
@@ -386,6 +416,10 @@ def aggregate(df: DataFrame, plan: Plan) -> DataFrame:
             if helper not in base_names:
                 aggs.append(exprs[helper].alias(f"_{helper}"))
     aggs.extend(F.expr(expr).alias(name) for name, expr in plan.extra_dims)
+    if event_times:
+        aggs += [F.min("ts").alias(FIRST_EVENT), F.max("ts").alias(LAST_EVENT)]
+    if t_mid is not None:
+        aggs += _half_state_aggs(t_mid)
     result = long.groupBy("key").agg(*aggs)
 
     def ref(name: str) -> Column:
@@ -440,7 +474,28 @@ def aggregate(df: DataFrame, plan: Plan) -> DataFrame:
     columns.extend(
         F.coalesce(ref(c), F.lit(0)).cast("long").alias(c) for c in counts if c not in names
     )
+    if event_times:
+        columns += [F.col(c) for c in EVENT_TIMES]
+    if t_mid is not None:
+        columns += [F.col(c) for c in STATE_COLUMNS]
     return result.select(*columns)
+
+
+def _half_state_aggs(t_mid: float) -> list[Column]:
+    out = F.col("side") == "out"
+    # The long table has no in row for a self-transfer; a sphere build's event rows do.
+    inn = (F.col("side") == "in") | (out & (F.col("other") == F.col("key")))
+    log_amount = F.coalesce(_log1p_non_negative(F.col("amount")), F.lit(0.0))
+    aggs = []
+    names = iter(STATE_COLUMNS)
+    for half in (F.col("ts") < t_mid, F.col("ts") >= t_mid):
+        for side in (out, inn):
+            rows = half & side
+            aggs.append(F.sum(F.when(rows, 1).otherwise(0)).alias(next(names)))
+            aggs.append(F.sum(F.when(rows, log_amount).otherwise(0.0)).alias(next(names)))
+        both = F.when(half & out, 1).otherwise(0) + F.when(half & inn, 1).otherwise(0)
+        aggs.append(F.sum(both).alias(next(names)))
+    return aggs
 
 
 def count_columns(plan: Plan) -> tuple[str, ...]:

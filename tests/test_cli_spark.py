@@ -41,6 +41,47 @@ def test_an_output_is_required(monkeypatch, capsys):
     assert "--output" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        ((), None),
+        (("--score-axes", "mahal"), ("mahal",)),
+        (("--score-axes", "mahal,current"), ("mahal", "current")),
+    ],
+)
+def test_score_axes_reaches_find_anomalies(spark, monkeypatch, argv, expected):
+    import hypertopos.spark as hs
+    from hypertopos.cli import spark_cmd
+
+    seen: dict[str, object] = {}
+
+    class _Stop(Exception):
+        pass
+
+    def fake(df, **kwargs):
+        seen.update(kwargs)
+        raise _Stop
+
+    monkeypatch.setattr(hs, "find_anomalies", fake)
+    monkeypatch.setattr(spark_cmd, "read_input", lambda *_: None)
+    with pytest.raises(_Stop):
+        _run(
+            monkeypatch,
+            "spark",
+            "find-anomalies",
+            "--input",
+            "t",
+            "--entity",
+            "src",
+            "--time",
+            "ts",
+            *argv,
+            "--show",
+            "5",
+        )
+    assert seen["score_axes"] == expected
+
+
 class _Reader:
     def __init__(self, calls: list[tuple[str, ...]]) -> None:
         self.calls = calls

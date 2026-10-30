@@ -10,13 +10,17 @@ import hashlib
 import math
 from pathlib import Path
 
+import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
 import hypertopos
 from hypertopos.builder import GDSBuilder
-from hypertopos.scoring import POOLED_GROUP, FrozenCalibration
+from hypertopos.builder.builder import _PatternReg
+from hypertopos.engine.robust import EventArrays
+from hypertopos.scoring import POOLED_GROUP, STATE_COLUMNS, FrozenCalibration
 from hypertopos.spark._plan import Plan, describe_plan
 
 SPHERE_ID = "spark"
@@ -24,6 +28,8 @@ LINE_ID = "entities"
 PATTERN_ID = "entity_pattern"
 KEY = "entity"
 CALIBRATION_GROUP = "calibration_group"
+
+_DAY = 86400.0
 
 # spark.driver.maxResultSize is 1 GB by default and fixed on serverless; stay below it.
 MAX_COLLECT_BYTES = 700_000_000
@@ -87,6 +93,7 @@ def fingerprint(
     group_by: str | None,
     min_group_size: int,
     score_per_group: bool = False,
+    score_axes: tuple[str, ...] = ("mahal",),
 ) -> str:
     """Same input, same settings, same hypertopos version -> same fingerprint.
 
@@ -109,6 +116,8 @@ def fingerprint(
     ]
     if score_per_group:
         parts.append("score_per_group=True")
+    if score_axes != ("mahal",):
+        parts.append(f"score_axes={score_axes!r}")
     return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
 
 
@@ -124,7 +133,9 @@ def build_sphere(entities: pa.Table, calibration: FrozenCalibration, path: str) 
     table, holding the values the calibration scores (small counts already
     shrunk). With ``group_by``, the build groups by the calibration's own groups
     (small ones already pooled), and with ``score_per_group`` scores each group
-    against its own reference, so flags agree with ``find_anomalies``.
+    against its own reference, so flags agree with ``find_anomalies``. With
+    the ``current`` axis the build reads it from the entities' half-state
+    columns, so the scores agree too.
     """
     shapes = calibration.shapes(entities)
     for j, dim in enumerate(calibration.dims):
@@ -137,7 +148,11 @@ def build_sphere(entities: pa.Table, calibration: FrozenCalibration, path: str) 
         raw = entities[calibration.group_by].cast(pa.string()).to_pylist()
         pooled = [POOLED_GROUP if g in calibration.pooled else g for g in raw]
         entities = entities.append_column(group_column, pa.array(pooled, pa.string()))
-    builder = GDSBuilder(SPHERE_ID, path)
+    builder = (
+        GDSBuilder(SPHERE_ID, path)
+        if calibration.halves is None
+        else _HalfStateBuilder(SPHERE_ID, path, entities, calibration.halves)
+    )
     builder.add_line(LINE_ID, entities, key_col=KEY, source_id="spark")
     builder.add_pattern(
         PATTERN_ID,
@@ -149,5 +164,53 @@ def build_sphere(entities: pa.Table, calibration: FrozenCalibration, path: str) 
         metric_properties=list(calibration.dims),
         score_per_group=calibration.score_per_group,
         score_min_group_size=calibration.min_group_size,
+        score_axes=list(calibration.reference.axes),
     )
     return builder.build()
+
+
+class _HalfStateBuilder(GDSBuilder):
+    """A build whose ``current`` axis reads the entities' half-state columns.
+
+    The entity table holds no events, only their per-half counts and log-amount
+    sums: each (entity, half, side) becomes that many event rows of equal
+    log-amount, placed so the build splits the halves at the same ``t_mid``.
+    """
+
+    def __init__(
+        self, sphere_id: str, path: str, entities: pa.Table, halves: tuple[float, float]
+    ) -> None:
+        super().__init__(sphere_id, path)
+        self._states = entities
+        self._halves = halves
+
+    def _score_events(self, pat: _PatternReg, entity_table: pa.Table) -> EventArrays | None:
+        if "current" not in pat.score_axes:
+            return None
+        rows = pc.index_in(
+            pc.cast(entity_table["primary_key"], pa.string()), value_set=self._states[KEY]
+        ).to_numpy(zero_copy_only=False)
+        raw = np.column_stack(
+            [self._states[c].to_numpy(zero_copy_only=False) for c in STATE_COLUMNS]
+        ).astype(np.float64)[rows]
+        t0, t_mid = self._halves
+        days = round((t_mid - t0) / _DAY)
+        # The build puts t_mid at t0 + ((last day + 1) // 2) days: a last event half
+        # a day into day 2 * days - 1 gives the same t_mid.
+        times = (t0, t0 + (2 * days - 0.5) * _DAY if days else t0)
+        code, direction, ts, amount = [], [], [], []
+        for half in (0, 1):
+            for side in (0, 1):
+                col = 5 * half + 2 * side
+                n = raw[:, col].astype(np.int64)
+                each = np.expm1(raw[:, col + 1] / np.maximum(n, 1))
+                code.append(np.repeat(np.arange(len(raw)), n))
+                amount.append(np.repeat(each, n))
+                direction.append(np.full(int(n.sum()), side, dtype=np.int8))
+                ts.append(np.full(int(n.sum()), times[half]))
+        return EventArrays(
+            np.concatenate(code),
+            np.concatenate(direction),
+            np.concatenate(ts),
+            np.concatenate(amount),
+        )

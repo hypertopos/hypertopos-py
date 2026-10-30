@@ -15,5 +15,6 @@ except ImportError as err:
 from hypertopos.spark._api import find_anomalies
 from hypertopos.spark._explain import Sphere, explain, sphere_of
 from hypertopos.spark._score import score
+from hypertopos.spark._status import calibration_status
 
-__all__ = ["Sphere", "explain", "find_anomalies", "score", "sphere_of"]
+__all__ = ["Sphere", "calibration_status", "explain", "find_anomalies", "score", "sphere_of"]

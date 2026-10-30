@@ -70,7 +70,11 @@ def synthetic_aml(
     segment = np.where(business, "business", "retail")
 
     normal = _normal_traffic(rng, ids, business, n_days)
-    laundering, account_typology = _laundering(rng, ids, business, n_days, laundering_share)
+    account_typology: dict[str, str]
+    if laundering_share == 0:
+        laundering, account_typology = {k: v[:0] for k, v in normal.items()}, {}
+    else:
+        laundering, account_typology = _laundering(rng, ids, business, n_days, laundering_share)
 
     columns = {k: np.concatenate([normal[k], laundering[k]]) for k in normal}
     order = np.argsort(columns["ts"], kind="stable")

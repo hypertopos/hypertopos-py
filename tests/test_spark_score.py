@@ -37,8 +37,13 @@ def events(spark):
 
 @pytest.fixture(scope="module")
 def result(events, tmp_path_factory):
+    # mahal alone: score() rescores on that axis, so the result is reproducible.
     out = find_anomalies(
-        events, **ROLES, group_by="segment", sphere_root=str(tmp_path_factory.mktemp("s"))
+        events,
+        **ROLES,
+        group_by="segment",
+        score_axes=("mahal",),
+        sphere_root=str(tmp_path_factory.mktemp("s")),
     ).cache()
     out.count()
     return out

@@ -68,7 +68,7 @@ def test_entity_table_runs_where_caching_is_refused(monkeypatch):
             return 2
 
     frame = NoCacheFrame()
-    monkeypatch.setattr(_api, "entity_frame", lambda df, plan, group_by: frame)
+    monkeypatch.setattr(_api, "entity_frame", lambda df, plan, group_by, **_: frame)
     monkeypatch.setattr(_api, "count_entities", lambda df, plan: 2)
     monkeypatch.setattr(_api, "collect_entities", lambda df, *, n_rows: ("collected", df))
     assert _api._entity_table(None, None, None, max_entities=10) == ("collected", frame)
@@ -112,7 +112,7 @@ def test_entity_table_aggregates_once_without_a_cache(monkeypatch):
 
     frame = AggregatedFrame()
     collected = {}
-    monkeypatch.setattr(_api, "entity_frame", lambda df, plan, group_by: frame)
+    monkeypatch.setattr(_api, "entity_frame", lambda df, plan, group_by, **_: frame)
     monkeypatch.setattr(_api, "count_entities", lambda df, plan: 7)
 
     def collect(df, *, n_rows=None):
@@ -147,7 +147,7 @@ def test_entity_table_counts_the_cached_frame_where_caching_works(monkeypatch):
 
     frame = CachedFrame()
     collected = {}
-    monkeypatch.setattr(_api, "entity_frame", lambda df, plan, group_by: frame)
+    monkeypatch.setattr(_api, "entity_frame", lambda df, plan, group_by, **_: frame)
     monkeypatch.setattr(_api, "count_entities", no_key_count)
 
     def collect(df, *, n_rows=None):

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import pyarrow as pa
@@ -30,6 +31,7 @@ from hypertopos.builder.dim_blocks import normalize_metric_block
 from hypertopos.engine.geometry import calibrated_deltas
 from hypertopos.engine.robust import POOLED_GROUP as POOLED_GROUP  # re-exported
 from hypertopos.engine.robust import (
+    HalfStates,
     Reference,
     RobustScores,
     dim_shares_rows,
@@ -38,6 +40,7 @@ from hypertopos.engine.robust import (
     is_anomaly,
     min_reference_size,
     pool_groups,
+    subset_states,
 )
 from hypertopos.engine.robust import score as score_reference
 
@@ -50,6 +53,14 @@ SHRINK_WEIGHT = 3.0
 """Pseudo-count of a shrunk dimension: a share or spread measured on ``n`` events
 becomes ``(n * value + SHRINK_WEIGHT * population_mean) / (n + SHRINK_WEIGHT)``,
 so one or two events cannot place an entity at an extreme by themselves."""
+STATE_COLUMNS: tuple[str, ...] = tuple(
+    f"{half}_{name}"
+    for half in ("first_half", "second_half")
+    for name in ("n_out", "log_amount_out", "n_in", "log_amount_in", "n")
+)
+"""Per-entity columns behind the ``current`` axis, for each calendar half: out
+events, sum of ``log1p(max(amount, 0))`` over them, in events, the same sum over
+them, all events (a self-transfer is an out and an in event)."""
 
 
 @dataclass(frozen=True)
@@ -58,6 +69,7 @@ class GroupCalibration:
     sigma: np.ndarray
     size: int
     reference: Reference | None = None  # the group's own score; None: the population's
+    vel_keys: np.ndarray | None = None  # keys of its velocity sample's rows, in its order
 
 
 @dataclass(frozen=True)
@@ -91,6 +103,12 @@ class FrozenCalibration:
     shrink: dict[str, tuple[str, float]] | None = None
     score_per_group: bool = False  # each group scored against its own reference
     min_group_size: int | None = None  # the pooling size, with score_per_group
+    # Calendar days the fitted events span; None when unknown (no time, or saved without it).
+    window_days: int | None = None
+    # (t0, t_mid) of the calendar halves behind ``current``; None: no ``current`` axis.
+    halves: tuple[float, float] | None = None
+    key: str | None = None  # the column identifying rows, with ``halves``
+    vel_keys: np.ndarray | None = None  # keys of the velocity sample's rows, in its order
 
     @classmethod
     def fit(
@@ -103,13 +121,16 @@ class FrozenCalibration:
         min_group_size: int | None = None,
         shrink: Mapping[str, str] | None = None,
         score_per_group: bool = False,
+        window_days: int | None = None,
+        halves: tuple[float, float] | None = None,
+        key: str | None = None,
     ) -> FrozenCalibration:
         """Calibrate on ``table``; nulls in a dimension count as 0, as in a build.
 
         The score's reference is fitted on the dimension values (after
-        shrinkage) over the whole population, also with ``group_by``. There are
-        no events, so the score has the ``mahal`` axis only, as in a build of
-        the same table. The deviations go through the steps of a sphere's metric
+        shrinkage) over the whole population, also with ``group_by``. Without
+        ``halves`` the score has the ``mahal`` axis only, as in a build of the
+        same table. The deviations go through the steps of a sphere's metric
         block: a global standardisation, then the population (or per-group)
         statistics. Scoring repeats the same arithmetic, so the fitted
         population scores to exactly the values a build stores.
@@ -126,9 +147,63 @@ class FrozenCalibration:
         unseen at fit time, are scored against the population. Without it,
         groups under ``min_group_size`` (default ``MIN_GROUP_SIZE``) are pooled
         for the deviations only.
+
+        ``window_days`` is the calendar span of the events behind ``table``,
+        kept so a later batch can be checked for the same window length.
+
+        ``halves`` ``(t0, t_mid)``: ``table`` carries the ``STATE_COLUMNS`` of
+        its events split at ``t_mid``, and the score adds the ``current``
+        axis, as a build with an event pattern over the same events does.
+        ``key`` names the column identifying rows, so a member rescored later
+        is left out of its own velocity neighbours as in the fit. With
+        ``score_per_group`` each group's reference fits its own velocity field
+        on its rows' half states, split at the same ``t_mid`` (a build splits
+        each group at its own events' middle day).
         """
+        return cls._fit(
+            table,
+            dims,
+            percentile=percentile,
+            group_by=group_by,
+            min_group_size=min_group_size,
+            shrink=shrink,
+            score_per_group=score_per_group,
+            window_days=window_days,
+            halves=halves,
+            key=key,
+        )[0]
+
+    @classmethod
+    def fit_scored(
+        cls, table: pa.Table, dims: Sequence[str], **settings: Any
+    ) -> tuple[FrozenCalibration, Scores]:
+        """:meth:`fit` (same settings), and the fitted table's own scores.
+
+        The scores equal ``score(table, members=True)``; they are the fit's
+        own, so the population is not scored a second time.
+        """
+        calibration, fitted = cls._fit(table, dims, **settings)
+        return calibration, calibration._scores(table, members=True, evidence=fitted)
+
+    @classmethod
+    def _fit(
+        cls,
+        table: pa.Table,
+        dims: Sequence[str],
+        *,
+        percentile: float = 99.0,
+        group_by: str | None = None,
+        min_group_size: int | None = None,
+        shrink: Mapping[str, str] | None = None,
+        score_per_group: bool = False,
+        window_days: int | None = None,
+        halves: tuple[float, float] | None = None,
+        key: str | None = None,
+    ) -> tuple[FrozenCalibration, RobustScores | None]:
         if score_per_group and group_by is None:
             raise ValueError("score_per_group needs group_by")
+        if halves is not None and key is None:
+            raise ValueError("halves need key, the column identifying rows")
         group_size = effective_min_group_size(min_group_size, percentile, score_per_group)
         priors = {
             dim: (count, float(_column(table, dim).mean())) for dim, count in (shrink or {}).items()
@@ -136,19 +211,31 @@ class FrozenCalibration:
         shapes = _shapes(table, dims, priors)
         x = shapes.astype(np.float64)
         references: dict[str, Reference] = {}
+        group_vel_keys: dict[str, np.ndarray] = {}
+        vel_keys: np.ndarray | None = None
+        states = None if halves is None else _half_states(table, halves)
         if score_per_group and group_by is not None:
-            grouped, _, _ = fit_grouped_reference(
+            grouped, fitted, _ = fit_grouped_reference(
                 x,
                 tuple(dims),
                 _group_ids(table, group_by),
                 percentile=percentile,
                 min_group_size=group_size,
+                states=states,
             )
             reference, references = grouped.population, grouped.groups
+            if states is not None and key is not None:
+                group_vel_keys = {
+                    gid: _keys(table, key)[rows] for gid, rows in (grouped.samples or {}).items()
+                }
         else:
-            reference, _ = fit_reference(x, tuple(dims))
+            reference, fitted = fit_reference(x, tuple(dims), states=states)
+        if states is not None and key is not None and fitted.sample_index is not None:
+            # Without knn the drawn rows are exactly the velocity sample, in its order.
+            vel_keys = _keys(table, key)[fitted.sample_index]
         standard, pre_mu, pre_sigma = normalize_metric_block(shapes)
-        mu, sigma, _, _, _ = compute_stats(standard, percentile)
+        # Only mu / sigma are used: the calibrated score flags rows, not theta.
+        mu, sigma, _, _, _ = compute_stats(standard, percentile, warn_rate=False)
         groups: dict[str, GroupCalibration] | None = None
         pooled: frozenset[str] = frozenset()
         if group_by is not None:
@@ -158,12 +245,14 @@ class FrozenCalibration:
             else:
                 ids = pool_small_groups(raw_ids, group_size)
                 pooled = frozenset(raw_ids[ids != raw_ids].tolist())
-            stats, _, _ = compute_stats_grouped(standard, ids, percentile)
+            stats, _, _ = compute_stats_grouped(standard, ids, percentile, warn_rate=False)
             groups = {
-                gid: GroupCalibration(g_mu, g_sigma, size, references.get(gid))
+                gid: GroupCalibration(
+                    g_mu, g_sigma, size, references.get(gid), group_vel_keys.get(gid)
+                )
                 for gid, (g_mu, g_sigma, _, size) in stats.items()
             }
-        return cls(
+        calibration = cls(
             dims=tuple(dims),
             percentile=percentile,
             pre_mu=pre_mu,
@@ -178,7 +267,12 @@ class FrozenCalibration:
             shrink=priors or None,
             score_per_group=score_per_group,
             min_group_size=group_size if score_per_group else None,
+            window_days=window_days,
+            halves=halves,
+            key=key if halves is not None else None,
+            vel_keys=vel_keys,
         )
+        return calibration, fitted
 
     def score(self, table: pa.Table, *, members: bool = False) -> Scores:
         """Score ``table`` against the frozen population (no recalibration).
@@ -186,10 +280,20 @@ class FrozenCalibration:
         New entities (the default) are calibrated against out-of-fold scores of
         the population, so they keep the alarm budget; ``members=True`` rescores
         the fitted table itself with its in-sample p-values, as a build stores.
+        With the ``current`` axis, rows carrying ``STATE_COLUMNS`` are scored
+        on it (their halves split wherever they were computed); rows without
+        them are scored without it, against the population's scores without
+        ``current``.
         """
+        return self._scores(table, members=members)
+
+    def _scores(
+        self, table: pa.Table, *, members: bool, evidence: RobustScores | None = None
+    ) -> Scores:
         shapes = self.shapes(table)
         assignments = self._assignments(table)
-        evidence = self._evidence(shapes.astype(np.float64), assignments, members)
+        if evidence is None:
+            evidence = self._evidence(shapes.astype(np.float64), table, assignments, members)
         standard = _deltas(shapes, self.pre_mu, self.pre_sigma)
         n = table.num_rows
         delta = np.empty_like(standard)
@@ -225,17 +329,35 @@ class FrozenCalibration:
     def _evidence(
         self,
         x: np.ndarray,
+        table: pa.Table,
         assignments: list[tuple[np.ndarray, GroupCalibration, str]],
         members: bool,
     ) -> RobustScores:
+        states = None
+        if self.halves is not None and set(STATE_COLUMNS) <= set(table.column_names):
+            states = _half_states(table, self.halves)
         if not self.score_per_group or len(x) == 0:
-            return score_reference(self.reference, x, members=members)
+            vel_pos = (
+                self._vel_pos(table, self.vel_keys) if members and states is not None else None
+            )
+            return score_reference(
+                self.reference, x, members=members, states=states, vel_pos=vel_pos
+            )
         # Each row's evidence from the reference that scores it: p, rank and flag
         # are within the row's group.
-        parts = [
-            (mask, score_reference(ref, x[mask], members=members))
-            for mask, ref in self._references(assignments)
-        ]
+        parts = []
+        for mask, cal, _ in assignments:
+            ref, vel_keys = (
+                (cal.reference, cal.vel_keys)
+                if cal.reference is not None
+                else (self.reference, self.vel_keys)
+            )
+            sub = subset_states(states, mask)
+            vel_pos = (
+                self._vel_pos(table.filter(mask), vel_keys) if members and sub is not None else None
+            )
+            scored = score_reference(ref, x[mask], members=members, states=sub, vel_pos=vel_pos)
+            parts.append((mask, scored))
         merged = {}
         for name in (
             "delta",
@@ -251,6 +373,14 @@ class FrozenCalibration:
                 out[mask] = getattr(part, name)
             merged[name] = out
         return RobustScores(axis_values={}, **merged)
+
+    def _vel_pos(self, table: pa.Table, vel_keys: np.ndarray | None) -> np.ndarray | None:
+        """Each row's position in a velocity sample (-1: not in it), found by key."""
+        if self.key is None or vel_keys is None or len(vel_keys) == 0:
+            return None
+        found = pc.index_in(_column_str(table, self.key), pa.array(vel_keys))
+        pos: np.ndarray = pc.fill_null(found, -1).to_numpy(zero_copy_only=False)
+        return pos
 
     def _references(
         self, assignments: list[tuple[np.ndarray, GroupCalibration, str]]
@@ -388,3 +518,17 @@ def _shapes(
 def _group_ids(table: pa.Table, group_by: str) -> np.ndarray:
     ids: np.ndarray = pc.cast(table[group_by], pa.string()).to_numpy(zero_copy_only=False)
     return ids.astype(str)
+
+
+def _half_states(table: pa.Table, halves: tuple[float, float]) -> HalfStates:
+    raw = np.column_stack([_column(table, c) for c in STATE_COLUMNS])
+    return HalfStates(np.log1p(raw[:, :5]), np.log1p(raw[:, 5:]), halves[0], halves[1])
+
+
+def _column_str(table: pa.Table, name: str) -> pa.Array:
+    return pc.cast(table[name], pa.string()).combine_chunks()
+
+
+def _keys(table: pa.Table, name: str) -> np.ndarray:
+    keys: np.ndarray = _column_str(table, name).to_numpy(zero_copy_only=False)
+    return keys.astype(object)

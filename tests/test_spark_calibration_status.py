@@ -12,6 +12,8 @@ import shutil
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
 import pytest
 
 pytest.importorskip("pyspark")
@@ -19,8 +21,16 @@ pytest.importorskip("pyspark")
 from pyspark.sql import functions as F  # noqa: E402
 
 from hypertopos.datasets import synthetic_aml  # noqa: E402
-from hypertopos.spark import calibration_status, find_anomalies, score, sphere_of  # noqa: E402
+from hypertopos.scoring import POOLED_GROUP, FrozenCalibration  # noqa: E402
+from hypertopos.spark import (  # noqa: E402
+    _status,  # noqa: E402
+    calibration_status,
+    find_anomalies,
+    score,
+    sphere_of,
+)
 from hypertopos.spark._api import CALIBRATION_FILE, ENTITIES_FILE, PLAN_FILE  # noqa: E402
+from hypertopos.spark._drift_stats import flag_count_p  # noqa: E402
 from hypertopos.spark._plan import window_days  # noqa: E402
 from hypertopos.spark._status import window_matches  # noqa: E402
 
@@ -201,6 +211,13 @@ def test_a_shifted_amount_is_drift_on_the_amount_dimensions(events, result):
     assert all(status["p_dimensions"][d] < 0.025 / 2 for d in status["drifted_dimensions"])
 
 
+def test_the_status_names_the_axes_of_the_scores_and_of_the_calibration(result, scored):
+    # find_anomalies with time defaults to mahal + current; score uses mahal alone.
+    status = calibration_status(scored, result)
+    assert status["calibration_axes"] == ["mahal", "current"]
+    assert status["score_axes"] == ["mahal"]
+
+
 def test_too_few_rows(result, scored):
     status = calibration_status(scored.limit(50), result)
     assert status["status"] == "too_few_rows"
@@ -208,18 +225,68 @@ def test_too_few_rows(result, scored):
     assert status["calibration_window_days"] == sphere_of(result).calibration().window_days
 
 
+@pytest.fixture(scope="module")
+def grouped_fits(events, tmp_path_factory):
+    """``find_anomalies`` with ``group_by="segment"``, per ``score_per_group``, fitted once."""
+    fits: dict[bool, object] = {}
+
+    def get(score_per_group):
+        if score_per_group not in fits:
+            fits[score_per_group] = find_anomalies(
+                events,
+                **ROLES,
+                group_by="segment",
+                score_per_group=score_per_group,
+                sphere_root=str(tmp_path_factory.mktemp("g")),
+            )
+        return fits[score_per_group]
+
+    return get
+
+
 @pytest.mark.parametrize("score_per_group", [True, False])
-def test_grouped_calibrations_are_unsupported(events, tmp_path_factory, score_per_group):
+def test_grouped_calibrations_report_a_status_per_group(events, grouped_fits, score_per_group):
+    grouped = grouped_fits(score_per_group)
+    scored = score(events, like=grouped, dimensions=True).cache()
+    status = calibration_status(scored, grouped)
+    assert status["status"] == "ok", status
+    assert status["rows"] == scored.count()
+    table = status["groups"]
+    assert set(table) == {"retail", "business"}
+    assert sum(g["rows"] for g in table.values()) == status["rows"]
+    assert sum(g["flagged"] for g in table.values()) == status["flagged"]
+    scopes = {r["segment"]: r["calibration_scope"] for r in scored.collect()}
+    for label, entry in table.items():
+        assert entry["scope"] == scopes[label] == "group"
+        assert entry["status"] == ("ok" if score_per_group else "untested")
+    assert status["drifted_groups"] == ([] if score_per_group else None)
+    assert set(status["p_dimensions"]) == set(sphere_of(grouped).calibration().dims)
+
+
+@pytest.mark.parametrize(
+    ("score_axes", "calibration_axes"),
+    [(None, ["mahal"]), (("mahal", "current"), ["mahal", "current"])],
+)
+def test_score_per_group_status_names_the_axes(events, tmp_path, score_axes, calibration_axes):
+    # With score_per_group the default is mahal alone; current is opt-in.
     grouped = find_anomalies(
         events,
         **ROLES,
         group_by="segment",
-        score_per_group=score_per_group,
-        sphere_root=str(tmp_path_factory.mktemp("g")),
+        score_per_group=True,
+        score_axes=score_axes,
+        sphere_root=str(tmp_path),
     )
     status = calibration_status(score(events, like=grouped, dimensions=True), grouped)
-    assert status["status"] == "unsupported"
-    assert status["reason"]
+    assert status["calibration_axes"] == calibration_axes
+    assert status["score_axes"] == ["mahal"]
+
+
+def test_a_grouped_scored_result_without_the_group_column_is_refused(events, grouped_fits):
+    grouped = grouped_fits(False)
+    scored = score(events, like=grouped, dimensions=True).drop("segment")
+    with pytest.raises(ValueError, match="segment"):
+        calibration_status(scored, grouped)
 
 
 def test_a_find_anomalies_result_is_refused(result):
@@ -230,3 +297,224 @@ def test_a_find_anomalies_result_is_refused(result):
 def test_a_scored_result_without_the_event_times_is_refused(result, scored):
     with pytest.raises(ValueError, match=r"score\(\.\.\., dimensions=True\)"):
         calibration_status(scored.drop("first_event", "last_event"), result)
+
+
+# Grouped calibrations, driven without Spark through the executor counter and the driver test.
+
+GROUP_DIMS = tuple(f"d{i}" for i in range(4))
+# (share, location, scale) per group: the groups differ from each other and from the population.
+GROUP_SHAPES = {"A": (0.45, 0.0, 1.0), "B": (0.35, 0.5, 1.2), "C": (0.12, -0.4, 0.8)}
+SMALL_GROUPS = {f"s{k}": (0.016, 0.8 + 0.1 * k, 1.0) for k in range(5)}
+
+
+def _group_table(rng, n, layout, *, shift=0.0, shifted=None):
+    names = list(layout)
+    shares = np.array([layout[g][0] for g in names])
+    seg = rng.choice(names, n, p=shares / shares.sum())
+    y = rng.standard_normal((n, len(GROUP_DIMS)))
+    for g, (_, loc, sd) in layout.items():
+        m = seg == g
+        y[m] = sd * y[m] + loc + (shift if g == shifted else 0.0)
+    columns = {d: np.exp(y[:, i]) for i, d in enumerate(GROUP_DIMS)}
+    return pa.table({**columns, "seg": pa.array(seg.tolist(), pa.string())})
+
+
+def _scored_batch(calibration, table):
+    scores = calibration.score(table)
+    values = calibration.shapes(table).astype(np.float64)
+    offsets = pa.array(np.arange(len(values) + 1, dtype=np.int32) * values.shape[1])
+    return pa.record_batch(
+        {
+            "p_value": pa.array(scores.conformal_p.astype(np.float64)),
+            "is_anomaly": pa.array(scores.is_anomaly),
+            "dimension_values": pa.ListArray.from_arrays(offsets, pa.array(values.ravel())),
+            "first_event": pa.array(np.zeros(len(values))),
+            "last_event": pa.array(np.zeros(len(values))),
+            "seg": table["seg"].combine_chunks(),
+        }
+    )
+
+
+def _local_status(calibration, batch, partitions=1):
+    units = _status.status_units(calibration)
+    bounds = np.linspace(0, batch.num_rows, partitions + 1).astype(int)
+    parts = [
+        row
+        for lo, hi in zip(bounds[:-1], bounds[1:], strict=True)
+        for out in _status.count_partition(units, [batch.slice(lo, hi - lo)])
+        for row in out.to_pylist()
+    ]
+    return _status.status_from_counts(calibration, units, parts)
+
+
+@pytest.fixture(scope="module")
+def group_layout():
+    return {**GROUP_SHAPES, **SMALL_GROUPS}
+
+
+@pytest.fixture(scope="module")
+def group_population(group_layout):
+    return _group_table(np.random.default_rng(11), 5_000, group_layout)
+
+
+@pytest.fixture(scope="module")
+def per_group(group_population):
+    return FrozenCalibration.fit(group_population, GROUP_DIMS, group_by="seg", score_per_group=True)
+
+
+def test_group_by_alone_is_the_population_test_with_a_table_per_group(
+    group_layout, group_population
+):
+    grouped = FrozenCalibration.fit(group_population, GROUP_DIMS, group_by="seg")
+    plain = FrozenCalibration.fit(group_population, GROUP_DIMS)
+    batch = _group_table(np.random.default_rng(12), 3_000, group_layout)
+    got = _local_status(grouped, _scored_batch(grouped, batch))
+    want = _local_status(plain, _scored_batch(plain, batch))
+    for key in ("rows", "flagged", "p_distribution", "p_dimensions", "p_flag_count", "status"):
+        assert got[key] == want[key], key
+    assert got["status"] == "ok", got
+    assert got["p_flag_count"] == flag_count_p(
+        got["flagged"], got["rows"], grouped.reference.n_fitted, grouped.percentile
+    )
+    assert got["drifted_groups"] is None
+    table = got["groups"]
+    assert set(table) == {"A", "B", "C", POOLED_GROUP}
+    assert sum(g["rows"] for g in table.values()) == got["rows"]
+    assert sum(g["flagged"] for g in table.values()) == got["flagged"]
+    assert table[POOLED_GROUP]["scope"] == "pooled"
+    assert table["A"]["scope"] == "group"
+    assert {g["status"] for g in table.values()} == {"untested"}
+    assert all(g["p_distribution"] is None for g in table.values())
+    assert "groups" not in want
+
+
+def test_group_by_alone_tests_unseen_groups_like_the_population_test(
+    group_layout, group_population
+):
+    # With group_by alone every row is scored against the population, so the status
+    # is the status without groups, also for rows of a group the calibration never
+    # saw (a renamed group here): the whole batch is tested.
+    grouped = FrozenCalibration.fit(group_population, GROUP_DIMS, group_by="seg")
+    plain = FrozenCalibration.fit(group_population, GROUP_DIMS)
+    batch = _group_table(np.random.default_rng(20), 3_000, group_layout)
+    renamed = pc.if_else(pc.equal(batch["seg"], "A"), "A-renamed", batch["seg"])
+    batch = batch.set_column(batch.schema.get_field_index("seg"), "seg", renamed)
+    got = _local_status(grouped, _scored_batch(grouped, batch))
+    want = _local_status(plain, _scored_batch(plain, batch))
+    for key in ("rows", "flagged", "p_distribution", "p_dimensions", "p_flag_count", "status"):
+        assert got[key] == want[key], key
+    assert got["groups"]["A-renamed"]["scope"] == "global"
+    assert got["groups"]["A-renamed"]["status"] == "untested"
+
+
+def test_group_by_alone_reads_a_shifted_new_segment_as_drift(group_layout, group_population):
+    grouped = FrozenCalibration.fit(group_population, GROUP_DIMS, group_by="seg")
+    layout = {**group_layout, "new": (0.3, 1.5, 1.0)}
+    batch = _group_table(np.random.default_rng(21), 4_000, layout)
+    status = _local_status(grouped, _scored_batch(grouped, batch))
+    assert status["status"] == "drift", status
+    assert status["groups"]["new"]["scope"] == "global"
+
+
+def test_score_per_group_with_recoded_group_values_is_too_few_rows(group_layout, per_group):
+    batch = _group_table(np.random.default_rng(22), 3_000, group_layout)
+    recoded = pc.binary_join_element_wise(batch["seg"], "-recoded", "")
+    batch = batch.set_column(batch.schema.get_field_index("seg"), "seg", recoded)
+    status = _local_status(per_group, _scored_batch(per_group, batch))
+    assert status["rows"] == 3_000
+    assert status["status"] == "too_few_rows", status
+    assert {g["scope"] for g in status["groups"].values()} == {"global"}
+    assert {g["status"] for g in status["groups"].values()} == {"untested"}
+
+
+def test_score_per_group_tests_each_reference_with_bonferroni_over_the_units(
+    group_layout, per_group
+):
+    batch = _group_table(np.random.default_rng(13), 4_000, group_layout)
+    status = _local_status(per_group, _scored_batch(per_group, batch))
+    table = status["groups"]
+    assert set(table) == {"A", "B", "C", POOLED_GROUP}
+    assert table[POOLED_GROUP]["scope"] == "pooled"
+    tested = [g for g in table.values() if g["status"] in ("ok", "drift")]
+    k = len(tested)
+    assert k == 4
+    assert status["p_distribution"] == pytest.approx(
+        min(1.0, k * min(g["p_distribution"] for g in tested))
+    )
+    for d in GROUP_DIMS:
+        assert status["p_dimensions"][d] == pytest.approx(
+            min(1.0, k * min(g["p_dimensions"][d] for g in tested))
+        )
+    assert status["p_flag_count"] is None
+    assert all(0.0 <= g["p_flag_count"] <= 1.0 for g in tested)
+    assert status["status"] == "ok", status
+    assert status["drifted_groups"] == []
+
+
+def test_score_per_group_finds_the_one_shifted_group(group_layout, per_group):
+    batch = _group_table(np.random.default_rng(14), 4_000, group_layout, shift=0.5, shifted="B")
+    status = _local_status(per_group, _scored_batch(per_group, batch))
+    assert status["status"] == "drift", status
+    assert status["drifted_groups"] == ["B"]
+    assert status["groups"]["B"]["status"] == "drift"
+    assert status["groups"]["B"]["drifted_dimensions"]
+    assert set(status["drifted_dimensions"]) <= set(status["groups"]["B"]["drifted_dimensions"])
+
+
+def test_rows_scored_by_the_population_are_counted_and_not_tested(group_layout, per_group):
+    unseen = {**group_layout, "new": (0.05, 2.0, 1.0)}
+    batch = _group_table(np.random.default_rng(15), 4_000, unseen)
+    status = _local_status(per_group, _scored_batch(per_group, batch))
+    new = status["groups"]["new"]
+    assert new["scope"] == "global"
+    assert new["status"] == "untested"
+    assert new["p_distribution"] is None
+    assert status["rows"] == 4_000
+    assert sum(g["rows"] for g in status["groups"].values()) == 4_000
+    assert status["status"] == "ok", status  # a group far from the population is not drift
+
+
+def test_a_unit_under_the_minimum_rows_is_excluded(group_layout, per_group):
+    few = {**group_layout, "C": (0.01, *group_layout["C"][1:])}
+    batch = _group_table(np.random.default_rng(16), 4_000, few)
+    status = _local_status(per_group, _scored_batch(per_group, batch))
+    c = status["groups"]["C"]
+    assert c["rows"] < _status.MIN_ROWS
+    assert c["status"] == "too_few_rows"
+    assert c["p_distribution"] is None
+    tested = [g for g in status["groups"].values() if g["status"] in ("ok", "drift")]
+    assert len(tested) == 3
+    assert status["p_distribution"] == pytest.approx(
+        min(1.0, len(tested) * min(g["p_distribution"] for g in tested))
+    )
+
+
+def test_no_tested_unit_is_too_few_rows(group_layout, per_group):
+    batch = _group_table(np.random.default_rng(17), 180, group_layout)
+    status = _local_status(per_group, _scored_batch(per_group, batch))
+    assert status["rows"] == 180
+    assert status["status"] == "too_few_rows"
+    assert status["p_distribution"] is None
+    assert {g["status"] for g in status["groups"].values()} == {"too_few_rows"}
+
+
+@pytest.mark.parametrize("score_per_group", [True, False])
+def test_counts_merge_over_partitions(group_layout, group_population, score_per_group):
+    calibration = FrozenCalibration.fit(
+        group_population, GROUP_DIMS, group_by="seg", score_per_group=score_per_group
+    )
+    table = _group_table(np.random.default_rng(18), 2_000, group_layout)
+    batch = _scored_batch(calibration, table)
+    assert _local_status(calibration, batch) == _local_status(calibration, batch, partitions=7)
+
+
+def test_the_unit_scope_is_the_scope_that_scored_the_row(group_layout, per_group):
+    table = _group_table(
+        np.random.default_rng(19), 3_000, {**group_layout, "new": (0.05, 0.0, 1.0)}
+    )
+    scopes = per_group.score(table).calibration_scope
+    status = _local_status(per_group, _scored_batch(per_group, table))
+    seg = np.asarray(table["seg"].to_pylist(), dtype=object)
+    labels = np.where(np.isin(seg, list(per_group.pooled)), POOLED_GROUP, seg)
+    for label, entry in status["groups"].items():
+        assert set(scopes[labels == label]) == {entry["scope"]}, label

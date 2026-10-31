@@ -7,6 +7,24 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.10.3] — 2026-10-31
+
+### Added
+
+- `hypertopos.spark.calibration_status` supports calibrations with `group_by`. With `group_by` alone the drift tests run on the whole batch, as without groups, groups unseen at calibration included. With `score_per_group=True` each group is tested against its own reference, and a Bonferroni correction over the tested groups keeps the combined false-alarm rate. The result adds `groups`, one entry per group (`scope`, `rows`, `flagged`, `alarm_rate`, the p-values, `drifted_dimensions`, `p_flag_count` and `status`: `ok` / `drift` / `too_few_rows` / `untested`), and `drifted_groups`. With `score_per_group=True`, groups under 100 rows and entities scored against the population (an unseen group, a pool too small for its own reference) are counted but not tested. It still takes one Spark action, and the scored frame must keep the group column. Grouped calibrations no longer return `"unsupported"`.
+- Spark guide: a recipe for the scheduled job that appends each run's `calibration_status` to a Delta table, one row for the batch and one per group, so the table shows when and in which group a calibration started to drift.
+- `hypertopos.spark.calibration_status` reports `score_axes`, the axes the scored batch was ranked on (`["mahal"]`: `score` ranks new entities on `mahal` alone), and `calibration_axes`, the axes of the `find_anomalies` result's own scores, so a rescored entity's `anomaly_score` is not read as the calibration's.
+
+### Changed
+
+- Spark guide and `gds-spark`: entities seen only as a counterparty (group `"(none)"`) are often flagged, and with `score_per_group` they are usually scored against the whole population, outside every group's alarm budget; the guide says how to leave them out. `calibration_status` documents `scope` as the reference `calibration_scope` names, and which fields are null on an `untested` group.
+- `hypertopos.spark.find_anomalies` with `score_per_group=True` and the `current` axis splits each group's two calendar halves at the middle day of that group's own events (for a pool with its own reference, of its entities' events), as a sphere build does. Entities scored against the population keep the middle day of the whole window. Per-group scores, p-values and flags with `current` change for any group whose first event is not the window's first or whose events do not span the whole window, and now equal those of a sphere built from the same events, also through `sphere_of` and on a cached calibration. The saved entity table of such a calibration also keeps each entity's first and last event time and its half states at its group's split (`group_first_half_n_out` … `group_second_half_n`).
+- The half-state amount sums behind `current` are exact, so the same events give the same `current` input however Spark partitions them.
+
+### Fixed
+
+- Spark guide and `gds-spark`: serverless compute on an older client environment refuses `persist`; the calibration check now says to write the scored frame to a table and read it back there.
+
 ## [0.10.2] — 2026-10-30
 
 ### Added

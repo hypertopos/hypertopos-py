@@ -20,7 +20,7 @@ from pyspark.sql import Column, DataFrame, Window
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
-from hypertopos.scoring import SHRINK_WEIGHT, STATE_COLUMNS
+from hypertopos.scoring import GROUP_STATE_COLUMNS, SHRINK_WEIGHT, STATE_COLUMNS
 
 Kind = Literal["poisson", "gaussian"]
 Stage = Literal["events", "pairs", "days", "gaps"]
@@ -30,6 +30,9 @@ _SECONDS_PER_DAY = 86400.0
 FIRST_EVENT = "first_event"
 LAST_EVENT = "last_event"
 EVENT_TIMES = (FIRST_EVENT, LAST_EVENT)
+# Fixed-point scales of the exact half-state log-amount sums (see _exact_sum).
+_HIGH = float(2**22)
+_LOW = float(2**52)
 
 
 @dataclass(frozen=True)
@@ -253,7 +256,14 @@ def build_plan(
         chosen = tuple(d for d in DIMS if d.name in wanted)
     extras = tuple((extra_dims or {}).items())
     # Columns the aggregation and the scored result add next to the dimensions.
-    reserved = {"entity", "key", "dimension_values", *EVENT_TIMES, *STATE_COLUMNS}
+    reserved = {
+        "entity",
+        "key",
+        "dimension_values",
+        *EVENT_TIMES,
+        *STATE_COLUMNS,
+        *GROUP_STATE_COLUMNS,
+    }
     clash = [n for n, _ in extras if n in _BY_NAME or n in reserved]
     if clash:
         raise ValueError(f"extra_dims names collide with built-in names: {clash}")
@@ -348,29 +358,16 @@ def window_days(first: float | None, last: float | None) -> int | None:
     return max(1, math.ceil((last - first) / _SECONDS_PER_DAY))
 
 
-def event_span(df: DataFrame, plan: Plan) -> tuple[float | None, float | None]:
-    """First and last event time (epoch seconds) of the events with an entity."""
-    ts = _epoch_seconds(df, plan.roles["time"])
-    row = df.where(F.col(plan.roles["entity"]).isNotNull()).select(F.min(ts), F.max(ts)).first()
-    if row is None:
-        return None, None
-    return row[0], row[1]
-
-
 def count_entities(df: DataFrame, plan: Plan) -> int:
     """Entities ``aggregate`` produces, from the keys alone (no dimensions computed)."""
     return int(_long_table(df, plan).select("key").distinct().count())
 
 
-def aggregate(
-    df: DataFrame, plan: Plan, *, event_times: bool = False, t_mid: float | None = None
-) -> DataFrame:
+def aggregate(df: DataFrame, plan: Plan, *, event_times: bool = False) -> DataFrame:
     """Compile the plan to Spark: one row per entity, ``entity`` + the plan's dims.
 
     ``event_times=True`` adds ``first_event`` / ``last_event`` (epoch seconds), in
-    the same aggregation. ``t_mid`` (epoch seconds) adds the ``STATE_COLUMNS``
-    of the calendar halves before / from it, in the same aggregation; a
-    self-transfer counts as an out and an in event there, as in a sphere build.
+    the same aggregation; they place the calendar halves of :func:`state_frame`.
     """
     long = _long_table(df, plan)
     names = {d.name for d in plan.dims}
@@ -418,8 +415,6 @@ def aggregate(
     aggs.extend(F.expr(expr).alias(name) for name, expr in plan.extra_dims)
     if event_times:
         aggs += [F.min("ts").alias(FIRST_EVENT), F.max("ts").alias(LAST_EVENT)]
-    if t_mid is not None:
-        aggs += _half_state_aggs(t_mid)
     result = long.groupBy("key").agg(*aggs)
 
     def ref(name: str) -> Column:
@@ -476,23 +471,58 @@ def aggregate(
     )
     if event_times:
         columns += [F.col(c) for c in EVENT_TIMES]
-    if t_mid is not None:
-        columns += [F.col(c) for c in STATE_COLUMNS]
     return result.select(*columns)
 
 
-def _half_state_aggs(t_mid: float) -> list[Column]:
+def state_frame(
+    df: DataFrame, plan: Plan, t_mid: float, splits: DataFrame | None = None
+) -> DataFrame:
+    """``entity`` + the ``STATE_COLUMNS`` of the calendar halves before / from
+    ``t_mid`` (epoch seconds); a self-transfer counts as an out and an in event,
+    as in a sphere build.
+
+    ``splits`` (``entity``, ``t_mid``) adds ``GROUP_STATE_COLUMNS``: the same
+    states split at the entity's own ``t_mid``, at ``t_mid`` for an entity not
+    in it. Its own aggregation, not the dimensions': there the distinct counts
+    would carry every state column through their row expansion.
+    """
+    long = _long_table(df, plan)
+    aggs = _half_state_aggs(F.lit(t_mid), STATE_COLUMNS)
+    if splits is not None:
+        own = splits.select(F.col("entity").alias("key"), F.col("t_mid").alias("_t_mid"))
+        long = long.join(own, "key", "left")
+        aggs += _half_state_aggs(F.coalesce(F.col("_t_mid"), F.lit(t_mid)), GROUP_STATE_COLUMNS)
+    names = STATE_COLUMNS + (GROUP_STATE_COLUMNS if splits is not None else ())
+    return long.groupBy("key").agg(*aggs).select(F.col("key").alias("entity"), *names)
+
+
+def _exact_sum(values: Column) -> Column:
+    """Sum independent of the row order, for log amounts (values in [0, 1024)).
+
+    Each finite value splits into whole multiples of ``2**-22`` and a remainder
+    cut to ``2**-52``; both parts add as integers, which is exact, and the
+    sum is put together once. NaN / infinity still propagate as in a double sum.
+    """
+    finite = ~F.isnan(values) & (values < float("inf"))
+    v = F.when(finite, values).otherwise(0.0)
+    high = F.floor(v * _HIGH)
+    low = F.floor((v - high / _HIGH) * _LOW)
+    exact = F.sum(high) / _HIGH + F.sum(low) / _LOW
+    return exact + F.sum(F.when(finite, 0.0).otherwise(values))
+
+
+def _half_state_aggs(t_mid: Column, columns: tuple[str, ...]) -> list[Column]:
     out = F.col("side") == "out"
     # The long table has no in row for a self-transfer; a sphere build's event rows do.
     inn = (F.col("side") == "in") | (out & (F.col("other") == F.col("key")))
     log_amount = F.coalesce(_log1p_non_negative(F.col("amount")), F.lit(0.0))
     aggs = []
-    names = iter(STATE_COLUMNS)
+    names = iter(columns)
     for half in (F.col("ts") < t_mid, F.col("ts") >= t_mid):
         for side in (out, inn):
             rows = half & side
             aggs.append(F.sum(F.when(rows, 1).otherwise(0)).alias(next(names)))
-            aggs.append(F.sum(F.when(rows, log_amount).otherwise(0.0)).alias(next(names)))
+            aggs.append(_exact_sum(F.when(rows, log_amount).otherwise(0.0)).alias(next(names)))
         both = F.when(half & out, 1).otherwise(0) + F.when(half & inn, 1).otherwise(0)
         aggs.append(F.sum(both).alias(next(names)))
     return aggs

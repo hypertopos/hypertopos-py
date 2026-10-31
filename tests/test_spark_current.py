@@ -25,7 +25,7 @@ from hypertopos.scoring import POOLED_GROUP, STATE_COLUMNS  # noqa: E402
 from hypertopos.spark import find_anomalies, score, sphere_of  # noqa: E402
 from hypertopos.spark._api import _score_axes  # noqa: E402
 from hypertopos.spark._build import LINE_ID, PATTERN_ID  # noqa: E402
-from hypertopos.spark._plan import aggregate, build_plan  # noqa: E402
+from hypertopos.spark._plan import build_plan, state_frame  # noqa: E402
 
 ROLES = {"entity": "src", "counterparty": "dst", "amount": "amt", "time": "ts"}
 SCHEMA = "src string, dst string, amt double, ts timestamp"
@@ -115,6 +115,64 @@ def per_group(wide_events, tmp_path_factory):
     ).cache()
 
 
+LATE = 17.3 * 86400  # group B starts here: not on a whole day after the window's start
+EARLY = 25.6 * 86400  # group C ends here
+
+
+def _partial_events(n_events: int = 12000, seed: int = 9) -> list[tuple]:
+    # Group A spans the whole window; group B (senders and receivers alike) only its
+    # later part and group C only its earlier part, so their own middle days lie
+    # after and before the window's; T is under the reference size and scored
+    # against the population.
+    rng = np.random.default_rng(seed)
+    rows = []
+    for i in range(n_events):
+        g = "ABCT"[int(rng.choice(4, p=[0.31, 0.31, 0.31, 0.07]))]
+        src = f"{g}{int(rng.integers(30 if g == 'T' else 240)):03d}"
+        receiver = f"{'A' if g == 'T' else g}{int(rng.integers(240)):03d}"
+        dst = src if i % 40 == 0 else receiver
+        amt = 0.0 if i % 53 == 0 else float(np.round(rng.lognormal(5, 1.2), 2))
+        lo = int(LATE) if g == "B" else 0
+        hi = int(EARLY) if g == "C" else 45 * 86400
+        ts = START + timedelta(seconds=int(rng.integers(lo, hi)))
+        rows.append((src, dst, amt, ts))
+    return rows
+
+
+@pytest.fixture(scope="module")
+def partial_rows() -> list[tuple]:
+    return _partial_events()
+
+
+@pytest.fixture(scope="module")
+def partial_events(spark, partial_rows):
+    df = (
+        spark.createDataFrame(partial_rows, SCHEMA)
+        .withColumn("segment", F.substring("src", 1, 1))
+        .cache()
+    )
+    df.count()
+    return df
+
+
+@pytest.fixture(scope="module")
+def partial_root(tmp_path_factory) -> Path:
+    return tmp_path_factory.mktemp("current_partial")
+
+
+@pytest.fixture(scope="module")
+def partial(partial_events, partial_root):
+    return find_anomalies(
+        partial_events,
+        **ROLES,
+        group_by="segment",
+        score_per_group=True,
+        score_axes=AXES,
+        sphere_root=str(partial_root),
+        cache=False,
+    ).cache()
+
+
 def _event_arrays(rows: list[tuple], keys: list[str]) -> EventArrays:
     """The event rows a build's ``current`` axis reads: one out row per event, one in row."""
     index = {k: i for i, k in enumerate(keys)}
@@ -133,7 +191,7 @@ def _event_arrays(rows: list[tuple], keys: list[str]) -> EventArrays:
 def test_state_columns_are_the_half_states_of_a_build(events, rows):
     epochs = [r[3].timestamp() for r in rows]
     t0, t_mid = halves(min(epochs), max(epochs))
-    table = aggregate(events, build_plan(**ROLES), t_mid=t_mid).toPandas().sort_values("entity")
+    table = state_frame(events, build_plan(**ROLES), t_mid).toPandas().sort_values("entity")
     keys = table["entity"].tolist()
     expected = half_states(_event_arrays(rows, keys), len(keys))
     assert (expected.t0, expected.t_mid) == (t0, t_mid)
@@ -206,7 +264,13 @@ def _assert_same_scores(result, geometry: dict) -> None:
 
 
 @pytest.mark.parametrize(
-    ("which", "events_of"), [("result", "rows"), ("grouped", "rows"), ("per_group", "wide_rows")]
+    ("which", "events_of"),
+    [
+        ("result", "rows"),
+        ("grouped", "rows"),
+        ("per_group", "wide_rows"),
+        ("partial", "partial_rows"),
+    ],
 )
 def test_find_anomalies_scores_as_a_sphere_built_from_the_events(
     which, events_of, request, tmp_path
@@ -238,7 +302,7 @@ def test_find_anomalies_scores_as_a_sphere_built_from_the_events(
     _assert_same_scores(result, geometry)
 
 
-@pytest.mark.parametrize("which", ["result", "grouped", "per_group"])
+@pytest.mark.parametrize("which", ["result", "grouped", "per_group", "partial"])
 def test_the_navigable_sphere_reports_the_same_scores(which, request):
     result = request.getfixturevalue(which)
     _assert_same_scores(result, _geometry(sphere_of(result).lance_path()))
@@ -356,3 +420,66 @@ def test_a_later_window_is_scored_per_group_without_current(wide_events, per_gro
     assert got.keys() == want.keys()
     for key, p in got.items():
         assert p == pytest.approx(want[key], abs=1e-9), key
+
+
+def test_each_group_splits_its_halves_at_its_own_middle_day(partial, partial_rows):
+    calibration = sphere_of(partial).calibration()
+    assert calibration.groups is not None
+    window = calibration.reference.t_mid
+    assert window is not None
+    for gid in "ABC":
+        # A group's events: those of its members, as sender or receiver.
+        times = [r[3].timestamp() for r in partial_rows if gid in (r[0][0], r[1][0])]
+        group = calibration.groups[gid].reference
+        assert group is not None and group.t_mid is not None
+        assert (group.t0, group.t_mid) == halves(min(times), max(times)), gid
+    after, before = (calibration.groups[g].reference for g in "BC")
+    assert after is not None and after.t_mid is not None and after.t_mid > window
+    assert before is not None and before.t_mid is not None and before.t_mid < window
+
+
+def test_a_cached_per_group_calibration_rescores_to_the_fit(partial, partial_events, partial_root):
+    again = find_anomalies(
+        partial_events,
+        **ROLES,
+        group_by="segment",
+        score_per_group=True,
+        score_axes=AXES,
+        sphere_root=str(partial_root),
+    )
+    assert sphere_of(again).fingerprint == sphere_of(partial).fingerprint
+    want = {r["entity"]: r["p_value"] for r in partial.collect()}
+    got = {r["entity"]: r["p_value"] for r in again.collect()}
+    assert got.keys() == want.keys()
+    for key, p in got.items():
+        assert p == pytest.approx(want[key], abs=1e-12), key
+
+
+def _layouts(spark, rows: list[tuple]) -> tuple:
+    base = spark.createDataFrame(rows, SCHEMA)
+    return base.repartition(1), base.repartition(5).sortWithinPartitions(F.rand(3))
+
+
+def test_half_state_sums_do_not_depend_on_the_partitioning(spark):
+    # Few entities with many events of varied size: double sums would differ in the
+    # last bits between the two layouts.
+    rows = _events(n_entities=4, n_events=6000, seed=11)
+    epochs = [r[3].timestamp() for r in rows]
+    _, t_mid = halves(min(epochs), max(epochs))
+    plan = build_plan(**ROLES)
+    tables = [
+        state_frame(df, plan, t_mid).toPandas().sort_values("entity").reset_index(drop=True)
+        for df in _layouts(spark, rows)
+    ]
+    for column in STATE_COLUMNS:
+        np.testing.assert_array_equal(tables[0][column], tables[1][column], err_msg=column)
+
+
+def test_the_p_values_do_not_depend_on_the_partitioning(spark, wide_rows, tmp_path):
+    p = []
+    for k, df in enumerate(_layouts(spark, wide_rows)):
+        out = find_anomalies(
+            df, **ROLES, score_axes=AXES, sphere_root=str(tmp_path / str(k)), cache=False
+        )
+        p.append(out.toPandas().sort_values("entity")["p_value"].to_numpy())
+    np.testing.assert_array_equal(p[0], p[1])

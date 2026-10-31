@@ -91,14 +91,19 @@ def _restore_navigator_engine_class_attrs() -> Iterator[None]:
 
 @pytest.fixture(scope="session")
 def spark() -> Iterator[Any]:
-    """One local SparkSession per test process (each xdist worker starts its own JVM)."""
+    """One local SparkSession per test process (each xdist worker starts its own JVM).
+
+    ``local[2,3]`` retries a failed task up to three times: under parallel test
+    workers a Python worker can miss its connect-back window, which ``local[2]``
+    (one attempt) turns into a failed test.
+    """
     pytest.importorskip("pyspark")
     os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
     os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
     from pyspark.sql import SparkSession
 
     session = (
-        SparkSession.builder.master("local[2]")
+        SparkSession.builder.master("local[2,3]")
         .appName("hypertopos-tests")
         .config("spark.ui.enabled", "false")
         .config("spark.sql.shuffle.partitions", "2")

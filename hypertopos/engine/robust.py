@@ -871,6 +871,49 @@ def pool_groups(
     return out, frozenset(str(v) for v in small)
 
 
+def score_groups(
+    ids: np.ndarray,
+    percentile: float,
+    min_group_size: int | None = None,
+    *,
+    stored_labels: bool = False,
+) -> tuple[np.ndarray, frozenset[str], list[str]]:
+    """``(labels, pooled, own)``: each row's label after :func:`pool_groups`, the
+    pooled group values, and the labels large enough for a reference of their own
+    (the rows of any other label are scored with the population)."""
+    labels, pooled = pool_groups(ids, percentile, min_group_size, stored_labels=stored_labels)
+    names, counts = np.unique(labels, return_counts=True)
+    bound = max(min_reference_size(percentile), min_group_size or 0)
+    own = [str(g) for g, c in zip(names, counts, strict=True) if c >= bound]
+    if len(own) > MAX_SCORE_GROUPS:
+        raise ValueError(
+            f"{len(own)} score groups exceed {MAX_SCORE_GROUPS}: group by a coarser "
+            "property or raise min_group_size"
+        )
+    return labels, pooled, own
+
+
+def group_halves(
+    labels: np.ndarray, own: Sequence[str], first: np.ndarray, last: np.ndarray
+) -> dict[str, tuple[float, float]]:
+    """:func:`halves` of each ``own`` score group, from its rows' first / last event.
+
+    ``first`` / ``last`` (epoch seconds, NaN for a row without timed events) are
+    per row; a group's halves are those of its members' events, as a build
+    splits each group at its own middle day. A group without timed events gets
+    ``(0.0, 0.0)``: its rows are inactive on ``current``.
+    """
+    out = {}
+    for gid in own:
+        mask = labels == gid
+        lo, hi = first[mask], last[mask]
+        if np.isnan(lo).all():
+            out[gid] = (0.0, 0.0)
+        else:
+            out[gid] = halves(float(np.nanmin(lo)), float(np.nanmax(hi)))
+    return out
+
+
 def subset_states(states: HalfStates | None, mask: np.ndarray) -> HalfStates | None:
     """The half states of the rows in ``mask``, split where they were computed."""
     if states is None:
@@ -920,6 +963,7 @@ def fit_grouped_reference(
     seed: int = 0,
     stored_labels: bool = False,
     states: HalfStates | None = None,
+    group_states: Mapping[str, HalfStates] | None = None,
 ) -> tuple[GroupedReference, RobustScores, np.ndarray]:
     """Fit one reference per group (``ids`` per row) and the population's.
 
@@ -932,17 +976,12 @@ def fit_grouped_reference(
     ``current`` comes from ``events`` (each group's own events, split at their
     own middle day) or from ``states`` (each group's rows of them, split where
     they were computed); each group fits its own velocity field.
+    ``group_states`` (score group -> the half states of its rows, in row order)
+    stand in for a group's rows of ``states``: computed at the group's own
+    middle day (:func:`group_halves`), they give the reference ``events`` give.
     """
     x = np.nan_to_num(np.asarray(x, dtype=np.float64))
-    labels, pooled = pool_groups(ids, percentile, min_group_size, stored_labels=stored_labels)
-    names, counts = np.unique(labels, return_counts=True)
-    bound = max(min_reference_size(percentile), min_group_size or 0)
-    own = [str(g) for g, c in zip(names, counts, strict=True) if c >= bound]
-    if len(own) > MAX_SCORE_GROUPS:
-        raise ValueError(
-            f"{len(own)} score groups exceed {MAX_SCORE_GROUPS}: group by a coarser "
-            "property or raise min_group_size"
-        )
+    labels, pooled, own = score_groups(ids, percentile, min_group_size, stored_labels=stored_labels)
     population, fitted = fit_reference(x, dims, axes=axes, events=events, seed=seed, states=states)
     keys = np.full(len(x), None, dtype=object)
     groups: dict[str, Reference] = {}
@@ -956,7 +995,11 @@ def fit_grouped_reference(
             axes=axes,
             events=subset_events(events, mask),
             seed=seed,
-            states=subset_states(states, mask),
+            states=(
+                group_states[gid]
+                if group_states is not None and gid in group_states
+                else subset_states(states, mask)
+            ),
         )
         groups[gid] = ref
         if scores.sample_index is not None:

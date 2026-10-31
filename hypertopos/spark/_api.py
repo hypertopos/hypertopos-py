@@ -12,6 +12,7 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
@@ -19,8 +20,14 @@ from pyspark.errors import AnalysisException, PySparkException
 from pyspark.sql import Column, DataFrame, Window
 from pyspark.sql import functions as F
 
-from hypertopos.engine.robust import halves
-from hypertopos.scoring import FrozenCalibration, Scores, effective_min_group_size
+from hypertopos.engine.robust import group_halves, halves, score_groups
+from hypertopos.scoring import (
+    GROUP_STATE_COLUMNS,
+    STATE_COLUMNS,
+    FrozenCalibration,
+    Scores,
+    effective_min_group_size,
+)
 from hypertopos.spark._build import KEY, collect_entities, fingerprint, sphere_dir
 from hypertopos.spark._plan import (
     EVENT_TIMES,
@@ -30,7 +37,7 @@ from hypertopos.spark._plan import (
     aggregate,
     build_plan,
     count_entities,
-    event_span,
+    state_frame,
     window_days,
 )
 from hypertopos.spark._result import TOP_REASONS, result_table
@@ -177,23 +184,32 @@ def find_anomalies(
         with open(path / CALIBRATION_FILE, "rb") as fh:
             calibration = pickle.load(fh)
     else:
+        entities = _entity_table(df, plan, group_by, max_entities)
+        # Key order makes the fit independent of the order Spark returns rows in.
+        entities = entities.sort_by(KEY)
+        # The window, and the halves of current, from the entities' own first and
+        # last events: exactly those of the events, without another read for them.
+        first = pc.min(entities[FIRST_EVENT]).as_py()
+        last = pc.max(entities[LAST_EVENT]).as_py()
+        window = window_days(first, last)
         split = None
+        by_group = None
         if "current" in axes:
-            first, last = event_span(df, plan)
             if first is None or last is None:
                 raise ValueError(f"the time column {time!r} holds no values")
             split = halves(first, last)
-        entities = _entity_table(
-            df, plan, group_by, max_entities, t_mid=None if split is None else split[1]
-        )
-        # Key order makes the fit independent of the order Spark returns rows in.
-        entities = entities.sort_by(KEY)
-        window = window_days(
-            pc.min(entities[FIRST_EVENT]).as_py(), pc.max(entities[LAST_EVENT]).as_py()
-        )
-        # The event times only measure the window: the saved entity table (and the
-        # sphere built from it) holds the dimensions alone.
-        entities = entities.drop_columns(list(EVENT_TIMES))
+            if score_per_group:
+                assert group_by is not None
+                entities, by_group = _with_group_states(
+                    df, plan, entities, group_by, split, percentile, group_size
+                )
+            else:
+                entities = _with_states(entities, state_frame(df, plan, split[1]))
+        if by_group is None:
+            # The event times only measure the window: the saved entity table (and
+            # the sphere built from it) holds the dimensions alone. Per group they
+            # stay, so the sphere build can place each group's own halves.
+            entities = entities.drop_columns(list(EVENT_TIMES))
         dim_names = [d.name for d in plan.dims] + [name for name, _ in plan.extra_dims]
         # The fit's own member scores are the result's: no second scoring pass.
         calibration, scores = FrozenCalibration.fit_scored(
@@ -207,6 +223,7 @@ def find_anomalies(
             window_days=window,
             halves=split,
             key=KEY if split is not None else None,
+            group_halves=by_group,
         )
         _save(path, entities, plan, calibration)
 
@@ -215,15 +232,70 @@ def find_anomalies(
     return shape_result(flat, len(calibration.dims), fp, path, group_by)
 
 
+def _with_states(entities: pa.Table, frame: DataFrame) -> pa.Table:
+    """``entities`` (sorted by key) with the state columns of ``frame`` appended."""
+    # A large collect reads the frame in chunks: cached, the aggregation runs once.
+    try:
+        frame = frame.persist()
+        cached = True
+    except AnalysisException:
+        cached = False
+    try:
+        states = collect_entities(frame, n_rows=entities.num_rows).sort_by(KEY)
+    finally:
+        if cached:
+            frame.unpersist()
+    if not states[KEY].equals(entities[KEY]):
+        raise RuntimeError("the half-state aggregation returned other entities")
+    for name in states.column_names[1:]:
+        entities = entities.append_column(name, states[name])
+    return entities
+
+
+def _with_group_states(
+    df: DataFrame,
+    plan: Plan,
+    entities: pa.Table,
+    group_by: str,
+    split: tuple[float, float],
+    percentile: float,
+    min_group_size: int,
+) -> tuple[pa.Table, dict[str, tuple[float, float]]]:
+    """The half states, and each score group's halves with ``GROUP_STATE_COLUMNS``:
+    every row's states split at its score group's own middle day, as a build
+    splits them (the window's for rows scored against the population).
+
+    The groups and their first / last events come from the entity table; both
+    splits come from one aggregation.
+    """
+    ids = pc.cast(entities[group_by], pa.string()).to_numpy(zero_copy_only=False).astype(str)
+    labels, _, own = score_groups(ids, percentile, min_group_size)
+    first, last = (
+        pc.cast(entities[c], pa.float64()).to_numpy(zero_copy_only=False) for c in EVENT_TIMES
+    )
+    by_group = group_halves(labels, own, first, last)
+    t_mid = np.full(entities.num_rows, split[1])
+    for gid, (_, mid) in by_group.items():
+        t_mid[labels == gid] = mid
+    moved = t_mid != split[1]
+    splits = None
+    if moved.any():
+        keys = pa.table({KEY: entities[KEY].filter(pa.array(moved)), "t_mid": t_mid[moved]})
+        splits = df.sparkSession.createDataFrame(keys.to_pandas())
+    entities = _with_states(entities, state_frame(df, plan, split[1], splits))
+    if splits is None:
+        for c, name in zip(STATE_COLUMNS, GROUP_STATE_COLUMNS, strict=True):
+            entities = entities.append_column(name, entities[c])
+    return entities, by_group
+
+
 def _entity_table(
     df: DataFrame,
     plan: Plan,
     group_by: str | None,
     max_entities: int,
-    *,
-    t_mid: float | None = None,
 ) -> pa.Table:
-    entity_df = entity_frame(df, plan, group_by, event_times=True, t_mid=t_mid)
+    entity_df = entity_frame(df, plan, group_by, event_times=True)
     # Cached, counting the frame computes the aggregation once and the collect
     # reads the cache. Where caching is refused (serverless on older client
     # environments) every action recomputes it, so the count comes from the keys
@@ -252,14 +324,12 @@ def entity_frame(
     group_by: str | None,
     *,
     event_times: bool = False,
-    t_mid: float | None = None,
 ) -> DataFrame:
     """Per-entity dimensions, plus the entity's ``group_by`` value when given.
 
-    ``event_times=True`` adds each entity's ``first_event`` / ``last_event``;
-    ``t_mid`` the half-state columns of the ``current`` axis.
+    ``event_times=True`` adds each entity's ``first_event`` / ``last_event``.
     """
-    entity_df = aggregate(df, plan, event_times=event_times, t_mid=t_mid)
+    entity_df = aggregate(df, plan, event_times=event_times)
     if group_by is None:
         return entity_df
     groups = _group_values(df, plan.roles["entity"], group_by)

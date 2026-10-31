@@ -54,4 +54,4 @@ __all__ = [
     "IntrinsicExtrinsicReport",
     "LeadLagReport",
 ]
-__version__ = "0.10.2"
+__version__ = "0.10.3"

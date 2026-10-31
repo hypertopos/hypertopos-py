@@ -40,6 +40,7 @@ from hypertopos.engine.robust import (
     is_anomaly,
     min_reference_size,
     pool_groups,
+    score_groups,
     subset_states,
 )
 from hypertopos.engine.robust import score as score_reference
@@ -61,6 +62,11 @@ STATE_COLUMNS: tuple[str, ...] = tuple(
 """Per-entity columns behind the ``current`` axis, for each calendar half: out
 events, sum of ``log1p(max(amount, 0))`` over them, in events, the same sum over
 them, all events (a self-transfer is an out and an in event)."""
+
+GROUP_STATE_COLUMNS: tuple[str, ...] = tuple(f"group_{c}" for c in STATE_COLUMNS)
+"""The ``STATE_COLUMNS`` of each row split at its score group's own middle day
+(the population's for rows scored against the population), for
+``score_per_group``: a build splits each group at its own events' middle day."""
 
 
 @dataclass(frozen=True)
@@ -124,6 +130,7 @@ class FrozenCalibration:
         window_days: int | None = None,
         halves: tuple[float, float] | None = None,
         key: str | None = None,
+        group_halves: Mapping[str, tuple[float, float]] | None = None,
     ) -> FrozenCalibration:
         """Calibrate on ``table``; nulls in a dimension count as 0, as in a build.
 
@@ -157,8 +164,11 @@ class FrozenCalibration:
         ``key`` names the column identifying rows, so a member rescored later
         is left out of its own velocity neighbours as in the fit. With
         ``score_per_group`` each group's reference fits its own velocity field
-        on its rows' half states, split at the same ``t_mid`` (a build splits
-        each group at its own events' middle day).
+        on its rows' half states. ``group_halves`` (score group -> ``(t0,
+        t_mid)`` of its own events) says the table also carries
+        ``GROUP_STATE_COLUMNS``, split there, as a build splits each group at
+        its own events' middle day; without it every group splits at
+        ``halves``.
         """
         return cls._fit(
             table,
@@ -171,6 +181,7 @@ class FrozenCalibration:
             window_days=window_days,
             halves=halves,
             key=key,
+            group_halves=group_halves,
         )[0]
 
     @classmethod
@@ -199,6 +210,7 @@ class FrozenCalibration:
         window_days: int | None = None,
         halves: tuple[float, float] | None = None,
         key: str | None = None,
+        group_halves: Mapping[str, tuple[float, float]] | None = None,
     ) -> tuple[FrozenCalibration, RobustScores | None]:
         if score_per_group and group_by is None:
             raise ValueError("score_per_group needs group_by")
@@ -215,6 +227,16 @@ class FrozenCalibration:
         vel_keys: np.ndarray | None = None
         states = None if halves is None else _half_states(table, halves)
         if score_per_group and group_by is not None:
+            group_states = None
+            if states is not None and group_halves is not None:
+                labels, _, own = score_groups(_group_ids(table, group_by), percentile, group_size)
+                split = _half_states(table, halves or (0.0, 0.0), GROUP_STATE_COLUMNS)
+                group_states = {
+                    gid: HalfStates(
+                        split.first[labels == gid], split.second[labels == gid], *group_halves[gid]
+                    )
+                    for gid in own
+                }
             grouped, fitted, _ = fit_grouped_reference(
                 x,
                 tuple(dims),
@@ -222,6 +244,7 @@ class FrozenCalibration:
                 percentile=percentile,
                 min_group_size=group_size,
                 states=states,
+                group_states=group_states,
             )
             reference, references = grouped.population, grouped.groups
             if states is not None and key is not None:
@@ -344,15 +367,22 @@ class FrozenCalibration:
                 self.reference, x, members=members, states=states, vel_pos=vel_pos
             )
         # Each row's evidence from the reference that scores it: p, rank and flag
-        # are within the row's group.
+        # are within the row's group, on its halves split where that group split.
+        group_states = (
+            _half_states(table, self.halves, GROUP_STATE_COLUMNS)
+            if states is not None
+            and self.halves is not None
+            and set(GROUP_STATE_COLUMNS) <= set(table.column_names)
+            else states
+        )
         parts = []
         for mask, cal, _ in assignments:
-            ref, vel_keys = (
-                (cal.reference, cal.vel_keys)
+            ref, vel_keys, own_states = (
+                (cal.reference, cal.vel_keys, group_states)
                 if cal.reference is not None
-                else (self.reference, self.vel_keys)
+                else (self.reference, self.vel_keys, states)
             )
-            sub = subset_states(states, mask)
+            sub = subset_states(own_states, mask)
             vel_pos = (
                 self._vel_pos(table.filter(mask), vel_keys) if members and sub is not None else None
             )
@@ -520,8 +550,10 @@ def _group_ids(table: pa.Table, group_by: str) -> np.ndarray:
     return ids.astype(str)
 
 
-def _half_states(table: pa.Table, halves: tuple[float, float]) -> HalfStates:
-    raw = np.column_stack([_column(table, c) for c in STATE_COLUMNS])
+def _half_states(
+    table: pa.Table, halves: tuple[float, float], columns: Sequence[str] = STATE_COLUMNS
+) -> HalfStates:
+    raw = np.column_stack([_column(table, c) for c in columns])
     return HalfStates(np.log1p(raw[:, :5]), np.log1p(raw[:, 5:]), halves[0], halves[1])
 
 

@@ -20,8 +20,13 @@ import hypertopos
 from hypertopos.builder import GDSBuilder
 from hypertopos.builder.builder import _PatternReg
 from hypertopos.engine.robust import EventArrays
-from hypertopos.scoring import POOLED_GROUP, STATE_COLUMNS, FrozenCalibration
-from hypertopos.spark._plan import Plan, describe_plan
+from hypertopos.scoring import (
+    GROUP_STATE_COLUMNS,
+    POOLED_GROUP,
+    STATE_COLUMNS,
+    FrozenCalibration,
+)
+from hypertopos.spark._plan import EVENT_TIMES, Plan, describe_plan
 
 SPHERE_ID = "spark"
 LINE_ID = "entities"
@@ -143,15 +148,20 @@ def build_sphere(entities: pa.Table, calibration: FrozenCalibration, path: str) 
             entities.schema.get_field_index(dim), dim, pa.array(shapes[:, j].astype("float64"))
         )
     group_column: str | None = None
+    group_t_mid = None
     if calibration.group_by is not None:
         group_column = CALIBRATION_GROUP
         raw = entities[calibration.group_by].cast(pa.string()).to_pylist()
         pooled = [POOLED_GROUP if g in calibration.pooled else g for g in raw]
         entities = entities.append_column(group_column, pa.array(pooled, pa.string()))
+        if calibration.halves is not None and set(GROUP_STATE_COLUMNS) <= set(
+            entities.column_names
+        ):
+            group_t_mid = np.array([_t_mid_of(calibration, g) for g in pooled])
     builder = (
         GDSBuilder(SPHERE_ID, path)
         if calibration.halves is None
-        else _HalfStateBuilder(SPHERE_ID, path, entities, calibration.halves)
+        else _HalfStateBuilder(SPHERE_ID, path, entities, calibration.halves, group_t_mid)
     )
     builder.add_line(LINE_ID, entities, key_col=KEY, source_id="spark")
     builder.add_pattern(
@@ -169,20 +179,37 @@ def build_sphere(entities: pa.Table, calibration: FrozenCalibration, path: str) 
     return builder.build()
 
 
+def _t_mid_of(calibration: FrozenCalibration, label: str) -> float:
+    assert calibration.halves is not None and calibration.groups is not None
+    group = calibration.groups.get(label)
+    ref = None if group is None else group.reference
+    return calibration.halves[1] if ref is None or ref.t_mid is None else ref.t_mid
+
+
 class _HalfStateBuilder(GDSBuilder):
     """A build whose ``current`` axis reads the entities' half-state columns.
 
     The entity table holds no events, only their per-half counts and log-amount
     sums: each (entity, half, side) becomes that many event rows of equal
     log-amount, placed so the build splits the halves at the same ``t_mid``.
+    With ``group_t_mid`` (each row's score group's ``t_mid``) the rows also
+    carry ``GROUP_STATE_COLUMNS`` and their first / last event: the events then
+    fill the intervals the two splits cut, and every row's events start and end
+    at its own first and last event, so each group's own halves come out too.
     """
 
     def __init__(
-        self, sphere_id: str, path: str, entities: pa.Table, halves: tuple[float, float]
+        self,
+        sphere_id: str,
+        path: str,
+        entities: pa.Table,
+        halves: tuple[float, float],
+        group_t_mid: np.ndarray | None = None,
     ) -> None:
         super().__init__(sphere_id, path)
         self._states = entities
         self._halves = halves
+        self._group_t_mid = group_t_mid
 
     def _score_events(self, pat: _PatternReg, entity_table: pa.Table) -> EventArrays | None:
         if "current" not in pat.score_axes:
@@ -190,9 +217,9 @@ class _HalfStateBuilder(GDSBuilder):
         rows = pc.index_in(
             pc.cast(entity_table["primary_key"], pa.string()), value_set=self._states[KEY]
         ).to_numpy(zero_copy_only=False)
-        raw = np.column_stack(
-            [self._states[c].to_numpy(zero_copy_only=False) for c in STATE_COLUMNS]
-        ).astype(np.float64)[rows]
+        raw = self._raw(STATE_COLUMNS)[rows]
+        if self._group_t_mid is not None:
+            return self._split_events(raw, rows)
         t0, t_mid = self._halves
         days = round((t_mid - t0) / _DAY)
         # The build puts t_mid at t0 + ((last day + 1) // 2) days: a last event half
@@ -208,6 +235,62 @@ class _HalfStateBuilder(GDSBuilder):
                 amount.append(np.repeat(each, n))
                 direction.append(np.full(int(n.sum()), side, dtype=np.int8))
                 ts.append(np.full(int(n.sum()), times[half]))
+        return EventArrays(
+            np.concatenate(code),
+            np.concatenate(direction),
+            np.concatenate(ts),
+            np.concatenate(amount),
+        )
+
+    def _raw(self, columns: tuple[str, ...]) -> np.ndarray:
+        return np.column_stack(
+            [
+                pc.fill_null(pc.cast(self._states[c], pa.float64()), np.nan).to_numpy(
+                    zero_copy_only=False
+                )
+                for c in columns
+            ]
+        )
+
+    def _split_events(self, pop: np.ndarray, rows: np.ndarray) -> EventArrays:
+        assert self._group_t_mid is not None
+        own = self._raw(GROUP_STATE_COLUMNS)[rows]
+        first, last = self._raw(EVENT_TIMES)[rows].T
+        t_mid = self._halves[1]
+        t_group = self._group_t_mid[rows]
+        later = t_group >= t_mid  # the group splits later: the population's first half is A
+        # Intervals A < min(t_mid, t_group) <= B < max(...) <= C; [count, log-sum] per side.
+        parts = np.empty((3, 2, 2, len(rows)))
+        for side in (0, 1):
+            for j in (0, 1):
+                col = 2 * side + j
+                p1, p2, g1, g2 = pop[:, col], pop[:, 5 + col], own[:, col], own[:, 5 + col]
+                parts[0, side, j] = np.where(later, p1, g1)
+                parts[1, side, j] = np.where(later, g1 - p1, p1 - g1)
+                parts[2, side, j] = np.where(later, g2, p2)
+        n = np.rint(parts[:, :, 0]).astype(np.int64)  # (3, 2, rows)
+        each = np.expm1(np.maximum(parts[:, :, 1], 0.0) / np.maximum(n, 1))
+        busy = n.sum(axis=1) > 0  # (3, rows)
+        lo = np.argmax(busy, axis=0)
+        hi = 2 - np.argmax(busy[::-1], axis=0)
+        times = np.tile(np.minimum(t_mid, t_group), (3, 1))  # a middle B
+        r = np.arange(len(rows))
+        times[lo, r] = first
+        times[hi, r] = last
+        # One interval only: one of its events moves to the first event, so the row
+        # still starts and ends where its events do.
+        moved = np.zeros_like(n)
+        single = (lo == hi) & busy.any(axis=0)
+        pick = np.where(n[lo, 0, r] > 0, 0, 1)
+        moved[lo[single], pick[single], r[single]] = 1
+        code, direction, ts, amount = [], [], [], []
+        for i in range(3):
+            for d in (0, 1):
+                for count, when in ((n[i, d] - moved[i, d], times[i]), (moved[i, d], first)):
+                    code.append(np.repeat(r, count))
+                    amount.append(np.repeat(each[i, d], count))
+                    direction.append(np.full(int(count.sum()), d, dtype=np.int8))
+                    ts.append(np.repeat(when, count))
         return EventArrays(
             np.concatenate(code),
             np.concatenate(direction),

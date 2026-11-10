@@ -29,6 +29,14 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
+      # The Spark tests (pyspark from the dev extra) start a local JVM; Spark 3.5 does not
+      # run on the runner image's newer default JDK.
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
       - name: Install
         run: |
           python -m pip install --upgrade pip

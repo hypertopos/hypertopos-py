@@ -483,3 +483,33 @@ def test_the_p_values_do_not_depend_on_the_partitioning(spark, wide_rows, tmp_pa
         )
         p.append(out.toPandas().sort_values("entity")["p_value"].to_numpy())
     np.testing.assert_array_equal(p[0], p[1])
+
+
+@pytest.mark.parametrize("which", ["result", "grouped", "per_group"])
+def test_score_ships_only_what_new_rows_are_scored_with(which, request):
+    # New rows carry no half states and are scored without current, so the
+    # in-sample fused scores and the current axis' sorted values stay on the
+    # driver; the shipped calibration is smaller and scores exactly the same.
+    import pickle
+
+    from hypertopos.spark._result import result_table
+    from hypertopos.spark._score import _shipped_calibration
+
+    result = request.getfixturevalue(which)
+    sphere = sphere_of(result)
+    calibration = sphere.calibration()
+    shipped = _shipped_calibration(calibration)
+    refs = [shipped.reference] + [
+        g.reference for g in (shipped.groups or {}).values() if g.reference is not None
+    ]
+    # The fixtures fit with current, so the dropped arrays are really checked.
+    assert any(ref.cal_sorted_no_current is not None for ref in refs)
+    for ref in refs:
+        assert ref.vel_s0 is None
+        if ref.cal_sorted_no_current is not None:
+            assert len(ref.cal_sorted) == 0
+            assert ref.cal_sorted_oof is None
+            assert len(ref.axis_sorted["current"]) == 0
+    assert len(pickle.dumps(shipped)) < len(pickle.dumps(calibration))
+    entities = sphere.entities().drop_columns(list(STATE_COLUMNS))
+    assert result_table(entities, shipped).equals(result_table(entities, calibration))

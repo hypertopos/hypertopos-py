@@ -215,6 +215,66 @@ def _uses_calibrated_score(pattern: Any) -> bool:
     return bool(getattr(pattern, "score_dims", None))
 
 
+def _densest_window(
+    keys: list[Any], timestamps: list[float], window_sec: float, seed: str
+) -> list[Any]:
+    """Distinct counterparties (sorted) of the window of ``window_sec`` that holds the most.
+
+    The window slides over the seed's whole history, so a burst earlier than its
+    last edge still counts; of equally full windows the latest wins.
+    """
+    if timestamps and max(timestamps) - min(timestamps) <= window_sec:
+        # The whole history fits in one window.
+        return sorted({k for k in keys if k != seed})
+    events = sorted((ts, k) for k, ts in zip(keys, timestamps, strict=True) if k != seed)
+    counts: dict[Any, int] = {}
+    best: tuple[int, int] = (0, 0)
+    best_len = 0
+    lo = 0
+    for hi, (ts, key) in enumerate(events):
+        counts[key] = counts.get(key, 0) + 1
+        while ts - events[lo][0] > window_sec:
+            old = events[lo][1]
+            counts[old] -= 1
+            if not counts[old]:
+                del counts[old]
+            lo += 1
+        if len(counts) >= best_len and counts:
+            best, best_len = (lo, hi), len(counts)
+    if not best_len:
+        return []
+    return sorted({k for _, k in events[best[0] : best[1] + 1]})
+
+
+def _population_drift(
+    rows: pa.Table, ref: Any, in_sample: bool
+) -> tuple[float | None, dict[str, float], list[str]] | None:
+    """``(p_distribution, p_dimensions, drifted_dimensions)`` when the scored
+    ``rows`` drifted from ``ref``, else None. ``in_sample``: their p-values were
+    calibrated in sample, so only the per-dimension test runs."""
+    from hypertopos.engine import drift_stats as ds
+
+    if "score_delta" not in rows.column_names or "conformal_p" not in rows.column_names:
+        return None
+    rows = rows.filter(pc.and_(pc.is_valid(rows["score_delta"]), pc.is_valid(rows["conformal_p"])))
+    if rows.num_rows < ALARM_RATE_MIN_ROWS:
+        return None
+    flat = pc.list_flatten(rows["score_delta"]).to_numpy(zero_copy_only=False)
+    delta = flat.reshape(rows.num_rows, len(ref.dims))
+    x = ds.values_from_score_delta(ref.cdf_grid, ref.cdf_levels, ref.lw_location, delta)
+    p = rows["conformal_p"].to_numpy(zero_copy_only=False).astype(np.float64)
+    grids = [ds.grid_levels(ref.cdf_grid[d], ref.cdf_levels) for d in range(len(ref.dims))]
+    vec = ds.batch_counts([g[0] for g in grids], p, x)
+    p_distribution: float | None
+    p_distribution, p_dims = ds.batch_tests(
+        vec, grids, tuple(ref.dims), int(ref.n_fitted), rows.num_rows
+    )
+    if in_sample:
+        p_distribution = None
+    is_drift, drifted = ds.drift_rule(p_distribution, p_dims)
+    return (p_distribution, p_dims, drifted) if is_drift else None
+
+
 def _anomaly_filter(pattern: Any) -> str | None:
     """Lance filter for the entities ``find_anomalies`` counts as anomalous.
 
@@ -6072,17 +6132,7 @@ class GDSNavigator:
         min_k: int,
     ) -> list[dict[str, Any]]:
         nbr = adj.neighbors_out_window(seed)
-        timestamps = nbr["timestamp"]
-        if not timestamps:
-            return []
-        to_keys = nbr["to_key"]
-        max_ts = max(timestamps)
-        recent = [
-            (t, ts)
-            for t, ts in zip(to_keys, timestamps, strict=True)
-            if t != seed and ts >= max_ts - window_sec
-        ]
-        unique = sorted({t for (t, _) in recent})
+        unique = _densest_window(nbr["to_key"], nbr["timestamp"], window_sec, seed)
         if len(unique) < min_k:
             return []
         return [
@@ -6103,17 +6153,7 @@ class GDSNavigator:
     ) -> list[dict[str, Any]]:
         """Mirror of _enum_fan_out_via_adj: seed = sink, collect distinct sources."""
         nbr = adj.neighbors_in_window(seed)
-        timestamps = nbr["timestamp"]
-        if not timestamps:
-            return []
-        from_keys = nbr["from_key"]
-        max_ts = max(timestamps)
-        recent = [
-            (f, ts)
-            for f, ts in zip(from_keys, timestamps, strict=True)
-            if f != seed and ts >= max_ts - window_sec
-        ]
-        unique = sorted({f for (f, _) in recent})
+        unique = _densest_window(nbr["from_key"], nbr["timestamp"], window_sec, seed)
         if len(unique) < min_k:
             return []
         return [
@@ -11030,7 +11070,9 @@ class GDSNavigator:
         pattern_id: str,
     ) -> list[dict[str, Any]]:
         """Check calibration drift against its thresholds and the calibration's age."""
-        alerts = self._check_calibration_age(pattern_id) + self._check_alarm_rate_drift(pattern_id)
+        alerts = self._check_calibration_age(pattern_id) + self._check_drift_since_calibration(
+            pattern_id
+        )
         tracker = self._storage.read_calibration_tracker(pattern_id)
         if tracker is None:
             return alerts
@@ -11102,16 +11144,22 @@ class GDSNavigator:
             }
         ]
 
-    def _check_alarm_rate_drift(self, pattern_id: str) -> list[dict[str, Any]]:
-        """Alert when rows written since the calibration are flagged above the budget.
+    def _check_drift_since_calibration(self, pattern_id: str) -> list[dict[str, Any]]:
+        """Alert when rows written since the calibration no longer look like its population.
 
         On a calibrated pattern, rows added or updated after the last
-        calibration are scored against the frozen reference; while the
-        population does not move, at most the alarm budget of them is flagged.
-        They share one calibration, so under exchangeability their flagged count
-        is beta-binomial (a calibration that happened to land high flags more
-        of every batch), not binomial; its one-sided tail tells when the
-        population has moved.
+        calibration are scored against the frozen reference. Two alerts:
+
+        - ``alarm_rate_drift``: more of them flagged than the alarm budget allows.
+          They share one calibration, so under exchangeability their flagged
+          count is beta-binomial (a calibration that happened to land high
+          flags more of every batch), not binomial; its one-sided tail tells
+          when the population has moved.
+        - ``population_drift``: the test Spark's ``calibration_status`` reports
+          as ``drift`` (:func:`hypertopos.engine.drift_stats.drift_rule`): the
+          rows' p-values against uniform and each dimension against the
+          reference's sketch, read back from the stored score deltas. It sees
+          shifts that leave the flagged count unchanged.
         """
         pattern = self._storage.read_sphere().patterns.get(pattern_id)
         calibrated = getattr(pattern, "last_calibrated_at", None)
@@ -11132,55 +11180,88 @@ class GDSNavigator:
         version = self._manifest.pattern_versions.get(pattern_id)
         if version is None:
             return []
-        geo = self._storage.read_geometry(pattern_id, version, columns=["updated_at", "is_anomaly"])
+        geo = self._storage.read_geometry(
+            pattern_id,
+            version,
+            columns=["updated_at", "is_anomaly", "conformal_p", "score_delta"],
+            filter=f"updated_at > TIMESTAMP '{calibrated.isoformat(sep=' ')}'",
+        )
         updated = geo["updated_at"]
         if pa.types.is_timestamp(updated.type) and updated.type.tz is not None:
             updated = pc.cast(updated, pa.timestamp(updated.type.unit))
-        since = pc.fill_null(pc.greater(updated, pa.scalar(calibrated, updated.type)), False)
-        n_new = int(pc.sum(since).as_py() or 0)
+        geo = geo.filter(
+            pc.fill_null(pc.greater(updated, pa.scalar(calibrated, updated.type)), False)
+        )
+        n_new = geo.num_rows
         if n_new < ALARM_RATE_MIN_ROWS:
             return []
-        flagged = int(pc.sum(pc.and_(since, pc.fill_null(geo["is_anomaly"], False))).as_py() or 0)
+        flagged = int(pc.sum(pc.fill_null(geo["is_anomaly"], False)).as_py() or 0)
         budget = 1.0 - float(pattern.anomaly_percentile) / 100.0
+        from hypertopos.engine import drift_stats as ds
         from hypertopos.engine import robust
 
         ref = self._storage.read_reference(pattern_id)
         n_ref = int(ref.n_fitted)
-        if (
+        # Built before out-of-fold calibration: its new rows were calibrated in
+        # sample and over-flag, so neither the budget nor their p-values hold.
+        in_sample = (
             ref.mahal_sorted_oof is None
             and 2 * robust.OOF_FOLDS <= n_ref <= robust.OOF_MAX_ROWS_PER_DIM * len(ref.dims)
-        ):
-            # Built before out-of-fold calibration: its new rows were calibrated
-            # in sample and over-flag, so the budget below does not hold.
-            return []
-        # A new row is flagged when it ranks among the top ``a`` of the n + 1.
-        a = int(np.floor(budget * (n_ref + 1)))
-        if a < 1:
-            return []
-        from scipy.stats import betabinom
-
-        p_value = float(betabinom.sf(flagged - 1, n_new, a, n_ref + 1 - a))
-        if p_value >= ALARM_RATE_ALPHA:
-            return []
-        return [
-            {
-                "severity": "MEDIUM",
-                "check_type": "alarm_rate_drift",
-                "pattern_id": pattern_id,
-                "message": (
-                    f"{flagged} of {n_new} rows written since the calibration are flagged, "
-                    f"against an alarm budget of {budget:.1%} (expected {budget * n_new:.0f}); "
-                    f"the population has moved from its reference. Call "
-                    f"recalibrate('{pattern_id}') to refit it."
-                ),
-                "details": {
-                    "n_new": n_new,
-                    "flagged": flagged,
-                    "expected": budget * n_new,
-                    "p_value": p_value,
-                },
-            }
-        ]
+        )
+        p_flag_count = (
+            None
+            if in_sample
+            else ds.flag_count_p(flagged, n_new, n_ref, float(pattern.anomaly_percentile))
+        )
+        alerts: list[dict[str, Any]] = []
+        if p_flag_count is not None and p_flag_count < ALARM_RATE_ALPHA:
+            alerts.append(
+                {
+                    "severity": "MEDIUM",
+                    "check_type": "alarm_rate_drift",
+                    "pattern_id": pattern_id,
+                    "message": (
+                        f"{flagged} of {n_new} rows written since the calibration are flagged, "
+                        f"against an alarm budget of {budget:.1%} (expected "
+                        f"{budget * n_new:.0f}); the population has moved from its reference. "
+                        f"Call recalibrate('{pattern_id}') to refit it."
+                    ),
+                    "details": {
+                        "n_new": n_new,
+                        "flagged": flagged,
+                        "expected": budget * n_new,
+                        "p_value": p_flag_count,
+                    },
+                }
+            )
+        drift = _population_drift(geo, ref, in_sample)
+        if drift is not None:
+            p_distribution, p_dims, drifted = drift
+            named = f" (dimensions: {', '.join(drifted)})" if drifted else ""
+            alerts.append(
+                {
+                    "severity": "MEDIUM",
+                    "check_type": "population_drift",
+                    "pattern_id": pattern_id,
+                    "message": (
+                        f"The {n_new} rows written since the calibration no longer follow its "
+                        f"population{named}; their p-values are not valid against it. Call "
+                        f"recalibrate('{pattern_id}') to refit it."
+                    ),
+                    "details": {
+                        "rows": n_new,
+                        "flagged": flagged,
+                        "alarm_rate": flagged / n_new,
+                        "expected_alarm_rate": budget,
+                        "p_distribution": p_distribution,
+                        "p_dimensions": p_dims,
+                        "drifted_dimensions": drifted,
+                        "p_flag_count": p_flag_count,
+                        "status": "drift",
+                    },
+                }
+            )
+        return alerts
 
     def _check_stale_vector_index(
         self,

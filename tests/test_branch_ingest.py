@@ -239,14 +239,19 @@ def test_alarm_rate_alert_counts_exactly_the_rows_ingested_since_calibration(
     builder.finalize_incremental(PID)
     session = HyperSphere.open(str(sphere_dir)).session("t")
     try:
-        (alert,) = session.navigator()._check_alarm_rate_drift(PID)
-        assert alert["details"]["n_new"] == 10  # the ten ingested rows, all far out
+        alerts = {
+            a["check_type"]: a for a in session.navigator()._check_drift_since_calibration(PID)
+        }
+        assert alerts["alarm_rate_drift"]["details"]["n_new"] == 10  # the ten ingested rows
+        # All far out on their one dimension, read back from the stored score deltas.
+        assert alerts["population_drift"]["details"]["rows"] == 10
+        assert alerts["population_drift"]["details"]["drifted_dimensions"] == ["event_count"]
         session.recalibrate(PID)
     finally:
         session.close()
     session = HyperSphere.open(str(sphere_dir)).session("t2")
     try:
-        assert session.navigator()._check_alarm_rate_drift(PID) == []
+        assert session.navigator()._check_drift_since_calibration(PID) == []
     finally:
         session.close()
 

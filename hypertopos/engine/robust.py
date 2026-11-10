@@ -36,6 +36,7 @@ VELOCITY_K = 50
 KNN_K = 100
 KNN_DIMS = 12
 MAX_REFERENCE_ROWS = 100_000
+_VELOCITY_BLOCK = 65_536  # rows per neighbour query of the velocity field (bounds the memory)
 OOF_FOLDS = 5
 # Above this many rows per dimension the in-sample calibration of new rows is
 # already within noise of the budget, and the folds would cost a full refit each.
@@ -151,8 +152,11 @@ def _sketch_and_gauss(
         if grid is None:
             out_grid[d] = _quantiles_of_sorted(v, levels)
         u[d, order] = _levels_of_sorted(out_grid[d], levels, v)
-    z = np.asarray(ndtri(np.clip(u, levels[0], levels[-1])), dtype=np.float64).T
-    return out_grid, np.ascontiguousarray(z)
+    # In place: at most two copies of the rows are alive at once (large fits are driver-bound).
+    del xt
+    np.clip(u, levels[0], levels[-1], out=u)
+    ndtri(u, out=u)
+    return out_grid, np.ascontiguousarray(u.T)
 
 
 def fit_cdf(x: np.ndarray, points: int = CDF_POINTS) -> tuple[np.ndarray, np.ndarray]:
@@ -178,7 +182,7 @@ def ledoit_wolf(z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     x = z - location
     n, p = x.shape
     emp = x.T @ x / n
-    x2 = x**2
+    x2 = np.square(x, out=x)  # x is not needed again: no second copy of the rows
     trace = x2.sum() / n
     mu = trace / p
     beta_ = float(np.sum(x2.T @ x2))
@@ -274,12 +278,16 @@ def _halves(events: EventArrays) -> tuple[float, float]:
 
 
 def _neighbours(
-    ref: np.ndarray, query: np.ndarray, k: int, self_pos: np.ndarray | None
+    ref: np.ndarray,
+    query: np.ndarray,
+    k: int,
+    self_pos: np.ndarray | None,
+    tree: cKDTree | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """k nearest reference rows of each query; ``self_pos`` leaves the query's own row out."""
     extra = 1 if self_pos is not None else 0
     k = min(k, len(ref) - extra)
-    dist, idx = cKDTree(ref).query(query, k=k + extra, workers=-1)
+    dist, idx = (cKDTree(ref) if tree is None else tree).query(query, k=k + extra, workers=-1)
     dist = np.asarray(dist).reshape(len(query), k + extra)
     idx = np.asarray(idx).reshape(len(query), k + extra)
     if self_pos is None:
@@ -335,16 +343,36 @@ def _current(
     pos = None if self_pos is None else self_pos[rows]
     if pos is not None and (pos < 0).all():
         pos = None
+    tree = cKDTree(ref.vel_s0)
     if pos is None:
-        _, idx = _neighbours(ref.vel_s0, s0[rows], VELOCITY_K, None)
-        out[rows] = np.linalg.norm(u[rows] - ref.vel_u[idx].mean(axis=1), axis=1)
+        out[rows] = _velocity_residual(ref, tree, s0[rows], u[rows], None)
         return out
     member = pos >= 0
     if (~member).any():
-        _, idx = _neighbours(ref.vel_s0, s0[rows[~member]], VELOCITY_K, None)
-        out[rows[~member]] = np.linalg.norm(u[rows[~member]] - ref.vel_u[idx].mean(axis=1), axis=1)
-    _, idx = _neighbours(ref.vel_s0, s0[rows[member]], VELOCITY_K, pos[member])
-    out[rows[member]] = np.linalg.norm(u[rows[member]] - ref.vel_u[idx].mean(axis=1), axis=1)
+        out[rows[~member]] = _velocity_residual(
+            ref, tree, s0[rows[~member]], u[rows[~member]], None
+        )
+    out[rows[member]] = _velocity_residual(
+        ref, tree, s0[rows[member]], u[rows[member]], pos[member]
+    )
+    return out
+
+
+def _velocity_residual(
+    ref: Reference, tree: cKDTree, s0: np.ndarray, u: np.ndarray, self_pos: np.ndarray | None
+) -> np.ndarray:
+    """Distance of each move ``u`` from the mean move of its nearest sampled states.
+
+    In blocks of rows: the neighbours' moves of every row at once would be
+    ``VELOCITY_K`` x 5 numbers per row. Each row's result does not depend on the block.
+    """
+    assert ref.vel_s0 is not None and ref.vel_u is not None
+    out = np.empty(len(s0))
+    for lo in range(0, len(s0), _VELOCITY_BLOCK):
+        hi = lo + _VELOCITY_BLOCK
+        pos = None if self_pos is None else self_pos[lo:hi]
+        _, idx = _neighbours(ref.vel_s0, s0[lo:hi], VELOCITY_K, pos, tree)
+        out[lo:hi] = np.linalg.norm(u[lo:hi] - ref.vel_u[idx].mean(axis=1), axis=1)
     return out
 
 
@@ -373,8 +401,14 @@ def _axes(
 ) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
     if z is None:
         z = to_gauss(ref.cdf_grid, ref.cdf_levels, x)
-    r = z - ref.lw_location
-    mahal = np.sqrt(np.maximum(np.sum((r @ ref.lw_precision) * r, axis=1), 0.0))
+    # ``z`` is consumed: the residuals and the quadratic form are formed in place,
+    # so a large fit holds one extra copy of the rows here instead of three.
+    r = z
+    r -= ref.lw_location
+    quad = r @ ref.lw_precision
+    quad *= r
+    mahal = np.sqrt(np.maximum(quad.sum(axis=1), 0.0))
+    del quad
     values: dict[str, np.ndarray] = {"mahal": mahal}
     if "current" in ref.axes:
         values["current"] = _current(ref, events, len(x), vel_pos, states)
@@ -613,7 +647,9 @@ def fit_reference(
     same reference. Rows drawn into a reference sample are scored with
     themselves left out; the others exactly as new rows.
     """
-    x = np.nan_to_num(np.asarray(x, dtype=np.float64))
+    x = np.asarray(x, dtype=np.float64)
+    if not np.isfinite(x).all():  # copy only when there is something to replace
+        x = np.nan_to_num(x)
     n = len(x)
     rng = np.random.default_rng(seed)
     has_motion = events is not None or states is not None
@@ -980,7 +1016,9 @@ def fit_grouped_reference(
     stand in for a group's rows of ``states``: computed at the group's own
     middle day (:func:`group_halves`), they give the reference ``events`` give.
     """
-    x = np.nan_to_num(np.asarray(x, dtype=np.float64))
+    x = np.asarray(x, dtype=np.float64)
+    if not np.isfinite(x).all():  # copy only when there is something to replace
+        x = np.nan_to_num(x)
     labels, pooled, own = score_groups(ids, percentile, min_group_size, stored_labels=stored_labels)
     population, fitted = fit_reference(x, dims, axes=axes, events=events, seed=seed, states=states)
     keys = np.full(len(x), None, dtype=object)

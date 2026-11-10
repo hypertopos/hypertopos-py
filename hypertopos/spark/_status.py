@@ -15,15 +15,14 @@ import pyarrow as pa
 import pyarrow.compute as pc
 from pyspark.sql import DataFrame
 
+from hypertopos.engine import drift_stats as ds
 from hypertopos.engine.robust import Reference
 from hypertopos.scoring import POOLED_GROUP, FrozenCalibration
-from hypertopos.spark import _drift_stats as ds
 from hypertopos.spark._explain import Sphere, sphere_of
 from hypertopos.spark._plan import EVENT_TIMES, FIRST_EVENT, LAST_EVENT, window_days
 
 MIN_ROWS = 100
 """Fewest rows a test runs on: the batch, and each group's reference with ``score_per_group``."""
-ALPHA = 0.025
 WINDOW_RATIO_MIN = 0.95
 """Shortest scored window, as a share of the calibration window, that keeps the alarm budget."""
 WINDOW_RATIO_MAX = 1.0
@@ -191,13 +190,6 @@ def _labels(units: StatusUnits, column: pa.Array | pa.ChunkedArray) -> np.ndarra
     return ids
 
 
-def _vector(values: list[np.ndarray], p: np.ndarray, x: np.ndarray) -> np.ndarray:
-    """The p-value histogram and each dimension's grid counts, concatenated."""
-    return np.concatenate(
-        [ds.p_histogram(p), *(ds.grid_counts(v, x[:, d]) for d, v in enumerate(values))]
-    )
-
-
 def count_partition(
     units: StatusUnits, batches: Iterable[pa.RecordBatch]
 ) -> Iterator[pa.RecordBatch]:
@@ -237,7 +229,11 @@ def count_partition(
             values = units.values.get(unit)
             vec = None
             if values is not None:
-                vec = _vector(values, p, x) if mask is None else _vector(values, p[mask], x[mask])
+                vec = (
+                    ds.batch_counts(values, p, x)
+                    if mask is None
+                    else ds.batch_counts(values, p[mask], x[mask])
+                )
             k = int(flag.sum()) if mask is None else int(flag[mask].sum())
             slot = acc.get(unit)
             if slot is None:
@@ -264,24 +260,6 @@ def count_partition(
             }
         )
     yield pa.RecordBatch.from_pylist(rows, schema=_COUNTS)
-
-
-def _unit_tests(
-    vec: np.ndarray,
-    grids: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
-    dims: tuple[str, ...],
-    n_fitted: int,
-    rows: int,
-) -> tuple[float, dict[str, float]]:
-    """``p_distribution`` and ``p_dimensions`` of one unit's summed counts."""
-    n_eff = ds.effective_n(n_fitted, rows)
-    p_dims: dict[str, float] = {}
-    start = ds.P_BINS
-    for dim, (v, low, high) in zip(dims, grids, strict=True):
-        stop = start + 2 * len(v) + 1
-        p_dims[dim] = ds.ks_p(ds.grid_ks(vec[start:stop], low, high), n_eff)
-        start = stop
-    return ds.ks_p(ds.uniform_ks_binned(vec[: ds.P_BINS]), n_eff), p_dims
 
 
 def _scope(calibration: FrozenCalibration, unit: str, tested: bool) -> str:
@@ -342,7 +320,7 @@ def status_from_counts(
         for unit, (n, _, vec) in totals.items():
             if vec is not None and n >= MIN_ROWS:
                 ref = refs[unit]
-                tested[unit] = _unit_tests(vec, _grids(ref, len(dims)), dims, ref.n_fitted, n)
+                tested[unit] = ds.batch_tests(vec, _grids(ref, len(dims)), dims, ref.n_fitted, n)
     k = len(tested)
     if calibration.group_by is not None:
         out["groups"] = {}
@@ -362,8 +340,7 @@ def status_from_counts(
             }
             if unit in tested:
                 p_dist, p_dims = tested[unit]
-                drifted = [d for d, p in p_dims.items() if p < ALPHA / (2 * k * len(dims))]
-                is_drift = p_dist < ALPHA / (2 * k) or bool(drifted)
+                is_drift, drifted = ds.drift_rule(p_dist, p_dims, k)
                 entry.update(
                     p_distribution=p_dist,
                     p_dimensions=p_dims,
@@ -379,7 +356,7 @@ def status_from_counts(
     # Bonferroni over the tested units: the smallest p of each test times their count.
     p_distribution = min(1.0, k * min(t[0] for t in tested.values()))
     p_dims = {d: min(1.0, k * min(t[1][d] for t in tested.values())) for d in dims}
-    drifted = [d for d, p in p_dims.items() if p < ALPHA / (2 * len(dims))]
+    is_drift, drifted = ds.drift_rule(p_distribution, p_dims)
     out.update(
         p_distribution=p_distribution,
         p_dimensions=p_dims,
@@ -389,7 +366,7 @@ def status_from_counts(
         else ds.flag_count_p(
             totals[None][1], totals[None][0], refs[None].n_fitted, calibration.percentile
         ),
-        status="drift" if p_distribution < ALPHA / 2 or drifted else "ok",
+        status="drift" if is_drift else "ok",
     )
     if (
         window is not None

@@ -28,6 +28,7 @@ _EDGE_DIM_DEFAULTS: dict[str, dict[str, Any]] = {
     "time_since_pair_last_edge": {"burst_seconds": 60.0, "dormant_seconds": "auto"},
     "pair_amount_zscore": {"cv_threshold": 0.05, "min_count": 3},
     "find_motif_structuring": {"time_window_hours": 1.0, "amt1_min": 10000.0, "amt2_max": 10000.0},
+    "edge_curvature_frc": {},
 }
 
 

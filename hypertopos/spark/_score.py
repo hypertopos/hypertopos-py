@@ -10,6 +10,7 @@ import pickle
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import replace
 
+import numpy as np
 import pyarrow as pa
 from pyspark.sql import DataFrame
 
@@ -52,25 +53,9 @@ def score(df: DataFrame, like: DataFrame | Sphere, *, dimensions: bool = False) 
     with open(sphere.path / PLAN_FILE, "rb") as fh:
         plan: Plan = pickle.load(fh)
     entities = entity_frame(df, plan, calibration.group_by, event_times=dimensions)
-    # New entities carry no half states: they are scored without ``current``, so
-    # the velocity field stays on the driver.
-    shipped = replace(
-        calibration,
-        vel_keys=None,
-        reference=_without_velocity(calibration.reference),
-        groups=None
-        if calibration.groups is None
-        else {
-            gid: replace(
-                cal,
-                vel_keys=None,
-                reference=None if cal.reference is None else _without_velocity(cal.reference),
-            )
-            for gid, cal in calibration.groups.items()
-        },
-    )
     flat = entities.mapInArrow(
-        _scorer(shipped, dimensions), _result_schema(calibration, dimensions)
+        _scorer(_shipped_calibration(calibration), dimensions),
+        _result_schema(calibration, dimensions),
     )
     return shape_result(
         flat,
@@ -83,8 +68,43 @@ def score(df: DataFrame, like: DataFrame | Sphere, *, dimensions: bool = False) 
     )
 
 
-def _without_velocity(reference: Reference) -> Reference:
-    return replace(reference, vel_s0=None, vel_u=None)
+def _shipped_calibration(calibration: FrozenCalibration) -> FrozenCalibration:
+    """What the executors need to score new entities.
+
+    New entities carry no half states, so they are scored without ``current``:
+    the velocity field, the in-sample fused scores and the ``current`` axis'
+    sorted values stay on the driver. That keeps the shipped calibration under
+    the Spark Connect message limit for a larger population.
+    """
+    return replace(
+        calibration,
+        vel_keys=None,
+        reference=_for_new_rows(calibration.reference),
+        groups=None
+        if calibration.groups is None
+        else {
+            gid: replace(
+                cal,
+                vel_keys=None,
+                reference=None if cal.reference is None else _for_new_rows(cal.reference),
+            )
+            for gid, cal in calibration.groups.items()
+        },
+    )
+
+
+def _for_new_rows(reference: Reference) -> Reference:
+    ref = replace(reference, vel_s0=None, vel_u=None)
+    if ref.cal_sorted_no_current is None:
+        # Without current every row is scored on the full calibration.
+        return ref
+    # A row without current takes rank 0.5 on that axis whatever its sorted values.
+    return replace(
+        ref,
+        cal_sorted=np.empty(0),
+        cal_sorted_oof=None,
+        axis_sorted={**ref.axis_sorted, "current": np.empty(0)},
+    )
 
 
 def _scorer(

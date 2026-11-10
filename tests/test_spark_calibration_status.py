@@ -21,6 +21,7 @@ pytest.importorskip("pyspark")
 from pyspark.sql import functions as F  # noqa: E402
 
 from hypertopos.datasets import synthetic_aml  # noqa: E402
+from hypertopos.engine.drift_stats import flag_count_p  # noqa: E402
 from hypertopos.scoring import POOLED_GROUP, FrozenCalibration  # noqa: E402
 from hypertopos.spark import (  # noqa: E402
     _status,  # noqa: E402
@@ -30,7 +31,6 @@ from hypertopos.spark import (  # noqa: E402
     sphere_of,
 )
 from hypertopos.spark._api import CALIBRATION_FILE, ENTITIES_FILE, PLAN_FILE  # noqa: E402
-from hypertopos.spark._drift_stats import flag_count_p  # noqa: E402
 from hypertopos.spark._plan import window_days  # noqa: E402
 from hypertopos.spark._status import window_matches  # noqa: E402
 

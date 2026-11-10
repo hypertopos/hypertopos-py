@@ -409,7 +409,7 @@ patterns:
       - find_motif_structuring
       - edge_curvature_frc              #   Forman-Ricci curvature; no params.
     anomaly_percentile: 95             # Theta threshold percentile (default: 95).
-    dimension_weights: kurtosis        # "kurtosis" (recommended), "auto", or [0.5, 0.3, ...].
+    dimension_weights: kurtosis        # Optional; default uniform. "kurtosis" / "auto" amplify heavy-tailed dims (weights >= 1), or [0.5, 0.3, ...].
 ```
 
 The six available `edge_dimensions` functions: `pair_edge_count` (Poisson, count of edges between this pair), `position_in_chain` (Poisson, ordinal position in detected chain — `min_position` rejects below 3 at YAML parse), `time_since_pair_last_edge` (Gaussian, seconds since this `(from, to)` pair last had an edge), `pair_amount_zscore` (Gaussian, per-pair amount z-score on LOW_VAR pairs only), `find_motif_structuring` (Bernoulli, 1 if this edge participates in any structuring motif), `edge_curvature_frc` (Gaussian, combinatorial Forman-Ricci curvature of the underlying undirected transaction graph: `4 − deg(u) − deg(v) + #triangles(u, v)` — negative values mark sparse-hub topology, near-zero marks tight rings, positive marks over-clustered local structure; no params). Values are baked into the event polygon shape via `dimension_kinds` and written as a sidecar Lance dataset at `_gds_meta/edge_features/{pid}/data.lance` for runtime per-edge predicate filtering.
@@ -436,7 +436,6 @@ patterns:
           - burst_monthly: "count:window=30d:agg=max"
     relations: auto                    # Auto-generate _d_* lines from derived dims.
     anomaly_percentile: 95
-    dimension_weights: kurtosis
     gmm_n_components: 3               # Gaussian mixture components for calibration.
     group_by_property: segment         # Per-group mu/sigma/theta calibration.
     score_per_group: true              # Score each group against its own calibrated reference.
@@ -454,7 +453,7 @@ patterns:
 | `derived_dimensions` | list | `null` | Aggregated features from event data (anchor patterns only). |
 | `anomaly_percentile` | float | `95.0` | Sets the alarm budget `1 − anomaly_percentile/100`. On a pattern with the calibrated score an entity is anomalous when its `conformal_p` is at most the budget; on other patterns, when `delta_norm` is above theta at this percentile. |
 | `score_axes` | list | `[mahal, current]` | Axes of the calibrated evidence score for continuous anchor patterns whose dimensions are point properties. A subset of `mahal` (shrunk-covariance Mahalanobis on rank-Gaussian coordinates), `current` (motion against the population's velocity field, from the pattern's event line) and `knn` (distance to nearest peers; opt-in, adds a nearest-neighbour pass to the build). Must contain `mahal`. `current` is fitted when exactly one event pattern references the pattern's entity line and carries an edge table (from / to keys, timestamp, amount) whose events span more than one moment; otherwise the pattern scores without it. The fitted axes are listed in `score_axes` in sphere.json. |
-| `dimension_weights` | string or list | `null` | `"kurtosis"` (recommended), `"auto"`, or explicit weight list. |
+| `dimension_weights` | string or list | `null` | `"kurtosis"`, `"auto"`, or explicit weight list; unset means uniform weights. |
 | `gmm_n_components` | int | `null` | Gaussian mixture components for multi-modal calibration. `recalibrate` and `incremental_update` refuse such a pattern; rebuild it instead. |
 | `group_by_property` | string | `null` | Column for per-group calibration (e.g. per-country theta). |
 | `score_per_group` | bool | `false` | When `true`, each group identified by `group_by_property` is scored against its own calibrated reference: `anomaly_score`, `conformal_p`, `score_rank_pct` and `is_anomaly` are within-group. Groups below the minimum reference size are pooled; the geometry column `score_group` names the reference used. Requires `group_by_property`. `recalibrate` refits every group's reference with the same pooling. |
@@ -465,7 +464,7 @@ patterns:
 | `description` | string | `null` | Human-readable description. Stored in sphere.json — visible to agents via `get_sphere_info`. |
 | `edge_table` | dict | `null` | Explicit edge table config (see below). Auto-emitted for event patterns with 2+ FK relations to same anchor line. |
 | `edge_dimensions` | list | `null` | Build-time per-edge dims for event patterns. Each item is either a bare dim name or a single-key dict with overrides. Six dims available: `pair_edge_count`, `position_in_chain` (`min_position` ≥ 3, default 5), `time_since_pair_last_edge`, `pair_amount_zscore` (LOW_VAR pairs only), `find_motif_structuring`, `edge_curvature_frc` (Forman-Ricci curvature; no params). |
-| `edge_dim_aggregations` | dict | `null` | **Anchor patterns only.** Aggregate per-edge sidecar dims of an event pattern up to per-anchor `_mean` / `_max` columns baked into the anchor polygon. `from: <event_pid>` is required and must reference an event pattern that declares `edge_dimensions:`. `dims: [...]` is required — must be a non-empty list of source dim names from the referenced sidecar (the previous "omit `dims` to aggregate everything" shorthand was removed; explicit declaration prevents build-vs-runtime label drift). Anchor regimes: `single` (account-style, anchor PK matches edge `from_key` OR `to_key`) and `pair` (composite-key, anchor PK = `<from>__<to>`); `chain` raises `NotImplementedError`. Builder switches to a two-phase build (events first, anchors second) when this block is present. |
+| `edge_dim_aggregations` | dict | `null` | **Anchor patterns only.** Aggregate per-edge sidecar dims of an event pattern up to per-anchor `_mean` / `_max` columns baked into the anchor polygon. `from: <event_pid>` is required and must reference an event pattern that declares `edge_dimensions:`. `dims: [...]` is required — must be a non-empty list of source dim names from the referenced sidecar (the previous "omit `dims` to aggregate everything" shorthand was removed; explicit declaration prevents build-vs-runtime label drift). Anchor regimes: `single` (account-style, anchor PK matches edge `from_key` OR `to_key`), `pair` (composite-key, anchor PK = `<from>__<to>`) and `chain` (the entity line is a registered chain line; each chain aggregates the edge dims of its events); an entity line that is none of these raises `NotImplementedError`. Builder switches to a two-phase build (events first, anchors second) when this block is present. |
 | `conformance_rules` | list | `null` | Declarative compliance predicates evaluated at build time against the entity-line points table. Each entry has shape `{rule_id?, severity, description?, violates_when}` where `severity` is one of `low` / `medium` / `high` / `critical` and `violates_when` is a predicate AST. `rule_id` is auto-assigned as `r0`, `r1`, ... when omitted; duplicate `rule_id`s are rejected. Predicate ops: `and`, `or`, `not` (logical compounds carry `terms`), `==`, `!=`, `<`, `<=`, `>`, `>=` (carry `prop` + scalar `value`), and `in` (carries `prop` + list `value`). The `prop` field references a raw column on the entity-line points table — unknown columns fail the build immediately. Violators land in a sidecar Lance dataset read by `find_conformance_violations`. |
 | `bootstrap_iterations` | int | `200` | Number of bootstrap resamples used to compute `anomaly_confidence` per entity. Skipped automatically for N > 50K, `group_by_property`, and on patterns with the calibrated score. |
 
@@ -753,7 +752,6 @@ composite_lines:
           - pair_std: std:amount
           - pair_diversity: count_distinct:category
     anomaly_percentile: 95
-    dimension_weights: kurtosis
 ```
 
 A composite line automatically:
@@ -1051,7 +1049,6 @@ patterns:
           - avg_order: avg:amount
     relations: auto
     anomaly_percentile: 95
-    dimension_weights: kurtosis
 ```
 
 ```bash
@@ -1102,7 +1099,6 @@ patterns:
       - column: amount
       - column: balance
     anomaly_percentile: 95
-    dimension_weights: kurtosis
 
   account_pattern:
     type: anchor
@@ -1117,7 +1113,6 @@ patterns:
           - burst_daily: "count:window=1d:agg=max"
     relations: auto
     anomaly_percentile: 95
-    dimension_weights: kurtosis
 
 aliases:
   high_value_accounts:

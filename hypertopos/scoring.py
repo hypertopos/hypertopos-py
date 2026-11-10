@@ -339,6 +339,22 @@ class FrozenCalibration:
             calibration_scope=scope,
         )
 
+    def row_evidence(
+        self, table: pa.Table, *, members: bool = False
+    ) -> tuple[RobustScores, list[Reference]]:
+        """The evidence behind each row's score (``axis_ranks`` included) and the
+        reference that scored it: its group's with ``score_per_group``."""
+        assignments = self._assignments(table)
+        evidence = self._evidence(
+            self.shapes(table).astype(np.float64), table, assignments, members
+        )
+        refs = [self.reference] * table.num_rows
+        if self.score_per_group:
+            for mask, ref in self._references(assignments):
+                for i in np.flatnonzero(mask):
+                    refs[i] = ref
+        return evidence, refs
+
     def score_shares(self, table: pa.Table, score_delta: np.ndarray) -> np.ndarray:
         """:func:`score_shares` of each row of ``table`` against the reference
         that scored it (its group's with ``score_per_group``)."""

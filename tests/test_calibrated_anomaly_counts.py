@@ -206,7 +206,7 @@ def test_freshly_built_sphere_raises_no_alarm_rate_alert(nav, monkeypatch) -> No
         raise AssertionError("geometry scanned")
 
     monkeypatch.setattr(nav._storage, "read_geometry", _no_scan)
-    assert nav._check_alarm_rate_drift(PID) == []
+    assert nav._check_drift_since_calibration(PID) == []
 
 
 def _ingested(nav, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -232,14 +232,14 @@ def test_rows_since_calibration_flagged_above_the_budget_raise_an_alert(nav, mon
     )
     _ingested(nav, monkeypatch)
     monkeypatch.setattr(nav._storage, "read_geometry", lambda *a, **k: table)
-    (alert,) = nav._check_alarm_rate_drift(PID)
+    (alert,) = nav._check_drift_since_calibration(PID)
     assert alert["check_type"] == "alarm_rate_drift"
     assert alert["details"]["n_new"] == n
     assert alert["details"]["flagged"] == 40
     assert alert["details"]["p_value"] < 0.01
     within = table.set_column(1, "is_anomaly", pa.array(np.arange(n) < 20))
     monkeypatch.setattr(nav._storage, "read_geometry", lambda *a, **k: within)
-    assert nav._check_alarm_rate_drift(PID) == []
+    assert nav._check_drift_since_calibration(PID) == []
 
 
 def test_alarm_rate_alert_is_quiet_on_a_population_that_did_not_move(nav, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -263,7 +263,7 @@ def test_alarm_rate_alert_is_quiet_on_a_population_that_did_not_move(nav, monkey
         )
         monkeypatch.setattr(nav._storage, "read_geometry", lambda *a, t=table, **k: t)
         monkeypatch.setattr(nav._storage, "read_reference", lambda *a, r=ref, **k: r)
-        fires += bool(nav._check_alarm_rate_drift(PID))
+        fires += bool(nav._check_drift_since_calibration(PID))
     assert fires <= 3  # nominal 1 % of 40; a binomial test fires on ~18 %
 
 
@@ -289,7 +289,7 @@ def test_alarm_rate_alert_skips_a_reference_without_out_of_fold_calibration(
     )
     monkeypatch.setattr(nav._storage, "read_geometry", lambda *a, **k: table)
     monkeypatch.setattr(nav._storage, "read_reference", lambda *a, **k: old)
-    assert nav._check_alarm_rate_drift(PID) == []
+    assert nav._check_drift_since_calibration(PID) == []
 
 
 def test_find_anomalies_reports_no_theta_forecast_as_emerging(nav) -> None:  # type: ignore[no-untyped-def]
@@ -304,3 +304,90 @@ def test_find_anomalies_dimensions_agree_with_explain(nav) -> None:  # type: ign
         assert poly.reliability_flags["dominant_dim"] == explained[0]["dim"]
         assert poly.anomaly_dimensions[0]["dim"] == explained[0]["dim"]
         assert sum(d["mahal_share"] for d in poly.anomaly_dimensions) <= 1.0 + 1e-9
+
+
+def _scored_rows(ref, x, pattern, later):  # type: ignore[no-untyped-def]
+    """Rows as ingest writes them after the calibration: p-values, flags and score deltas."""
+    from hypertopos.engine.robust import is_anomaly, score
+
+    sc = score(ref, x)
+    n = len(x)
+    return pa.table(
+        {
+            "updated_at": pa.array([later] * n, type=pa.timestamp("us")),
+            "is_anomaly": pa.array(is_anomaly(sc.conformal_p, pattern.anomaly_percentile)),
+            "conformal_p": pa.array(sc.conformal_p.astype(np.float32)),
+            "score_delta": pa.array(sc.delta.tolist(), type=pa.list_(pa.float32())),
+        }
+    )
+
+
+def _correlated(rng, n, shift=0.0):  # type: ignore[no-untyped-def]
+    cov = np.full((5, 5), 0.5) + 0.5 * np.eye(5)
+    x = np.exp(rng.multivariate_normal(np.zeros(5), cov, n) + shift)
+    x[rng.random(n) < 0.9, 4] = 0.0  # a tied dimension
+    return x
+
+
+def test_score_delta_gives_back_the_grid_test_of_the_values() -> None:
+    from hypertopos.engine import drift_stats as ds
+    from hypertopos.engine.robust import fit_reference, score
+
+    rng = np.random.default_rng(3)
+    ref, _ = fit_reference(_correlated(rng, 5_000), tuple(f"d{i}" for i in range(5)))
+    for shift in (0.0, 0.3):
+        x = _correlated(rng, 2_000, shift)
+        delta = score(ref, x).delta  # float32, as stored
+        back = ds.values_from_score_delta(ref.cdf_grid, ref.cdf_levels, ref.lw_location, delta)
+        for d in range(5):
+            values, low, high = ds.grid_levels(ref.cdf_grid[d], ref.cdf_levels)
+            exact = ds.grid_ks(ds.grid_counts(values, x[:, d]), low, high)
+            got = ds.grid_ks(ds.grid_counts(values, back[:, d]), low, high)
+            assert got == pytest.approx(exact, abs=1e-6)
+
+
+def test_population_drift_fires_on_a_shift_the_flag_count_misses(nav, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from hypertopos.engine.robust import fit_reference
+
+    _ingested(nav, monkeypatch)
+    pattern = nav._storage.read_sphere().patterns[PID]
+    later = pattern.last_calibrated_at.replace(tzinfo=None) + timedelta(days=3)
+    rng = np.random.default_rng(5)
+    ref, _ = fit_reference(_correlated(rng, 5_000), tuple(f"d{i}" for i in range(5)))
+    monkeypatch.setattr(nav._storage, "read_reference", lambda *a, **k: ref)
+    quiet = _scored_rows(ref, _correlated(rng, 2_000), pattern, later)
+    monkeypatch.setattr(nav._storage, "read_geometry", lambda *a, **k: quiet)
+    assert nav._check_drift_since_calibration(PID) == []
+    moved = _scored_rows(ref, _correlated(rng, 2_000, 0.2), pattern, later)
+    monkeypatch.setattr(nav._storage, "read_geometry", lambda *a, **k: moved)
+    alerts = {a["check_type"]: a for a in nav._check_drift_since_calibration(PID)}
+    drift = alerts["population_drift"]
+    assert drift["severity"] == "MEDIUM"
+    assert drift["details"]["status"] == "drift"
+    assert drift["details"]["rows"] == 2_000
+    assert set(drift["details"]["p_dimensions"]) == set(ref.dims)
+    assert drift["details"]["drifted_dimensions"]
+
+
+def test_population_drift_without_out_of_fold_scores_runs_only_the_dimension_test(
+    nav, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    # In-sample calibrated new rows have non-uniform p-values: only the
+    # per-dimension test, which does not depend on the calibration, is run.
+    from hypertopos.engine.robust import fit_reference
+
+    _ingested(nav, monkeypatch)
+    pattern = nav._storage.read_sphere().patterns[PID]
+    later = pattern.last_calibrated_at.replace(tzinfo=None) + timedelta(days=3)
+    rng = np.random.default_rng(7)
+    ref, _ = fit_reference(_correlated(rng, 5_000), tuple(f"d{i}" for i in range(5)))
+    moved = _scored_rows(ref, _correlated(rng, 2_000, 0.2), pattern, later)
+    old = dataclasses.replace(
+        ref, mahal_sorted_oof=None, cal_sorted_oof=None, cal_sorted_no_current_oof=None
+    )
+    monkeypatch.setattr(nav._storage, "read_reference", lambda *a, **k: old)
+    monkeypatch.setattr(nav._storage, "read_geometry", lambda *a, **k: moved)
+    (drift,) = nav._check_drift_since_calibration(PID)
+    assert drift["check_type"] == "population_drift"
+    assert drift["details"]["p_distribution"] is None
+    assert drift["details"]["drifted_dimensions"]

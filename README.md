@@ -9,11 +9,11 @@
 [![PyArrow](https://img.shields.io/badge/format-PyArrow-red.svg)](https://arrow.apache.org/docs/python/)
 [![Lance](https://img.shields.io/badge/storage-Lance-blueviolet.svg)](https://github.com/lance-format/lance)
 [![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io)
-[![Version](https://img.shields.io/badge/version-0.10.3-%235500FF.svg)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.11.0-%235500FF.svg)](pyproject.toml)
 
 Describe your tables in a YAML file, run `hypertopos build`, and every entity gets a position relative to its own population — so "out of place", "similar", "drifting" and "different between groups" become distances you read instead of queries you write.
 
-- **No model, no labels.** Every entity's anomaly score is calibrated against the population itself — at the 95th percentile at most 5 % of the population is flagged; entities scored later against the stored calibration keep that budget while the population does not move, and `check_alerts` reports `alarm_rate_drift` when it does; nothing is trained and nothing has to be annotated.
+- **No model, no labels.** Every entity's anomaly score is calibrated against the population itself — at the 95th percentile at most 5 % of the population is flagged; entities scored later against the stored calibration keep that budget while the population does not move, and `check_alerts` reports `alarm_rate_drift` when it does, and `population_drift` when later rows no longer follow the population; nothing is trained and nothing has to be annotated.
 - **Explanations in the data's own columns.** `explain_anomaly` turns an anomaly's p-value into bits of evidence and splits them over the dimensions that carry it, so the parts add up to the whole.
 - **One snapshot per reader, what-if on a branch.** A session keeps its answers while data keeps arriving; a recalibration or trial ingest runs on a copy-free branch, gets compared with main, then is promoted or deleted.
 
@@ -321,7 +321,7 @@ Every capability below comes from one decision: an entity is a point in a space 
 | Capability | What it does | Instead of |
 |---|---|---|
 | Population-relative coordinates | `delta = (shape − μ) / σ` per dimension; one vector serves anomaly, clustering, drift and comparison | Learned embeddings with latent dimensions that need retraining when the data shifts |
-| Calibrated anomaly score | Continuous anchor patterns score each entity on rank-Gaussian, shrunk-covariance Mahalanobis distance plus, when an event line with an edge table exists, its motion against the population's velocity field (`score_axes`, nearest-peer distance opt-in); a conformal p-value against the fitted population makes `is_anomaly` an alarm budget: at the 95th percentile at most 5 % of the population is flagged; entities scored later keep that budget (on smaller calibrations via out-of-fold scores; on larger ones the difference is within noise); `check_alerts` reports `alarm_rate_drift` when later rows exceed it | Choosing a contamination rate or a hand-tuned cut-off, or trusting a p-value from a Gaussian null the data does not follow |
+| Calibrated anomaly score | Continuous anchor patterns score each entity on rank-Gaussian, shrunk-covariance Mahalanobis distance plus, when an event line with an edge table exists, its motion against the population's velocity field (`score_axes`, nearest-peer distance opt-in); a conformal p-value against the fitted population makes `is_anomaly` an alarm budget: at the 95th percentile at most 5 % of the population is flagged; entities scored later keep that budget (on smaller calibrations via out-of-fold scores; on larger ones the difference is within noise); `check_alerts` reports `alarm_rate_drift` when later rows exceed it and `population_drift` when they no longer follow the population | Choosing a contamination rate or a hand-tuned cut-off, or trusting a p-value from a Gaussian null the data does not follow |
 | Self-calibrating threshold | θ is a percentile of the population's own `delta_norm` — per group when a pattern declares `group_by_property` — for event, mixture and discrete patterns | Choosing a contamination rate or a hand-tuned cut-off |
 | Per-group calibrated references | `score_per_group` (Spark `find_anomalies`, pattern YAML) scores each `group_by` group against its own calibrated reference, so `is_anomaly` means rare within the group and each group keeps its own alarm budget; groups too small to flag anyone are pooled, `score_group` / `calibration_scope` name the reference, and `recalibrate` refits every group | One global cut-off that floods the alarms with the largest or most volatile group, or one model per segment maintained by hand |
 | Distribution-aware dimensions | Each dimension declares a kind (gaussian, poisson, bernoulli), detected or set with `kind:` on precomputed dimensions; `sphere_overview` flags dead, sparse and dominant dimensions with concrete advice | One metric for every feature, and silent garbage when a feature breaks its assumption |
@@ -333,8 +333,11 @@ Every capability below comes from one decision: an entity is a point in a space 
 | Capability | What it does | Instead of |
 |---|---|---|
 | Named attribution | `explain_anomaly` turns the p-value into bits of evidence (`−log2 conformal_p`) and splits them exactly over the scoring axes and the real dimensions; on patterns that θ decides, by each dimension's share of `delta_norm²` | SHAP / LIME approximations over a trained model |
+| Evidence by axis | `hypertopos.spark.axis_evidence` (and `FrozenCalibration.row_evidence`) splits each entity's bits of evidence between values that are extreme against the population and activity that changed against the population's own flow | One score that cannot say whether an entity is extreme or has changed |
 | Alternative hypotheses | `find_diverse_explanations` returns disjoint dimension sets that each explain the anomaly | One explanation and a manual search for "what else could it be" |
 | Error-controlled detection | The alarm budget on every calibrated pattern; a cell gate (hypergeometric enrichment, Benjamini-Hochberg or Storey over cells) that names the regions holding more anomalies than their size predicts; a `calibration_age` alert when the reference gets old | A ranked list with no statement about false alarms or where they concentrate |
+| Limits of a calibration | `hypertopos.spark.calibration_card` states what a calibration can see: the smallest p-value a fitted entity can get, whether the population or a group can flag anyone at all, the groups pooled for being too small, and the dimensions where one value holds nearly every entity | Reading "no anomalies" as "nothing unusual" when the population was too small to flag anyone |
+| Population drift alert | `check_alerts` raises `population_drift` when the rows written since a calibration no longer follow the calibrated population (their p-values or a dimension's values), with the same test as Spark's `calibration_status`, also when the flagged count looks normal | Watching the alert count and missing a population that moved without raising it |
 | Verdicts an agent can act on | `assess_anomaly_certainty`, `consensus_classification`, `calibration_drift_report`, `theta_sensitivity_report` return a verdict with its rationale | Stitching several low-level calls and interpreting them by hand |
 | Anomaly by absence | `find_density_gaps` finds combinations that are missing from the population; `find_conformance_violations` checks declared rules | Outlier detection, which only sees extremes that exist |
 
@@ -450,6 +453,8 @@ See [Configuration](docs/configuration.md) for the YAML reference and [Container
 | [Container Deployment](docs/container-deployment.md) | Run the CLI as one-shot container jobs |
 | [hypertopos on Spark](docs/spark.md) | From a Spark DataFrame of events to per-entity geometry |
 | [Benchmarks](docs/benchmarks.md) | Validation results — banking, AML, transportation |
+| [When not to use hypertopos](docs/when-not-to-use.md) | The cases where another tool is the better choice |
+| [Refutations](docs/refutations.md) | Hypotheses that were tested, failed and are closed |
 
 ## Status
 

@@ -11,13 +11,19 @@ below the exact statistic. The per-dimension test compares the rows' values with
 the reference's CDF sketch at its grid values, tie-correct: at a value carried
 by several grid points the new rows' share below it is compared with the first
 level there and their share at or below it with the last.
+
+Spark's ``calibration_status`` and the sphere's ``check_alerts`` both decide
+drift with :func:`drift_rule` over :func:`batch_tests`.
 """
 
 from __future__ import annotations
 
 import numpy as np
+from scipy.special import ndtr
 from scipy.stats import betabinom, kstwo
 
+ALPHA = 0.025
+"""Family error rate of one drift decision, split between the p-value and the dimension tests."""
 P_BINS = 4096
 P_EDGES = np.arange(P_BINS + 1) / P_BINS
 
@@ -80,3 +86,52 @@ def flag_count_p(flagged: int, rows: int, n_fitted: int, percentile: float) -> f
     if a < 1:
         return None
     return float(betabinom.sf(flagged - 1, rows, a, n_fitted + 1 - a))
+
+
+def batch_counts(values: list[np.ndarray], p: np.ndarray, x: np.ndarray) -> np.ndarray:
+    """The p-value histogram and each dimension's grid counts, concatenated."""
+    return np.concatenate(
+        [p_histogram(p), *(grid_counts(v, x[:, d]) for d, v in enumerate(values))]
+    )
+
+
+def batch_tests(
+    vec: np.ndarray,
+    grids: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
+    dims: tuple[str, ...],
+    n_fitted: int,
+    rows: int,
+) -> tuple[float, dict[str, float]]:
+    """``p_distribution`` and ``p_dimensions`` of one batch's summed counts."""
+    n_eff = effective_n(n_fitted, rows)
+    p_dims: dict[str, float] = {}
+    start = P_BINS
+    for dim, (v, low, high) in zip(dims, grids, strict=True):
+        stop = start + 2 * len(v) + 1
+        p_dims[dim] = ks_p(grid_ks(vec[start:stop], low, high), n_eff)
+        start = stop
+    return ks_p(uniform_ks_binned(vec[:P_BINS]), n_eff), p_dims
+
+
+def drift_rule(
+    p_distribution: float | None, p_dimensions: dict[str, float], tests: int = 1
+) -> tuple[bool, list[str]]:
+    """Drift verdict and drifted dimensions, Bonferroni over the two tests, the
+    dimensions and ``tests`` batches. ``p_distribution`` None: that test was not run."""
+    cut = ALPHA / (2 * tests)
+    drifted = [d for d, p in p_dimensions.items() if p < cut / len(p_dimensions)]
+    return (p_distribution is not None and p_distribution < cut) or bool(drifted), drifted
+
+
+def values_from_score_delta(
+    grid: np.ndarray, levels: np.ndarray, location: np.ndarray, score_delta: np.ndarray
+) -> np.ndarray:
+    """Each dimension's values as the grid test sees them, from stored ``score_delta``.
+
+    ``score_delta`` is the rank-Gaussian coordinate minus ``location``; its level
+    read back on the sketch gives a value with the same position among the grid
+    values (a tied value comes back exactly, since it maps to the middle of its
+    flat run of levels). Values outside the grid come back at its end points.
+    """
+    u = ndtr(np.asarray(score_delta, dtype=np.float64) + location)
+    return np.column_stack([np.interp(u[:, d], levels, grid[d]) for d in range(len(grid))])

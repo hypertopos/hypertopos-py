@@ -15,6 +15,7 @@ from hypertopos.engine.robust import (
     counterfactual,
     fit_cdf,
     fit_reference,
+    half_states,
     is_anomaly,
     ledoit_wolf,
     reference_from_arrays,
@@ -247,3 +248,49 @@ def test_shapley_shares_survive_a_singular_covariance() -> None:
     assert np.all(shares >= 0.0)
     d2 = np.einsum("ij,jk,ik->i", rows, np.linalg.pinv(cov), rows)
     assert shares.sum(axis=1) == pytest.approx(d2, rel=1e-6)
+
+
+def _peak_bytes(fn, *args):
+    import tracemalloc
+
+    started = not tracemalloc.is_tracing()
+    if started:
+        tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        base, _ = tracemalloc.get_traced_memory()
+        fn(*args)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        if started:
+            tracemalloc.stop()
+    return peak - base
+
+
+def test_the_rank_gaussian_fit_holds_at_most_two_copies_of_the_rows():
+    x = np.random.default_rng(0).standard_normal((200_000, 12))
+    peak = _peak_bytes(robust._sketch_and_gauss, x, None, robust._levels(robust.CDF_POINTS))
+    assert peak <= 2.5 * x.nbytes, peak / x.nbytes
+
+
+def test_the_shrunk_covariance_holds_at_most_one_copy_of_the_rows():
+    z = np.random.default_rng(1).standard_normal((200_000, 12))
+    assert _peak_bytes(ledoit_wolf, z) <= 1.3 * z.nbytes
+
+
+def test_a_large_fit_holds_at_most_four_copies_of_the_rows():
+    # Above the out-of-fold size the fit is the sketch, the covariance and one scoring pass.
+    x = np.random.default_rng(2).standard_normal((200_000, 12))
+    peak = _peak_bytes(fit_reference, x, [f"d{i}" for i in range(12)])
+    assert peak <= 4.0 * x.nbytes, peak / x.nbytes
+
+
+def test_the_current_axis_fit_does_not_hold_all_neighbour_velocities_at_once(monkeypatch):
+    # The velocity residual of every row is formed from its 50 nearest sampled states;
+    # gathered for all rows at once that is 50 x 5 numbers per row. A small block keeps
+    # the per-block cost out of the per-row figure.
+    monkeypatch.setattr(robust, "_VELOCITY_BLOCK", 4_096)
+    x, ev = _population(200_000, 3, drift=0.1)
+    states = half_states(ev, len(x))
+    peak = _peak_bytes(lambda: fit_reference(x, ("a", "b", "c"), states=states))
+    assert peak / len(x) <= 800, peak / len(x)

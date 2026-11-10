@@ -125,7 +125,7 @@ def test_reliability_flags_use_the_group_reference(sphere: Path) -> None:
 
 
 def test_alarm_rate_drift_is_silent_on_a_per_group_pattern(sphere: Path) -> None:
-    assert _navigator(sphere)._check_alarm_rate_drift(PID) == []
+    assert _navigator(sphere)._check_drift_since_calibration(PID) == []
 
 
 def test_compare_branches_has_no_single_threshold(tmp_path: Path) -> None:

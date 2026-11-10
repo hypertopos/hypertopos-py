@@ -8,13 +8,10 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from scipy.stats import betabinom, kstest, kstwo
 
-pytest.importorskip("pyspark")
-
-from scipy.stats import betabinom, kstest, kstwo  # noqa: E402
-
-from hypertopos.engine import robust  # noqa: E402
-from hypertopos.spark import _drift_stats as ds  # noqa: E402
+from hypertopos.engine import drift_stats as ds
+from hypertopos.engine import robust
 
 D = 4
 ZERO_SHARE = {2: 0.90, 3: 0.99}  # tied dimensions: most of their mass sits at one value

@@ -183,3 +183,12 @@ def test_reject_malformed_entry():
 def test_empty_list_returns_empty_config():
     cfg = parse_edge_dimensions([], pattern_type="event")
     assert cfg.dims == {}
+
+
+def test_parse_every_known_edge_dimension_by_name():
+    # Every dimension the engine computes is accepted by name, with no params.
+    from hypertopos.engine.edge_features import EDGE_DIM_KINDS
+
+    for name in EDGE_DIM_KINDS:
+        cfg = parse_edge_dimensions([name], pattern_type="event")
+        assert name in cfg.dims

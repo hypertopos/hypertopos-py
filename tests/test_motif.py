@@ -3300,3 +3300,38 @@ class TestChainKAdaptiveFrontierCap:
             f"_rank_motifs dispatched chain_k k={k} with max_frontier="
             f"{call_args.args[4]}, expected {expected_frontier} (per-k cap)"
         )
+
+
+def _burst_then_ordinary(direction: str):  # type: ignore[no-untyped-def]
+    """15 distinct counterparties within 20 h, then 3 ordinary edges weeks later."""
+    from hypertopos.engine.adjacency import AdjacencyIndex
+
+    day = 86400.0
+    burst = [(f"T{i:02d}", 3600.0 * 1.3 * i) for i in range(15)]  # 0 .. 18.2 h
+    later = [("L0", 30 * day), ("L1", 45 * day), ("L2", 60 * day)]
+    rows = burst + later
+    pairs = [("HUB", c) if direction == "out" else (c, "HUB") for c, _ in rows]
+    return AdjacencyIndex.from_edge_lists(
+        from_keys=[f for f, _ in pairs],
+        to_keys=[t for _, t in pairs],
+        timestamps=[ts for _, ts in rows],
+        amounts=[1.0] * len(rows),
+        event_keys=[f"e{i}" for i in range(len(rows))],
+    )
+
+
+@pytest.mark.parametrize(
+    ("direction", "enum"),
+    [("out", GDSNavigator._enum_fan_out_via_adj), ("in", GDSNavigator._enum_fan_in_via_adj)],
+)
+def test_fan_motif_finds_a_burst_followed_by_later_ordinary_edges(direction, enum) -> None:  # type: ignore[no-untyped-def]
+    # The window slides over the seed's whole history: a burst earlier than the
+    # seed's last edge is still a fan, with every counterparty of the burst.
+    adj = _burst_then_ordinary(direction)
+    (found,) = enum("HUB", adj, 24 * 3600.0, 3)
+    assert found["k"] == 15
+    keys = {e[1] if direction == "out" else e[0] for e in found["edges"]}
+    assert keys == {f"T{i:02d}" for i in range(15)}
+    # A window shorter than the burst finds the densest part of it.
+    (part,) = enum("HUB", adj, 6 * 3600.0, 3)
+    assert part["k"] == 5

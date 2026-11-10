@@ -112,6 +112,23 @@ explain(result, entities=["ACC-1029", "ACC-4471"], dims=["amount_sum_out", "n_di
 
 The first three rows of an entity are its `top_reasons`. `explain` runs on the driver over the cached calibration; it needs the result DataFrame itself, because renaming or selecting away the `entity` column drops the metadata that points to the calibration.
 
+`explain` divides the `mahal` part of the score over dimensions; `axis_evidence` says how large that part is next to `current`, one row per entity:
+
+```python
+from hypertopos.spark import axis_evidence
+
+axis_evidence(result, top_n=20).show()
+```
+
+| Column | Meaning |
+|---|---|
+| `entity`, `p_value`, `is_anomaly` | As in the result |
+| `bits` | The entity's evidence, `-log2 p_value` |
+| `bits_mahal` | The part from how far its values lie from the population: the part `explain` divides over dimensions |
+| `bits_current` | The part from how unusually its activity changed between the two halves of the period; null without the `current` axis (see [Score axes](#score-axes)), when `bits_mahal` equals `bits` |
+
+A flagged entity with most of its bits on `current` stands out because it changed, not because its values are extreme, so its `explain` rows tell only part of the story. It takes the same `entities`, `top_n` and, for a `score` result, `events` arguments as `explain`.
+
 ### The calibration behind a result
 
 `sphere_of(result)` returns the handle to what a result rests on, without a path to type:
@@ -124,6 +141,29 @@ sphere.path                                   # where the entity table and calib
 sphere.geometry()                             # pyarrow table: every dimension's value and delta, plus the scores
 sphere.to_delta(spark, "main.aml.entity_geometry")   # the same table, written with saveAsTable
 ```
+
+#### What the calibration can and cannot see
+
+`calibration_card(result)` (or of a `Sphere`) reads the saved calibration on the driver and states the limits of its evidence, before anyone reads the flags:
+
+```python
+from hypertopos.spark import calibration_card
+
+card = calibration_card(result)
+card["can_flag"], card["p_floor"], card["tied_dimensions"]
+```
+
+| Key | Meaning |
+|---|---|
+| `entities`, `flagged` | Rows the calibration was fitted on, and how many of them are flagged |
+| `percentile`, `alpha` | The flag rule: an entity is flagged when its `p_value` is at most `alpha = 1 - percentile / 100` |
+| `p_floor`, `can_flag` | The smallest p-value a fitted entity can get, `2 / (n + 1)` (it counts itself in the reference), and whether it reaches `alpha`: a population smaller than `2 / alpha - 1` entities can never flag a fitted entity |
+| `tied_dimensions` | `{dim: share}` for dimensions where one value holds at least 95 % of the entities (a share that is almost always 0, a count that is almost always 1). On such a dimension any other value is an extreme deviation by itself, so check whether a flag rests on it (`explain`) before acting |
+| `score_axes`, `window_days` | The axes of `anomaly_score` and the calendar days the calibration covers |
+| `groups` | With `group_by`: per group its `entities`, `scored_by` (`group`: its own reference, with `score_per_group`; `global`: the population's), `reference_size`, `p_floor` and `can_flag` |
+| `pooled_groups` | Groups too small for their own statistics, calibrated together as one pool |
+
+It needs no Spark action and changes no score.
 
 ### Hand the result to an agent
 
@@ -188,7 +228,7 @@ It runs two tests, with a combined false-alarm rate of about 2.5 % when nothing 
 - the batch's `p_value` against uniform (a Kolmogorov-Smirnov test, `p_distribution`), which catches a shift of the joint score;
 - each dimension against the calibrated population's distribution of that dimension (`p_dimensions`, one Kolmogorov-Smirnov test per dimension with a Bonferroni correction), which names the dimensions that moved in `drifted_dimensions`. Tied values, such as a dimension that is mostly zero, are compared correctly.
 
-Both tests account for the calibration itself being a sample, so a small calibration does not raise false alarms. The result also reports `rows`, `flagged`, `alarm_rate`, `expected_alarm_rate` (1 − `percentile` / 100) and `p_flag_count`, the tail probability of that many flags under the frozen calibration (beta-binomial). That last test is reported for reference and does not set `status`.
+The sphere path runs the same two tests on rows ingested after a calibration: `check_alerts` reports them as `population_drift`. Both tests account for the calibration itself being a sample, so a small calibration does not raise false alarms. The result also reports `rows`, `flagged`, `alarm_rate`, `expected_alarm_rate` (1 − `percentile` / 100) and `p_flag_count`, the tail probability of that many flags under the frozen calibration (beta-binomial). That last test is reported for reference and does not set `status`.
 
 It also checks the length of the scored window. `window_days` is the batch's calendar span, from its first to its last event, in whole days rounded up (at least 1); `calibration_window_days` is the same span of the events the calibration was fitted on, stored with the calibration. When the scored window is not between 95 % and 100 % of the calibration window's length, `status` is `window_mismatch` with a `reason` naming both windows: calibrate on a window of the same length as the scored one. Window lengths matter more than they look: a window 10 % shorter than its calibration already doubles the alarm rate, and a 5 % longer one quadruples it. Use fixed-length windows (e.g. 28 or 30 days), not calendar months: February against January is 28 / 31 = 0.90 and fails. The tests above are still computed and reported. A calibration saved before this check existed has `calibration_window_days` `None` and skips it until you calibrate again.
 
@@ -260,7 +300,7 @@ The entity table and its calibration are stored under `sphere_root`. The default
 The driver temp directory does not survive a cluster restart. Set `sphere_root` to a persistent location, such as a Unity Catalog Volume, to keep calibrations. On serverless compute a custom Spark conf cannot be set, so pass `sphere_root=` or set `HYPERTOPOS_SPHERE_ROOT`.
 
 > [!TIP]
-> The driver holds the per-entity table, its calibration and the result. With the `current` axis, `lance_path()` also rebuilds one row per event side from the half states on the driver (about 25 bytes each) while it builds the sphere. With all dimensions, the calibration step alone takes under 1 GB per million entities, and the whole call takes several times that, so size the driver at a few GB per million entities. `max_entities` (5 million by default) stops a larger run with a clear error before it starts; raise it on a bigger driver.
+> The driver holds the per-entity table, its calibration and the result. With the `current` axis, `lance_path()` also rebuilds one row per event side from the half states on the driver (about 25 bytes each) while it builds the sphere. With all dimensions, the driver's Python process peaks at about 2.5 GB per million entities, with `mahal` alone or with `current`; the peak comes after the calibration, while the result and the sphere are built (the calibration step itself takes about 1.5 GB per million). Size the driver at about 3 GB per million entities. `max_entities` (5 million by default) is a row count, not a memory check: it stops a larger run with a clear error before it starts, but a run under it can still run out of driver memory. The limit is the memory of the driver you run on, so compare that estimate with your driver before a large run. Where the driver's memory cannot be set, as on Databricks serverless, it can also differ between runs. Serverless driver containers have been measured from about 8 GB to about 25 GB in one workspace. When the estimate is close to your driver's memory, set `max_entities` lower, or run on a driver with more memory and raise `max_entities` there. `score` sends the calibration with its tasks, about 16 MB per million fitted entities; Spark Connect (as on Databricks serverless) refuses a message above 128 MB, so `score` there works up to about 8 million fitted entities.
 
 ### From the command line
 
@@ -362,4 +402,4 @@ Times are converted to UTC epoch seconds arithmetically, so results do not depen
 - Dimensions are per entity. Pair-level and chain-level patterns (counterparty graphs, chains, motifs) are built by the file-based builder; see [Configuration](configuration.md).
 - Each dimension is standardised against the population (mean and standard deviation, with a floor of 0.01 on the deviation) and never clipped, so an entity far beyond the usual range stays far. `delta_norm` treats dimensions as independent (two dimensions that move together each count in it); the anomaly score does not, because it measures distance on rank-Gaussian coordinates with a shrunk covariance. The distance is measured from one centre per population, so a population made of several distinct kinds of entity is described poorly without `group_by`.
 - `find_anomalies` calibrates on the data it is given; to measure new data against an earlier calibration, use `score`.
-- The smallest possible `p_value` is `1/(n+1)` for a population of n entities, so at `percentile=99` a population needs about 100 entities before anything can be flagged.
+- The smallest `p_value` a fitted entity can get is `2/(n+1)` for a population of n entities (it counts itself in the reference), so at `percentile=99` a population needs about 200 entities before `find_anomalies` can flag anyone. A new row scored with `score` has a floor of `1/(n+1)`.

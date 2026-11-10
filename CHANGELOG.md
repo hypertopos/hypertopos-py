@@ -7,6 +7,28 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-11-10
+
+### Added
+
+- `hypertopos.spark.axis_evidence(result, ...)`: one row per entity with its evidence `bits` (`-log2 p_value`) split into `bits_mahal` (how far its values lie from the population, the part `explain` divides over dimensions) and `bits_current` (how unusually its activity changed between the two halves of the period; null without the `current` axis). Takes the same `entities`, `top_n` and `events` arguments as `explain`.
+- `FrozenCalibration.row_evidence(table, members=...)` returns each row's score evidence, axis ranks included, and the reference that scored it (its group's with `score_per_group`).
+- `hypertopos.spark.calibration_card(like)`: what the calibration behind a result can and cannot see, read on the driver with no Spark action. It reports the flag rule (`percentile`, `alpha`), `flagged`, the smallest p-value a fitted entity can get (`p_floor`) and whether it reaches `alpha` (`can_flag`; a population smaller than `2 / alpha - 1` can never flag a fitted entity), `tied_dimensions` (one value held by at least 95 % of the entities, where any other value is extreme by itself), `score_axes` and `window_days`; with `group_by`, the same per group (`scored_by`, `reference_size`, `p_floor`, `can_flag`) and the `pooled_groups`.
+- `check_alerts` raises `population_drift` (MEDIUM) on a calibrated pattern when the rows written since its calibration no longer follow the calibrated population: their `conformal_p` against uniform and each dimension against the population's distribution, the same test and decision as Spark's `calibration_status` `drift`. It also catches shifts that leave the flagged count normal, where `alarm_rate_drift` stays silent. `details`: `rows`, `flagged`, `alarm_rate`, `expected_alarm_rate`, `p_distribution`, `p_dimensions`, `drifted_dimensions`, `p_flag_count`, `status`.
+- Documentation: a "When not to use hypertopos" page lists the cases where another tool is the better choice, and the refutations page records the extensions of the calibrated score that were tested and closed (alert sets by false-discovery rate, counterfactual explanations, group masking, other axis fusions, kurtosis weights, evidence as supervised features, the agent comparison against SQL).
+
+### Changed
+
+- The calibration step of `hypertopos.spark.find_anomalies`, and of a sphere build, needs less driver memory at its peak: it holds fewer copies of the entity table at once. Scores, p-values and flags are unchanged.
+- Configuration reference: `dimension_weights` is no longer called recommended; the default is uniform weights, and `kurtosis` / `auto` amplify heavy-tailed dimensions.
+- Spark guide and `gds-spark`: driver sizing guidance from measured runs. `max_entities` is a row count, not a memory check; the guide gives the driver memory a run needs per million entities, so a run can be checked against the driver it runs on, including drivers whose memory cannot be set and varies between runs.
+
+### Fixed
+
+- `edge_dimensions: [edge_curvature_frc]` in `sphere.yaml` no longer fails with a `KeyError` at parse time; the dimension is accepted by name like the other five. The configuration reference also lists the `chain` anchor regime of `edge_dim_aggregations` as supported (it was described as raising `NotImplementedError`).
+- `fan_out` / `fan_in` motifs (as `find_high_potential_motifs` counts them) find the densest window of `time_window_hours` anywhere in the seed's history; they no longer miss a burst of transfers that was followed by later ordinary activity, and report every counterparty of that burst.
+- Spark `score` against a calibration with the `current` axis no longer fails on large populations on Spark Connect (for example Databricks serverless) with "Sent message larger than max": it ships only what new entities are scored with, so the shipped calibration is about half its earlier size. Scores are unchanged.
+
 ## [0.10.3] — 2026-10-31
 
 ### Added

@@ -195,33 +195,7 @@ def explain(
         ``above`` / ``below`` / ``at`` the mean. Rows are ordered by entity
         score, then by share.
     """
-    sphere = sphere_of(result)
-    calibration = sphere.calibration()
-    if dims is not None:
-        unknown = [d for d in dims if d not in calibration.dims]
-        if unknown:
-            raise ValueError(f"unknown dims {unknown}; calibrated: {list(calibration.dims)}")
-    if entities is None:
-        keys = [
-            r[KEY] for r in result.orderBy("anomaly_score", ascending=False).limit(top_n).collect()
-        ]
-    else:
-        keys = [str(k) for k in entities]
-    scored = bool(KEY in result.columns and result.schema[KEY].metadata.get(METADATA_SCORED))
-    if scored:
-        if events is None:
-            raise ValueError(
-                "this is a score() result: its entities are not in the calibration; "
-                "pass the events it scored, explain(result, events=df)"
-            )
-        table = _scored_entities(events, sphere, keys, calibration.group_by)
-    else:
-        table = sphere.entities()
-        table = table.filter(pc.is_in(table[KEY], value_set=pa.array(keys, pa.string())))
-    missing = set(keys) - set(table[KEY].to_pylist())
-    if missing:
-        raise ValueError(f"not in this result: {sorted(missing)[:10]}")
-
+    calibration, table, keys, scored = _explained(result, entities, top_n, events, dims)
     scores = calibration.score(table, members=not scored)
     shapes = calibration.shapes(table)
     mu, sigma = calibration.raw_params(table)
@@ -251,3 +225,102 @@ def explain(
         "delta double, pct_of_total double, direction string"
     )
     return result.sparkSession.createDataFrame(rows, schema)
+
+
+def axis_evidence(
+    result: DataFrame,
+    entities: Sequence[str] | None = None,
+    top_n: int = 50,
+    events: DataFrame | None = None,
+) -> DataFrame:
+    """How much of an entity's evidence is extreme values, how much is change: one row per entity.
+
+    Args:
+        result: The DataFrame ``find_anomalies`` or ``score`` returned.
+        entities: Entity keys; default is the ``top_n`` highest scores.
+        top_n: How many of the highest-scoring entities, when ``entities`` is None.
+        events: For a ``score`` result, the events it scored (as for ``explain``).
+
+    Returns:
+        ``entity, p_value, is_anomaly, bits, bits_mahal, bits_current``:
+        ``bits`` is the entity's evidence ``-log2 p_value``, split over the
+        score axes as ``explain_anomaly`` splits it on a sphere. ``bits_mahal``
+        is the part from how far its values lie from the population (the part
+        ``explain`` divides over dimensions), ``bits_current`` the part from how
+        unusually its activity changed between the two halves of the period.
+        ``bits_current`` is null when the result has no ``current`` axis
+        (without a ``time`` role, and by default with ``score_per_group``,
+        where ``score_axes`` must name it); then ``bits_mahal`` equals ``bits``.
+        Rows are ordered by entity score.
+    """
+    from hypertopos.engine.robust import attribute
+
+    calibration, table, keys, scored = _explained(result, entities, top_n, events, None)
+    evidence, refs = calibration.row_evidence(table, members=not scored)
+    # The result's own p-value and flag: rescoring a few rows can land one rank
+    # step away from the score the whole table got (floating-point summation order).
+    stored = {
+        r[KEY]: r
+        for r in result.where(F.col(KEY).isin(keys)).select(KEY, "p_value", "is_anomaly").collect()
+    }
+    if set(keys) - set(stored):
+        raise ValueError(f"not in this result: {sorted(set(keys) - set(stored))[:10]}")
+    names = table[KEY].to_pylist()
+    rank = {k: i for i, k in enumerate(keys)}
+    rows = []
+    for i in sorted(range(len(names)), key=lambda i: rank[names[i]]):
+        p = float(stored[names[i]]["p_value"])
+        split = attribute(refs[i], evidence.delta[i], evidence.axis_ranks[i], p)
+        rows.append(
+            (
+                names[i],
+                p,
+                bool(stored[names[i]]["is_anomaly"]),
+                split.bits,
+                split.axis_bits.get("mahal", 0.0),
+                split.axis_bits.get("current"),
+            )
+        )
+    schema = (
+        f"{KEY} string, p_value double, is_anomaly boolean, bits double, bits_mahal double, "
+        "bits_current double"
+    )
+    return result.sparkSession.createDataFrame(rows, schema)
+
+
+def _explained(
+    result: DataFrame,
+    entities: Sequence[str] | None,
+    top_n: int,
+    events: DataFrame | None,
+    dims: Sequence[str] | None,
+) -> tuple[FrozenCalibration, pa.Table, list[str], bool]:
+    """The calibration, the entity table of the entities to explain, their keys in
+    order, and whether ``result`` came from ``score``."""
+    sphere = sphere_of(result)
+    calibration = sphere.calibration()
+    if dims is not None:
+        unknown = [d for d in dims if d not in calibration.dims]
+        if unknown:
+            raise ValueError(f"unknown dims {unknown}; calibrated: {list(calibration.dims)}")
+    if entities is None:
+        keys = [
+            r[KEY] for r in result.orderBy("anomaly_score", ascending=False).limit(top_n).collect()
+        ]
+    else:
+        keys = [str(k) for k in entities]
+    scored = bool(KEY in result.columns and result.schema[KEY].metadata.get(METADATA_SCORED))
+    if scored:
+        if events is None:
+            raise ValueError(
+                "this is a score() result: its entities are not in the calibration; "
+                "pass the events it scored, explain(result, events=df)"
+            )
+        table = _scored_entities(events, sphere, keys, calibration.group_by)
+    else:
+        table = sphere.entities()
+        table = table.filter(pc.is_in(table[KEY], value_set=pa.array(keys, pa.string())))
+    missing = set(keys) - set(table[KEY].to_pylist())
+    if missing:
+        raise ValueError(f"not in this result: {sorted(missing)[:10]}")
+    return calibration, table, keys, scored

@@ -40,7 +40,7 @@ from hypertopos.spark._plan import (
     state_frame,
     window_days,
 )
-from hypertopos.spark._result import TOP_REASONS, result_table
+from hypertopos.spark._result import RANK_PREFIX, TOP_REASONS, result_table
 
 MAX_ENTITIES = 5_000_000
 NO_GROUP = "(none)"
@@ -89,6 +89,7 @@ def find_anomalies(
     sphere_root: str | None = None,
     cache: bool = True,
     max_entities: int = MAX_ENTITIES,
+    dimension_ranks: bool = False,
 ) -> DataFrame:
     """Score every entity of an event table against its population.
 
@@ -103,7 +104,7 @@ def find_anomalies(
             computed per group. By default the score, its p-value, flag and the
             reasons' shares stay population-wide; see ``score_per_group``. An
             entity takes the most frequent value in its own events (ties: the
-            smallest); entities seen only as a counterparty go to ``"(none)"``.
+            smallest); an entity with no value in the column goes to ``"(none)"``.
         percentile: Population percentile above which an entity is flagged.
         dims: ``"auto"`` or the dimension names to use (see ``docs/spark.md``).
         extra_dims: ``{name: Spark SQL aggregate}`` over the event rows.
@@ -131,6 +132,13 @@ def find_anomalies(
             the driver's temp directory.
         cache: Reuse the calibration made earlier from the same input and settings.
         max_entities: Refuse to calibrate above this many entities (driver memory).
+        dimension_ranks: Add ``dimension_rank_pct``, a map from dimension name
+            to where the entity's value sits in the population (its group's
+            with ``score_per_group``), 0-100: the share of that population
+            below the value, tied values taking the middle of their range.
+            The value is the one measured: shares and spreads are ranked
+            before the small-count adjustment the score applies.
+            Filter on it in SQL, e.g. ``dimension_rank_pct['n_out'] >= 99``.
 
     Returns:
         One row per entity: ``entity``, ``anomaly_score`` (the calibrated
@@ -152,8 +160,8 @@ def find_anomalies(
         result adds that column and ``calibration_scope`` (``group``,
         ``pooled``, or with ``score_per_group`` ``global`` for an entity
         scored against the whole population). The
-        ``entity`` column's metadata carries the fingerprint and the
-        calibration path.
+        ``entity`` column's metadata carries the calibration's path, which
+        :func:`sphere_of` reads.
     """
     if score_per_group and group_by is None:
         raise ValueError("score_per_group needs group_by")
@@ -178,6 +186,11 @@ def find_anomalies(
         score_axes=axes,
     )
     path = sphere_dir(_sphere_root(df, sphere_root), fp)
+    if (path / CALIBRATION_FILE).exists() and not (path / ENTITIES_FILE).exists():
+        raise ValueError(
+            f"{path} holds an exported reference of this calibration (export_reference), "
+            "without its entities: pass another sphere_root"
+        )
     scores: Scores | None = None  # a cached entry holds no member scores: they are computed below
     if cache and (path / CALIBRATION_FILE).exists():
         entities = pq.read_table(path / ENTITIES_FILE)
@@ -227,9 +240,18 @@ def find_anomalies(
         )
         _save(path, entities, plan, calibration)
 
-    table = result_table(entities, calibration, members=True, scores=scores)
+    table = result_table(
+        entities, calibration, members=True, dimension_ranks=dimension_ranks, scores=scores
+    )
     flat = df.sparkSession.createDataFrame(table.to_pandas())
-    return shape_result(flat, len(calibration.dims), fp, path, group_by)
+    return shape_result(
+        flat,
+        len(calibration.dims),
+        fp,
+        path,
+        group_by,
+        rank_dims=calibration.dims if dimension_ranks else None,
+    )
 
 
 def _with_states(entities: pa.Table, frame: DataFrame) -> pa.Table:
@@ -393,6 +415,7 @@ def shape_result(
     *,
     scored: bool = False,
     dimensions: bool = False,
+    rank_dims: Sequence[str] | None = None,
 ) -> DataFrame:
     """Flat reason columns -> the result contract; metadata only when ``fp`` is given."""
     k = min(TOP_REASONS, n_dims)
@@ -423,4 +446,9 @@ def shape_result(
         columns += [group_by, "calibration_scope"]
     if dimensions:
         columns += ["dimension_values", *EVENT_TIMES]
+    if rank_dims is not None:
+        pairs = [
+            c for j, name in enumerate(rank_dims) for c in (F.lit(name), F.col(f"{RANK_PREFIX}{j}"))
+        ]
+        columns.append(F.create_map(*pairs).alias("dimension_rank_pct"))
     return flat.select(*columns)

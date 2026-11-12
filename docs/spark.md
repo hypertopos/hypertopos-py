@@ -54,7 +54,7 @@ result = find_anomalies(
 result.orderBy("anomaly_score", ascending=False).show(5, truncate=False)
 ```
 
-One row per entity, sender or receiver:
+One row per entity, a key of the `entity` column:
 
 | Column | Meaning |
 |---|---|
@@ -104,7 +104,7 @@ explain(result, entities=["ACC-1029", "ACC-4471"], dims=["amount_sum_out", "n_di
 | Column | Meaning |
 |---|---|
 | `entity`, `dim` | The entity and one of its dimensions |
-| `value` | The entity's value of the dimension (log-scaled where the dimension is) |
+| `value` | The entity's value of the dimension as the score uses it (log-scaled where the dimension is; shares and spreads after the small-count adjustment) |
 | `mu`, `sigma` | The population mean and standard deviation it is compared with (its group's, with `group_by`) |
 | `delta` | `(value − mu) / sigma`: the signed deviation in standard deviations |
 | `pct_of_total` | The dimension's share of the Mahalanobis part of `anomaly_score`, in percent (`explain_anomaly` gives the same share as a fraction); an entity's rows sum to 100. The `current` axis has no per-dimension split |
@@ -128,6 +128,51 @@ axis_evidence(result, top_n=20).show()
 | `bits_current` | The part from how unusually its activity changed between the two halves of the period; null without the `current` axis (see [Score axes](#score-axes)), when `bits_mahal` equals `bits` |
 
 A flagged entity with most of its bits on `current` stands out because it changed, not because its values are extreme, so its `explain` rows tell only part of the story. It takes the same `entities`, `top_n` and, for a `score` result, `events` arguments as `explain`.
+
+### Where a value sits in the population
+
+`top_reasons` and `explain` say which dimensions carry an entity's score. To ask the opposite question — which entities sit at a given place on dimensions you name — add the population rank of every dimension to the result:
+
+```python
+result = find_anomalies(events, entity="from_account", counterparty="to_account",
+                        amount="amount", time="ts", dimension_ranks=True)
+
+# many counterparties, small amounts
+result.where("dimension_rank_pct['n_distinct_out'] >= 99 AND dimension_rank_pct['amount_mean_out'] <= 20")
+```
+
+`dimension_rank_pct` is a map from dimension name to a number between 0 and 100: the share of the population whose value of that dimension is below the entity's. Read it this way:
+
+- It is read from distributions kept in the calibration, so it needs no second pass over the events.
+- With `score_per_group=True` the rank is within the entity's own group (or the pool, or the whole population, as `calibration_scope` says), which answers "is this high for entities like this one".
+- Tied values share the middle of their range: where most entities have the same value of a dimension (see `tied_dimensions` in the calibration card), they all rank near the middle and any other value ranks at an end.
+- The rank is of the value as measured. The score itself uses the shares and spreads (`round_amount_share`, `top_counterparty_share_out`, `in_out_ratio`, `amount_std_*`, `iet_std`, `hour_share_night`, `weekend_share`) after a small-count adjustment, which pulls an entity with few events toward the population mean; the rank ignores that adjustment, so entities with the same measured share have the same rank whatever their event counts. `explain` shows the adjusted value.
+- A calibration saved by an earlier version does not hold the measured values' distribution: `dimension_ranks=True` and `evidence_record` on it raise and ask to recalibrate.
+- From Python, `sphere_of(result).calibration().dimension_rank_pct(table, scores.score_delta)` gives the same ranks for an entity table and its `calibration().score(table)`.
+- `score(new_events, like=result, dimension_ranks=True)` gives the rank of new entities' values in the calibrated population, not among themselves.
+- The column is off by default; it adds one number per entity and dimension to the result.
+
+### One record per entity
+
+`evidence_record(result)` puts everything behind an entity's verdict in one row, so a case can be read, stored and audited without joining four outputs:
+
+```python
+from hypertopos.spark import evidence_record
+
+records = evidence_record(result, top_n=20)          # or entities=[...]
+records.write.mode("append").saveAsTable("main.aml.case_records")
+```
+
+| Columns | What they hold |
+|---|---|
+| `entity`, `p_value`, `is_anomaly`, `anomaly_score` | The verdict, exactly as the result holds it; with `group_by` also the group column and `calibration_scope` |
+| `bits`, `bits_mahal`, `bits_current` | The evidence and its split between extreme values and changed activity (as `axis_evidence`) |
+| `reasons` | The result's `top_reasons`, each with the entity's measured `value` of the dimension (log-scaled where the dimension is) and its `rank_pct` in the population that scored it (for shares and spreads `explain` shows the adjusted value the score uses; the record shows the measured one) |
+| `notes` | What limits this entity's evidence: `no_incoming_events` (no event names it as the counterparty, so every incoming count, sum, mean and extreme is 0), `tied_dimension:<dim>` (a reason rests on a dimension where one value holds at least 95 % of the entities), `reference_cannot_flag` (the population that scored it is too small for any of its entities to reach the threshold), `scope_pooled` / `scope_global` (with `score_per_group`, scored against the pool of small groups or the whole population) |
+| `reference_size`, `percentile`, `score_axes`, `window_days` | The population and the rule the verdict was made with |
+| `calibration`, `hypertopos_version` | The calibration's fingerprint (the one `sphere_of(result)` shows) and the library version that wrote the record |
+
+It runs on the driver over the saved calibration, like `explain`, and reads the verdict from the result instead of recomputing it. It reads the result once. For a `score` result pass the events it scored, `evidence_record(scored, events=new_events)`: the dimensions of the selected entities are recomputed from their events, and a scored frame that is not persisted or written to a table is itself recomputed by that one read. The record does not say whether the calibration still held when a batch was scored; keep the `calibration_status` of that batch next to it (see the monitoring table below).
 
 ### The calibration behind a result
 
@@ -159,6 +204,8 @@ card["can_flag"], card["p_floor"], card["tied_dimensions"]
 | `percentile`, `alpha` | The flag rule: an entity is flagged when its `p_value` is at most `alpha = 1 - percentile / 100` |
 | `p_floor`, `can_flag` | The smallest p-value a fitted entity can get, `2 / (n + 1)` (it counts itself in the reference), and whether it reaches `alpha`: a population smaller than `2 / alpha - 1` entities can never flag a fitted entity |
 | `tied_dimensions` | `{dim: share}` for dimensions where one value holds at least 95 % of the entities (a share that is almost always 0, a count that is almost always 1). On such a dimension any other value is an extreme deviation by itself, so check whether a flag rests on it (`explain`) before acting |
+| `flag_drivers` | `{dim: share}` of the flagged entities whose largest reason is that dimension, largest first: what the flags of this calibration are mostly about. The reasons split the `mahal` part of the evidence, so with the `current` axis check `axis_evidence` for how much of a flag that part is. When one or two dimensions lead most flags and the evidence is mostly `mahal`, the result is close to a ranking on those dimensions; if such a dimension is also in `tied_dimensions`, or is a near-copy of another one, consider calibrating without it (`dims=[...]`) and compare who is flagged |
+| `one_sided` | When the entity table has `n_in` (as with the default dimensions with a counterparty): `{no_incoming_events: {entities, flagged}}`, the entities no event names as the counterparty and how many of them are flagged. Every incoming count, sum, mean and extreme is 0 for such an entity, which can be enough for a flag. Whether that is a finding depends on the data (when the counterparty is a merchant, no entity has incoming events), so report these flags separately |
 | `score_axes`, `window_days` | The axes of `anomaly_score` and the calendar days the calibration covers |
 | `groups` | With `group_by`: per group its `entities`, `scored_by` (`group`: its own reference, with `score_per_group`; `global`: the population's), `reference_size`, `p_floor` and `can_flag` |
 | `pooled_groups` | Groups too small for their own statistics, calibrated together as one pool |
@@ -272,6 +319,84 @@ spark.createDataFrame(rows, SCHEMA).write.mode("append").saveAsTable("main.aml.c
 
 `status` on the batch row is `ok`, `drift`, `window_mismatch` or `too_few_rows`; a group row's is also `untested` (see above). A run whose batch row is not `ok` is the signal to recalibrate on a recent window, of the same length as the scored one. The fields that do not apply are null: the p-values under 100 rows, `p_flag_count` on the batch row with `score_per_group=True`, and the p-values and `p_flag_count` of an `untested` group (every group row with `group_by` alone). `scope` is the reference `calibration_scope` names for the group's rows.
 
+#### Keep the scored entities too
+
+The checks table says when the calibration moved. To see when an *entity* moved, append every run's scored rows as well, with the run date and the calibration they were judged against:
+
+```python
+from pyspark.sql import functions as F
+
+history = (today.select("entity", "p_value", "is_anomaly", "anomaly_score", "top_reasons")
+           .withColumn("run_date", F.lit(run))
+           .withColumn("calibration", F.lit(like.fingerprint)))
+history.write.mode("append").saveAsTable("main.aml.entity_history")
+```
+
+Since when is an entity flagged, and how often:
+
+```sql
+SELECT entity, MIN(run_date) AS first_flagged, MAX(run_date) AS last_flagged,
+       COUNT(*) AS runs_flagged
+FROM main.aml.entity_history WHERE is_anomaly GROUP BY entity
+```
+
+Who is flagged in a run without having been flagged in the run before:
+
+```sql
+SELECT entity, run_date FROM (
+  SELECT *, LAG(is_anomaly) OVER (PARTITION BY entity ORDER BY run_date) AS flagged_before
+  FROM main.aml.entity_history)
+WHERE is_anomaly AND NOT COALESCE(flagged_before, false)
+```
+
+What an entity looked like on a past date is a filter on `run_date`; join `calibration_checks` on `run_date` to see whether the calibration still held that day. Compare p-values and flags only between runs with the same `calibration`: after a recalibration an entity can change sides because the population it is compared with changed, not because it did. For a case that needs the full evidence, store its `evidence_record` row instead of the five columns above.
+
+#### Score against a population without receiving its entities
+
+A calibration can be handed to another team, workspace or organisation so that they score their own events against your population, without the population's entities:
+
+```python
+shared = sphere_of(result).export_reference("/Volumes/main/shared/hypertopos")
+
+# on the other side
+from hypertopos.spark import calibration_status, score, sphere_of
+
+like = sphere_of(shared_path)                # str(shared.path), handed over with the directory
+scored = score(their_events, like=like, dimensions=True)
+calibration_status(scored, like=like)     # do their entities look like that population at all?
+```
+
+`export_reference(root)` writes the calibration and the aggregation plan to a directory of the same name under `root` and returns that `Sphere`; hand over that directory (`shared.path`). A `root` that already holds this calibration with its entities is refused. Against it `score`, `calibration_status` and `explain(scored, events=...)` work as against the original. `calibration_card`, `evidence_record`, `entities()`, `geometry()` and what is built from them (`lance_path()`, `to_delta()`, `mcp_config()`) need the entity table and say so. Their events must use the same column names as yours, the `group_by` column included: the plan stores the names given to `find_anomalies`. The dimensions are then the same by construction, which is what makes the two populations comparable.
+
+What the copy holds, so that nobody mistakes it for an anonymised dataset: no entity table, no entity keys, no entity states; but each dimension's quantiles, the smallest and largest values included, the sorted scores of the population, and with `group_by` the names and sizes of the groups. It describes the population closely. A `drift` status on the other side means their entities are not distributed like yours, which is usually the first thing worth knowing before any of their flags is read. `root` must not be the directory the calibration itself is kept in, and `find_anomalies` refuses a `sphere_root` under which an export of the same calibration sits.
+
+### What changed between two runs
+
+`compare` joins two results judged against the same calibration and says, per entity, whether it entered or left the flag:
+
+```python
+from hypertopos.spark import compare, score
+
+yesterday = score(spark.table("main.aml.transactions_yesterday"), like=result)
+today = score(spark.table("main.aml.transactions_today"), like=result)
+
+changes = compare(yesterday, today)
+changes.where("transition = 'entered'").orderBy("p_value_current").show()
+```
+
+| Column | Meaning |
+|---|---|
+| `entity` | Every entity present in either result |
+| `transition` | `entered` (flagged now, not before), `left`, `stayed_flagged`, `stayed_unflagged`, `appeared` (only in the current result) or `disappeared` (only in the previous one) |
+| `p_value_previous`, `p_value_current` | The p-value each result holds; null on the side the entity is absent from |
+| `is_anomaly_previous`, `is_anomaly_current` | The flag each result holds |
+| `anomaly_score_previous`, `anomaly_score_current` | The score each result holds |
+
+- Both must be `score` results scored `like` the same sphere (a copy made with `export_reference` counts as the same). Results of two calibrations are refused, because their p-values are measured against different populations.
+- A `find_anomalies` result is refused too: it holds each entity's verdict inside its own reference, and with the `current` axis on other axes than `score` uses, so the same events would show entities entering and leaving the flag. To compare with the calibration window, score its events first: `score(events, like=result)`.
+- Some entities change sides between two ordinary windows by chance, as many as the alarm budget allows: read `entered` as a list to look at, not as a count of incidents.
+- It says that a verdict changed, not why. For the reasons of the current run read its `top_reasons` or call `explain`. The dimension whose population rank moved most between the two runs is deliberately not reported: between two ordinary windows an entity's ranks move a lot by themselves, mostly in dimensions built from few events, so the largest movement rarely names what changed.
+
 ### Per-group populations
 
 `group_by` names an entity property, such as a segment or a country. With groups, `delta_norm` and the reasons' `delta` are always measured against the entity's own group. Two modes decide what happens to the score and the flag:
@@ -285,7 +410,7 @@ find_anomalies(tx, entity="from_account", counterparty="to_account", amount="amo
                time="ts", group_by="segment", score_per_group=True)
 ```
 
-An entity takes the most frequent value of the column in its own events, and the smallest one on a tie. Entities seen only as a counterparty go to the group `"(none)"`. Such an entity has no outgoing events, so it is often flagged: it is far from a population of senders. `"(none)"` is usually small and pooled, and with `score_per_group` a pool too small for its own reference is scored against the whole population, outside every group's alarm budget, so the flagged count rises above the budget by these entities. Filter them out of the result, or give them a group value, when they are not of interest. The result gains the `group_by` column and `calibration_scope`: `"group"` when the entity was scored by its own group's reference, `"pooled"` when by the pool's, and `"global"` when by the whole population (a group unseen at calibration, or, with `score_per_group`, a pool too small for its own reference).
+An entity takes the most frequent value of the column in its own events, and the smallest one on a tie. An entity whose events have no value in the column goes to the group `"(none)"`. The result gains the `group_by` column and `calibration_scope`: `"group"` when the entity was scored by its own group's reference, `"pooled"` when by the pool's, and `"global"` when by the whole population (a group unseen at calibration, or, with `score_per_group`, a pool too small for its own reference).
 
 ### Where the work runs, and the cache
 
@@ -341,7 +466,7 @@ Every event is read from both sides:
 - **Out row.** One per event with a non-null entity. The key is the entity and the other side is the counterparty.
 - **In row.** One per event whose counterparty is non-null and differs from the entity. The key is the counterparty and the other side is the entity.
 
-So an account that only receives money still gets a shape. Two edge cases:
+The entities are the keys of the `entity` column. A key seen only as a counterparty (an account that only receives, a merchant) gets no row and is not part of the calibrated population: its events count for the entities on the other side. To score those keys, make a second call with the roles swapped (`entity=` the receiving column, `counterparty=` the sending one). A calibration saved by an earlier version still holds such keys in its population: calibrate again with `find_anomalies` (and export the reference again) before scoring against it. An entity that no event names as the counterparty has every incoming count, sum, mean and extreme at 0, which by itself can put it among the flags: `calibration_card` counts such entities under `one_sided`, and `evidence_record` notes them (`no_incoming_events`). Two edge cases:
 
 - An event with a null entity is dropped.
 - A self-transfer (entity = counterparty) counts once, as an out row.
@@ -403,3 +528,4 @@ Times are converted to UTC epoch seconds arithmetically, so results do not depen
 - Each dimension is standardised against the population (mean and standard deviation, with a floor of 0.01 on the deviation) and never clipped, so an entity far beyond the usual range stays far. `delta_norm` treats dimensions as independent (two dimensions that move together each count in it); the anomaly score does not, because it measures distance on rank-Gaussian coordinates with a shrunk covariance. The distance is measured from one centre per population, so a population made of several distinct kinds of entity is described poorly without `group_by`.
 - `find_anomalies` calibrates on the data it is given; to measure new data against an earlier calibration, use `score`.
 - The smallest `p_value` a fitted entity can get is `2/(n+1)` for a population of n entities (it counts itself in the reference), so at `percentile=99` a population needs about 200 entities before `find_anomalies` can flag anyone. A new row scored with `score` has a floor of `1/(n+1)`.
+- The score weighs combinations of dimensions and caps how far any single value counts: a value far beyond everything in the population counts like one just beyond it, and dimensions that move together count as one piece of evidence. An entity that is extreme on one family of dimensions only (every amount a thousand times too large, say) can therefore stay under the threshold. `dimension_rank_pct` (`dimension_ranks=True`) shows which entities sit at the top of a dimension, but a rank does not say by how much: to catch a value that is wildly off, use a range check on the column.

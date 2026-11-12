@@ -1,6 +1,6 @@
 roles: entity=src counterparty=dst amount=amt time=ts
 log_amounts: log1p(max(x, 0)) on amounts and gaps, negatives count as 0
-long table: one out row per event with a non-null entity (key = entity, other = counterparty); one in row per event whose counterparty is non-null and differs from the entity (key = counterparty, other = entity); events with a null entity are dropped; keys are cast to string; time is epoch seconds in UTC (timestamp = instant, timestamp_ntz = wall clock read as UTC, date = UTC midnight, numeric = epoch seconds)
+long table: one out row per event with a non-null entity (key = entity, other = counterparty); one in row per event whose counterparty is non-null and differs from the entity (key = counterparty, other = entity); events with a null entity are dropped; a key with no out row (seen only as a counterparty) is not an entity; keys are cast to string; time is epoch seconds in UTC (timestamp = instant, timestamp_ntz = wall clock read as UTC, date = UTC midnight, numeric = epoch seconds)
 dims:
   n_out [poisson] stage=events: out rows
   n_in [poisson] stage=events: in rows

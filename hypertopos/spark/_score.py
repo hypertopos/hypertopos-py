@@ -20,10 +20,16 @@ from hypertopos.spark._api import PLAN_FILE, entity_frame, shape_result
 from hypertopos.spark._build import KEY
 from hypertopos.spark._explain import Sphere, sphere_of
 from hypertopos.spark._plan import EVENT_TIMES, Plan
-from hypertopos.spark._result import TOP_REASONS, result_table
+from hypertopos.spark._result import RANK_PREFIX, TOP_REASONS, result_table
 
 
-def score(df: DataFrame, like: DataFrame | Sphere, *, dimensions: bool = False) -> DataFrame:
+def score(
+    df: DataFrame,
+    like: DataFrame | Sphere,
+    *,
+    dimensions: bool = False,
+    dimension_ranks: bool = False,
+) -> DataFrame:
     """Score new events against the population ``like`` was calibrated on.
 
     Args:
@@ -34,6 +40,11 @@ def score(df: DataFrame, like: DataFrame | Sphere, *, dimensions: bool = False) 
             input ``calibration_status`` needs, together with ``first_event``
             and ``last_event``, each entity's first and last event time in
             epoch seconds (UTC).
+        dimension_ranks: Add ``dimension_rank_pct``, a map from dimension name
+            to where the entity's value sits in the calibrated population
+            (its group's with ``score_per_group``), 0-100: the share of that
+            population below the value as measured (shares and spreads before
+            the small-count adjustment the score applies).
 
     Returns:
         The ``find_anomalies`` columns for the entities in ``df``, measured
@@ -50,12 +61,14 @@ def score(df: DataFrame, like: DataFrame | Sphere, *, dimensions: bool = False) 
     """
     sphere = like if isinstance(like, Sphere) else sphere_of(like)
     calibration = sphere.calibration()
+    if dimension_ranks:
+        calibration.require_rank_grid()  # here, not in the first action on the executors
     with open(sphere.path / PLAN_FILE, "rb") as fh:
         plan: Plan = pickle.load(fh)
     entities = entity_frame(df, plan, calibration.group_by, event_times=dimensions)
     flat = entities.mapInArrow(
-        _scorer(_shipped_calibration(calibration), dimensions),
-        _result_schema(calibration, dimensions),
+        _scorer(_shipped_calibration(calibration), dimensions, dimension_ranks),
+        _result_schema(calibration, dimensions, dimension_ranks),
     )
     return shape_result(
         flat,
@@ -65,6 +78,7 @@ def score(df: DataFrame, like: DataFrame | Sphere, *, dimensions: bool = False) 
         calibration.group_by,
         scored=True,
         dimensions=dimensions,
+        rank_dims=calibration.dims if dimension_ranks else None,
     )
 
 
@@ -108,19 +122,22 @@ def _for_new_rows(reference: Reference) -> Reference:
 
 
 def _scorer(
-    calibration: FrozenCalibration, dimensions: bool
+    calibration: FrozenCalibration, dimensions: bool, dimension_ranks: bool
 ) -> Callable[[Iterable[pa.RecordBatch]], Iterable[pa.RecordBatch]]:
     def run(batches: Iterable[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
         for batch in batches:
             if batch.num_rows:
                 yield from result_table(
-                    pa.Table.from_batches([batch]), calibration, dimensions=dimensions
+                    pa.Table.from_batches([batch]),
+                    calibration,
+                    dimensions=dimensions,
+                    dimension_ranks=dimension_ranks,
                 ).to_batches()
 
     return run
 
 
-def _result_schema(calibration: FrozenCalibration, dimensions: bool) -> str:
+def _result_schema(calibration: FrozenCalibration, dimensions: bool, dimension_ranks: bool) -> str:
     fields = [
         f"{KEY} string",
         "anomaly_score double",
@@ -135,4 +152,6 @@ def _result_schema(calibration: FrozenCalibration, dimensions: bool) -> str:
         fields += [f"`{calibration.group_by}` string", "calibration_scope string"]
     if dimensions:
         fields += ["dimension_values array<double>", *(f"{c} double" for c in EVENT_TIMES)]
+    if dimension_ranks:
+        fields += [f"{RANK_PREFIX}{j} double" for j in range(len(calibration.dims))]
     return ", ".join(fields)

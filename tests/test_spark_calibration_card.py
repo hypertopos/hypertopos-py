@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from collections import Counter
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -91,3 +93,55 @@ def test_a_population_too_small_for_its_own_members_cannot_flag(spark, tmp_path)
     assert card["p_floor"] == pytest.approx(2.0 / (n + 1))
     assert card["can_flag"] is False
     assert card["flagged"] == 0
+
+
+def test_card_says_which_dimensions_lead_the_flags(readme):
+    card = calibration_card(readme)
+    lead = Counter(r["top_reasons"][0]["dim"] for r in readme.where("is_anomaly").collect())
+    total = sum(lead.values())
+    assert card["flag_drivers"] == pytest.approx({d: c / total for d, c in lead.items()})
+    shares = list(card["flag_drivers"].values())
+    assert shares == sorted(shares, reverse=True)
+    assert sum(shares) == pytest.approx(1.0)
+
+
+def test_flag_drivers_split_only_the_flagged_entities(readme, monkeypatch):
+    # The split over dimensions costs far more per row than the score: do it for
+    # the flagged entities, not for the population.
+    from hypertopos.scoring import FrozenCalibration
+
+    seen = []
+    real = FrozenCalibration.score_shares
+
+    def counting(self, table, score_delta):
+        seen.append(table.num_rows)
+        return real(self, table, score_delta)
+
+    monkeypatch.setattr(FrozenCalibration, "score_shares", counting)
+    card = calibration_card(readme)
+    assert seen == [card["flagged"]]
+
+
+def test_card_counts_the_entities_with_no_incoming_events(spark, tmp_path):
+    events = spark.range(6_000).selectExpr(
+        "CASE WHEN id % 200 = 0 THEN concat('S', id % 3) ELSE concat('E', id % 600) END AS src",
+        "concat('E', (id * 7919 + 13) % 600) AS dst",
+        "exp(randn(5)) * 100 AS amt",
+        "timestamp_seconds(1767225600 + (id * 7907) % 5184000) AS ts",
+    )
+    result = find_anomalies(
+        events, entity="src", counterparty="dst", amount="amt", time="ts", sphere_root=str(tmp_path)
+    ).cache()
+    table = sphere_of(result).entities().to_pandas().set_index("entity")
+    flagged = {r["entity"] for r in result.where("is_anomaly").select("entity").collect()}
+    silent = set(table.index[table["n_in"] == 0])
+    assert silent == {"S0", "S1", "S2"}  # they only send
+    assert calibration_card(result)["one_sided"] == {
+        "no_incoming_events": {"entities": 3, "flagged": len(silent & flagged)}
+    }
+
+
+def test_card_has_no_one_sided_count_without_a_counterparty(spark, tmp_path):
+    events = spark.range(3_000).selectExpr("concat('E', id % 300) AS src", "rand(1) * 100 AS amt")
+    result = find_anomalies(events, entity="src", amount="amt", sphere_root=str(tmp_path))
+    assert "one_sided" not in calibration_card(result)

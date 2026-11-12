@@ -12,7 +12,7 @@ pytest.importorskip("pyspark")
 
 from pyspark.sql import functions as F  # noqa: E402
 
-from hypertopos.spark import find_anomalies  # noqa: E402
+from hypertopos.spark import find_anomalies, score  # noqa: E402
 from hypertopos.spark._api import METADATA_FINGERPRINT, METADATA_PATH  # noqa: E402
 
 N_ENTITIES = 3000
@@ -162,7 +162,7 @@ def test_group_value_is_the_most_frequent_one_and_tiny_groups_are_pooled(spark, 
     assert out["E1"]["seg"] == "b"
     assert out["E1"]["calibration_scope"] == "pooled"  # a one-entity group cannot set a threshold
     assert out["F1"]["calibration_scope"] == "group"
-    assert out["X"]["seg"] == "(none)"  # seen only as a counterparty
+    assert "X" not in out  # seen only as a counterparty: not an entity
 
 
 def test_score_per_group_needs_group_by_and_a_reference_size(events, tmp_path):
@@ -207,3 +207,36 @@ def test_score_per_group_flags_within_each_group(events, result, tmp_path):
     path = out.schema["entity"].metadata[METADATA_PATH]
     assert same.schema["entity"].metadata[METADATA_PATH] == path
     assert path != result.schema["entity"].metadata[METADATA_PATH]
+
+
+def test_a_receive_only_key_is_left_out_with_every_axis_and_by_score(spark, tmp_path):
+    # R only receives; the events of E7 have no segment.
+    events = (
+        spark.range(12_000)
+        .selectExpr(
+            "concat('E', id % 600) AS src",
+            "CASE WHEN id % 300 = 0 THEN 'R' ELSE concat('E', (id * 7919 + 13) % 600) END AS dst",
+            "exp(randn(5)) * 100 AS amt",
+            "timestamp_seconds(1767225600 + (id * 7907) % 5184000) AS ts",
+            "CASE WHEN id % 600 = 7 THEN NULL WHEN id % 600 < 300 THEN 'a' ELSE 'b' END AS seg",
+        )
+        .cache()
+    )
+    roles = {"entity": "src", "counterparty": "dst", "amount": "amt", "time": "ts"}
+    result = find_anomalies(
+        events, **roles, group_by="seg", sphere_root=str(tmp_path / "a")
+    ).cache()
+    rows = {r["entity"]: r for r in result.collect()}
+    assert len(rows) == 600 and "R" not in rows
+    assert rows["E7"]["seg"] == "(none)"
+    per_group = find_anomalies(
+        events,
+        **roles,
+        group_by="seg",
+        score_per_group=True,
+        score_axes=("mahal", "current"),
+        sphere_root=str(tmp_path / "b"),
+    )
+    assert per_group.count() == 600
+    scored = {r["entity"] for r in score(events, like=result).select("entity").collect()}
+    assert scored == set(rows)

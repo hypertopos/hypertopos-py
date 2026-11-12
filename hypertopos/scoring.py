@@ -25,6 +25,7 @@ from typing import Any
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
+from scipy.special import ndtr
 
 from hypertopos.builder._stats import compute_stats, compute_stats_grouped
 from hypertopos.builder.dim_blocks import normalize_metric_block
@@ -35,6 +36,7 @@ from hypertopos.engine.robust import (
     Reference,
     RobustScores,
     dim_shares_rows,
+    fit_cdf,
     fit_grouped_reference,
     fit_reference,
     is_anomaly,
@@ -42,6 +44,7 @@ from hypertopos.engine.robust import (
     pool_groups,
     score_groups,
     subset_states,
+    to_gauss,
 )
 from hypertopos.engine.robust import score as score_reference
 
@@ -76,6 +79,9 @@ class GroupCalibration:
     size: int
     reference: Reference | None = None  # the group's own score; None: the population's
     vel_keys: np.ndarray | None = None  # keys of its velocity sample's rows, in its order
+    # With a reference of its own: the quantile grid of the measured values of its
+    # adjusted dimensions, (len(shrink), Q) in ``shrink`` order.
+    raw_grid: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -115,6 +121,10 @@ class FrozenCalibration:
     halves: tuple[float, float] | None = None
     key: str | None = None  # the column identifying rows, with ``halves``
     vel_keys: np.ndarray | None = None  # keys of the velocity sample's rows, in its order
+    # Quantile grid of the measured (unadjusted) values of the ``shrink`` dimensions over
+    # the fitted population, (len(shrink), Q) in ``shrink`` order; None without ``shrink``,
+    # and on a calibration saved before measured ranks existed.
+    raw_grid: np.ndarray | None = None
 
     @classmethod
     def fit(
@@ -259,6 +269,7 @@ class FrozenCalibration:
         standard, pre_mu, pre_sigma = normalize_metric_block(shapes)
         # Only mu / sigma are used: the calibrated score flags rows, not theta.
         mu, sigma, _, _, _ = compute_stats(standard, percentile, warn_rate=False)
+        measured = np.column_stack([_column(table, dim) for dim in priors]) if priors else None
         groups: dict[str, GroupCalibration] | None = None
         pooled: frozenset[str] = frozenset()
         if group_by is not None:
@@ -271,7 +282,14 @@ class FrozenCalibration:
             stats, _, _ = compute_stats_grouped(standard, ids, percentile, warn_rate=False)
             groups = {
                 gid: GroupCalibration(
-                    g_mu, g_sigma, size, references.get(gid), group_vel_keys.get(gid)
+                    g_mu,
+                    g_sigma,
+                    size,
+                    references.get(gid),
+                    group_vel_keys.get(gid),
+                    fit_cdf(measured[ids == gid])[0]
+                    if measured is not None and gid in references
+                    else None,
                 )
                 for gid, (g_mu, g_sigma, _, size) in stats.items()
             }
@@ -294,6 +312,7 @@ class FrozenCalibration:
             halves=halves,
             key=key if halves is not None else None,
             vel_keys=vel_keys,
+            raw_grid=None if measured is None else fit_cdf(measured)[0],
         )
         return calibration, fitted
 
@@ -363,6 +382,40 @@ class FrozenCalibration:
         out = np.zeros(np.shape(score_delta), dtype=np.float64)
         for mask, ref in self._references(self._assignments(table)):
             out[mask] = dim_shares_rows(ref, score_delta[mask])
+        return out
+
+    def require_rank_grid(self) -> None:
+        """Raise when dimension ranks cannot be computed: adjusted dimensions without the
+        distribution of their measured values (a calibration saved by an earlier version)."""
+        if self.shrink and self.raw_grid is None:
+            raise ValueError(
+                "this calibration was saved without the measured values' distribution; "
+                "recalibrate with find_anomalies to get dimension ranks and evidence records"
+            )
+
+    def dimension_rank_pct(self, table: pa.Table, score_delta: np.ndarray) -> np.ndarray:
+        """Where each dimension's measured value sits in the population that scored its row.
+
+        0-100: the share of that population (the row's group with
+        ``score_per_group``) below the value; tied values take the middle of their
+        range. A dimension with a small-count adjustment is ranked on the value
+        as measured, not on the adjusted value the score uses, so equal measured
+        values rank equal. ``score_delta``: the rows' :attr:`Scores.score_delta`.
+        """
+        delta = np.asarray(score_delta, dtype=np.float64)
+        out = np.empty(delta.shape, dtype=np.float64)
+        adjusted = [self.dims.index(dim) for dim in self.shrink or {}]
+        self.require_rank_grid()
+        for mask, cal, _ in self._assignments(table):
+            own = self.score_per_group and cal.reference is not None
+            ref = cal.reference if own and cal.reference is not None else self.reference
+            ranks = 100.0 * ndtr(delta[mask] + ref.lw_location)
+            grid = cal.raw_grid if own else self.raw_grid
+            if adjusted and grid is not None:
+                rows = pa.table({d: table[d] for d in self.shrink or {}}).filter(pa.array(mask))
+                measured = np.column_stack([_column(rows, d) for d in self.shrink or {}])
+                ranks[:, adjusted] = 100.0 * ndtr(to_gauss(grid, ref.cdf_levels, measured))
+            out[mask] = ranks
         return out
 
     def _evidence(
@@ -544,7 +597,8 @@ def _deltas(shapes: np.ndarray, mu: np.ndarray, sigma: np.ndarray) -> np.ndarray
 
 def _column(table: pa.Table, name: str) -> np.ndarray:
     values: np.ndarray = pc.fill_null(table[name], 0).to_numpy(zero_copy_only=False)
-    return values.astype(np.float64)
+    values = values.astype(np.float64)
+    return np.where(np.isnan(values), 0.0, values)  # a NaN counts as 0, like a null
 
 
 def _shapes(

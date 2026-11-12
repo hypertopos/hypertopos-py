@@ -198,6 +198,7 @@ LONG_TABLE = (
     "one out row per event with a non-null entity (key = entity, other = counterparty); "
     "one in row per event whose counterparty is non-null and differs from the entity "
     "(key = counterparty, other = entity); events with a null entity are dropped; "
+    "a key with no out row (seen only as a counterparty) is not an entity; "
     "keys are cast to string; time is epoch seconds in UTC "
     "(timestamp = instant, timestamp_ntz = wall clock read as UTC, date = UTC midnight, "
     "numeric = epoch seconds)"
@@ -317,9 +318,11 @@ def _long_table(df: DataFrame, plan: Plan) -> DataFrame:
         if "counterparty" in roles
         else F.lit(None).cast("string")
     )
-    amount = (
-        F.col(roles["amount"]).cast("double") if "amount" in roles else F.lit(None).cast("double")
-    )
+    missing = F.lit(None).cast("double")
+    amount = missing
+    if "amount" in roles:
+        # A NaN amount is a missing amount: Spark's sum, mean and max would return NaN for it.
+        amount = F.nanvl(F.col(roles["amount"]).cast("double"), missing)
     ts = _epoch_seconds(df, roles["time"]) if "time" in roles else F.lit(None).cast("double")
     base = df.select(entity.alias("e"), other.alias("o"), amount.alias("amount"), ts.alias("ts"))
     base = base.where(F.col("e").isNotNull())
@@ -342,6 +345,15 @@ def _long_table(df: DataFrame, plan: Plan) -> DataFrame:
     return out_rows.unionByName(in_rows)
 
 
+def _entities_only(per_key: DataFrame) -> DataFrame:
+    """Rows of the keys seen in the entity column; ``per_key`` carries ``_out_rows``."""
+    return per_key.where(F.col("_out_rows") > 0)
+
+
+def _out_rows() -> Column:
+    return F.sum(F.when(F.col("side") == "out", 1).otherwise(0)).alias("_out_rows")
+
+
 def _side_amount(side: str) -> Column:
     return F.when(F.col("side") == side, F.col("amount"))
 
@@ -360,7 +372,8 @@ def window_days(first: float | None, last: float | None) -> int | None:
 
 def count_entities(df: DataFrame, plan: Plan) -> int:
     """Entities ``aggregate`` produces, from the keys alone (no dimensions computed)."""
-    return int(_long_table(df, plan).select("key").distinct().count())
+    keys = _long_table(df, plan).where(F.col("side") == "out").select("key")
+    return int(keys.distinct().count())
 
 
 def aggregate(df: DataFrame, plan: Plan, *, event_times: bool = False) -> DataFrame:
@@ -415,7 +428,7 @@ def aggregate(df: DataFrame, plan: Plan, *, event_times: bool = False) -> DataFr
     aggs.extend(F.expr(expr).alias(name) for name, expr in plan.extra_dims)
     if event_times:
         aggs += [F.min("ts").alias(FIRST_EVENT), F.max("ts").alias(LAST_EVENT)]
-    result = long.groupBy("key").agg(*aggs)
+    result = _entities_only(long.groupBy("key").agg(*aggs, _out_rows()))
 
     def ref(name: str) -> Column:
         return F.col(name) if name in base_names else F.col(f"_{name}")
@@ -493,7 +506,8 @@ def state_frame(
         long = long.join(own, "key", "left")
         aggs += _half_state_aggs(F.coalesce(F.col("_t_mid"), F.lit(t_mid)), GROUP_STATE_COLUMNS)
     names = STATE_COLUMNS + (GROUP_STATE_COLUMNS if splits is not None else ())
-    return long.groupBy("key").agg(*aggs).select(F.col("key").alias("entity"), *names)
+    states = _entities_only(long.groupBy("key").agg(*aggs, _out_rows()))
+    return states.select(F.col("key").alias("entity"), *names)
 
 
 def _exact_sum(values: Column) -> Column:

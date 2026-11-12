@@ -19,7 +19,14 @@ pytest.importorskip("pyspark")
 
 from pyspark.sql import types as T  # noqa: E402
 
-from hypertopos.spark._plan import DIMS, aggregate, build_plan, describe_plan  # noqa: E402
+from hypertopos.spark._plan import (  # noqa: E402
+    DIMS,
+    aggregate,
+    build_plan,
+    count_entities,
+    describe_plan,
+    state_frame,
+)
 
 GOLDEN = Path(__file__).parent / "golden" / "spark_plan_full.txt"
 
@@ -133,12 +140,28 @@ def test_empty_side_fills_zero(spark):
     rows = [("X", "Y", 5.0, _ts(5, 10))]
     plan = build_plan(**FULL_ROLES, log_amounts=False)
     out = {r["entity"]: r.asDict() for r in aggregate(_frame(spark, rows, SCHEMA), plan).collect()}
-    y = out["Y"]
-    assert y["n_out"] == 0
-    assert y["amount_mean_out"] == 0.0
-    assert y["amount_min_out"] == 0.0
-    assert y["top_counterparty_share_out"] == 0.0
-    assert y["iet_mean"] == 0.0
+    x = out["X"]
+    assert x["n_in"] == 0
+    assert x["amount_mean_in"] == 0.0
+    assert x["amount_max_in"] == 0.0
+    assert x["amount_std_in"] == 0.0
+    assert x["iet_mean"] == 0.0
+
+
+def test_a_key_seen_only_as_a_counterparty_is_not_an_entity(spark):
+    rows = [
+        ("X", "Y", 5.0, _ts(5, 10)),
+        ("X", "Z", 7.0, _ts(6, 10)),
+        ("Z", "X", 9.0, _ts(7, 10)),
+    ]
+    df = _frame(spark, rows, SCHEMA)
+    plan = build_plan(**FULL_ROLES, log_amounts=False)
+    out = {r["entity"]: r.asDict() for r in aggregate(df, plan).collect()}
+    assert sorted(out) == ["X", "Z"]  # Y never appears in the entity column
+    assert (out["Z"]["n_out"], out["Z"]["n_in"]) == (1, 1)  # an entity keeps its in rows
+    assert count_entities(df, plan) == 2
+    t_mid = _ts(6, 0).timestamp()
+    assert sorted(r["entity"] for r in state_frame(df, plan, t_mid).collect()) == ["X", "Z"]
 
 
 def test_log_amounts_is_log1p_of_non_negative_part(events):
@@ -324,8 +347,9 @@ def test_random_events_match_a_pandas_oracle(spark):
     inn = valid[valid["dst"].notna() & (valid["dst"] != valid["src"])]
     in_rows = inn.assign(key=inn["dst"], other=inn["src"], side="in")
     long = pd.concat([out_rows, in_rows], ignore_index=True)
-    assert sorted(got) == sorted(long["key"].unique())
-    for key, g in long.groupby("key"):
+    entities = set(valid["src"])
+    assert sorted(got) == sorted(entities)
+    for key, g in long[long["key"].isin(entities)].groupby("key"):
         o = g[g["side"] == "out"]
         i = g[g["side"] == "in"]
         row = got[key]

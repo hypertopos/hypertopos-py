@@ -7,6 +7,28 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-11-12
+
+### Added
+
+- `hypertopos.spark.compare(previous, current)`: joins two `score` results scored against the same calibration and returns one row per entity with its `transition` (`entered`, `left`, `stayed_flagged`, `stayed_unflagged`, `appeared`, `disappeared`) and the p-value, flag and score of each side. Results of two calibrations, and `find_anomalies` results, are refused.
+- `hypertopos.spark.find_anomalies` and `score` take `dimension_ranks=True` and add `dimension_rank_pct`, a map from dimension name to where the entity's value sits in the calibrated population (its group's with `score_per_group`), 0-100: the share of that population below the entity's measured value. Entities can then be selected by position in SQL, e.g. `dimension_rank_pct['n_distinct_out'] >= 99 AND dimension_rank_pct['amount_mean_out'] <= 20`. `FrozenCalibration.dimension_rank_pct` gives the same ranks from Python.
+- Spark guide: a recipe for an entity history table (each scored run appended with its run date and calibration fingerprint) with the queries for when an entity was first flagged and which entities are newly flagged in a run. The limits section and the "When not to use hypertopos" page state that the score caps how far a single value counts, so an entity extreme on one family of dimensions can stay unflagged, and point to a range check for that case.
+- `hypertopos.spark.evidence_record(result)`: one row per entity with everything behind its verdict — the p-value, flag and score as the result holds them, the evidence in bits and its split over the axes, the top reasons with the entity's measured value and its rank in the population, `notes` on what limits the evidence (`no_incoming_events`, `tied_dimension:<dim>`, `reference_cannot_flag`, `scope_pooled`, `scope_global`), and where the verdict comes from (`reference_size`, `percentile`, `score_axes`, `window_days`, the calibration's fingerprint and the library version). Works on `find_anomalies` results and, with `events=`, on `score` results.
+- `calibration_card` reports `flag_drivers`: for each dimension, the share of the flagged entities whose largest reason it is, largest first — what the flags of a calibration are mostly about.
+- `calibration_card` reports `one_sided`: how many entities have no incoming events, and how many of them are flagged.
+- `Sphere.export_reference(root)`: saves a calibration without its entity table, entity keys and entity states, so another team or organisation can score its own events against the population (`score`, `calibration_status`, `explain(scored, events=...)`) without receiving the population's entities. Functions that need the entity table (`calibration_card`, `evidence_record`, `entities`, `geometry`) say so on such a calibration, and `find_anomalies` refuses to calibrate into its directory.
+
+### Changed
+
+- `hypertopos.spark`: the entities are the keys of the `entity` column. A key seen only as a counterparty (an account that only receives, a merchant) no longer gets a row, a score or a place in the calibrated population; events that name an entity as the counterparty still count for its incoming dimensions. Before, such a key was an entity with every outgoing dimension at 0 and was often flagged for that alone. On data with such keys the result has fewer rows, and the p-values and flags of the other entities change with the population. To score the receiving side, make a second call with the roles swapped. A calibration saved by an earlier version still holds such keys in its population: calibrate again with `find_anomalies` (and export the reference again) before scoring against it. With `group_by`, the group `"(none)"` now holds only entities whose events have no value in the column.
+- `axis_evidence` reads the result with one Spark action instead of two when the entities are picked by `top_n`, so on a result that is not persisted (a `score` result, typically) it no longer recomputes it twice.
+
+### Fixed
+
+- A NaN amount is treated as a missing amount: the event counts and its amount does not, as for a null. Before, a NaN amount made the entity's amount sums, means, maxima and spreads NaN, which distorted the small-count adjustment of share and spread dimensions for the whole population and broke the `current` axis. A NaN in any other dimension counts as 0 for that entity. A calibration saved from such data keeps the distortion until it is recalibrated.
+- `sphere_of(result).fingerprint` equals `sphere_of(path).fingerprint` for the same calibration: both are the name of the calibration directory. Before, a result gave a longer identifier than its path did.
+
 ## [0.11.0] — 2026-11-10
 
 ### Added

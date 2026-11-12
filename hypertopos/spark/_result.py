@@ -14,6 +14,7 @@ from hypertopos.spark._build import KEY
 from hypertopos.spark._plan import EVENT_TIMES
 
 TOP_REASONS = 3
+RANK_PREFIX = "dim_rank_"
 
 
 def result_table(
@@ -22,6 +23,7 @@ def result_table(
     *,
     members: bool = False,
     dimensions: bool = False,
+    dimension_ranks: bool = False,
     scores: Scores | None = None,
 ) -> pa.Table:
     """Per-entity result with flat reason columns (``reason_<i>_dim/_delta/_pct``).
@@ -33,7 +35,10 @@ def result_table(
     ``members=True``: ``entities`` is the table the calibration was fitted on.
     ``dimensions=True`` adds ``dimension_values``: the values the score was
     computed on, in ``calibration.dims`` order, and copies ``first_event`` /
-    ``last_event`` from ``entities``. ``scores``: the rows' scores, when already
+    ``last_event`` from ``entities``. ``dimension_ranks=True`` adds one
+    ``dim_rank_<j>`` column per dimension, in ``calibration.dims`` order: where
+    the value sits in the population that scored the row, 0-100.
+    ``scores``: the rows' scores, when already
     computed (by :meth:`FrozenCalibration.fit_scored` on this same table, so
     row-aligned with ``entities``); otherwise they are computed here.
     """
@@ -67,4 +72,8 @@ def result_table(
         columns["dimension_values"] = pa.ListArray.from_arrays(offsets, pa.array(values.ravel()))
         for name in EVENT_TIMES:
             columns[name] = entities[name].combine_chunks()
+    if dimension_ranks:
+        ranks = calibration.dimension_rank_pct(entities, scores.score_delta)
+        for j in range(ranks.shape[1]):
+            columns[f"{RANK_PREFIX}{j}"] = pa.array(ranks[:, j])
     return pa.table(columns)

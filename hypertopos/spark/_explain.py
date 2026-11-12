@@ -21,14 +21,13 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import DataFrame, Row, SparkSession
 from pyspark.sql import functions as F
 
 from hypertopos.scoring import FrozenCalibration
 from hypertopos.spark._api import (
     CALIBRATION_FILE,
     ENTITIES_FILE,
-    METADATA_FINGERPRINT,
     METADATA_PATH,
     METADATA_SCORED,
     PLAN_FILE,
@@ -49,7 +48,47 @@ class Sphere:
 
     def entities(self) -> pa.Table:
         """The per-entity table the calibration was fitted on."""
+        if not (self.path / ENTITIES_FILE).exists():
+            raise ValueError(
+                "this calibration was exported without its entities (export_reference): "
+                "new events can be scored and checked against it (score, calibration_status, "
+                "explain with events=), but it cannot show the population it was fitted on"
+            )
         return pq.read_table(self.path / ENTITIES_FILE)
+
+    def export_reference(self, root: str | os.PathLike[str]) -> Sphere:
+        """Save what scoring against this population needs, and nothing about its entities.
+
+        Writes the calibration and the aggregation plan to a directory of the
+        same name under ``root`` and returns that ``Sphere``. The copy holds no
+        entity table, no entity keys and no entity states: ``score``,
+        ``calibration_status`` and
+        ``explain(..., events=)`` work against it; ``calibration_card``,
+        ``evidence_record``, ``entities`` and ``geometry`` need the original. It
+        does hold each dimension's quantiles, extremes included, and the
+        population's sorted scores, so it describes the population closely.
+        """
+        from hypertopos.spark._score import _shipped_calibration
+
+        target = Path(root) / self.path.name
+        if target.resolve() == self.path.resolve():
+            raise ValueError(
+                "export_reference would overwrite this calibration: pass a directory "
+                "other than the one it is kept in"
+            )
+        if (target / ENTITIES_FILE).exists():
+            raise ValueError(
+                f"{target} holds a calibration with its entities: export_reference would "
+                "replace that calibration and leave its entity table in the export; pass "
+                "another directory"
+            )
+        target.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.path / PLAN_FILE, target / PLAN_FILE)
+        tmp = target / (CALIBRATION_FILE + ".tmp")
+        with open(tmp, "wb") as fh:
+            pickle.dump(_shipped_calibration(self.calibration()), fh)
+        os.replace(tmp, target / CALIBRATION_FILE)  # written last: marks the export complete
+        return Sphere(path=target, fingerprint=self.fingerprint)
 
     def calibration(self) -> FrozenCalibration:
         with open(self.path / CALIBRATION_FILE, "rb") as fh:
@@ -135,7 +174,7 @@ def sphere_of(result: DataFrame | str | os.PathLike[str]) -> Sphere:
                 f"no hypertopos calibration at {path}: pass the path of sphere_of(result) "
                 "from a find_anomalies call whose sphere_root is persistent storage"
             )
-        return Sphere(path=path, fingerprint=path.name)
+        return Sphere(path=path, fingerprint=path.resolve().name)
     metadata = result.schema[KEY].metadata if KEY in result.columns else {}
     if METADATA_PATH not in metadata:
         raise ValueError(
@@ -148,7 +187,8 @@ def sphere_of(result: DataFrame | str | os.PathLike[str]) -> Sphere:
             f"the calibration at {path} is gone (driver temp directories do not survive a "
             "restart); run find_anomalies again, or set sphere_root to a persistent location"
         )
-    return Sphere(path=path, fingerprint=metadata[METADATA_FINGERPRINT])
+    # The directory name is the identifier: a path gives the same one in a later process.
+    return Sphere(path=path, fingerprint=path.resolve().name)
 
 
 def _scored_entities(
@@ -192,10 +232,10 @@ def explain(
         entity's ``anomaly_score`` in percent (the Shapley split of its
         Mahalanobis evidence that ``explain_anomaly`` reports on a sphere, so
         correlated dimensions share a deviation they make together), and
-        ``above`` / ``below`` / ``at`` the mean. Rows are ordered by entity
-        score, then by share.
+        ``above`` / ``below`` / ``at`` the mean. Entities come in the order of
+        ``entities`` when given, otherwise by score; their rows by share.
     """
-    calibration, table, keys, scored = _explained(result, entities, top_n, events, dims)
+    calibration, table, keys, scored, _ = _explained(result, entities, top_n, events, dims)
     scores = calibration.score(table, members=not scored)
     shapes = calibration.shapes(table)
     mu, sigma = calibration.raw_params(table)
@@ -251,20 +291,16 @@ def axis_evidence(
         ``bits_current`` is null when the result has no ``current`` axis
         (without a ``time`` role, and by default with ``score_per_group``,
         where ``score_axes`` must name it); then ``bits_mahal`` equals ``bits``.
-        Rows are ordered by entity score.
+        Rows come in the order of ``entities`` when given, otherwise by score.
     """
     from hypertopos.engine.robust import attribute
 
-    calibration, table, keys, scored = _explained(result, entities, top_n, events, None)
-    evidence, refs = calibration.row_evidence(table, members=not scored)
     # The result's own p-value and flag: rescoring a few rows can land one rank
     # step away from the score the whole table got (floating-point summation order).
-    stored = {
-        r[KEY]: r
-        for r in result.where(F.col(KEY).isin(keys)).select(KEY, "p_value", "is_anomaly").collect()
-    }
-    if set(keys) - set(stored):
-        raise ValueError(f"not in this result: {sorted(set(keys) - set(stored))[:10]}")
+    calibration, table, keys, scored, stored = _explained(
+        result, entities, top_n, events, None, verdict=True
+    )
+    evidence, refs = calibration.row_evidence(table, members=not scored)
     names = table[KEY].to_pylist()
     rank = {k: i for i, k in enumerate(keys)}
     rows = []
@@ -294,28 +330,39 @@ def _explained(
     top_n: int,
     events: DataFrame | None,
     dims: Sequence[str] | None,
-) -> tuple[FrozenCalibration, pa.Table, list[str], bool]:
+    *,
+    verdict: bool = False,
+) -> tuple[FrozenCalibration, pa.Table, list[str], bool, dict[str, Row]]:
     """The calibration, the entity table of the entities to explain, their keys in
-    order, and whether ``result`` came from ``score``."""
+    order, whether ``result`` came from ``score``, and with ``verdict`` the
+    result's own rows for those keys, read in the same single action that picks them
+    (a result that is not persisted is recomputed by every action on it)."""
     sphere = sphere_of(result)
     calibration = sphere.calibration()
     if dims is not None:
         unknown = [d for d in dims if d not in calibration.dims]
         if unknown:
             raise ValueError(f"unknown dims {unknown}; calibrated: {list(calibration.dims)}")
+    scored = bool(KEY in result.columns and result.schema[KEY].metadata.get(METADATA_SCORED))
+    if scored and events is None:
+        # before any action: reading a score result that is not persisted rescores it
+        raise ValueError(
+            "this is a score() result: its entities are not in the calibration; "
+            "pass the events it scored, explain(result, events=df)"
+        )
+    rows: list[Row] = []
     if entities is None:
-        keys = [
-            r[KEY] for r in result.orderBy("anomaly_score", ascending=False).limit(top_n).collect()
-        ]
+        rows = result.orderBy("anomaly_score", ascending=False).limit(top_n).collect()
+        keys = [r[KEY] for r in rows]
     else:
         keys = [str(k) for k in entities]
-    scored = bool(KEY in result.columns and result.schema[KEY].metadata.get(METADATA_SCORED))
+        if verdict:
+            rows = result.where(F.col(KEY).isin(keys)).collect()
+    stored = {r[KEY]: r for r in rows} if verdict else {}
+    if verdict and set(keys) - set(stored):
+        raise ValueError(f"not in this result: {sorted(set(keys) - set(stored))[:10]}")
     if scored:
-        if events is None:
-            raise ValueError(
-                "this is a score() result: its entities are not in the calibration; "
-                "pass the events it scored, explain(result, events=df)"
-            )
+        assert events is not None
         table = _scored_entities(events, sphere, keys, calibration.group_by)
     else:
         table = sphere.entities()
@@ -323,4 +370,4 @@ def _explained(
     missing = set(keys) - set(table[KEY].to_pylist())
     if missing:
         raise ValueError(f"not in this result: {sorted(missing)[:10]}")
-    return calibration, table, keys, scored
+    return calibration, table, keys, scored, stored

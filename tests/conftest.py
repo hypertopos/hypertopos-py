@@ -107,13 +107,43 @@ def spark() -> Iterator[Any]:
         .appName("hypertopos-tests")
         .config("spark.ui.enabled", "false")
         .config("spark.sql.shuffle.partitions", "2")
-        .config("spark.driver.memory", "1g")
+        # The heaviest Spark tests keep 400-550 MB live in the driver; CI gives the JVM
+        # more room, a laptop running several workers keeps the small default.
+        .config("spark.driver.memory", os.environ.get("HYPERTOPOS_TEST_SPARK_MEMORY", "1g"))
+        # A worker keeps this session for hundreds of queries: without these the driver
+        # holds the plan and metrics of the last 1,000 executions and runs out of heap.
+        .config("spark.sql.ui.retainedExecutions", "5")
+        .config("spark.ui.retainedJobs", "20")
+        .config("spark.ui.retainedStages", "20")
+        .config("spark.ui.retainedTasks", "200")
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.execution.arrow.pyspark.enabled", "true")
         .getOrCreate()
     )
     yield session
     session.stop()
+
+
+def release_spark_cache() -> None:
+    """Drop every cached DataFrame of the running session, if there is one."""
+    if "pyspark" not in sys.modules:
+        return
+    from pyspark.sql import SparkSession
+
+    session = SparkSession.getActiveSession()
+    if session is not None:
+        session.catalog.clearCache()
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _release_spark_cache_after_module() -> Iterator[None]:
+    """Module fixtures cache their frames and nothing unpersists them.
+
+    A worker keeps one JVM with a small heap for the whole run, so the cached
+    frames of every module would pile up until a later test runs out of heap.
+    """
+    yield
+    release_spark_cache()
 
 
 @pytest.fixture
